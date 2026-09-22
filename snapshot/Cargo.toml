@@ -1,0 +1,9 @@
+[package]
+name = "night-snapshot"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+night-compiler = { path = "../compiler" }
+anyhow = "1"
+rustc-hash = "2"

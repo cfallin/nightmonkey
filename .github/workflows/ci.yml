@@ -1,0 +1,95 @@
+name: CI
+concurrency:
+  group: ${{ github.head_ref || github.ref }}-${{ github.workflow }}
+  cancel-in-progress: true
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+defaults:
+  run:
+    shell: bash
+
+# NightMonkey builds against a pinned branch of the SpiderMonkey fork that
+# carries the external compiler hook API.
+env:
+  FIREFOX_REPO: bytecodealliance/firefox
+  FIREFOX_REF: wasi-ff147
+  SM_OBJDIR: obj-nightmonkey-sm
+
+jobs:
+  jit-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve the SpiderMonkey revision
+        id: smrev
+        run: |
+          sha=$(git ls-remote "https://github.com/$FIREFOX_REPO" "refs/heads/$FIREFOX_REF" | cut -f1)
+          if [ -z "$sha" ]; then
+            echo "::error::branch $FIREFOX_REF not found on https://github.com/$FIREFOX_REPO"
+            exit 1
+          fi
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+
+      - name: Cache the SpiderMonkey checkout
+        id: cache-src
+        uses: actions/cache@v4
+        with:
+          path: firefox
+          key: firefox-src-${{ steps.smrev.outputs.sha }}
+
+      - name: Fetch SpiderMonkey (shallow)
+        if: steps.cache-src.outputs.cache-hit != 'true'
+        run: |
+          git init firefox
+          cd firefox
+          git remote add origin "https://github.com/$FIREFOX_REPO"
+          git fetch --depth 1 origin "${{ steps.smrev.outputs.sha }}"
+          git checkout --detach FETCH_HEAD
+
+      - name: Cache the mach toolchains
+        uses: actions/cache@v4
+        with:
+          path: ~/.mozbuild
+          key: mozbuild-${{ runner.os }}-${{ steps.smrev.outputs.sha }}
+          restore-keys: mozbuild-${{ runner.os }}-
+
+      - name: Bootstrap SpiderMonkey
+        run: |
+          cd firefox
+          ./mach --no-interactive bootstrap --application-choice=js
+          # mach bootstrap only fetches host-target toolchains; the wasm32-wasi
+          # sysroot (crt1.o, libc) must be fetched explicitly into ~/.mozbuild.
+          rustup component add rust-src
+          rustup target add wasm32-wasip1
+          cd ~/.mozbuild && "$GITHUB_WORKSPACE/firefox/mach" --log-no-times artifact toolchain --from-build sysroot-wasm32-wasi
+
+      - name: Cache the SpiderMonkey objdir
+        uses: actions/cache@v4
+        with:
+          path: firefox/${{ env.SM_OBJDIR }}
+          key: firefox-obj-${{ runner.os }}-${{ steps.smrev.outputs.sha }}-${{ hashFiles('spidermonkey/mozconfig') }}
+
+      - name: Build SpiderMonkey
+        run: scripts/build-spidermonkey.sh firefox
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            build/cargo
+          key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-${{ runner.os }}-
+
+      - name: Build NightMonkey
+        run: |
+          cmake -S . -B build -DSPIDERMONKEY_DIST="$GITHUB_WORKSPACE/firefox/$SM_OBJDIR/dist"
+          cmake --build build
+
+      - name: jit-tests (AOT lane)
+        run: scripts/run-jit-tests.sh firefox build -- --format=automation

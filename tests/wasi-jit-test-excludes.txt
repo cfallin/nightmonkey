@@ -1,0 +1,63 @@
+# jit-tests that cannot run on the wasm32-wasi shell NightMonkey builds
+# (spidermonkey/mozconfig: no shared memory or Atomics, no Intl, no
+# threads, a small native stack). Applied to BOTH lanes by
+# scripts/run-jit-tests.sh; independent of the AOT tier. One path per line,
+# relative to js/src/jit-test/tests; the comment is the skip condition the
+# test would carry in-tree.
+
+# !this.Atomics || !Atomics.pause || helperThreadCount() === 0 || getBuildConfiguration("arm64-simulator") === true
+atomics/pause-multi.js
+
+# !this.Atomics || !Atomics.pause
+atomics/pause-single.js
+
+# !this.Atomics
+auto-regress/bug1916581.js
+cacheir/atomics-store-non-number-value.js
+ion/bug1791520.js
+ion/bug1987592.js
+ion/dce-with-rinstructions.js
+ion/recover-atomics-islockfree.js
+ion/recover-int64tobigint.js
+
+# typeof Intl === 'undefined'
+auto-regress/bug1928407.js
+basic/segmenter-atomref.js
+bug1742592.js
+
+# getBuildConfiguration("wasi")
+basic/allow-relazify.js
+basic/functionnames.js
+debug/envChain_frame-eval-relazify.js
+environments/bug1966196.js
+function/function-displayName-computed.js
+gc/gcparam.js
+ion/bug1921215.js
+resist-fingerprinting/math-fdlibm-sincostan.js
+typedarray/arraybuffer-transfer.js
+
+# !this.SharedArrayBuffer
+cacheir/inlinable-native-accessor-7.js
+cacheir/inlinable-native-accessor-8.js
+dataview/resizable-dataview-bytelength-with-sab.js
+dataview/resizable-dataview-byteoffset-sab.js
+dataview/resizable-dataview-get-elem-with-sab.js
+dataview/resizable-dataview-set-elem-with-sab.js
+fuses/species-fuse-sharedarraybuffer-1.js
+fuses/species-fuse-sharedarraybuffer-2.js
+ion/bug1877709.js
+sharedbuf/growable-sab-over-mailbox.js
+structured-clone/growable-shared-array-buffers.js
+typedarray/arraybuffer-pin.js
+typedarray/construct-with-growable-sharedarraybuffer.js
+typedarray/growable-sharedarraybuffer-bytelength.js
+typedarray/resizable-typedarray-bytelength-with-sab.js
+typedarray/resizable-typedarray-byteoffset-sab.js
+typedarray/resizable-typedarray-get-elem-with-sab.js
+typedarray/resizable-typedarray-has-elem-with-sab.js
+typedarray/resizable-typedarray-intrinsic-typedArrayLength.js
+typedarray/resizable-typedarray-length-with-sab.js
+typedarray/resizable-typedarray-set-elem-with-sab.js
+
+# Excluded by the SpiderMonkey CI for every configuration (long-running).
+wasm/atomicity.js

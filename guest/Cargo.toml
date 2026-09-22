@@ -1,0 +1,17 @@
+[package]
+name = "night-guest"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# The in-process test lane's guest-side compiler: night-compiler and
+# night-snapshot as one static library for the shell's wasm target, linked
+# into the NightMonkey shell next to SpiderMonkey's own Rust library. Its C
+# entry points are the `#[no_mangle]` functions those crates export
+# (compiler/night-compiler.h, snapshot/night-snapshot.h).
+[lib]
+crate-type = ["staticlib"]
+
+[dependencies]
+night-compiler = { path = "../compiler" }
+night-snapshot = { path = "../snapshot" }

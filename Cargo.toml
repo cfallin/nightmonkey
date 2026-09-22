@@ -1,0 +1,18 @@
+[workspace]
+resolver = "2"
+members = [
+    "compiler",
+    "snapshot",
+    "nightmonkey",
+    "wasm-jit-runner",
+    "guest",
+]
+
+[workspace.package]
+rust-version = "1.82.0"
+
+# The host tools are built by CMake (see CMakeLists.txt); a plain
+# `cargo build` needs SPIDERMONKEY_DIST in the environment for the
+# compiler's build script, which reads the engine's opcode table from it.
+[profile.release]
+debug = false

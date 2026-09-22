@@ -1,0 +1,8 @@
+- async/generator codegen
+- remaining unsupported opcodes: `Eval`, `BigInt`, ES module import ops,
+  `using`
+- move abstract-interpretation transfer func for ops to types analysis
+  (currently in emitter for historical reasons)
+- use a DSL to write lowering cases and type transfer functions for each op?
+  - maybe ISLE?
+- `module_is_bigint_free` is weird and we should do better

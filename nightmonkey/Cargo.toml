@@ -1,0 +1,20 @@
+[package]
+name = "nightmonkey"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+default = []
+wizen = ["dep:wizer", "dep:libc"]
+
+[dependencies]
+night-compiler = { path = "../compiler" }
+night-snapshot = { path = "../snapshot" }
+waffle = { version = "0.3.1", features = ["parallel"] }
+anyhow = "1"
+wizer = { version = "9", optional = true }
+libc = { version = "0.2", optional = true }
+
+[[bin]]
+name = "nightmonkey"
+path = "src/main.rs"

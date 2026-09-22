@@ -1,0 +1,42 @@
+# jstests that do not run under the NightMonkey AOT tier. Consumed by
+# jstests.py --exclude-file (AOT lane only). Paths are relative to
+# js/src/tests.
+
+# The NightMonkey tier has no frame introspection: fun.caller and fun.arguments read null from a compiled frame.
+test262/language/arguments-object/10.6-13-a-2.js
+test262/language/arguments-object/10.6-13-a-3.js
+non262/Function/regress-222029-001.js
+non262/Function/regress-222029-002.js
+non262/Function/regress-85880.js
+test262/built-ins/Function/15.3.5.4_2-95gs.js
+test262/staging/sm/extensions/arguments-property-access-in-function.js
+test262/staging/sm/extensions/function-caller-skips-eval-frames.js
+test262/staging/sm/extensions/function-properties.js
+test262/staging/sm/regress/regress-577648-1.js
+test262/staging/sm/regress/regress-577648-2.js
+test262/staging/sm/regress/regress-586482-1.js
+test262/staging/sm/regress/regress-586482-2.js
+test262/staging/sm/regress/regress-586482-3.js
+test262/staging/sm/regress/regress-586482-4.js
+# Compiled frames carry no source positions: Error.stack, lineNumber, columnNumber and fileName are empty for them.
+non262/async-functions/ErrorStack.js
+non262/Exceptions/errstack-001.js
+non262/Promise/any-stack.js
+non262/extensions/column-numbers.js
+non262/extensions/errorcolumnblame.js
+non262/extensions/regress-50447-1.js
+non262/extensions/toSource-infinite-recursion.js
+non262/regress/regress-167328.js
+non262/template-strings/debugLineNumber.js
+shell/script-file-name-utf8.js
+test262/staging/sm/extensions/regress-645160.js
+# Error messages from compiled code cannot name the offending expression (no bytecode frame to decompile), so the engine falls back to the value's source.
+non262/extensions/regress-353116.js
+non262/regress/regress-328664.js
+non262/regress/regress-372364.js
+non262/regress/regress-420919.js
+test262/staging/sm/object/toPrimitive.js
+# loadRelativeToScript resolves against the calling script's frame, which a compiled caller does not expose.
+non262/extensions/clone-v1-typed-array.js
+non262/object/15.2.3.6-function-length.js
+non262/object/15.2.3.6-new-definition.js

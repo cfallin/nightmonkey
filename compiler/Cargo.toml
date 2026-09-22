@@ -1,0 +1,19 @@
+[package]
+name = "night-compiler"
+version = "0.1.0"
+edition = "2021"
+rust-version.workspace = true
+
+[dependencies]
+# AOT Wasm emitter: builds the codegen core module and merges it into
+# the runtime reactor module (weval-style).
+waffle = "0.3.1"
+log = "0.4"
+# Fast non-SipHash maps: the translator/merge keys are small integers (pcs,
+# entity ids), and profile showed SipHash dominating large-input translation.
+rustc-hash = "2"
+# Blob carving for the in-process batch path; version-matched to waffle's.
+wasmparser = { version = "0.248", default-features = false, features = ["std", "validate", "simd"] }
+
+[dev-dependencies]
+wasm-encoder = "0.248"

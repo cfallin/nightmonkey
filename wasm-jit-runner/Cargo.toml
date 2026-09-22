@@ -1,0 +1,16 @@
+[package]
+name = "wasm-jit-runner"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1"
+wasmtime = "45"
+wasmtime-wasi = "45"
+wasm-encoder = { version = "0.252", features = ["wasmparser"] }
+wasmparser = "0.252"
+sha2 = "0.10"
+
+[profile.release]
+debug = true
+
