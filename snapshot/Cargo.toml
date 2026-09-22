@@ -1,0 +1,16 @@
+[package]
+name = "night-snapshot"
+version = "0.1.0"
+edition = "2021"
+authors.workspace = true
+license.workspace = true
+
+[features]
+# Engine version (see compiler/src/opcodes/): exactly one.
+default = ["ff147"]
+ff147 = ["night-compiler/ff147"]
+
+[dependencies]
+night-compiler = { path = "../compiler", default-features = false }
+anyhow = "1"
+rustc-hash = "2"

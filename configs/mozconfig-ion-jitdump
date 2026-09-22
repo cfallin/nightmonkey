@@ -1,0 +1,13 @@
+ac_add_options --enable-project=js
+ac_add_options --enable-js-shell
+ac_add_options --disable-tests
+ac_add_options --disable-clang-plugin
+ac_add_options --enable-jitspew
+ac_add_options --enable-jitdump
+ac_add_options --enable-optimize=-O3
+ac_add_options --disable-release
+ac_add_options --enable-js-streams
+ac_add_options --prefix=obj-ion/dist
+mk_add_options MOZ_OBJDIR=obj-ion
+mk_add_options AUTOCLOBBER=1
+export RUSTFLAGS="-Cdebuginfo=0"

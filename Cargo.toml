@@ -1,0 +1,20 @@
+[workspace]
+resolver = "2"
+members = [
+    "compiler",
+    "snapshot",
+    "nightmonkey",
+    "wasm-jit-runner",
+    "guest",
+]
+
+[workspace.package]
+rust-version = "1.82.0"
+authors = ["Chris Fallin <chris@cfallin.org>"]
+license = "Apache-2.0 WITH LLVM-exception"
+
+# The host tools are built by CMake (see CMakeLists.txt), which also checks
+# the checked-in opcode table (compiler/src/opcodes/) against the engine
+# being built against; a plain `cargo build` needs nothing from the engine.
+[profile.release]
+debug = false
