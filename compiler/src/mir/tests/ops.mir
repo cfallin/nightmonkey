@@ -1,0 +1,141 @@
+; Op and type coverage: one valid function touching most of the opcode
+; set and every module table. Not a realistic program.
+
+module {
+  layout L3 = { x: val{int32} range[0,99], y: val{int32,double}, next: val{object} obj{Plain} }
+  layout L4 = { } elements r5
+  layout L6 = { a: val{int32}, b: val }
+  snap S0 = Function(s1)
+  fuse F0 = ArraySpecies
+  binding G0 = Math : val{object}
+  native N0 = charCodeAt
+  region R0 = field(L3, x)
+  region R1 = field(*, next)
+  region R2 = elements(r5)
+  region R3 = tadata(Float64)
+  region R4 = global(G0)
+  region R5 = env(2)
+  region R6 = unknown
+}
+
+func @s7 (formals=2, locals=0, depths={0:0, 4:0, 8:1}) {
+  root entry b0
+
+b0(v0: obj{Function(s7)}, v1: val, v2: val, v3: val):
+  v4 = const.val int32 5
+  v5 = const.val double 1.5
+  v6 = const.val null
+  v7 = const.i32 -3
+  v8 = const.f64 -0.0
+  v9 = const.bool true
+  v10 = const.obj S0
+  v11 = const.str "hello world"
+  v12 = unbox.i32 v4
+  v13 = unbox.f64num v5
+  v14 = i32.to_int v12
+  v15 = i32.to_f64 v7
+  v16 = int.to_f64 v14
+  v17: val{int32,double} = weaken v4
+  v18 = f64.add v13, v15
+  v19 = f64.neg v18
+  v20 = i32.and v12, v7
+  v21 = i32.ushr v12, v7
+  v22 = to_int32 v19
+  v23 = i32.cmp.lt v12, v7
+  v24 = math.sqrt v13
+  v25 = math.atan2 v13, v24
+  v26 = i32.add.wrap v12, v7
+  v27 = int.add v14, v14
+  v28 = js.typeof v1
+  v29 = js.tobool v1
+  v30 = length.string v11
+  v31 = env.current
+  v32 = env.parent v31
+  v33 = env.load v32 2
+  env.store v31, v33 2
+  v34 = new_array v12
+  v35 = elements_ptr v34
+  v36 = length.array v34
+  v37 = f64.cmp.ge v16, v24
+  v38 = box v8
+  br v23 -> then b1, else b2
+b1:
+  guard.unbox.obj v2 -> ok b3(v40: obj), fail b90
+b2:
+  unreachable
+b3(v40: obj):
+  guard.layout v40 L3 types -> ok b4(v41: obj{L3 types}), fail b90
+b4(v41: obj{L3 types}):
+  load_field v41 next @{slot=2, ic=0x100} -> ok_clean b5(v42: val{object} obj{Plain}), ok_dirty b90, err b92
+b5(v42: val{object} obj{Plain}):
+  v44 = unbox.obj v42
+  v45 = const.val int32 7
+  store_field v41, v45 x @{slot=0, mask=0x1} -> ok_clean b6, ok_dirty b90, err b92
+b6:
+  guard.tags v3 {int32,double} -> ok b7(v46: val{int32,double}), fail b90
+b7(v46: val{int32,double}):
+  v47 = unbox.f64num v46
+  f64.to_int_exact v47 -> ok b8(v48: i32), fail b90
+b8(v48: i32):
+  i32.mul.ovf v48, v12 -> ok b9(v49: i32), fail b90
+b9(v49: i32):
+  check.fuse F0 -> ok b10(v50: fact.fuse(F0)), fail b90
+b10(v50: fact.fuse(F0)):
+  check.binding G0 -> ok b11(v51: fact.binding(G0)), fail b90
+b11(v51: fact.binding(G0)):
+  v52 = load_gname v51 G0
+  store_gname v51, v52 G0 !pred{fuse}
+  v53 = unbox.obj v52
+  guard.singleton v53 S0 -> ok b12(v54: obj{Function(s1), S0}), fail b90
+b12(v54: obj{Function(s1), S0}):
+  guard.script v10 s1 -> ok b13(v55: obj{Function(s1), S0}), fail b90
+b13(v55: obj{Function(s1), S0}):
+  call_direct v55, v1, v4 @{call=0x200, targets=[s1]} -> ok_clean b14(v56: val), ok_dirty b14(v56: val), err b92
+b14(v56: val):
+  js.add v56, v4 -> ok_clean b15(v58: val{int32,double,string,bigint}), ok_dirty b15(v58: val{int32,double,string,bigint}), err b92
+b15(v58: val{int32,double,string,bigint}):
+  js.getprop v58 length -> ok_clean b16(v59: val), ok_dirty b16(v59: val), err b92
+b16(v59: val):
+  js.setprop v1, v59 "x y" -> ok_clean b17, ok_dirty b17, err b92
+b17:
+  js.getname print !pred{layout,types,constructing,fuse,binding,native} -> ok b18(v60: val), err b92
+b18(v60: val):
+  js.compare.stricteq v60, v6 -> ok_clean b19(v61: bool), ok_dirty b19(v61: bool), err b92
+b19(v61: bool):
+  v62 = box v61
+  v63 = new_object L6
+  v64 = const.val int32 1
+  init_field v63, v64 a -> ok b20(v65: obj{Plain, L6 types constructing(1)}), fail b90
+b20(v65: obj{Plain, L6 types constructing(1)}):
+  init_field v65, v1 b -> ok b21(v66: obj{Plain, L6 types constructing(2)}), fail b90
+b21(v66: obj{Plain, L6 types constructing(2)}):
+  v67 = publish_layout v66 !pred{constructing}
+  str.char_code_at v11, v12 -> ok b22(v69: i32[0,65535]), fail b90
+b22(v69: i32[0,65535]):
+  guard.unbox.obj v1 -> ok b25(v73: obj), fail b90
+b25(v73: obj):
+  guard.kind v73 TypedArray(Float64) -> ok b26(v74: obj{TypedArray(Float64)}), fail b90
+b26(v74: obj{TypedArray(Float64)}):
+  load_ta v74, v12 -> ok b27(v75: f64), fail b90
+b27(v75: f64):
+  store_ta v74, v12, v75 -> ok b28, fail b90
+b28:
+  v76 = length.ta v74
+  load_elem v34, v12 -> ok b29(v77: val), fail b90
+b29(v77: val):
+  store_elem v34, v12, v77 -> ok b30, fail b90
+b30:
+  switch v69 -> case0 b23, case1 b23, default b24
+b23:
+  v70 = box v69
+  v71: val = weaken v70
+  exit pc=8 this=v1 args=[v2, v3] locals=[] stack=[v71]
+b24:
+  v72 = box v49
+  v78: val = weaken v72
+  return v78
+b90:
+  exit pc=0 this=v1 args=[v2, v3] locals=[] stack=[]
+b92:
+  exit.throw pc=4 this=v1 args=[v2, v3] locals=[] stack=[]
+}

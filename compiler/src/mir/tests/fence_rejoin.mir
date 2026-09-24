@@ -1,0 +1,133 @@
+; MIR.md §10.3, after guard folding and hoisting:
+;
+;   function s20(a, f) { for (let i = 0; i < 100; i++) { a.x; f(); a.x; } }
+;
+; - The first guard on `a` has hoisted to the preheader: the entry and
+;   onramp guard chains establish `obj{L3 types}` for P's param, so the
+;   in-loop guard folds by type.
+; - The second `a.x` folds on the call's `ok_clean` edge: a's claim
+;   survives it.
+; - On `ok_dirty`, `a` is weakened through b8's param and re-guarded up
+;   to the clean edge's type, so the join (b9) stays as strong as the
+;   clean path.
+; - Each `err` edge goes to a shared per-pc throw block.
+
+module {
+  layout L3 = { x: val{int32} }
+}
+
+func @s20 (formals=2, locals=1, depths={0:0, 10:0, 12:0, 14:1, 16:0, 20:1, 22:0, 24:1, 26:0}) {
+  root entry b0
+  root onramp(pc=10) b20
+
+; Function entry: callee, this, a, f. `i` starts undefined.
+b0(v0: obj{Function(s20)}, v1: val, v2: val, v3: val):
+  guard.unbox.obj v2 -> ok b1(v4: obj), fail b90
+b1(v4: obj):
+  guard.layout v4 L3 types -> ok b2(v5: obj{L3 types}), fail b90
+b2(v5: obj{L3 types}):
+  v6 = const.i32 0
+  jump b3(v1, v5, v3, v6)
+
+; P: the loop's preheader.
+b3(v7: val, v8: obj{L3 types}, v9: val, v10: i32):
+  jump b4(v7, v8, v9, v10)
+
+; The loop header.
+b4(v11: val, v12: obj{L3 types}, v13: val, v14: i32):
+  v15 = const.i32 100
+  v16 = i32.cmp.lt v14, v15
+  br v16 -> then b5, else b30
+
+; a.x
+b5:
+  load_field v12 x @{site=20:12, slot=0} -> ok_clean b6(v17: val{int32}), ok_dirty b40(v18: val{int32}, v12), err b91
+
+; f()
+b6(v17: val{int32}):
+  v25 = const.val undefined
+  call v13, v25 @{site=20:16, call=0x40} -> ok_clean b9(v12), ok_dirty b8(v27: val, v12), err b92
+
+; The dirty rejoin: re-guard `a` up to its clean type.
+b8(v27: val, v28: obj):
+  guard.layout v28 L3 types -> ok b9(v30: obj{L3 types}), fail b41
+
+; a.x again, on the joined (still strong) `a`.
+b9(v30: obj{L3 types}):
+  load_field v30 x @{site=20:22, slot=0} -> ok_clean b10(v31: val{int32}), ok_dirty b42(v32: val{int32}, v30), err b93
+
+; i++ and the latch.
+b10(v31: val{int32}):
+  v34 = const.i32 1
+  i32.add.ovf v14, v34 -> ok b11(v35: i32), fail b43
+b11(v35: i32):
+  jump b4(v11, v30, v13, v35)
+
+b30:
+  v40 = const.val undefined
+  return v40
+
+; The onramp root O: guard the frame up to P's param types.
+b20(v70: val, v71: val, v72: val, v73: val):
+  guard.unbox.obj v71 -> ok b21(v74: obj), fail b44
+b21(v74: obj):
+  guard.layout v74 L3 types -> ok b22(v75: obj{L3 types}), fail b44
+b22(v75: obj{L3 types}):
+  guard.unbox.i32 v73 -> ok b23(v76: i32), fail b44
+b23(v76: i32):
+  jump b3(v70, v75, v72, v76)
+b44:
+  exit pc=10 this=v70 args=[v71, v72] locals=[v73] stack=[]
+
+; Exits. Each upcasts its operands to val first.
+b90:
+  v60 = const.val undefined
+  v61: val = weaken v60
+  exit pc=0 this=v1 args=[v2, v3] locals=[v61] stack=[]
+b40(v18: val{int32}, v19: obj):
+  v80: val = weaken v18
+  v81 = box v19
+  v82: val = weaken v81
+  v83 = box v14
+  v84: val = weaken v83
+  exit pc=14 this=v11 args=[v82, v13] locals=[v84] stack=[v80]
+b41:
+  v85 = box v28
+  v86: val = weaken v85
+  v87 = box v14
+  v88: val = weaken v87
+  exit pc=20 this=v11 args=[v86, v13] locals=[v88] stack=[v27]
+b42(v32: val{int32}, v33: obj):
+  v89: val = weaken v32
+  v90 = box v33
+  v91: val = weaken v90
+  v92 = box v14
+  v93: val = weaken v92
+  exit pc=24 this=v11 args=[v91, v13] locals=[v93] stack=[v89]
+b43:
+  v94 = box v30
+  v95: val = weaken v94
+  v96 = box v14
+  v97: val = weaken v96
+  exit pc=26 this=v11 args=[v95, v13] locals=[v97] stack=[]
+
+; Throw blocks: one per pc, the state before the op.
+b91:
+  v100 = box v12
+  v101: val = weaken v100
+  v102 = box v14
+  v103: val = weaken v102
+  exit.throw pc=12 this=v11 args=[v101, v13] locals=[v103] stack=[]
+b92:
+  v104 = box v12
+  v105: val = weaken v104
+  v106 = box v14
+  v107: val = weaken v106
+  exit.throw pc=16 this=v11 args=[v105, v13] locals=[v107] stack=[]
+b93:
+  v108 = box v30
+  v109: val = weaken v108
+  v110 = box v14
+  v111: val = weaken v110
+  exit.throw pc=22 this=v11 args=[v109, v13] locals=[v111] stack=[]
+}

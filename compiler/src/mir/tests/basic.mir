@@ -1,0 +1,71 @@
+; function s12(n) { let s = 0; for (let i = 0; i < n; i++) s += i; return s; }
+;
+; Guard-at-defs on entry, an int32 loop with overflow exits, and an
+; onramp root at the loop header. Result types left out are inferred.
+
+func @s12 (formals=1, locals=2, depths={0:0, 9:0, 24:0, 30:0}) {
+  root entry b0
+  root onramp(pc=9) b20
+
+b0(v0: obj{Function(s12)}, v1: val, v2: val):          ; callee, this, n
+  guard.unbox.i32 v2 -> ok b1(v3: i32), fail b90
+
+b1(v3: i32):
+  v4 = const.i32 0
+  jump b2(v1, v3, v4, v4)
+
+; P: this, n, s, i.
+b2(v5: val, v6: i32, v7: i32, v8: i32):
+  jump b3(v5, v6, v7, v8)
+
+; The loop header.
+b3(v9: val, v10: i32, v11: i32, v12: i32):
+  v13 = i32.cmp.lt v12, v10
+  br v13 -> then b4, else b10
+
+b4:
+  i32.add.ovf v11, v12 -> ok b5(v14: i32), fail b91
+b5(v14: i32):
+  v15 = const.i32 1
+  i32.add.ovf v12, v15 -> ok b6(v16: i32), fail b92
+b6(v16: i32):
+  jump b3(v9, v10, v14, v16)
+
+b10:
+  v17 = box v11
+  v18: val = weaken v17
+  return v18
+
+; O: the onramp root at the loop header.
+b20(v30: val, v31: val, v32: val, v33: val):
+  guard.unbox.i32 v31 -> ok b21(v34: i32), fail b93
+b21(v34: i32):
+  guard.unbox.i32 v32 -> ok b22(v35: i32), fail b93
+b22(v35: i32):
+  guard.unbox.i32 v33 -> ok b23(v36: i32), fail b93
+b23(v36: i32):
+  jump b2(v30, v34, v35, v36)
+b93:
+  exit pc=9 this=v30 args=[v31] locals=[v32, v33] stack=[]
+
+b90:
+  v40 = const.val undefined
+  v41: val = weaken v40
+  exit pc=0 this=v1 args=[v2] locals=[v41, v41] stack=[]
+b91:
+  v42 = box v10
+  v43: val = weaken v42
+  v44 = box v11
+  v45: val = weaken v44
+  v46 = box v12
+  v47: val = weaken v46
+  exit pc=24 this=v9 args=[v43] locals=[v45, v47] stack=[]
+b92:
+  v48 = box v10
+  v49: val = weaken v48
+  v50 = box v14
+  v51: val = weaken v50
+  v52 = box v12
+  v53: val = weaken v52
+  exit pc=30 this=v9 args=[v49] locals=[v51, v53] stack=[]
+}
