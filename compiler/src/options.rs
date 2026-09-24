@@ -4,7 +4,9 @@
 //! Everything here is either a production parameter or a diagnostic that
 //! produces output without changing codegen. There are deliberately no
 //! switches that select between codegen designs: the compiler has one
-//! lowering strategy and one analysis, and they are not configurable.
+//! lowering strategy and one analysis, and they are not configurable. The
+//! one exception is [`MirMode`], which gates the MIR tier (`docs/MIR.md`)
+//! while it replaces the legacy OPT path and is removed with it.
 
 /// Write one line of diagnostic output.
 ///
@@ -93,6 +95,10 @@ pub struct Diagnostics {
     pub trace_field: Option<String>,
     /// Trace the per-context evaluation of one read site, `<sid>:<pc>`.
     pub trace_site: Option<String>,
+    /// MIR coverage: one `night: mir <sid> <status>` line per script
+    /// (`compiled`, `declined:<reason>`, or `legacy` when MIR is off), and
+    /// a summary. Coverage is measured, never assumed.
+    pub mir: bool,
 }
 
 impl Diagnostics {
@@ -115,6 +121,7 @@ impl Diagnostics {
             || self.trace_cell.is_some()
             || self.trace_field.is_some()
             || self.trace_site.is_some()
+            || self.mir
     }
 
     /// Whether `source_id`'s bytecode should be disassembled.
@@ -155,12 +162,37 @@ pub struct Instrumentation {
     pub blocks: bool,
 }
 
+/// Which OPT tier compiles a script (`docs/MIR.md` §13).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum MirMode {
+    /// The legacy OPT+GEN lowering only.
+    #[default]
+    Off,
+    /// MIR for the scripts the builder accepts, legacy for the rest.
+    On,
+    /// MIR or GEN-only, never legacy OPT: for coverage testing.
+    Only,
+}
+
+impl std::str::FromStr for MirMode {
+    type Err = String;
+    fn from_str(s: &str) -> Result<MirMode, String> {
+        match s {
+            "off" => Ok(MirMode::Off),
+            "on" => Ok(MirMode::On),
+            "only" => Ok(MirMode::Only),
+            _ => Err(format!("bad MIR mode `{s}` (expected off, on or only)")),
+        }
+    }
+}
+
 /// Options for a whole compilation.
 #[derive(Clone, Debug, Default)]
 pub struct Options {
     /// Leave every script interpreted. A triage switch: it isolates whether
     /// a failure comes from compiled code without rebuilding.
     pub force_interp: bool,
+    pub mir: MirMode,
     pub diagnostics: Diagnostics,
     pub instrument: Instrumentation,
 }

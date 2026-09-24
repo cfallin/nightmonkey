@@ -12,10 +12,12 @@
 //! - [`ops`]: opcodes, signatures, successor shapes and effect summaries;
 //! - [`func`] and [`module`]: the function body and the module tables;
 //! - [`print`] and [`parse`]: the text format, for tests and dumps;
-//! - [`verify`]: the validator.
+//! - [`verify`]: the validator;
+//! - [`gate`]: which tier compiles a script, and the coverage census.
 
 pub mod entity;
 pub mod func;
+pub mod gate;
 pub mod module;
 pub mod ops;
 pub mod parse;

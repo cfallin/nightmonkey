@@ -72,7 +72,7 @@ pub mod source;
 pub mod view;
 pub mod wasm;
 
-pub use options::{Diagnostics, Options};
+pub use options::{Diagnostics, MirMode, Options};
 
 /// Build an in-process AOT batch for the `Source` graph at `analysis_source`
 /// (root `root_id`): compiled function blobs in wasm-jit-runner format, the

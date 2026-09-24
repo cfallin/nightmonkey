@@ -1975,6 +1975,7 @@ pub fn translate_all(
         likely_elems: &env.likely_elems,
         fused_gnames: &env.fused_gnames_tx,
     };
+    let mut mir_census = crate::mir::gate::MirCensus::default();
     for id in script_ids {
         let SourceObject::Script(script) = source.object(id) else {
             unreachable!()
@@ -1983,6 +1984,11 @@ pub fn translate_all(
             n_skipped += 1;
             continue;
         }
+        mir_census.record(
+            ScriptId::new(id.id()),
+            &crate::mir::gate::status(opts.mir),
+            opts.diagnostics.mir,
+        );
         match bbv::translate_script(
             &tx_ctx,
             m,
@@ -2097,6 +2103,9 @@ pub fn translate_all(
     }
     if opts.diagnostics.stats {
         crate::diag_line!("night: {n_compiled} scripts compiled, {n_skipped} skipped");
+    }
+    if opts.diagnostics.mir {
+        crate::diag_line!("{}", mir_census.summary());
     }
 
     // ---- Regex AOT: compile each snapshotted irregexp bytecode program to a

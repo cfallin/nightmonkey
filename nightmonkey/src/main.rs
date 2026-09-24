@@ -71,6 +71,9 @@ Output
 
 Compilation
   --force-interp           leave every script interpreted
+  --mir <off|on|only>      the MIR tier: off (default), on (MIR where the
+                           builder accepts, legacy elsewhere), or only (MIR
+                           or GEN-only, never legacy OPT; coverage testing)
 
 Diagnostics
   --stats                  report phase timings and counts
@@ -90,6 +93,8 @@ Diagnostics
                            arrival (the peel rule's census)
   --dump-redundant         per-op census of box round trips, dead boxes and
                            frame round trips in the emitted IR
+  --dump-mir               per-script MIR coverage (compiled, declined with
+                           a reason, or legacy) and a summary
 
 Instrumentation (CHANGES the generated code; never on in production)
   --census                 emit night_runtime_census calls: per-track version
@@ -145,6 +150,8 @@ fn parse_args() -> Result<Args> {
             "--keep-names" => keep_names = true,
             "--dump-graph" => dump_graph = true,
             "--force-interp" => opts.force_interp = true,
+            "--mir" => opts.mir = val(&mut it, "--mir")?.parse().map_err(anyhow::Error::msg)?,
+            "--dump-mir" => opts.diagnostics.mir = true,
             "--stats" => opts.diagnostics.stats = true,
             "--dump-opsize" => opts.diagnostics.opsize = true,
             "--dump-ctxedge" => opts.diagnostics.ctxedge = true,
