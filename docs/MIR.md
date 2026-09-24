@@ -977,6 +977,22 @@ splice a MIR-compiled script's bytecode.
 - `ok_dirty` re-guarding stays eager (up to the clean edge's types).
   Heuristics can come later.
 
+**M0 (implementation)**
+- An `err` edge into a *throw block* is not a fence edge. A throw block
+  has no params, contains only upcasts (`box`, `weaken`) and constants,
+  and ends in `exit.throw`. Nothing in it relies on a killable
+  component, so it may upcast pre-op values whose claims the op killed
+  (§5.3's "no params"). An `err` edge to any other block is a fence edge
+  with the op's kill pattern.
+- A declared result type may be any supertype of the op's rule. `weaken`
+  is the op whose only purpose is that.
+- `new_object K` yields `Obj{Plain, K constructing(0)}`, and
+  `init_field` is always a fallible terminator.
+- `check.native` produces `Fact(NativeIntact)`. `f64.to_int_exact`
+  yields an `I32`.
+- Every static kill needs a witness, including structural ones such as
+  `publish_layout`'s kill of constructing claims.
+
 ## 13. Implementation plan
 
 Each milestone ends with a test gate. MIR is enabled per script behind

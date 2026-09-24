@@ -11,7 +11,8 @@
 //! - [`types`]: the lattice (subtyping, join, killable components);
 //! - [`ops`]: opcodes, signatures, successor shapes and effect summaries;
 //! - [`func`] and [`module`]: the function body and the module tables;
-//! - [`print`] and [`parse`]: the text format, for tests and dumps.
+//! - [`print`] and [`parse`]: the text format, for tests and dumps;
+//! - [`verify`]: the validator.
 
 pub mod entity;
 pub mod func;
@@ -20,6 +21,7 @@ pub mod ops;
 pub mod parse;
 pub mod print;
 pub mod types;
+pub mod verify;
 
 #[cfg(test)]
 mod tests;
@@ -30,3 +32,4 @@ pub use module::Module;
 pub use parse::parse;
 pub use print::print_module;
 pub use types::Type;
+pub use verify::{verify, verify_module};
