@@ -63,6 +63,7 @@ pub mod env_regions;
 pub mod facts;
 pub mod ids;
 pub mod likelier;
+pub mod mir;
 pub mod opcodes;
 pub mod opsem;
 pub mod options;
