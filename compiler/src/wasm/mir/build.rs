@@ -728,10 +728,32 @@ impl<'s, 'a> Run<'s, 'a> {
         }
         let headers: Vec<Pc> = self.preheaders.keys().copied().collect();
         for h in headers {
-            self.onramp_root(h);
+            if self.wants_onramp(h) {
+                self.onramp_root(h);
+            }
         }
         Ok(())
     }
+
+    /// The onramp-root policy (`docs/BASELINE.md` §7): every outermost
+    /// loop gets a root, which needs no code duplication. An inner loop's
+    /// root side-enters every loop around it, which waffle's reducifier
+    /// pays for by duplicating code, so it gets one only when its
+    /// outermost enclosing loop is small.
+    fn wants_onramp(&self, h: Pc) -> bool {
+        let outer = self
+            .s
+            .loops
+            .iter()
+            .filter(|&(&hh, &e)| hh < h && h < e)
+            .map(|(&hh, &e)| e.get() - hh.get())
+            .max();
+        match outer {
+            None => true,
+            Some(len) => len <= self.s.ctx.opts.inner_onramp_bytes(),
+        }
+    }
+
 
     /// The onramp root `O` for loop header `h` (§5.2): the frame at `h`,
     /// all `Val(⊤)`, guarded up to the preheader's param types. On

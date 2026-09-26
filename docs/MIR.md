@@ -1181,6 +1181,20 @@ declines for everything else).
 **W. waffle's reducifier, driven by M3 data** (BASELINE.md §8): measure
 the duplication on real onramp-shaped MIR, and change waffle only if
 the numbers call for it.
+- **Measured (2026-09-26)** over every jit-test file under `--pipeline
+  mir`. The regex matchers, which reducify in every pipeline, were
+  subtracted per file.
+  - Only 12 MIR bodies needed reducification. Their blocks grew 1.30×
+    (at most 1.40×) and their values 1.73× (at most 2.42×; the max-SSA
+    cut's params), with at most 4 contexts.
+  - With onramps on outermost loops only, none did.
+- **The onramp-root policy** is `--mir-inner-onramp-bytes N` (default
+  400): an inner loop gets a root only when its outermost enclosing loop
+  spans at most `N` bytecode bytes. In this data the default behaved the
+  same as no limit.
+- **No reducifier change is called for.** The one waffle change so far
+  is the alias fix M3 needed. MIR's coverage is still the M2 subset,
+  so re-measure once M4 widens it.
 
 **M4. Objects and calls**
 - `guard.layout {types}`, and `load_field`/`store_field` with the local

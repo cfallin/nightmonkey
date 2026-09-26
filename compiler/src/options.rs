@@ -214,8 +214,22 @@ pub struct Options {
     /// also fails on every `N`th guard executed, program-wide, to exercise
     /// exits on code that would otherwise stay on the fast path. 0 = off.
     pub mir_stress: u32,
+    /// The onramp-root policy for inner loops (`--mir-inner-onramp-bytes
+    /// N`; `docs/BASELINE.md` §7): an inner loop gets an onramp root only
+    /// when its outermost enclosing loop spans at most `N` bytecode bytes,
+    /// since each such root side-enters the loops around it and waffle's
+    /// reducifier duplicates code for that. 0 = outermost loops only.
+    /// `None` = the default, [`Options::inner_onramp_bytes`].
+    pub mir_inner_onramp_bytes: Option<u32>,
     pub diagnostics: Diagnostics,
     pub instrument: Instrumentation,
+}
+
+impl Options {
+    /// The inner-loop onramp budget in effect (`mir_inner_onramp_bytes`).
+    pub fn inner_onramp_bytes(&self) -> u32 {
+        self.mir_inner_onramp_bytes.unwrap_or(400)
+    }
 }
 
 impl Options {
@@ -233,6 +247,13 @@ impl Options {
             "--force-interp" => self.force_interp = true,
             "--pipeline" => self.pipeline = arg(flag)?.parse()?,
             "--strict-coverage" => self.strict_coverage = true,
+            "--mir-inner-onramp-bytes" => {
+                self.mir_inner_onramp_bytes = Some(
+                    arg(flag)?
+                        .parse()
+                        .map_err(|e| format!("--mir-inner-onramp-bytes: {e}"))?,
+                )
+            }
             "--mir-stress" => {
                 self.mir_stress = arg(flag)?
                     .parse()
