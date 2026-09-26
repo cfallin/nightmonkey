@@ -20,7 +20,8 @@
 //! vp+E+16         new.target
 //! vp+E+24         rval
 //! vp+E+32         resume word                     (int32 Value, see `ResumeWord`)
-//! vp+O+8k         operand stack, k < depth(pc)    O = E + 40
+//! vp+E+40         onramp backoff                  (int32 Value, see `backoff`)
+//! vp+O+8k         operand stack, k < depth(pc)    O = E + 48
 //! ```
 
 use std::collections::BTreeMap;
@@ -102,8 +103,8 @@ impl FrameLayout {
     pub const THIS: u32 = 8;
     pub const ARGS: u32 = 16;
     /// Fixed slots after the locals: env, arguments object, new.target,
-    /// rval, resume word.
-    const FIXED_SLOTS: u32 = 5;
+    /// rval, resume word, onramp backoff.
+    const FIXED_SLOTS: u32 = 6;
 
     pub fn of(script: &Script) -> FrameLayout {
         FrameLayout {
@@ -146,6 +147,13 @@ impl FrameLayout {
 
     pub fn resume(&self) -> u32 {
         self.env() + 32
+    }
+
+    /// The onramp backoff: how many more loop-header visits baseline makes
+    /// before it next tries a MIR onramp (`docs/BASELINE.md` §7). A MIR
+    /// exit sets it, so baseline makes progress before re-entering.
+    pub fn backoff(&self) -> u32 {
+        self.env() + 40
     }
 
     pub fn operand_base(&self) -> u32 {
@@ -489,8 +497,9 @@ mod tests {
         assert_eq!(l.new_target(), 64);
         assert_eq!(l.rval(), 72);
         assert_eq!(l.resume(), 80);
-        assert_eq!(l.operand_base(), 88);
-        assert_eq!(l.operand(2), 104);
+        assert_eq!(l.backoff(), 88);
+        assert_eq!(l.operand_base(), 96);
+        assert_eq!(l.operand(2), 112);
     }
 
     #[test]

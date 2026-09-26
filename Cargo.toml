@@ -18,3 +18,8 @@ license = "Apache-2.0 WITH LLVM-exception"
 # being built against; a plain `cargo build` needs nothing from the engine.
 [profile.release]
 debug = false
+
+# waffle fixes in progress (the reducifier; docs/MIR.md step W). Revert to
+# the crates.io release once they are published.
+[patch.crates-io]
+waffle = { path = "../waffle" }

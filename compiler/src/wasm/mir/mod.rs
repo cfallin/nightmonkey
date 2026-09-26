@@ -9,6 +9,7 @@ pub mod lower;
 use crate::bytecode::Script;
 use crate::ids::ScriptId;
 use crate::wasm::baseline;
+use crate::wasm::baseline::layout;
 use crate::wasm::translate::{AtomTable, ExtraBody, Outcome, TranslateCtx};
 use waffle::Module;
 
@@ -43,16 +44,21 @@ pub fn translate_script(
         crate::diag_line!("{}", crate::mir::print::print_func(&mm, &f));
     }
     let resumes = lower::resume_words(&f);
-    let base = baseline::translate_script(ctx, m, atoms, sid, script, is_global, &resumes)?;
-    let (base_sig, base_body, base_off) = match base {
-        Outcome::Compiled {
-            sig,
-            body,
-            body_off_patches,
-            ..
-        } => (sig, body, body_off_patches),
-        Outcome::Skipped(reason) => return Ok(Err(format!("baseline declined: {reason}"))),
-    };
+    let onramps: Vec<(crate::ids::Pc, Vec<layout::ResumeWord>)> = f
+        .roots
+        .iter()
+        .filter_map(|r| match r.kind {
+            crate::mir::func::RootKind::Onramp(pc) => {
+                Some((pc, lower::resume_words_from(&f, r.block)))
+            }
+            _ => None,
+        })
+        .collect();
+    let base =
+        match baseline::build_body(ctx, m, atoms, sid, script, is_global, &resumes, &onramps)? {
+            Ok(b) => b,
+            Err(reason) => return Ok(Err(format!("baseline declined: {reason}"))),
+        };
     let lowered = match lower::lower(
         m,
         ctx.helpers,
@@ -79,10 +85,10 @@ pub fn translate_script(
         body_off_patches: vec![],
         ctor_nslots_patches: vec![],
         extra_bodies: vec![ExtraBody {
-            sig: base_sig,
-            body: base_body,
-            body_off_patches: base_off,
-            main_call_patches: vec![],
+            sig: base.sig,
+            body: base.body,
+            body_off_patches: base.body_off_patches,
+            main_call_patches: base.main_calls,
         }],
         extra_call_patches: lowered.baseline_calls.into_iter().map(|v| (v, 0)).collect(),
     }))

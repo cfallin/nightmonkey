@@ -1929,13 +1929,13 @@ fn translate_for_pipeline(
                 declines.push(Decline::new(Tier::Mir, reason));
                 (
                     Tier::Baseline,
-                    baseline::translate_script(ctx, m, atoms, sid, script, is_global, &[])?,
+                    baseline::translate_script(ctx, m, atoms, sid, script, is_global)?,
                 )
             }
         },
         Pipeline::Baseline => (
             Tier::Baseline,
-            baseline::translate_script(ctx, m, atoms, sid, script, is_global, &[])?,
+            baseline::translate_script(ctx, m, atoms, sid, script, is_global)?,
         ),
     };
     let tier = match &outcome {

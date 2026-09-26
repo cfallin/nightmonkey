@@ -112,7 +112,8 @@ decided**, so every tier agrees on it by construction.
 | `vp+E+16` | new.target | always present |
 | `vp+E+24` | rval | always present |
 | `vp+E+32` | resume word | int32 Value; §4 |
-| `vp+O+8k` | operand stack `k < depth(pc)` | `O = E + 40` |
+| `vp+E+40` | onramp backoff | int32 Value; §7 |
+| `vp+O+8k` | operand stack `k < depth(pc)` | `O = E + 48` |
 
 **State at pc.** The frame together with `depth(pc)`, the static operand
 depth computed by a forward pass over `nuses`/`ndefs`, fully describes
@@ -584,6 +585,28 @@ Deviations from the plan above, and details it did not settle:
   - A `continue` word lands on the pc's block; a `throw` word lands on
     the pc's exception landing, with the exception pending.
   - A resume word outside the set traps: that is a compiler bug.
+- **Onramps (for M3).** `build_body` takes the loop headers with a MIR
+  onramp root, each with the resume words that root reaches.
+  - At such a header's code (after its resume dispatch), baseline reads
+    the frame's backoff slot (`vp+E+40`, a sixth fixed slot). If it is
+    nonzero, baseline counts it down. If zero, baseline writes the
+    header's resume word and calls the MIR body with its own `sp` and
+    `ARGC_ONRAMP_BIT`.
+  - A normal return is baseline's own return; an error is an error
+    return.
+  - `ERR_DEOPT` means the MIR exit rewrote the frame and the resume word.
+    Baseline then routes by that word, but only among the words that
+    root reaches, which are pcs inside the loops around the header or
+    after it. For each word it jumps to the dispatch block of the
+    innermost surrounding loop that contains the word's pc (a back edge
+    to that loop's header), or else along the word's route from outside
+    every loop.
+  - The entry's resume dispatch would not do here: it is also entered
+    from the function entry, so a loop reaching it would have a second
+    entry. The per-root word set is what excludes, say, an entry-guard
+    exit at pc 0.
+  - Every MIR exit sets the backoff (32), so baseline makes progress
+    between attempts: MIR.md §5.2's no-livelock rule.
 - **Then MIR, revised (§9):**
   - M0b: the small M0 follow-ups of §9 (the `magic` tag, the rval
     operand, declared loops);

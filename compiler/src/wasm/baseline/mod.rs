@@ -28,11 +28,60 @@ pub const FORCE_INTERPRETER: &str = "ForceInterpreter";
 /// `bbv::translate_script`: `Outcome::Compiled` with a `night_abi_sig2`
 /// body, or `Outcome::Skipped` with the reason (the script is then
 /// interpreted).
-///
-/// `resumes` are the resume words a MIR body's exits and throws carry
-/// (`docs/BASELINE.md` §4): the body then also accepts an
-/// `ARGC_RESUME_BIT` entry that routes to them.
 pub fn translate_script(
+    ctx: &TranslateCtx,
+    m: &mut Module,
+    atoms: &mut AtomTable,
+    source_id: ScriptId,
+    script: &Script,
+    is_global: bool,
+) -> Result<Outcome, String> {
+    Ok(
+        match build_body(ctx, m, atoms, source_id, script, is_global, &[], &[])? {
+            Ok(b) => Outcome::Compiled {
+                sig: b.sig,
+                body: b.body,
+                likely_patches: vec![],
+                fuse_call_patches: vec![],
+                call_cell_patches: vec![],
+                alloc_cell_patches: vec![],
+                iof_cell_patches: vec![],
+                construct_cell_patches: vec![],
+                strlit_patches: vec![],
+                intrinsic_cell_patches: vec![],
+                prop_ic_patches: vec![],
+                body_off_patches: b.body_off_patches,
+                ctor_nslots_patches: vec![],
+                extra_bodies: vec![],
+                extra_call_patches: vec![],
+            },
+            Err(reason) => Outcome::Skipped(reason),
+        },
+    )
+}
+
+/// A built baseline body and its placeholders.
+pub struct Built {
+    pub sig: waffle::Signature,
+    pub body: FunctionBody,
+    /// Adapter-offset placeholders (`Outcome::Compiled::body_off_patches`).
+    pub body_off_patches: Vec<waffle::Value>,
+    /// Direct-call placeholders for the script's MIR body: the onramps.
+    pub main_calls: Vec<waffle::Value>,
+}
+
+/// Build a script's baseline body; `Ok(Err(reason))` is a decline.
+///
+/// For the MIR tier (`docs/BASELINE.md` §4, §7):
+/// - `resumes` are the resume words the MIR body's exits and throws
+///   carry. The body then also accepts an `ARGC_RESUME_BIT` entry that
+///   routes to them.
+/// - `onramps` are the loop headers at which the MIR body has an onramp
+///   root, each with the resume words its root reaches. At each, the body
+///   calls the MIR body (`main_calls`) unless the frame's backoff says to
+///   wait, and routes a DEOPT return by those words.
+#[allow(clippy::too_many_arguments)]
+pub fn build_body(
     ctx: &TranslateCtx,
     m: &mut Module,
     atoms: &mut AtomTable,
@@ -40,13 +89,14 @@ pub fn translate_script(
     script: &Script,
     is_global: bool,
     resumes: &[layout::ResumeWord],
-) -> Result<Outcome, String> {
+    onramps: &[(crate::ids::Pc, Vec<layout::ResumeWord>)],
+) -> Result<Result<Built, String>, String> {
     if script
         .parser()
         .opcodes()
         .any(|op| op == JSOp::ForceInterpreter)
     {
-        return Ok(Outcome::Skipped(FORCE_INTERPRETER.into()));
+        return Ok(Err(FORCE_INTERPRETER.into()));
     }
     // Code size is linear in bytecode size, but a multi-megabyte script
     // (an Emscripten-style giant function) becomes a function of millions
@@ -56,40 +106,40 @@ pub fn translate_script(
     // few-hundred-KiB script compiles fine here.
     const MAX_BASELINE_BYTECODE: usize = 1024 * 1024;
     if script.bytecode.len() > MAX_BASELINE_BYTECODE {
-        return Ok(Outcome::Skipped(format!(
+        return Ok(Err(format!(
             "script too large ({} bytecode bytes)",
             script.bytecode.len()
         )));
     }
     let depths = match StackDepths::compute(script) {
         Ok(d) => d,
-        Err(e) => return Ok(Outcome::Skipped(format!("stack depths ({e})"))),
+        Err(e) => return Ok(Err(format!("stack depths ({e})"))),
     };
     if let Err(e) = depths.check_try_notes(script) {
-        return Ok(Outcome::Skipped(format!("BUG: try notes ({e})")));
+        return Ok(Err(format!("BUG: try notes ({e})")));
     }
     // The generator state saved across a suspend holds locals and
     // operands, not the actuals or the arguments object: those may be read
     // only before the first suspend (the frontend reads them in the
     // prologue and keeps the results in bindings).
     if script.is_generator_or_async && reads_actuals_after_yield(script) {
-        return Ok(Outcome::Skipped(
-            "generator reads actuals after a yield".into(),
-        ));
+        return Ok(Err("generator reads actuals after a yield".into()));
     }
     if codegen::needs_env(script) {
         if let Some(reason) = env_unsupported(ctx.source, script) {
-            return Ok(Outcome::Skipped(reason));
+            return Ok(Err(reason));
         }
     }
     let sig = ctx.helpers.night_abi_sig2;
     let body = FunctionBody::new(m, sig);
-    let mut gen = match codegen::Gen::new(ctx, atoms, script, is_global, body, depths, resumes) {
+    let mut gen = match codegen::Gen::new(
+        ctx, atoms, script, is_global, body, depths, resumes, onramps,
+    ) {
         Ok(g) => g,
-        Err(e) => return Ok(Outcome::Skipped(e)),
+        Err(e) => return Ok(Err(e)),
     };
     if let Err(e) = gen.run() {
-        return Ok(Outcome::Skipped(e));
+        return Ok(Err(e));
     }
     // The design promises reducibility by construction (docs/BASELINE.md
     // §4): check it, so a violation declines just this script, loudly.
@@ -97,7 +147,7 @@ pub fn translate_script(
     // function anyway, and it is quadratic on long block chains; see
     // waffle's DOMTREE-TODO.md.)
     if let Err(e) = gen.body.verify_reducible() {
-        return Ok(Outcome::Skipped(format!("BUG: irreducible body ({e})")));
+        return Ok(Err(format!("BUG: irreducible body ({e})")));
     }
     if ctx.opts.diagnostics.stats {
         crate::diag_line!(
@@ -109,23 +159,13 @@ pub fn translate_script(
         );
     }
     let body_off_patches = std::mem::take(&mut gen.body_off_patches);
-    Ok(Outcome::Compiled {
+    let main_calls = std::mem::take(&mut gen.main_calls);
+    Ok(Ok(Built {
         sig,
         body: gen.body,
-        likely_patches: vec![],
-        fuse_call_patches: vec![],
-        call_cell_patches: vec![],
-        alloc_cell_patches: vec![],
-        iof_cell_patches: vec![],
-        construct_cell_patches: vec![],
-        strlit_patches: vec![],
-        intrinsic_cell_patches: vec![],
-        prop_ic_patches: vec![],
         body_off_patches,
-        ctor_nslots_patches: vec![],
-        extra_bodies: vec![],
-        extra_call_patches: vec![],
-    })
+        main_calls,
+    }))
 }
 
 /// The env shapes the baseline prologue can build (`NightEnvSetup`): a

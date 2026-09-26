@@ -17,12 +17,14 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use waffle::entity::EntityRef;
 use waffle::{
     Block, BlockTarget, Func, FunctionBody, MemoryArg, Operator, Terminator, Type, Value, ValueDef,
 };
 
 use super::layout::{
-    self, FrameLayout, ResumeMode, ResumeWord, StackDepths, ARGC_FLAGS, ARGC_RESUME_BIT,
+    self, FrameLayout, ResumeMode, ResumeWord, StackDepths, ARGC_FLAGS, ARGC_ONRAMP_BIT,
+    ARGC_RESUME_BIT, ERR_DEOPT,
 };
 use crate::bytecode::{BytecodeParser, JSOp, Script, TryNoteKind};
 use crate::ids::Pc;
@@ -103,6 +105,15 @@ pub(super) struct Gen<'a> {
     ext_resumes: Vec<ResumeWord>,
     /// `argc` as passed, flags included.
     argc_raw: Value,
+    /// The ABI's script parameter, passed through to onramp calls.
+    script_param: Value,
+    /// Loop headers with a MIR onramp root (`docs/BASELINE.md` §7), with
+    /// the resume words that root reaches.
+    onramps: BTreeMap<Pc, Vec<ResumeWord>>,
+    /// Direct-call placeholders for the script's MIR body.
+    pub(super) main_calls: Vec<Value>,
+    /// The resume dispatch (`ARGC_RESUME_BIT` entry).
+    resume_disp: Option<Block>,
     /// Loop headers that dispatch resumes: header pc -> (dispatch block,
     /// the header's own code block). Every branch to the header goes to the
     /// dispatch block, which is therefore the loop's header node.
@@ -163,6 +174,7 @@ impl<'a> Gen<'a> {
         body: FunctionBody,
         depths: StackDepths,
         resumes: &[ResumeWord],
+        onramps: &[(Pc, Vec<ResumeWord>)],
     ) -> R<Gen<'a>> {
         let layout = FrameLayout::of(script);
         let needs_env = needs_env(script);
@@ -172,7 +184,8 @@ impl<'a> Gen<'a> {
         }
         let entry = body.entry;
         let p = |i: usize| body.blocks[entry].params[i].1;
-        let (cx, sp, argc, retval_out, new_target) = (p(0), p(1), p(2), p(3), p(5));
+        let (cx, sp, argc, retval_out, script_param, new_target) =
+            (p(0), p(1), p(2), p(3), p(4), p(5));
         Ok(Gen {
             ctx,
             atoms,
@@ -203,6 +216,10 @@ impl<'a> Gen<'a> {
             resume_words: BTreeSet::new(),
             ext_resumes: resumes.to_vec(),
             argc_raw: argc,
+            script_param,
+            onramps: onramps.iter().cloned().collect(),
+            main_calls: vec![],
+            resume_disp: None,
             dispatch: BTreeMap::new(),
             gen_dispatch_blk: None,
             body_off_patches: vec![],
@@ -838,6 +855,7 @@ impl<'a> Gen<'a> {
         self.store_i64(self.vp, self.layout.rval(), undef);
         let resume = self.i64c(TAG_INT32 << 32);
         self.store_i64(self.vp, self.layout.resume(), resume);
+        self.store_i64(self.vp, self.layout.backoff(), resume);
         // Exceptions from the prologue have no handler: pc 0, depth 0.
         (self.pc, self.d) = (Pc::new(0), 0);
         if self.needs_env {
@@ -910,6 +928,10 @@ impl<'a> Gen<'a> {
             self.live = true;
             Some(disp)
         };
+        self.resume_disp = resume_blk;
+        if !self.onramps.is_empty() && resume_blk.is_none() {
+            return Err("BUG: onramps without resume words".into());
+        }
         self.prologue();
         let mut leaders = layout::leaders(self.script);
         // A suspend returns, so the code after it is entered only by a
@@ -931,6 +953,9 @@ impl<'a> Gen<'a> {
                     None => b,
                 };
                 self.live = true;
+                if depth.is_some() && self.onramps.contains_key(&pc) {
+                    self.onramp(pc);
+                }
             }
             let (Some(d), true) = (depth, self.live) else {
                 // Unreachable: skip the op.
@@ -1003,6 +1028,123 @@ impl<'a> Gen<'a> {
     fn set_resume_word(&mut self, payload: u32) {
         let v = self.i64c((TAG_INT32 << 32) | u64::from(payload));
         self.store_i64(self.vp, self.layout.resume(), v);
+    }
+
+    /// A MIR onramp at loop header `h`, before the header's code: count the
+    /// frame's backoff down, or, when it is zero, call the MIR body at its
+    /// onramp root for `h` with this frame. The MIR body returns normally
+    /// (baseline returns its result), or DEOPT with the frame rewritten
+    /// and a resume word set (baseline resumes through its dispatch). MIR
+    /// exits set the backoff, so baseline runs some iterations before it
+    /// tries again.
+    fn onramp(&mut self, h: Pc) {
+        let backoff = self.load_i32(self.vp, self.layout.backoff());
+        let z = self.i32c(0);
+        let ready = self.binop(Operator::I32Eq, backoff, z, Type::I32);
+        let (try_blk, wait_blk, cont) = (
+            self.body.add_block(),
+            self.body.add_block(),
+            self.body.add_block(),
+        );
+        self.cond_br(ready, Self::goto(try_blk), Self::goto(wait_blk));
+        self.cur = wait_blk;
+        self.live = true;
+        let one = self.i32c(1);
+        let left = self.binop(Operator::I32Sub, backoff, one, Type::I32);
+        let boxed = self.boxed_int32(left);
+        self.store_i64(self.vp, self.layout.backoff(), boxed);
+        self.br(Self::goto(cont));
+        self.cur = try_blk;
+        self.live = true;
+        let w = ResumeWord {
+            pc: h,
+            mode: ResumeMode::Continue,
+        };
+        self.set_resume_word(w.encode() as u32);
+        let bit = self.i32c(ARGC_ONRAMP_BIT);
+        let argc = self.binop(Operator::I32Or, self.argc, bit, Type::I32);
+        let args = [
+            self.cx,
+            self.sp,
+            argc,
+            self.retval_out,
+            self.script_param,
+            self.new_target,
+        ];
+        let args = self.body.arg_pool.from_iter(args.into_iter());
+        let tys = self
+            .body
+            .type_pool
+            .from_iter([Type::I32, Type::I32].into_iter());
+        let call = self.push_val(ValueDef::Operator(
+            Operator::Call {
+                function_index: Func::invalid(),
+            },
+            args,
+            tys,
+        ));
+        self.main_calls.push(call);
+        let err = self.push_val(ValueDef::PickOutput(call, 0, Type::I32));
+        let eff = self.push_val(ValueDef::PickOutput(call, 1, Type::I32));
+        let (done, other, deopt) = (
+            self.body.add_block(),
+            self.body.add_block(),
+            self.body.add_block(),
+        );
+        let z = self.i32c(0);
+        let is_done = self.binop(Operator::I32Eq, err, z, Type::I32);
+        self.cond_br(is_done, Self::goto(done), Self::goto(other));
+        self.cur = done;
+        self.live = true;
+        self.terminate(Terminator::Return {
+            values: vec![err, eff],
+        });
+        self.cur = other;
+        self.live = true;
+        let d = self.i32c(ERR_DEOPT);
+        let is_deopt = self.binop(Operator::I32Eq, err, d, Type::I32);
+        let error = self.error_return();
+        self.cond_br(is_deopt, Self::goto(deopt), Self::goto(error));
+        // DEOPT: route by the resume word the MIR exit wrote, among those
+        // this onramp's root reaches -- only pcs inside the loops around
+        // it or after it, which route reducibly (`deopt_route`). Not
+        // through the entry's resume dispatch: that block is also entered
+        // from the function entry, so a loop reaching it would have two
+        // entries.
+        let words = self.onramps[&h].clone();
+        let hops: Vec<(ResumeWord, Block)> =
+            words.iter().map(|&w| (w, self.deopt_route(h, w))).collect();
+        self.cur = deopt;
+        self.live = true;
+        let word = self.resume_word();
+        let bad = self.body.add_block();
+        self.dispatch_on(word, hops, Self::goto(bad));
+        self.cur = bad;
+        self.live = true;
+        self.terminate(Terminator::Unreachable);
+        self.cur = cont;
+        self.live = true;
+    }
+
+    /// Where an onramp at header `h` sends a DEOPT for resume word `w`,
+    /// keeping the CFG reducible: to the dispatch block of the innermost
+    /// loop around the onramp that contains `w.pc` (a back edge to that
+    /// loop's header, which routes inward), or, when none does, along
+    /// `w`'s route from outside every loop (a loop exit, then entries only
+    /// through headers).
+    fn deopt_route(&mut self, h: Pc, w: ResumeWord) -> Block {
+        let mut around: Vec<(Pc, Pc)> = self
+            .loops
+            .iter()
+            .copied()
+            .filter(|&(hh, e)| hh <= h && h < e)
+            .collect();
+        // Innermost first.
+        around.sort_by_key(|&(hh, e)| (std::cmp::Reverse(hh), e));
+        match around.iter().find(|&&(hh, e)| hh < w.pc && w.pc < e) {
+            Some(&(hh, _)) => self.block(hh),
+            None => self.resume_route(w),
+        }
     }
 
     /// The first hop toward resume word `w` from outside every loop: the
@@ -1127,6 +1269,8 @@ impl<'a> Gen<'a> {
         ] {
             self.store_i64(self.vp, off, undef);
         }
+        let zero = self.i64c(TAG_INT32 << 32);
+        self.store_i64(self.vp, self.layout.backoff(), zero);
         self.set_resume_word(RESUME_NONE);
         let lp = self.add_off(self.vp, self.layout.local_base());
         let nl = self.i32c(self.layout.nlocals);

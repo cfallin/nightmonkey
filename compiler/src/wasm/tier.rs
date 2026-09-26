@@ -67,9 +67,12 @@ pub struct TierStatus {
 }
 
 impl TierStatus {
-    /// Interpreted for a reason the coverage gate does not accept.
+    /// Interpreted for a reason the coverage gate does not accept, or
+    /// declined by any tier for a compiler bug (a `BUG:` reason): a
+    /// fallback to a lower tier must not hide one.
     pub fn is_gap(&self) -> bool {
-        self.tier == Tier::Interp && !self.declines.iter().any(|d| d.allowed)
+        (self.tier == Tier::Interp && !self.declines.iter().any(|d| d.allowed))
+            || self.declines.iter().any(|d| d.reason.contains("BUG:"))
     }
 }
 
@@ -136,7 +139,7 @@ impl TierCensus {
             .collect();
         let more = self.gaps.len().saturating_sub(SHOWN);
         Err(format!(
-            "strict coverage: {} script(s) interpreted: {}{}",
+            "strict coverage: {} script(s) interpreted or hit a compiler bug: {}{}",
             self.gaps.len(),
             listed.join("; "),
             if more > 0 {
@@ -195,8 +198,19 @@ mod tests {
         );
         let e = c.check_strict().unwrap_err();
         assert!(
-            e.starts_with("strict coverage: 1 script(s) interpreted: script 3: interp"),
+            e.starts_with(
+                "strict coverage: 1 script(s) interpreted or hit a compiler bug: script 3: interp"
+            ),
             "{e}"
         );
+        // A compiler bug is a gap even when a lower tier took the script.
+        let mut c = TierCensus::default();
+        let st = TierStatus {
+            tier: Tier::Baseline,
+            declines: vec![Decline::new(Tier::Mir, "BUG: invalid MIR")],
+        };
+        assert!(st.is_gap());
+        c.record(ScriptId::new(4), st, false);
+        assert!(c.check_strict().is_err());
     }
 }

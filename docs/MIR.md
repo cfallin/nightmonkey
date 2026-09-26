@@ -1158,6 +1158,25 @@ declines for everything else).
   return.
 - Gate: tests under the stress mode, including onramps into nested
   loops.
+- **Done:**
+  - **Roots.** Every loop header that has a preheader gets an onramp
+    root. The root re-deopts at the header with its own params, and the
+    policy knob is still to come.
+  - **Entry.** The MIR entry dispatches on `ARGC_ONRAMP_BIT` by the
+    resume word, and loads the root's params from the frame. It pads
+    the formals only on a fresh entry.
+  - **Exits** also set the frame's onramp backoff. Under an onramp they
+    return `ERR_DEOPT` instead of calling baseline.
+  - The baseline side is in `BASELINE.md` §7.
+  - **waffle fix.** Onramps into nested loops made waffle's reducifier
+    fail. `resolve_aliases` left aliases in terminator operands, which
+    the duplication did not remap. That is fixed in waffle (branch
+    `cfallin/resolve-aliases-terminators`), which the workspace uses
+    through `[patch.crates-io]` until a release.
+  - **Tests.** `tests/jit-test/night/mir-onramps.js` covers re-entry,
+    re-deopt, nested and triply nested loops, and loop-carried values
+    of every representation. It and the jit-test lane pass under the
+    stress mode.
 
 **W. waffle's reducifier, driven by M3 data** (BASELINE.md §8): measure
 the duplication on real onramp-shaped MIR, and change waffle only if

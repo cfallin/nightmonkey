@@ -726,7 +726,74 @@ impl<'s, 'a> Run<'s, 'a> {
         if self.live {
             self.term(Opcode::Unreachable, vec![], vec![]);
         }
+        let headers: Vec<Pc> = self.preheaders.keys().copied().collect();
+        for h in headers {
+            self.onramp_root(h);
+        }
         Ok(())
+    }
+
+    /// The onramp root `O` for loop header `h` (§5.2): the frame at `h`,
+    /// all `Val(⊤)`, guarded up to the preheader's param types. On
+    /// success it enters the preheader; on failure it re-deopts at `h`
+    /// with its own params.
+    fn onramp_root(&mut self, h: Pc) {
+        let tys = self.table[&h].clone();
+        let p = self.preheaders[&h];
+        let o = self.new_block();
+        self.f.roots.push(Root {
+            kind: RootKind::Onramp(h),
+            block: o,
+        });
+        let params: Vec<mir::Value> = tys
+            .iter()
+            .map(|_| self.f.add_param(o, MType::VAL_TOP))
+            .collect();
+        let depth = tys.len() - self.frame_len();
+        self.f.frame.depths.insert(h, u32::try_from(depth).unwrap());
+        let fail = self.new_block();
+        self.at(fail);
+        let (nargs, nlocals) = (self.s.nargs, self.s.nlocals);
+        self.term(
+            Opcode::Exit {
+                pc: h,
+                nargs,
+                nlocals,
+            },
+            params.clone(),
+            vec![],
+        );
+        self.at(o);
+        let mut args = vec![];
+        for (&v, &t) in params.iter().zip(&tys) {
+            let op = match t {
+                Ty::I32 => Some(Opcode::GuardUnbox(UnboxKind::I32)),
+                Ty::F64 => Some(Opcode::GuardUnbox(UnboxKind::F64Num)),
+                Ty::Bool => Some(Opcode::GuardUnbox(UnboxKind::Bool)),
+                Ty::Val(tags) if tags == TagSet::ALL => None,
+                Ty::Val(tags) => Some(Opcode::GuardTags(tags)),
+            };
+            let Some(op) = op else {
+                args.push(EdgeArg::Value(v));
+                continue;
+            };
+            let ok = self.new_block();
+            let out = self.f.add_param(ok, t.mir());
+            self.term(
+                op,
+                vec![v],
+                vec![
+                    Edge {
+                        block: ok,
+                        args: vec![EdgeArg::Out(0)],
+                    },
+                    Self::goto(fail),
+                ],
+            );
+            self.at(ok);
+            args.push(EdgeArg::Value(out));
+        }
+        self.term(Opcode::Jump, vec![], vec![Edge { block: p, args }]);
     }
 
     /// The entry root: callee, `this`, formals. Formals with a claim are

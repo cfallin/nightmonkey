@@ -6135,15 +6135,17 @@ mod tests {
     /// Compile `s` with the baseline tier and assert the emitted module
     /// validates.
     fn baseline_compile_and_validate(s: Script) {
-        baseline_compile_and_validate_resumes(s, &[]);
+        baseline_compile_and_validate_resumes(s, &[], &[]);
     }
 
     /// `baseline_compile_and_validate`, with MIR resume words (the
-    /// `ARGC_RESUME_BIT` entry). Baseline declines an irreducible body, so
-    /// this also checks the resume routing stays reducible.
+    /// `ARGC_RESUME_BIT` entry) and onramp headers. Baseline declines an
+    /// irreducible body, so this also checks the resume routing and the
+    /// onramps' DEOPT edges stay reducible.
     fn baseline_compile_and_validate_resumes(
         s: Script,
         resumes: &[crate::wasm::baseline::layout::ResumeWord],
+        onramps: &[(Pc, Vec<crate::wasm::baseline::layout::ResumeWord>)],
     ) {
         let (mut m, helpers) = module_with_helpers();
         let source = Source {
@@ -6155,7 +6157,7 @@ mod tests {
         let mut atoms = AtomTable::new(Names::default());
         let opts = Options::default();
         let ctx = empty_ctx(helpers, &source, &opts);
-        match crate::wasm::baseline::translate_script(
+        match crate::wasm::baseline::build_body(
             &ctx,
             &mut m,
             &mut atoms,
@@ -6163,16 +6165,22 @@ mod tests {
             &s,
             false,
             resumes,
+            onramps,
         )
         .expect("translate")
         {
-            Outcome::Compiled { sig, body, .. } => {
-                m.funcs
-                    .push(waffle::FuncDecl::Body(sig, "f".to_string(), body));
+            Ok(b) => {
+                let mut body = b.body;
+                // The onramps' MIR body: the function itself stands in.
+                let f = m.funcs.push(waffle::FuncDecl::None);
+                for v in b.main_calls {
+                    patch_call(&mut body, v, f);
+                }
+                m.funcs[f] = waffle::FuncDecl::Body(b.sig, "f".to_string(), body);
                 let bytes = m.to_wasm_bytes().expect("serialize");
                 waffle::wasmparser::validate(&bytes).expect("emitted module validates");
             }
-            Outcome::Skipped(reason) => panic!("unexpectedly skipped: {reason}"),
+            Err(reason) => panic!("unexpectedly skipped: {reason}"),
         }
     }
 
@@ -6295,7 +6303,20 @@ mod tests {
             w(28, true),
             w(38, false),
         ];
-        baseline_compile_and_validate_resumes(script(code, 1), &resumes);
+        baseline_compile_and_validate_resumes(script(code.clone(), 1), &resumes, &[]);
+        // With onramps at both loop headers.
+        // Each onramp's root reaches only pcs inside its loops or after.
+        let outer = resumes.iter().copied().filter(|w| w.pc.get() > 0).collect();
+        let inner = resumes
+            .iter()
+            .copied()
+            .filter(|w| w.pc.get() >= 6)
+            .collect();
+        baseline_compile_and_validate_resumes(
+            script(code, 1),
+            &resumes,
+            &[(Pc::new(0), outer), (Pc::new(6), inner)],
+        );
 
         // try { a0(); } catch { return exception }, in a loop:
         // @0 LoopHead; @6 Try; @7 GetArg 0; @10 Undefined; @11 Call 0;
@@ -6320,7 +6341,7 @@ mod tests {
             start: Pc::new(7),
             length: 13,
         }];
-        baseline_compile_and_validate_resumes(s, &[w(11, true), w(11, false), w(14, false)]);
+        baseline_compile_and_validate_resumes(s, &[w(11, true), w(11, false), w(14, false)], &[]);
     }
 
     #[test]

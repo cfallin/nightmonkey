@@ -8,6 +8,8 @@
 //!   `Val` and `Int` are i64, `F64` is f64, the rest i32, and ghosts
 //!   (`Fact`) vanish. Blocks map one to one, plus internal blocks for the
 //!   ops that branch.
+//! - **Reducibility (§5.4).** A function with onramp roots may be
+//!   irreducible; waffle's backend makes it reducible by duplication.
 //! - **Rooting (§4.4).** Before a may-GC helper call, every managed value
 //!   (`Val`, `Obj`, `Str`) live across it is stored, boxed, to the
 //!   NightStack just above the padded formals, and the helper's `top` is
@@ -31,6 +33,7 @@ use waffle::{
     ValueDef,
 };
 
+use crate::ids::Pc;
 use crate::mir;
 use crate::mir::func::{Edge, EdgeArg, RootKind};
 use crate::mir::ops::{
@@ -43,7 +46,7 @@ use crate::opsem::{
     PRIM_UNDEFINED,
 };
 use crate::wasm::baseline::layout::{
-    FrameLayout, ResumeMode, ResumeWord, ARGC_FLAGS, ARGC_RESUME_BIT,
+    FrameLayout, ResumeMode, ResumeWord, ARGC_FLAGS, ARGC_ONRAMP_BIT, ARGC_RESUME_BIT, ERR_DEOPT,
 };
 use crate::wasm::bbv::abi::{
     BINOP_BITAND, BINOP_BITNOT, BINOP_BITOR, BINOP_BITXOR, BINOP_DEC, BINOP_DIV, BINOP_INC,
@@ -58,6 +61,9 @@ use crate::wasm::translate::{
 type R<T> = Result<T, String>;
 
 const UNDEF: u64 = TAG_UNDEFINED << 32;
+
+/// The onramp backoff an exit leaves in the frame (`FrameLayout::backoff`).
+const ONRAMP_BACKOFF: u32 = 32;
 
 /// `JS::GenericNaN()`'s bits.
 const CANONICAL_NAN_BITS: u64 = 0x7FF8_0000_0000_0000;
@@ -81,6 +87,32 @@ pub fn resume_words(f: &mir::Func) -> Vec<ResumeWord> {
         };
         let (pc, _, _) = d.op.exit_shape().unwrap();
         out.insert(ResumeWord { pc, mode });
+    }
+    out.into_iter().collect()
+}
+
+/// The resume words of the exits and throws reachable from `root`: where
+/// an activation entered there can resume baseline.
+pub fn resume_words_from(f: &mir::Func, root: mir::Block) -> Vec<ResumeWord> {
+    let mut seen = BTreeSet::new();
+    let mut work = vec![root];
+    let mut out = BTreeSet::new();
+    while let Some(b) = work.pop() {
+        if !seen.insert(b) {
+            continue;
+        }
+        work.extend(f.succs(b));
+        if let Some(t) = f.terminator(b) {
+            let op = f.insts[t].op;
+            if let Some((pc, _, _)) = op.exit_shape() {
+                let mode = if matches!(op, Opcode::Exit { .. }) {
+                    ResumeMode::Continue
+                } else {
+                    ResumeMode::Throw
+                };
+                out.insert(ResumeWord { pc, mode });
+            }
+        }
     }
     out.into_iter().collect()
 }
@@ -125,6 +157,10 @@ struct Lower<'a> {
     baseline_calls: Vec<Value>,
     /// The stress mode's period (`Options::mir_stress`); 0 = off.
     stress: u32,
+    /// Whether the function has onramp roots, and (if so) the entry's
+    /// test of `ARGC_ONRAMP_BIT`, which says how this activation began.
+    has_onramps: bool,
+    onramp_flag: Value,
 }
 
 /// Lower `f` (a function of `mm`, whose baseline frame is `layout`) into a
@@ -164,6 +200,8 @@ pub fn lower(
         root_base,
         baseline_calls: vec![],
         stress,
+        has_onramps: f.roots.iter().any(|r| r.kind != RootKind::Entry),
+        onramp_flag: argc,
     };
     l.run()?;
     Ok(Lowered {
@@ -425,16 +463,10 @@ impl<'a> Lower<'a> {
             .collect()
     }
 
-    /// Blocks reachable from the entry root. (Onramp roots are M3.)
+    /// Blocks reachable from a root.
     fn reachable(&self) -> BTreeSet<mir::Block> {
         let mut seen = BTreeSet::new();
-        let mut work: Vec<mir::Block> = self
-            .f
-            .roots
-            .iter()
-            .filter(|r| r.kind == RootKind::Entry)
-            .map(|r| r.block)
-            .collect();
+        let mut work: Vec<mir::Block> = self.f.roots.iter().map(|r| r.block).collect();
         while let Some(b) = work.pop() {
             if seen.insert(b) {
                 work.extend(self.f.succs(b));
@@ -540,12 +572,48 @@ impl<'a> Lower<'a> {
         Ok(())
     }
 
-    /// The entry: pad the formals the caller did not pass with undefined
-    /// (the frame below the rooting slots must hold valid Values), then
-    /// enter the entry root with callee, `this` and the formals.
+    /// The entry. Under `ARGC_ONRAMP_BIT` (baseline at a loop header),
+    /// enter the onramp root the resume word names, with its params read
+    /// from the baseline frame. Otherwise, pad the formals the caller did
+    /// not pass with undefined (the frame below the rooting slots must hold
+    /// valid Values), then enter the entry root with callee, `this` and the
+    /// formals.
     fn entry(&mut self) -> R<()> {
+        let bit = self.i32c(ARGC_ONRAMP_BIT);
+        self.onramp_flag = self.bin(Operator::I32And, self.argc, bit, Type::I32);
         let flags = self.i32c(!ARGC_FLAGS);
         self.argc = self.bin(Operator::I32And, self.argc, flags, Type::I32);
+        let onramps: Vec<(Pc, mir::Block)> = self
+            .f
+            .roots
+            .iter()
+            .filter_map(|r| match r.kind {
+                RootKind::Onramp(pc) => Some((pc, r.block)),
+                RootKind::Entry => None,
+            })
+            .collect();
+        if !onramps.is_empty() {
+            let disp = self.body.add_block();
+            let fresh = self.body.add_block();
+            self.cond_br(self.onramp_flag, Self::to(disp), Self::to(fresh));
+            self.cur = disp;
+            let word = self.load_i32(self.sp, self.layout.resume());
+            for (pc, root) in onramps {
+                let w = ResumeWord {
+                    pc,
+                    mode: ResumeMode::Continue,
+                };
+                let k = self.i32c(w.encode() as u32);
+                let hit = self.bin(Operator::I32Eq, word, k, Type::I32);
+                let (yes, no) = (self.body.add_block(), self.body.add_block());
+                self.cond_br(hit, Self::to(yes), Self::to(no));
+                self.cur = yes;
+                self.enter_onramp(pc, root)?;
+                self.cur = no;
+            }
+            self.terminate(Terminator::Unreachable);
+            self.cur = fresh;
+        }
         let root = self
             .f
             .roots
@@ -583,6 +651,51 @@ impl<'a> Lower<'a> {
             target: BlockTarget { block: b, args },
         });
         Ok(())
+    }
+
+    /// Enter onramp root `root` (loop header `pc`) with the baseline
+    /// frame's state at `pc`: `this`, formals, locals, rval and the
+    /// operand stack.
+    fn enter_onramp(&mut self, pc: Pc, root: mir::Block) -> R<()> {
+        let l = self.layout;
+        let (sp, vp) = (self.sp, self.sp);
+        let depth = *self
+            .f
+            .frame
+            .depths
+            .get(&pc)
+            .ok_or("lowering: no depth at an onramp")?;
+        let mut vals = vec![self.load_i64(sp, FrameLayout::THIS)];
+        for i in 0..l.nargs {
+            vals.push(self.load_i64(sp, l.arg(i)));
+        }
+        for j in 0..l.nlocals {
+            vals.push(self.load_i64(vp, l.local(j)));
+        }
+        vals.push(self.load_i64(vp, l.rval()));
+        for k in 0..depth {
+            vals.push(self.load_i64(vp, l.operand(k)));
+        }
+        if vals.len() != self.f.blocks[root].params.len() {
+            return Err("lowering: an onramp root's params are not the frame".into());
+        }
+        let block = self.blocks[&root];
+        self.terminate(Terminator::Br {
+            target: BlockTarget { block, args: vals },
+        });
+        Ok(())
+    }
+
+    fn to(block: Block) -> BlockTarget {
+        BlockTarget {
+            block,
+            args: vec![],
+        }
+    }
+
+    fn load_i32(&mut self, addr: Value, offset: u32) -> Value {
+        let m = self.mem(2, offset);
+        self.un(Operator::I32Load { memory: m }, addr, Type::I32)
     }
 
     /// The waffle target for MIR edge `e`, with `outs` standing for the
@@ -1063,6 +1176,19 @@ impl<'a> Lower<'a> {
         self.store_i64(vp, l.new_target(), self.new_target);
         let word = self.i64c((TAG_INT32 << 32) | u64::from(w.encode() as u32));
         self.store_i64(vp, l.resume(), word);
+        // Baseline waits this many loop-header visits before it tries an
+        // onramp again, so it makes progress from here.
+        let backoff = self.i64c((TAG_INT32 << 32) | u64::from(ONRAMP_BACKOFF));
+        self.store_i64(vp, l.backoff(), backoff);
+        if self.has_onramps {
+            // Entered by an onramp: the baseline caller resumes itself.
+            let (deopt, call_blk) = (self.body.add_block(), self.body.add_block());
+            self.cond_br(self.onramp_flag, Self::to(deopt), Self::to(call_blk));
+            self.cur = deopt;
+            let d = self.i32c(ERR_DEOPT);
+            self.ret(d);
+            self.cur = call_blk;
+        }
         let bit = self.i32c(ARGC_RESUME_BIT);
         let argc = self.bin(Operator::I32Or, self.argc, bit, Type::I32);
         let call = self.call(
