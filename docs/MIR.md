@@ -1,15 +1,19 @@
-# NightMonkey MIR: draft design (rev 5)
+# NightMonkey MIR: draft design (rev 6)
 
-Status: **draft for iteration**. Nothing here is implemented. See
-`mir-tier.md` for the motivation. Rev 5 folds in the reviews of revs
-1–4. Optimizations that must work are in §10, decisions are logged in §12,
-and the implementation plan is §13.
+Status: **draft for iteration**. M0 (the IR core) is implemented in
+`compiler/src/mir/`. See `mir-tier.md` for the motivation. Rev 6
+replaces GEN (the BBV `Dirty` track) with the baseline tier of
+`docs/BASELINE.md` as the deopt destination and onramp source.
+Optimizations that must work are in §10, decisions are logged in §12,
+and the implementation plan is `docs/BASELINE.md` §8.
 
 ## 0. Summary
 
-- **MIR represents OPT only.** GEN is today's `Dirty`-track lowering in
-  `wasm/bbv`. It is the deopt destination, and the source of onramps
-  back into MIR.
+- **MIR represents OPT only.** The *baseline* tier (`docs/BASELINE.md`)
+  is the deopt destination and the source of onramps back into MIR.
+  Baseline keeps the whole JS frame in NightStack memory, and that
+  frame format is the whole interface between the tiers. MIR and
+  baseline are separate Wasm functions.
 - **The IR is SSA over a CFG with typed blockparams.** There are no
   frame slots in MIR. Locals, args, `this`, and the JS operand stack are
   all SSA values. The only NightStack traffic MIR code produces is GC
@@ -31,19 +35,19 @@ and the implementation plan is §13.
   and "raw i32" are different types. Unboxing the former is infallible;
   unboxing an arbitrary Value is a fallible guard.
 - **A fallible op is a two-target terminator.** The failure target
-  usually exits to GEN, but may instead run an inline slowpath and
+  usually exits to baseline, but may instead run an inline slowpath and
   merge back.
-- **Everything crossing the OPT/GEN boundary is `Val(⊤)`:** boxed, with
-  no other known type.
+- **Everything crossing the MIR/baseline boundary is `Val(⊤)`:** boxed,
+  with no other known type.
   - **An exit is a variadic op** carrying the resume PC plus every
-    `this`/arg/local/operand-stack value. Each value is first upcast to
-    `Val(⊤)` (infallible boxing and forgetting).
+    `this`/arg/local/rval/operand-stack value. Each value is first
+    upcast to `Val(⊤)` (infallible boxing and forgetting).
   - **Every loop header can accept an onramp.** An onramp enters through
     an *onramp entry block* that takes the same full state as `Val(⊤)`.
     The block runs ordinary MIR guards, then either re-deopts or jumps
     into the loop's preheader.
-  - Deopt writes the frame that GEN expects, and an onramp reads it back
-    into SSA.
+  - Deopt writes the baseline frame and resumes baseline at the pc. An
+    onramp reads the frame back into SSA.
 - **MIR is the sole input to the backend.** Everything a lowering needs
   is attached to the op, or lives in MIR-level tables the ops reference.
 - **Loads and stores carry access descriptors** (field or element, and
@@ -51,11 +55,12 @@ and the implementation plan is §13.
   without a functional memory model.
 - **The effect-flags word is implicit, flow-carried state.** It is
   derived from op effects and threaded during lowering.
-- **Lowering handles GC rooting and loop-token duplication.** GC
-  rooting is done by an MIR-value-to-waffle-value map that is spilled
-  and reloaded around may-GC ops. Loop-token duplication is done by
-  lowering MIR blocks in several loop-header token contexts, which is
-  the mechanism GEN uses today. Neither concept appears in MIR.
+- **Lowering handles GC rooting.** An MIR-value-to-waffle-value map is
+  spilled and reloaded around may-GC ops. It does not appear in MIR.
+- **MIR has no reducibility invariant.** An onramp into a nested loop
+  side-enters every enclosing loop. MIR declares its loops explicitly,
+  and waffle's backend reducifier makes the lowered function reducible
+  (§5.4).
 
 ## 1. IR structure
 
@@ -214,8 +219,8 @@ Fences kill them like any other type (§4).
   - `ok_clean` is not a fence edge, so every per-object and global fact
     survives. This is the rejoin.
   - `ok_dirty` is a fence edge with the op's static kill pattern.
-    `b2` weakens by parameter typing, then exits to GEN or re-guards
-    and merges.
+    `b2` weakens by parameter typing, then exits to baseline or
+    re-guards and merges.
   - `err` goes to a throw exit (§5.3).
 - An op with no dynamic effect report has a single `ok` edge carrying
   its kill pattern.
@@ -235,8 +240,8 @@ Fences kill them like any other type (§4).
 
 | Component | Meaning | In the type? | On failure |
 |---|---|---|---|
-| identity (`keys`) | object has layout K | yes, killable | exit to GEN at the op's PC |
-| `TYPES` (+`RANGES`) | K's protected fields hold their predicted types (and ranges) | **yes, killable** | exit to GEN at the op's PC |
+| identity (`keys`) | object has layout K | yes, killable | exit to baseline at the op's PC |
+| `TYPES` (+`RANGES`) | K's protected fields hold their predicted types (and ranges) | **yes, killable** | exit to baseline at the op's PC |
 | `SLOTS` | K's fields sit in their predicted fixed slots | **no**: local to each op | the IC, staying in OPT |
 
 - **Identity and `TYPES` are part of what OPT means.**
@@ -244,7 +249,7 @@ Fences kill them like any other type (§4).
     `Obj{layout K, types}`. With local-first guarding (§8), the builder
     emits one `guard.layout K {types}` before each such op. Lowering
     fuses it into a single masked stamp compare, as today.
-  - **On failure, including a class-key miss, it exits to GEN** at the
+  - **On failure, including a class-key miss, it exits to baseline** at the
     op's own PC, before anything observable has happened. Staying in
     OPT with an unexpected class would give up the type specialization
     that follows from it.
@@ -276,7 +281,7 @@ Fences kill them like any other type (§4).
     clear `SLOTS` on a mispredicted add. That invalidates no type,
     because `SLOTS` is never in a type.
   - SLOTS-miss receivers are therefore served in OPT, not regressed to
-    GEN as they are today.
+    GEN as they are in today's backend.
 - **Shallow `TYPES` for object-typed fields.** A valid `TYPES` bit on an
   object is shallow. It constrains what the parent's field holds, and
   says nothing about the child object's own `TYPES` bit: a deep meaning
@@ -414,8 +419,8 @@ booleans, null/undefined and objects.
    per-field check on the generic side.
    - Any field write by generic code clears `TYPES`, `SLOTS` and
      `RANGES`, whatever the value. Generic code here means the C++
-     runtime and engine (`setSlot`/`initSlot`), runtime helpers, and
-     GEN's compiled stores.
+     runtime and engine (`setSlot`/`initSlot`), runtime helpers (so
+     every baseline store), and legacy GEN's compiled stores.
    - In the engine hook, this becomes
      `storeClearMask = RANGES | TYPES | SLOTS`, and
      `storeNonNumberClearMask` becomes redundant.
@@ -437,19 +442,19 @@ booleans, null/undefined and objects.
    - **Consequences to watch:**
      - *Permanent demotion.* A generic write clears the bits for good,
        and nothing re-establishes them except a constructor-exit or
-       delegate restamp. So an object that has been written by GEN, the
-       runtime or the interpreter even once will fail its `types` guard
-       in OPT from then on. That includes each exit-then-onramp cycle
-       whose GEN portion stores to it. Today, number-conforming generic
+       delegate restamp. So an object that has been written by baseline,
+       GEN, the runtime or the interpreter even once will fail its
+       `types` guard in OPT from then on. That includes each
+       exit-then-onramp cycle whose baseline portion stores to it. Today, number-conforming generic
        stores keep `TYPES`, so this is a behavior change we should
        measure (demotion census by bump site, which already exists).
        Mitigation if needed: GEN stores whose site has a static claim
        could check it inline, as legacy typed sites will.
-     - *Construction outside OPT.* Objects built by the interpreter or
-       GEN never keep `TYPES`, because their initializing stores are
-       generic.
+     - *Construction outside OPT.* Objects built by the interpreter,
+       baseline or GEN never keep `TYPES`, because their initializing
+       stores are generic.
      - *Epoch churn.* Every clear bumps `gNightStampEpoch`, so callees
-       that run in GEN report dirty more often. Callers then take
+       that run in baseline or GEN report dirty more often. Callers then take
        `ok_dirty` and re-guard, which is correct but costlier.
      - *`SLOTS` on value stores.* Clearing `SLOTS` on a plain value
        store is stronger than needed, since slots don't move. It only
@@ -472,41 +477,58 @@ booleans, null/undefined and objects.
 5. **Prediction witnesses and fences** need nothing new. A `types`
    claim is still killed only by engine-store fences.
 
-## 5. The OPT/GEN boundary: exits, onramps, throws
+## 5. The MIR/baseline boundary: exits, onramps, throws
 
-**Boundary rule:** every value crossing between OPT and GEN has type
-`Val(⊤)` (boxed, nothing else known).
+The baseline tier (`docs/BASELINE.md`) keeps the whole JS frame in
+NightStack memory. Its frame format (BASELINE.md §2) is the only
+interface between the tiers: state at a pc is the frame plus the static
+operand depth there. MIR and baseline are separate Wasm functions per
+script, and the MIR body is the script's table entry.
+
+**Boundary rule:** every value crossing between MIR and baseline has
+type `Val(⊤)` (boxed, nothing else known). `Val(⊤)` includes magic
+values (TDZ, element holes), since frames hold them.
 
 - Deopt upcasts, infallibly: `box` if needed, then `weaken` to `Val(⊤)`.
 - An onramp reestablishes knowledge by running ordinary MIR guards. The
-  guard implementations are therefore shared with the rest of OPT, and
+  guard implementations are therefore shared with the rest of MIR, and
   the lowering has no separate onramp proof machinery.
 
 ### 5.1 Exits
 
 ```
-exit pc, [this, args…], [locals…], [stack…]      -- every operand : Val(⊤)
+exit pc, this, [args…], [locals…], rval, [stack…]   -- every operand : Val(⊤)
 ```
 
-- **The arity is fixed by the script:** all formals, all locals, and the
-  operand-stack depth at `pc`. v1 passes and stores every one of them.
-  A liveness analysis at the target PC can prune dead ones as soon as
-  IR size or exit cost warrants it. The builder inserts the `box`/`weaken`
-  upcasts explicitly. Boxing is thus visible to the optimizer; for
-  example, a box can be sunk into the exit path.
+- **The arity is fixed by the script:** all formals, all locals, the
+  rval, and the operand-stack depth at `pc`. v1 passes and stores every
+  one of them. A liveness analysis at the target PC can prune dead ones
+  as soon as IR size or exit cost warrants it. The builder inserts the
+  `box`/`weaken` upcasts explicitly. Boxing is thus visible to the
+  optimizer; for example, a box can be sunk into the exit path.
+- **The env slot is not an operand.** v1 declines env ops, so the env
+  chain is fixed for the whole activation, and the MIR prologue writes
+  it once.
 - **Resume rule:** an exit to an op's own PC is allowed only if no
   observable part of the op has happened. Otherwise it targets the
   successor PC, with the op's result on the stack.
-- **Lowering creates the frame GEN expects:**
-  1. Store `this`, the args and the locals into their NightStack frame
-     slots. (GEN keeps locals in frame slots, since the GC traces the
-     frame.)
-  2. Pass the operand stack, GEN's carried set, and the flags
-     accumulator as the block args of GEN's version at `pc` in the
-     current token context.
+- **Lowering writes a complete baseline frame and resumes baseline:**
+  1. Store every operand, plus the env, arguments-object and new.target
+     slots, into the frame layout at `pc`.
+  2. Write the resume word: `pc`, in mode `continue`.
+  3. If this activation entered MIR at the function entry, call the
+     baseline body with `ARGC_RESUME_BIT` and return its result. If it
+     entered by an onramp from baseline, return `err = 2` (DEOPT) to
+     that baseline caller, which resumes itself. A JS frame therefore
+     never uses more than three native frames.
 
-  While running in MIR, the frame slots hold stale but valid values
-  (initialized by the prologue), so the GC never sees garbage.
+  MIR does not maintain a baseline frame while it runs. It uses the
+  NightStack only for GC rooting, above the caller-built
+  `[callee, this, args…]`, and only across may-GC ops. The exit writes
+  the whole frame at once.
+- **Each exit lowers its own stores.** Values reloaded after rooting are
+  different waffle values on different paths, so exit blocks are never
+  shared across predecessors in waffle.
 - **Reserved extensions:** a parent-frame chain (for inlining) and
   virtual-object recipes (for scalar replacement). v1's validator
   rejects both.
@@ -515,39 +537,42 @@ exit pc, [this, args…], [locals…], [stack…]      -- every operand : Val(�
 
 - **Onramp roots exist only at loop headers** (plus function entry).
   This matches the heuristic JITs have settled on for tier-up.
-  Everywhere else, rejoining OPT happens inside MIR, through the
-  `ok_dirty` re-guard path (§4.2, §8).
+  Everywhere else, rejoining optimized code happens inside MIR, through
+  the `ok_dirty` re-guard path (§4.2, §8).
+- **MIR declares its loops**: header, preheader, from the bytecode
+  loops. A loop's body is every block that reaches one of its latches
+  without passing through the header. That is well-defined even though
+  onramps make the CFG irreducible (§5.4).
 - **Every MIR loop has a canonical preheader `P`.**
   - Its params are the full frame state at the header PC, typed with the
     prediction for that header, **including class (layout) claims**. It
     is not weakened to make reentry easier. So `O`, and any `ok_dirty`
     path inside the loop that reaches the back edge, guard stamps as
     well as tags.
-  - `P` is the loop header's only non-backedge predecessor, so it
-    dominates the loop. It is where LICM hoists to.
-- **Every loop also has an onramp entry block `O`.**
-  - `O` is outside the loop, and is a root of the MIR CFG. (A MIR
-    function has several roots, and the validator's dominance uses a
-    virtual root.)
+  - `P` is the loop header's only predecessor from outside the loop. It
+    is where LICM hoists to.
+- **A loop may have an onramp root `O`.**
+  - `O` is a root of the MIR CFG. A MIR function has several roots, and
+    the validator's dominance uses a virtual root.
   - `O`'s params are the same frame state, all `Val(⊤)`.
   - Its body is a guard chain: guard each value up to `P`'s param type.
   - When every guard passes, it jumps to `P`.
   - When a guard fails, it re-deopts with `exit header_pc, …`, using
     `O`'s own params as the operands.
-- **Lowering an onramp** has three steps, all in GEN:
-  1. A GEN edge into the loop header's version loads `this`, the args
-     and the locals from the frame (tearing the frame down back into
-     SSA).
-  2. It branches into `O`, bringing along the operand stack and the
-     flags accumulator.
-  3. A failed onramp's exit lands in the GEN header block itself, not
-     on the edge that attempts the onramp.
-
-  Whether a given GEN edge attempts the onramp at all is a lowering
-  policy, for example based on the cost of `O`'s guards.
+  - Which headers get an `O` is policy (BASELINE.md §7). Every
+    outermost loop gets one. An inner loop gets one subject to the
+    code-size cost of §5.4.
+- **Lowering an onramp:**
+  1. At a loop header, baseline calls the MIR body with its own `sp`
+     and `ARGC_ONRAMP_BIT`, with the header named in the resume word.
+     Backoff keeps failing guards from costing a call per iteration.
+  2. The MIR body's single entry block dispatches with one `br_table` to
+     `O`, whose lowering loads its params from the frame.
+  3. If MIR returns normally, baseline returns the value. If it returns
+     DEOPT, baseline resumes at the resume word's pc.
 - **Progress:** a failure in `O`, or in a guard hoisted into `P`, exits
-  to GEN at the header. GEN runs at least one iteration before its back
-  edge can attempt the onramp again, so there is no livelock.
+  to baseline at the header. Baseline runs at least one iteration
+  before it attempts the onramp again, so there is no livelock.
 - **Function entry** is the same construct at PC 0. Its root takes
   `callee`, `this` and the formals as `Val(⊤)`. The guard chain applies
   the builder's entry types (the `arg_types` guard-at-defs policy).
@@ -559,15 +584,15 @@ exit pc, [this, args…], [locals…], [stack…]      -- every operand : Val(�
   share one throw block per PC:
 
   ```
-  exit.throw pc, [this, args…], [locals…], [stack…]   -- every operand : Val(⊤)
+  exit.throw pc, this, [args…], [locals…], rval, [stack…]   -- every operand : Val(⊤)
   ```
 
   Its operands are the state *before* the op, which dominates every
   throwing point within that op. The block therefore needs no params.
-- **It lowers through today's `exception_target` path:**
-  1. unwind-closing for for-in and destructuring iterators;
-  2. then the GEN handler version, or the error-return block when no try
-     note covers `pc`.
+- **It lowers like `exit`**, with the resume word in mode `throw`.
+  Baseline then runs its own exception landing for `pc`: iterator
+  closes, env unwinding, and then the catch/finally handler or the
+  error return.
 
   Scripts with try/catch are therefore supported, and MIR itself has no
   exceptional control flow.
@@ -575,17 +600,20 @@ exit pc, [this, args…], [locals…], [stack…]      -- every operand : Val(�
   fold throw semantics into the ops, and materialize them only in the
   lowering to waffle.
 
-### 5.4 Loop tokens and reducibility
+### 5.4 Reducibility
 
-MIR's own CFG is reducible (it follows bytecode loops). The combined
-MIR-plus-GEN function is kept reducible during lowering:
+MIR has no reducibility invariant. An onramp into a nested loop enters
+through that loop's preheader, which lies inside every enclosing loop,
+so it side-enters each of them.
 
-- each MIR block may be lowered once per loop-header token context, as
-  GEN versions are today;
-- exits and onramps pick targets through the same token rules, so a
-  side entry lands in peel funnels.
-
-None of this appears in MIR.
+- The lowering emits the MIR CFG as-is. waffle's backend reducifier
+  duplicates the partial first iteration from the side entry up to the
+  enclosing loop's header, where the copy rejoins the original.
+- The steady-state loop exists once, whichever block the reducifier
+  picks as header. The choice only decides which fragment of one
+  iteration is duplicated.
+- The cost is measured on real MIR after M3 (BASELINE.md §8, step W)
+  before any change to waffle is considered.
 
 ## 6. Effects and memory
 
@@ -780,7 +808,7 @@ with the operand stack and locals as SSA values:
   carries on the `ok_clean` edge, and rejoins the clean path. The join
   therefore stays as strong as the clean path, and downstream guards can
   still fold against it. A failed re-guard exits at `pc_after`. This
-  replaces today's call-return onramp without a trip through GEN.
+  replaces today's call-return onramp without a trip through baseline.
 - Explicit `box`/`weaken` upcasts before every `exit` and `exit.throw`.
 - A guard-at-defs policy against the per-PC prediction: OPT state at a
   PC boundary must be at least as strong as the prediction in its
@@ -793,14 +821,17 @@ with the operand stack and locals as SSA values:
 
 For each script:
 
-1. Build GEN with the Bbv emitter, pinned to `Dirty`, with tokens. This
-   exposes GEN versions for exits, and the loop-header edges that may
-   branch into onramp roots `O` (after reloading locals from the frame).
-2. Lower MIR into the same `FunctionBody`, once per required token
-   context. Op lowerings reuse the existing emit helpers, parameterized
-   by MIR types and attachments rather than `Operand`/`Ctx`.
-3. Perform rooting (§4.4) and flags threading (§6) during this walk.
-4. Run `assert_reducible`, then emit.
+1. Build the MIR body (or decline). Its exit and throw pcs, and its
+   onramp headers, are the resume set the baseline compile needs.
+2. Compile baseline for the script with that resume set
+   (BASELINE.md §4).
+3. Lower MIR into its own `FunctionBody`. The entry block dispatches
+   to the function-entry root or, under `ARGC_ONRAMP_BIT`, to an onramp
+   root. Op lowerings take MIR types and attachments rather than BBV's
+   `Operand`/`Ctx`, and may share emit code where it fits.
+4. Perform rooting (§4.4) and flags threading (§6) during this walk.
+   Each exit writes the baseline frame (§5.1).
+5. Emit. waffle's backend reducifies the body (§5.4).
 
 ## 10. Optimizations that must work
 
@@ -904,8 +935,8 @@ stores and may-run-JS fences.
 
 ## 11. v1 scope
 
-"Declined" means that **a script is translated entirely by the legacy
-path when the MIR builder meets one of these**:
+"Declined" means that **a script is compiled by baseline alone when the
+MIR builder meets one of these** (under `pipeline=mir`; BASELINE.md §5):
 
 - generator and async bodies
 - `arguments` and rest
@@ -914,9 +945,7 @@ path when the MIR builder meets one of these**:
 
 Try/catch is supported (§5.3). There is no hidden decline for inlining.
 The MIR builder does not inline anything, so calls in a MIR-compiled
-script are always real calls. It never refuses a script because the
-legacy path would have inlined into it. Legacy callers remain free to
-splice a MIR-compiled script's bytecode.
+script are always real calls.
 
 ## 12. Decision log
 
@@ -993,6 +1022,24 @@ splice a MIR-compiled script's bytecode.
 - Every static kill needs a witness, including structural ones such as
   `publish_layout`'s kill of constructing claims.
 
+**Rev 6**
+- The baseline tier (`docs/BASELINE.md`) replaces GEN as the deopt
+  destination and onramp source. Its frame format is the interface
+  between the tiers.
+- MIR and baseline are separate Wasm functions. Exits write the frame
+  and resume baseline (`ARGC_RESUME_BIT` plus the frame's resume word).
+  Onramps are calls from baseline loop headers (`ARGC_ONRAMP_BIT`),
+  and a MIR body entered that way returns `err = 2` to deopt. Loop
+  tokens and peel funnels are gone.
+- MIR has no reducibility invariant. MIR declares its loops, and
+  waffle's reducifier handles onramp side entries. Measuring its cost
+  comes after M3, and changing waffle comes only if the data calls for
+  it.
+- `exit`/`exit.throw` carry the rval. `Val(⊤)` includes magic values.
+- MIR does not maintain a baseline frame while it runs. It uses the
+  NightStack only for GC rooting, and writes the whole frame at an exit.
+- `docs/MIR-GEN-SEAM.md` is retired.
+
 ## 13. Implementation plan
 
 Each milestone ends with a test gate. MIR is enabled per script behind
@@ -1010,30 +1057,47 @@ counts, with reasons, so that coverage is measured rather than assumed
 - Gate: unit tests on hand-written textual MIR, including negative
   validator tests.
 
-**M1. Minimal lowering, MIR to waffle, integrated with GEN**
-- Bbv in Dirty-with-tokens mode, exposing GEN versions for exits.
-- The function-entry root.
+Baseline steps B0–B4 (BASELINE.md §8) come before M1: MIR needs a
+total baseline to exit into.
+
+**M0b. M0 follow-ups for rev 6**
+- `TagSet` gains `magic`. `Val(⊤)` includes it, nothing unboxes it, and
+  `guard.tags` can remove it.
+- `exit`/`exit.throw` and onramp roots carry the rval.
+- Loops are declared (header, preheader). The validator's
+  "irreducible" error goes, and its preheader check keys off the
+  declared loops.
+
+**M1. Minimal lowering, MIR to its own waffle function**
+- The function-entry root, and the entry dispatch.
 - Lowering for constants, int32/f64/int arithmetic, compares, `br`,
-  `jump`, loops, `return`, `exit`, and `exit.throw`, with frame writes.
+  `jump`, loops, `return`, `exit`, and `exit.throw`. Exits and throws
+  write the baseline frame and resume baseline (§5.1).
 - Flags threading, returning `FLAGS_ALL` wherever it is not yet
   derived.
 - Gate: hand-written MIR for small scripts runs correctly, including
-  forced exits.
+  forced exits into baseline.
 
 **M2. JSOps-to-MIR builder** for the M1 subset (locals and args as SSA,
 guard-at-defs, `js.*` fallbacks for arithmetic and compare, and
 declines for everything else).
-- Gate: the jit-tests AOT lane passes with MIR enabled, and the counts
+- Gate: the jit-tests lane passes under `pipeline=mir`, and the counts
   show MIR actually compiled the scripts.
 - Also add a **stress mode** that fails a fraction of guards (or every
   Nth one) at runtime. It exercises exits, throw exits and, later,
   onramps on code the tests would otherwise keep on the fast path.
 
 **M3. Onramps**
-- Loop preheaders `P` and roots `O`.
-- GEN loop-header edges that reload from the frame and branch into `O`.
-- Lowering once per token context.
-- Gate: tests under the stress mode, plus `assert_reducible`.
+- Declared loops, preheaders `P`, and roots `O`, with the onramp-root
+  policy.
+- Baseline loop headers call into `O` with backoff, and handle a DEOPT
+  return.
+- Gate: tests under the stress mode, including onramps into nested
+  loops.
+
+**W. waffle's reducifier, driven by M3 data** (BASELINE.md §8): measure
+the duplication on real onramp-shaped MIR, and change waffle only if
+the numbers call for it.
 
 **M4. Objects and calls**
 - `guard.layout {types}`, and `load_field`/`store_field` with the local
@@ -1074,5 +1138,5 @@ tests.
 
 After M6, work moves to the remaining optimization passes (representation selection,
 numeric demand, memory optimizations, LICM, inlining, scalar
-replacement). Beyond that, GEN-only coverage of the declined categories
-comes before the legacy OPT path can be deleted.
+replacement). Once MIR's coverage and performance match the legacy
+path, BBV can be deleted.
