@@ -54,8 +54,8 @@ use crate::wasm::bbv::abi::{
     CMP_LE, CMP_LT, CMP_NE, CMP_STRICTEQ, CMP_STRICTNE, FLAGS_ALL,
 };
 use crate::wasm::translate::{
-    Helpers, TAG_BIGINT_HI, TAG_BOOLEAN, TAG_CLEAR, TAG_INT32, TAG_MAGIC, TAG_NULL, TAG_OBJECT,
-    TAG_STRING, TAG_SYMBOL, TAG_UNDEFINED,
+    AtomTable, Helpers, MAGIC_UNINITIALIZED_LEXICAL, TAG_BIGINT_HI, TAG_BOOLEAN, TAG_CLEAR,
+    TAG_INT32, TAG_MAGIC, TAG_NULL, TAG_OBJECT, TAG_STRING, TAG_SYMBOL, TAG_UNDEFINED,
 };
 
 type R<T> = Result<T, String>;
@@ -71,6 +71,8 @@ const CANONICAL_NAN_BITS: u64 = 0x7FF8_0000_0000_0000;
 /// A lowered MIR function.
 pub struct Lowered {
     pub body: FunctionBody,
+    /// Adapter-offset placeholders of direct calls.
+    pub body_off_patches: Vec<Value>,
     /// `Call` placeholders for the script's baseline body, one per exit.
     pub baseline_calls: Vec<Value>,
 }
@@ -161,15 +163,20 @@ struct Lower<'a> {
     /// test of `ARGC_ONRAMP_BIT`, which says how this activation began.
     has_onramps: bool,
     onramp_flag: Value,
+    mm: &'a mir::Module,
+    atoms: &'a mut AtomTable,
+    /// Adapter-offset placeholders (`Outcome::Compiled::body_off_patches`).
+    body_off_patches: Vec<Value>,
 }
 
 /// Lower `f` (a function of `mm`, whose baseline frame is `layout`) into a
 /// new body of `m`.
-pub fn lower(
+pub fn lower<'a>(
     m: &mut Module,
     h: Helpers,
-    _mm: &mir::Module,
-    f: &mir::Func,
+    mm: &'a mir::Module,
+    atoms: &'a mut AtomTable,
+    f: &'a mir::Func,
     layout: FrameLayout,
     stress: u32,
 ) -> R<Lowered> {
@@ -202,10 +209,14 @@ pub fn lower(
         stress,
         has_onramps: f.roots.iter().any(|r| r.kind != RootKind::Entry),
         onramp_flag: argc,
+        mm,
+        atoms,
+        body_off_patches: vec![],
     };
     l.run()?;
     Ok(Lowered {
         body: l.body,
+        body_off_patches: l.body_off_patches,
         baseline_calls: l.baseline_calls,
     })
 }
@@ -755,6 +766,19 @@ impl<'a> Lower<'a> {
     /// rooted, reloading them afterwards. Returns the helper's i32 status
     /// and the boxed result it wrote at `top`.
     fn gc_call(&mut self, f: Func, args: &[Value], live: &[mir::Value]) -> R<(Value, Value)> {
+        self.spill(live)?;
+        let top_off = self.root_base + 8 * u32::try_from(live.len()).unwrap();
+        let top = self.add_off(self.sp, top_off);
+        let mut full = vec![self.cx, top];
+        full.extend_from_slice(args);
+        let ok = self.call1(f, &full, Type::I32);
+        self.reload(live)?;
+        let result = self.load_i64(self.sp, top_off);
+        Ok((ok, result))
+    }
+
+    /// Store `live` (managed values), boxed, to the rooting slots.
+    fn spill(&mut self, live: &[mir::Value]) -> R<()> {
         for (i, &v) in live.iter().enumerate() {
             let t = self.ty(v);
             let w = self.get(v)?;
@@ -762,11 +786,11 @@ impl<'a> Lower<'a> {
             let off = self.root_base + 8 * u32::try_from(i).unwrap();
             self.store_i64(self.sp, off, b);
         }
-        let top_off = self.root_base + 8 * u32::try_from(live.len()).unwrap();
-        let top = self.add_off(self.sp, top_off);
-        let mut full = vec![self.cx, top];
-        full.extend_from_slice(args);
-        let ok = self.call1(f, &full, Type::I32);
+        Ok(())
+    }
+
+    /// Reload `live` from the rooting slots (a GC may have moved them).
+    fn reload(&mut self, live: &[mir::Value]) -> R<()> {
         for (i, &v) in live.iter().enumerate() {
             let t = self.ty(v);
             let off = self.root_base + 8 * u32::try_from(i).unwrap();
@@ -774,8 +798,7 @@ impl<'a> Lower<'a> {
             let w = self.unboxed_managed(&t, raw);
             self.vmap.insert(v, w);
         }
-        let result = self.load_i64(self.sp, top_off);
-        Ok((ok, result))
+        Ok(())
     }
 
     // --- instructions ------------------------------------------------------------------
@@ -797,6 +820,7 @@ impl<'a> Lower<'a> {
                     ConstVal::Bool(b) => (TAG_BOOLEAN << 32) | u64::from(b),
                     ConstVal::Int32(n) => (TAG_INT32 << 32) | u64::from(n as u32),
                     ConstVal::Double(bits) => bits,
+                    ConstVal::Uninitialized => (TAG_MAGIC << 32) | MAGIC_UNINITIALIZED_LEXICAL,
                 };
                 let v = self.i64c(bits);
                 self.def(inst, v);
@@ -1049,6 +1073,47 @@ impl<'a> Lower<'a> {
             | Opcode::JsUnop(_)
             | Opcode::JsCompare(_)
             | Opcode::JsToNumeric => self.js_op(inst, &d.op, &a)?,
+            Opcode::JsTypeofEq(k) => {
+                // A leaf: no GC, no JS.
+                let kv = self.i32c(u32::from(k));
+                let f = self.h.typeof_eq;
+                let v = self.call1(f, &[self.cx, a[0], kv], Type::I32);
+                self.def(inst, v);
+            }
+            Opcode::JsConstantStrictEq(k) => {
+                // A leaf: no GC, no JS.
+                let kv = self.i32c(u32::from(k));
+                let f = self.h.constant_strict_eq;
+                let v = self.call1(f, &[self.cx, a[0], kv], Type::I32);
+                self.def(inst, v);
+            }
+            Opcode::JsGetName(name) => {
+                // `ok` and `err` (a static kill): not a clean/dirty op.
+                let at = self.atom(name);
+                let z = self.i32c(0);
+                let live = self.live_across(inst);
+                let (ok, r) = self.gc_call(self.h.get_gname, &[at, z], &live)?;
+                let t = self.edge(inst, 0, &[r])?;
+                let e = self.edge(inst, 1, &[])?;
+                self.cond_br(ok, t, e);
+            }
+            Opcode::JsGetProp(name) => {
+                let at = self.atom(name);
+                self.js_call(inst, self.h.get_property, &[a[0], at], false)?;
+            }
+            Opcode::JsSetProp(name, strict) => {
+                let at = self.atom(name);
+                let sv = self.i32c(u32::from(strict));
+                self.js_call(inst, self.h.set_property, &[a[0], at, a[1], sv], false)?;
+            }
+            Opcode::JsGetElem => {
+                self.js_call(inst, self.h.get_element, &[a[0], a[1]], false)?;
+            }
+            Opcode::JsSetElem(strict) => {
+                let sv = self.i32c(u32::from(strict));
+                self.js_call(inst, self.h.set_element, &[a[0], a[1], a[2], sv], false)?;
+            }
+            Opcode::Call => self.js_call_op(inst, &a)?,
             op => {
                 return Err(format!(
                     "lowering: {} is not lowered yet",
@@ -1060,10 +1125,16 @@ impl<'a> Lower<'a> {
     }
 
     /// A fallible check: `ok` to the `ok` edge with `outs`, else `fail`.
-    /// Under the stress mode, it also fails whenever the stress helper
-    /// says so.
+    /// Under the stress mode, a guard whose failure exits also fails
+    /// whenever the stress helper says so. (One whose failure merges back,
+    /// a tag test, must keep its meaning.)
     fn guard(&mut self, inst: mir::Inst, ok: Value, outs: &[Value]) -> R<()> {
-        let ok = if self.stress == 0 {
+        let fail_blk = self.f.insts[inst].succs[1].block;
+        let exits = self
+            .f
+            .terminator(fail_blk)
+            .is_some_and(|t| self.f.insts[t].op.exit_shape().is_some());
+        let ok = if self.stress == 0 || !exits {
             ok
         } else {
             let n = self.i32c(self.stress);
@@ -1145,6 +1216,114 @@ impl<'a> Lower<'a> {
             result
         };
         let t = self.edge(inst, 1, &[out])?;
+        let e = self.edge(inst, 2, &[])?;
+        self.cond_br(ok, t, e);
+        Ok(())
+    }
+
+    /// The helpers' atom id for MIR atom `a`, as an i32 constant.
+    fn atom(&mut self, a: mir::entity::AtomId) -> Value {
+        let id = self.atoms.intern_chars(self.mm.atoms[a].chars());
+        self.i32c(id)
+    }
+
+    /// A JS call (`callee`, `this`, args; all boxed). The callee's frame
+    /// is written just above the rooting slots, and the call enters a
+    /// compiled callee's body directly when it can (`call_indirect`, as
+    /// baseline's calls do: JS call depth is then bounded by the
+    /// NightStack, not the native stack), else the generic helper. The
+    /// result is at the frame's top. Success takes `ok_dirty`.
+    fn js_call_op(&mut self, inst: mir::Inst, ops: &[Value]) -> R<()> {
+        /// Headroom a compiled body may use past its actuals (the runtime
+        /// entries' `kNightStackHeadroomSlots`).
+        const HEADROOM: u32 = 64 * 1024;
+        let live = self.live_across(inst);
+        self.spill(&live)?;
+        let frame = self.root_base + 8 * u32::try_from(live.len()).unwrap();
+        for (k, &v) in ops.iter().enumerate() {
+            self.store_i64(self.sp, frame + 8 * u32::try_from(k).unwrap(), v);
+        }
+        let argc = u32::try_from(ops.len() - 2).unwrap();
+        let top_off = frame + 8 * (argc + 2);
+        let base = self.add_off(self.sp, frame);
+        let top = self.add_off(self.sp, top_off);
+        let z = self.i32c(0);
+        let cls = {
+            let args = self.body.arg_pool.from_iter([ops[0], z, z].into_iter());
+            let tys = self
+                .body
+                .type_pool
+                .from_iter([Type::I32, Type::I32, Type::I32].into_iter());
+            self.push_val(ValueDef::Operator(
+                Operator::Call {
+                    function_index: self.h.call_classify,
+                },
+                args,
+                tys,
+            ))
+        };
+        let funcidx = self.push_val(ValueDef::PickOutput(cls, 0, Type::I32));
+        let script = self.push_val(ValueDef::PickOutput(cls, 1, Type::I32));
+        let limit_addr = self.i32c(self.h.night_stack_limit_base);
+        let limit = self.load_i32(limit_addr, 0);
+        let hi = self.add_off(top, HEADROOM);
+        let fits = self.bin(Operator::I32LeU, hi, limit, Type::I32);
+        let compiled = self.bin(Operator::I32Ne, funcidx, z, Type::I32);
+        let direct = self.bin(Operator::I32And, compiled, fits, Type::I32);
+        let (direct_b, generic_b, join) = (
+            self.body.add_block(),
+            self.body.add_block(),
+            self.body.add_block(),
+        );
+        let ok = self.body.add_blockparam(join, Type::I32);
+        self.cond_br(direct, Self::to(direct_b), Self::to(generic_b));
+
+        self.cur = direct_b;
+        let argc_v = self.i32c(argc);
+        let undef = self.i64c(UNDEF);
+        // Bodies sit `N` table slots below their adapters (`wasm/mod.rs`).
+        let off = self.i32c(u32::MAX);
+        self.body_off_patches.push(off);
+        let body_idx = self.bin(Operator::I32Sub, funcidx, off, Type::I32);
+        let args = self
+            .body
+            .arg_pool
+            .from_iter([self.cx, base, argc_v, top, script, undef, body_idx].into_iter());
+        let tys = self
+            .body
+            .type_pool
+            .from_iter([Type::I32, Type::I32].into_iter());
+        let call = self.push_val(ValueDef::Operator(
+            Operator::CallIndirect {
+                sig_index: self.h.night_abi_sig2,
+                table_index: self.h.indirect_table,
+            },
+            args,
+            tys,
+        ));
+        let err = self.push_val(ValueDef::PickOutput(call, 0, Type::I32));
+        let ok_direct = self.un(Operator::I32Eqz, err, Type::I32);
+        self.terminate(Terminator::Br {
+            target: BlockTarget {
+                block: join,
+                args: vec![ok_direct],
+            },
+        });
+
+        self.cur = generic_b;
+        let argc_v = self.i32c(argc);
+        let ok_generic = self.call1(self.h.call, &[self.cx, top, base, argc_v], Type::I32);
+        self.terminate(Terminator::Br {
+            target: BlockTarget {
+                block: join,
+                args: vec![ok_generic],
+            },
+        });
+
+        self.cur = join;
+        self.reload(&live)?;
+        let result = self.load_i64(self.sp, top_off);
+        let t = self.edge(inst, 1, &[result])?;
         let e = self.edge(inst, 2, &[])?;
         self.cond_br(ok, t, e);
         Ok(())

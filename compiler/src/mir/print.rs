@@ -341,12 +341,16 @@ pub fn mnemonic(op: &Opcode) -> String {
         JsUnop(u) => format!("js.unop.{}", js_unop_name(*u)),
         JsCompare(c) => format!("js.compare.{}", js_cc_name(*c)),
         JsTypeof => "js.typeof".into(),
+        JsTypeofEq(_) => "js.typeof_eq".into(),
+        JsConstantStrictEq(_) => "js.constant_strict_eq".into(),
         JsToBool => "js.tobool".into(),
         JsToNumeric => "js.tonumeric".into(),
         JsGetProp(_) => "js.getprop".into(),
-        JsSetProp(_) => "js.setprop".into(),
+        JsSetProp(_, false) => "js.setprop".into(),
+        JsSetProp(_, true) => "js.setprop.strict".into(),
         JsGetElem => "js.getelem".into(),
-        JsSetElem => "js.setelem".into(),
+        JsSetElem(false) => "js.setelem".into(),
+        JsSetElem(true) => "js.setelem.strict".into(),
         JsGetName(_) => "js.getname".into(),
         LoadField(_) => "load_field".into(),
         StoreField(_) => "store_field".into(),
@@ -387,12 +391,20 @@ fn immediates(m: &Module, op: &Opcode) -> Option<String> {
             crate::mir::ops::ConstVal::Bool(b) => b.to_string(),
             crate::mir::ops::ConstVal::Int32(n) => format!("int32 {n}"),
             crate::mir::ops::ConstVal::Double(bits) => format!("double {}", f64_str(*bits)),
+            crate::mir::ops::ConstVal::Uninitialized => "uninitialized".into(),
         },
+        JsTypeofEq(k) => k.to_string(),
+        JsConstantStrictEq(k) => k.to_string(),
         ConstI32(n) => n.to_string(),
         ConstF64(bits) => f64_str(*bits),
         ConstBool(b) => b.to_string(),
         ConstObj(s) | GuardSingleton(s) => s.to_string(),
-        ConstStr(a) | JsGetProp(a) | JsSetProp(a) | JsGetName(a) | LoadField(a) | StoreField(a)
+        ConstStr(a)
+        | JsGetProp(a)
+        | JsSetProp(a, _)
+        | JsGetName(a)
+        | LoadField(a)
+        | StoreField(a)
         | InitField(a) => atom(Some(m), *a),
         GuardTags(t) => tags_str(*t),
         GuardKind(k) => kind_str(*k),

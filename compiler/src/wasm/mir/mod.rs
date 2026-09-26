@@ -63,6 +63,7 @@ pub fn translate_script(
         m,
         ctx.helpers,
         &mm,
+        atoms,
         &f,
         baseline::layout::FrameLayout::of(script),
         ctx.opts.mir_stress,
@@ -82,7 +83,7 @@ pub fn translate_script(
         strlit_patches: vec![],
         intrinsic_cell_patches: vec![],
         prop_ic_patches: vec![],
-        body_off_patches: vec![],
+        body_off_patches: lowered.body_off_patches,
         ctor_nslots_patches: vec![],
         extra_bodies: vec![ExtraBody {
             sig: base.sig,

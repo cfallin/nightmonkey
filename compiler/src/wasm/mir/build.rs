@@ -142,7 +142,7 @@ pub fn build(
         let mut run = Run::new(&shape, &table);
         run.build()?;
         if run.out == table {
-            let mm = mir::Module::default();
+            let mm = std::mem::take(&mut run.mm);
             return Ok((mm, run.finish()));
         }
         for (pc, tys) in run.out {
@@ -221,6 +221,17 @@ impl<'a> Shape<'a> {
         p
     }
 
+    /// Whether the op after the one at `pc` consumes its result as
+    /// `typeof` does (a name lookup then does not throw when unbound).
+    fn next_is_typeof(&self, pc: Pc, op: JSOp) -> bool {
+        let next = usize::try_from((pc + op.len()).get()).unwrap();
+        self.script
+            .bytecode
+            .get(next)
+            .and_then(|&b| JSOp::from_byte(b))
+            .is_some_and(|o| matches!(o, JSOp::Typeof | JSOp::TypeofEq | JSOp::TypeofExpr))
+    }
+
     /// The entry type the analysis predicts for formal `i` (guard-at-defs).
     fn arg_claim(&self, i: u32) -> Ty {
         let claim = self
@@ -250,6 +261,8 @@ struct Run<'s, 'a> {
     /// The types flowing into each block this run (joined).
     out: BTreeMap<Pc, Vec<Ty>>,
     f: mir::Func,
+    /// The module tables the function references (its atoms).
+    mm: mir::Module,
     blocks: BTreeMap<Pc, mir::Block>,
     preheaders: BTreeMap<Pc, mir::Block>,
     cur: mir::Block,
@@ -279,6 +292,7 @@ impl<'s, 'a> Run<'s, 'a> {
             table,
             out: BTreeMap::new(),
             f,
+            mm: mir::Module::default(),
             blocks: BTreeMap::new(),
             preheaders: BTreeMap::new(),
             cur,
@@ -493,6 +507,61 @@ impl<'s, 'a> Run<'s, 'a> {
         p
     }
 
+    /// The atom for gcthing `index` (a name), in the module's table.
+    fn atom(&mut self, index: u32) -> R<mir::entity::AtomId> {
+        let gc = *self
+            .s
+            .script
+            .gcthings
+            .get(usize::try_from(index).unwrap())
+            .ok_or_else(|| format!("name index {index} out of range"))?;
+        match self.s.ctx.source.object(gc) {
+            crate::source::SourceObject::String(s) => Ok(self.mm.intern_atom(s.chars())),
+            _ => Err(format!("name index {index} is not a string")),
+        }
+    }
+
+    /// A generic op with a static kill (`ok`, `err`): the builder attaches
+    /// its prediction witness (§4.5), which for a generic op is "may kill
+    /// anything".
+    fn js_static(&mut self, op: Opcode, args: Vec<mir::Value>, out: MType) -> mir::Value {
+        let ok = self.new_block();
+        let p = self.f.add_param(ok, out);
+        let err = self.exit_block(true);
+        let (inst, _) = self.f.add_inst(
+            self.cur,
+            op,
+            args,
+            &[],
+            vec![
+                Edge {
+                    block: ok,
+                    args: vec![EdgeArg::Out(0)],
+                },
+                Self::goto(err),
+            ],
+        );
+        self.f.witnesses[inst] = Some(mir::func::Witness {
+            may_kill: mir::types::KillPattern::ALL,
+        });
+        self.live = false;
+        self.at(ok);
+        p
+    }
+
+    /// A generic op with no output: both success edges continue; an
+    /// exception goes to the op's throw block.
+    fn js_void(&mut self, op: Opcode, args: Vec<mir::Value>) {
+        let ok = self.new_block();
+        let err = self.exit_block(true);
+        self.term(
+            op,
+            args,
+            vec![Self::goto(ok), Self::goto(ok), Self::goto(err)],
+        );
+        self.at(ok);
+    }
+
     /// A generic op: both success edges continue with its output (of type
     /// `out`); an exception goes to the op's throw block.
     fn js(&mut self, op: Opcode, args: Vec<mir::Value>, out: MType) -> mir::Value {
@@ -629,6 +698,39 @@ impl<'s, 'a> Run<'s, 'a> {
         }
     }
 
+    /// Whether boxed `x`'s tag is in `tags`, as a raw bool: a `guard.tags`
+    /// whose failure edge merges back rather than exiting.
+    fn tag_test(&mut self, x: mir::Value, tags: TagSet) -> mir::Value {
+        let (t, e, j) = (self.new_block(), self.new_block(), self.new_block());
+        let p = self.f.add_param(j, MType::Bool);
+        self.f.add_param(t, MType::val(tags));
+        self.term(
+            Opcode::GuardTags(tags),
+            vec![x],
+            vec![
+                Edge {
+                    block: t,
+                    args: vec![EdgeArg::Out(0)],
+                },
+                Self::goto(e),
+            ],
+        );
+        for (b, val) in [(t, true), (e, false)] {
+            self.at(b);
+            let k = self.inst(Opcode::ConstBool(val), vec![], Some(MType::Bool));
+            self.term(
+                Opcode::Jump,
+                vec![],
+                vec![Edge {
+                    block: j,
+                    args: vec![EdgeArg::Value(k)],
+                }],
+            );
+        }
+        self.at(j);
+        p
+    }
+
     /// `!c` for a raw bool: a diamond.
     fn not(&mut self, c: mir::Value) -> mir::Value {
         let (t, e, j) = (self.new_block(), self.new_block(), self.new_block());
@@ -754,7 +856,6 @@ impl<'s, 'a> Run<'s, 'a> {
         }
     }
 
-
     /// The onramp root `O` for loop header `h` (§5.2): the frame at `h`,
     /// all `Val(⊤)`, guarded up to the preheader's param types. On
     /// success it enters the preheader; on failure it re-deopts at `h`
@@ -861,7 +962,10 @@ impl<'s, 'a> Run<'s, 'a> {
         let mut p = self.s.imms(pc);
         let int_ty = Ty::I32;
         match op {
-            Nop | Lineno | JumpTarget | LoopHead | NopDestructuring | NopIsAssignOp => {}
+            // (`DebugLeaveLexicalEnv` only matters with an env chain, which
+            // MIR declines.)
+            Nop | Lineno | JumpTarget | LoopHead | NopDestructuring | NopIsAssignOp
+            | DebugLeaveLexicalEnv => {}
 
             Undefined => {
                 let v = self.const_val(ConstVal::Undefined);
@@ -892,9 +996,10 @@ impl<'s, 'a> Run<'s, 'a> {
                 let v = self.const_f64(x);
                 self.push(v, Ty::F64);
             }
-            // The TDZ sentinel is a magic value, which MIR has no constant
-            // for.
-            Uninitialized => return Err("Uninitialized".into()),
+            Uninitialized => {
+                let v = self.const_val(ConstVal::Uninitialized);
+                self.push(v, Ty::Val(TagSet::MAGIC));
+            }
             Void => {
                 self.pop();
                 let v = self.const_val(ConstVal::Undefined);
@@ -1249,6 +1354,96 @@ impl<'s, 'a> Run<'s, 'a> {
                 let x = self.st[self.rval_ix()];
                 let v = self.boxed(x);
                 self.term(Opcode::Return, vec![v], vec![]);
+            }
+
+            FunctionThis if self.s.script.strict => {
+                let x = self.st[0];
+                self.st.push(x);
+            }
+            StrictConstantEq | StrictConstantNe => {
+                let operand = p.next_uint16().unwrap();
+                let a = self.pop();
+                let x = self.boxed(a);
+                let mut r = self.inst(
+                    Opcode::JsConstantStrictEq(operand),
+                    vec![x],
+                    Some(MType::Bool),
+                );
+                if op == StrictConstantNe {
+                    r = self.not(r);
+                }
+                self.push(r, Ty::Bool);
+            }
+            IsNullOrUndefined => {
+                // [v] -> [v, v is null or undefined], decided by the tags
+                // when they say, else by a tag test merging both ways.
+                let a = self.top();
+                let nullish = TagSet::prims(PRIM_NULL | PRIM_UNDEFINED);
+                let tags = a.ty.tags();
+                let r = if tags.subset_of(nullish) {
+                    self.inst(Opcode::ConstBool(true), vec![], Some(MType::Bool))
+                } else if tags.intersect(nullish).is_empty() {
+                    self.inst(Opcode::ConstBool(false), vec![], Some(MType::Bool))
+                } else {
+                    let x = self.boxed(a);
+                    self.tag_test(x, nullish)
+                };
+                self.push(r, Ty::Bool);
+            }
+            TypeofEq => {
+                let operand = p.next_uint8().unwrap();
+                let a = self.pop();
+                let x = self.boxed(a);
+                let r = self.inst(Opcode::JsTypeofEq(operand), vec![x], Some(MType::Bool));
+                self.push(r, Ty::Bool);
+            }
+
+            // --- generic names, properties, elements and calls ---
+            GetGName => {
+                if self.s.next_is_typeof(pc, op) {
+                    return Err("GetGName for typeof".into());
+                }
+                let a = self.atom(p.next_uint32().unwrap())?;
+                let r = self.js_static(Opcode::JsGetName(a), vec![], MType::VAL_TOP);
+                self.push(r, Ty::Val(TagSet::ALL));
+            }
+            GetProp => {
+                let a = self.atom(p.next_uint32().unwrap())?;
+                let recv = self.pop();
+                let x = self.boxed(recv);
+                let r = self.js(Opcode::JsGetProp(a), vec![x], MType::VAL_TOP);
+                self.push(r, Ty::Val(TagSet::ALL));
+            }
+            SetProp | StrictSetProp => {
+                let a = self.atom(p.next_uint32().unwrap())?;
+                let v = self.pop();
+                let recv = self.pop();
+                let (x, y) = (self.boxed(recv), self.boxed(v));
+                self.js_void(Opcode::JsSetProp(a, op == StrictSetProp), vec![x, y]);
+                self.st.push(v);
+            }
+            GetElem => {
+                let key = self.pop();
+                let recv = self.pop();
+                let (x, k) = (self.boxed(recv), self.boxed(key));
+                let r = self.js(Opcode::JsGetElem, vec![x, k], MType::VAL_TOP);
+                self.push(r, Ty::Val(TagSet::ALL));
+            }
+            SetElem | StrictSetElem => {
+                let v = self.pop();
+                let key = self.pop();
+                let recv = self.pop();
+                let (x, k, y) = (self.boxed(recv), self.boxed(key), self.boxed(v));
+                self.js_void(Opcode::JsSetElem(op == StrictSetElem), vec![x, k, y]);
+                self.st.push(v);
+            }
+            Call | CallIgnoresRv | CallContent => {
+                let argc = usize::from(p.next_uint16().unwrap());
+                let n = self.st.len();
+                let operands: Vec<Slot> = self.st.drain(n - argc - 2..).collect();
+                let vals: Vec<mir::Value> = operands.into_iter().map(|x| self.boxed(x)).collect();
+                let r = self.js(Opcode::Call, vals, MType::VAL_TOP);
+                self.push(r, Ty::Val(TagSet::ALL));
             }
 
             op => return Err(format!("{op:?}")),

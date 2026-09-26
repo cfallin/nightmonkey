@@ -6249,8 +6249,10 @@ mod tests {
                     nlocals: f.frame.locals,
                     rebase_vp: false,
                 };
-                let lowered = crate::wasm::mir::lower::lower(&mut m, helpers, &mm, f, layout, 3)
-                    .unwrap_or_else(|e| panic!("{name}: {e}"));
+                let mut atoms = AtomTable::new(Names::default());
+                let lowered =
+                    crate::wasm::mir::lower::lower(&mut m, helpers, &mm, &mut atoms, f, layout, 3)
+                        .unwrap_or_else(|e| panic!("{name}: {e}"));
                 let mut body = lowered.body;
                 // The exits' baseline body: the function itself stands in
                 // (same signature).

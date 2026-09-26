@@ -1206,6 +1206,22 @@ the numbers call for it.
 - Generic and direct calls with `ok_clean`/`ok_dirty`/`err` edges and
   `ok_dirty` re-guarding.
 - Rooting in lowering.
+- **M4a done (the generic half).** New ops and their lowerings:
+  - `js.getname` (`GetGName`). It is `ok`/`err` with a static kill, so
+    the builder attaches its prediction witness ("may kill anything").
+  - `js.getprop`, `js.setprop[.strict]`, `js.getelem`,
+    `js.setelem[.strict]`, through the runtime helpers.
+  - `call` (`Call`, `CallIgnoresRv`, `CallContent`), lowered like
+    baseline's calls. A compiled callee is entered directly through
+    `call_indirect`, else through the generic helper. The callee's frame
+    goes just above the rooting slots.
+  - Strict `FunctionThis`.
+  - `const.val uninitialized` (the TDZ sentinel, `Val{magic}`), so
+    `let` bindings compile.
+  - The leaf compares `js.typeof_eq` and `js.constant_strict_eq`, and
+    `IsNullOrUndefined` as a `guard.tags` whose failure edge merges
+    back.
+  - The stress mode fails only guards whose failure exits.
 
 **M5. Remaining v1 coverage**
 - Elements and typed arrays, including array stamping in the analysis.

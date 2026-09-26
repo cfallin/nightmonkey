@@ -29,6 +29,9 @@ pub enum ConstVal {
     Int32(i32),
     /// Bits of an f64, so the opcode stays `Eq` (and NaNs round-trip).
     Double(u64),
+    /// The TDZ sentinel (`JS_UNINITIALIZED_LEXICAL`), a magic value: what an
+    /// uninitialized `let`/`const` binding holds.
+    Uninitialized,
 }
 
 /// The target of an unbox.
@@ -289,12 +292,19 @@ pub enum Opcode {
     JsUnop(JsUnop),
     JsCompare(JsCc),
     JsTypeof,
+    /// `typeof v == type` (or `!=`), the operand byte of `JSOp::TypeofEq`
+    /// (`js::TypeofEqOperand`): a leaf.
+    JsTypeofEq(u8),
+    /// `v === c` for the constant the operand of `JSOp::StrictConstantEq`
+    /// encodes (`js::ConstantCompareOperand`): a leaf.
+    JsConstantStrictEq(u16),
     JsToBool,
     JsToNumeric,
     JsGetProp(AtomId),
-    JsSetProp(AtomId),
+    /// Strict-mode (`true`) or sloppy assignment.
+    JsSetProp(AtomId, bool),
     JsGetElem,
-    JsSetElem,
+    JsSetElem(bool),
     JsGetName(AtomId),
 
     // Objects.
@@ -400,7 +410,7 @@ impl Opcode {
             | StrCharCodeAt
             | InitField(_) => OK_FAIL.to_vec(),
             JsAdd | JsBinop(_) | JsUnop(_) | JsCompare(_) | JsToNumeric | JsGetProp(_)
-            | JsSetProp(_) | JsGetElem | JsSetElem | LoadField(_) | StoreField(_) | Call
+            | JsSetProp(..) | JsGetElem | JsSetElem(_) | LoadField(_) | StoreField(_) | Call
             | CallDirect | Construct | CallNative(_) => CLEAN_DIRTY_ERR.to_vec(),
             // No dynamic effect report: the kill is static, on `ok`.
             JsGetName(_) => OK_ERR.to_vec(),
@@ -570,6 +580,7 @@ pub fn const_val_type(c: ConstVal) -> Type {
             ObjInfo::TOP,
             StrInfo::TOP,
         )),
+        ConstVal::Uninitialized => Type::val(TagSet::MAGIC),
     }
 }
 
@@ -966,15 +977,20 @@ pub fn signature(op: &Opcode, args: &[Type], m: &Module) -> SigResult {
             val(&args[0], "js.tobool")?;
             Sig::result(Type::Bool)
         }
+        JsTypeofEq(_) | JsConstantStrictEq(_) => {
+            arity(args, 1)?;
+            val(&args[0], "js leaf compare")?;
+            Sig::result(Type::Bool)
+        }
         JsToNumeric => {
             arity(args, 1)?;
             val(&args[0], "js.tonumeric")?;
             Sig::output(Type::val(number_or_bigint))
         }
-        JsGetProp(_) | JsGetElem | JsSetProp(_) | JsSetElem => {
+        JsGetProp(_) | JsGetElem | JsSetProp(..) | JsSetElem(_) => {
             let n = match op {
                 JsGetProp(_) => 1,
-                JsGetElem | JsSetProp(_) => 2,
+                JsGetElem | JsSetProp(..) => 2,
                 _ => 3,
             };
             arity(args, n)?;
@@ -1397,7 +1413,9 @@ pub fn effects(op: &Opcode, args: &[Type], m: &Module) -> Effects {
     let mut fx = Effects::PURE;
     match op {
         JsAdd | JsBinop(_) | JsUnop(_) | JsCompare(_) | JsToNumeric | JsGetProp(_)
-        | JsSetProp(_) | JsGetElem | JsSetElem => return Effects::generic(FlagsEffect::Dynamic),
+        | JsSetProp(..) | JsGetElem | JsSetElem(_) => {
+            return Effects::generic(FlagsEffect::Dynamic)
+        }
         JsGetName(_) => return Effects::generic(FlagsEffect::Bits(FlagBits::ALL)),
         Call | CallDirect | Construct | CallNative(_) => {
             return Effects::generic(FlagsEffect::Callee)
