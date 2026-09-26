@@ -31,8 +31,9 @@ MIR.md changes that follow.
   waffle's reducifier handles that (§7).
 - **Two gates, but only one lasting.** A script runs the MIR pipeline
   only if baseline supports every op in it and the MIR builder does too.
-  Baseline is total: it supports every JSOp except eval and
-  `ForceInterpreter` (§6). After that its gate is vacuous and the MIR
+  Baseline is total: it supports every JSOp except `ForceInterpreter`
+  (§6), including scripts that call eval (the eval'd code itself is
+  interpreted). After that its gate is vacuous and the MIR
   builder's gate is the only real one.
 
 ## 1. What exists and what we reuse
@@ -294,11 +295,9 @@ The cost is one compare per loop iteration in baseline code.
 ## 6. Covering every JSOp
 
 Baseline is **total**: it supports all 242 JSOps except
-- `ForceInterpreter`, which by definition means "run in the
-  interpreter";
-- the eval ops (`Eval`, `StrictEval`, `SpreadEval`, `StrictSpreadEval`),
-  which are truly dynamic code. A script containing one stays
-  interpreted.
+`ForceInterpreter`, which by definition means "run in the interpreter".
+A script that calls eval is compiled like any other; the code eval
+produces at runtime is interpreted, since the compiler is AOT only.
 
 Beyond what BBV's GEN path already covers:
 
@@ -306,7 +305,7 @@ Beyond what BBV's GEN path already covers:
 |---|---|
 | `BigInt` | helper: `script->getBigInt(pc)` |
 | `NonSyntacticGlobalThis`, `EnvCallee`, `SetIntrinsic` | new helpers |
-| `Eval`, `StrictEval`, `SpreadEval`, `StrictSpreadEval` | stay declined: the script is interpreted |
+| `Eval`, `StrictEval`, `SpreadEval`, `StrictSpreadEval` | helper around the engine's JIT-facing direct-eval entry. The frame supplies the env chain, `this` and new.target, and the caller script comes from the callee. The eval'd script runs in the interpreter. A non-strict direct eval can add bindings, but only to the environment object, which baseline keeps in its frame slot, so no baseline invariant is at stake |
 | `DynamicImport`, `ImportMeta`, `GetImport` | new helpers; module scripts are in scope (B4) |
 | `AddDisposable`, `TakeDisposeCapability`, `CreateSuppressedError` | new helpers |
 | `DebugCheckSelfHosted` | no-op |
@@ -403,8 +402,8 @@ byte-identical.
 - **B4. Every JSOp.** The §6 table: new helpers, then lifting the
   env/generator/size gates. Gate: the full jit-test lane under
   `pipeline=baseline --strict-coverage`, whose allowlist is only
-  scripts containing eval or `ForceInterpreter`. Record the performance datapoint against
-  the interpreter-only lane and legacy BBV.
+  scripts containing `ForceInterpreter`. Record the performance
+  datapoint against the interpreter-only lane and legacy BBV.
 - **B5 (optional, measured).** The compiled-callee call path (§3.4),
   then any inline fast path whose win shows up in the numbers.
 - **Then MIR, revised (§9):**
@@ -481,5 +480,6 @@ byte-identical.
    indirection.
 5. **A script declined in `Baseline` mode is interpreted**, not
    compiled by BBV, so the lane measures baseline alone.
-6. **Baseline is total** except for eval and `ForceInterpreter` (§6).
+6. **Baseline is total** except for `ForceInterpreter` (§6). Scripts
+   that call eval are compiled, and the eval'd code is interpreted.
    Module ops are in B4.
