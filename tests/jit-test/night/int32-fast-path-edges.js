@@ -277,3 +277,53 @@ assertEq(or(-0, "d"), "d");
 var ix = [7, 8, 9];
 assertEq(get(ix, div(4, 2)), 9);
 assertEq(get(ix, add(0.5, 0.5)), 8);
+
+// SetElem: the in-bounds overwrite arm must leave everything but plain
+// writable dense elements to the generic path.
+function put(o, i, v) { o[i] = v; return o; }
+function sput(o, i, v) { "use strict"; o[i] = v; return o; }
+var sa = [1, 2, 3];
+assertEq(String(put(sa, 1, "x")), "1,x,3");
+assertEq(String(put(sa, 3, 4)), "1,x,3,4");
+assertEq(sa.length, 4);
+var fz = Object.freeze([1, 2]);
+put(fz, 0, 9);
+assertEq(fz[0], 1);
+var threw = false;
+try { sput(fz, 0, 9); } catch (e) { threw = e instanceof TypeError; }
+assertEq(threw, true);
+var sl = Object.seal([1, 2]);
+put(sl, 0, 9);
+assertEq(sl[0], 9);
+var ro = [1, 2];
+Object.defineProperty(ro, 0, { value: 1, writable: false });
+put(ro, 0, 9);
+assertEq(ro[0], 1);
+var holey = [1, , 3];
+var setterHit = 0;
+Object.defineProperty(Array.prototype, 1, {
+  set(v) { setterHit = v; }, configurable: true
+});
+put(holey, 1, 7);
+assertEq(setterHit, 7);
+assertEq(holey.hasOwnProperty(1), false);
+delete Array.prototype[1];
+var accessor = [0];
+var got = 0;
+Object.defineProperty(accessor, 0, { set(v) { got = v; }, configurable: true });
+put(accessor, 0, 5);
+assertEq(got, 5);
+var i32 = new Int32Array(2);
+put(i32, 1, 2.7);
+assertEq(i32[1], 2);
+var plain = { 0: "a" };
+put(plain, 0, "b");
+assertEq(plain[0], "b");
+function argsPut() { put(arguments, 0, "q"); return arguments[0]; }
+assertEq(argsPut("p"), "q");
+// Objects stored into a tenured array stay reachable (post barrier).
+var tenured = [null, null];
+gc();
+for (var q = 0; q < 2; q++) put(tenured, q, { n: q });
+gc();
+assertEq(tenured[1].n, 1);

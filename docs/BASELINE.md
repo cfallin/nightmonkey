@@ -179,6 +179,12 @@ tier stays non-speculative. The ops:
   dense element of a native object. The helper itself has no dense arm;
   BBV inlines one, so without this baseline's element reads took the
   generic lookup.
+- **`SetElem`** stays a helper call. The helper gains an arm for an
+  in-bounds overwrite of a non-hole dense element whose elements are not
+  frozen, gated on the same receivers as its append arm. The store runs
+  through `setDenseElement` and its barriers. BBV has this arm inline;
+  inlining it in baseline too would need the GC barriers in Wasm, which
+  is not worth it for this tier.
 
 Each fast path is a diamond with its own slow block (§8's fan-in note).
 The slow path sees exactly the frame the plain lowering sees.
@@ -449,37 +455,64 @@ byte-identical.
   datapoint against the interpreter-only lane and legacy BBV.
 - **B5 (optional, measured).** Any inline fast path whose win shows up
   in the numbers. The compiled-callee call path moved into B3 (see
-  below).
+  below). **Done:** the §3.1 fast paths, and an in-bounds overwrite arm
+  in the `set_element` helper. The results are below.
 
-**Performance (2026-09-26).** Octane score, best of 2, one core each,
-all lanes through the same in-process runner (`inproc-shell.sh`):
+**Performance (2026-09-26).** Octane score, best of 2. Every lane runs
+through the same in-process runner (`inproc-shell.sh`), each bench on
+its own physical core, six at a time. "B4" is baseline before the fast
+paths, from the earlier run; the other columns are from one run.
 
-| bench | interp | baseline | legacy BBV | baseline/interp | legacy/baseline |
-|---|---:|---:|---:|---:|---:|
-| richards | 291 | 388 | 1059 | 1.33 | 2.73 |
-| deltablue | 291 | 536 | 5772 | 1.84 | 10.77 |
-| crypto | 866 | 443 | 14951 | 0.51 | 33.75 |
-| raytrace | 880 | 1128 | 3998 | 1.28 | 3.54 |
-| earley-boyer | 1192 | 1535 | 12070 | 1.29 | 7.86 |
-| navier-stokes | 1506 | 616 | 20989 | 0.41 | 34.07 |
-| splay | 4563 | 5053 | 8074 | 1.11 | 1.60 |
-| regexp | 521 | 788 | 2121 | 1.51 | 2.69 |
-| pdfjs | 3994 | 3344 | 21817 | 0.84 | 6.52 |
-| mandreel | 882 | 817 | 2559 | 0.93 | 3.13 |
-| code-load | 33066 | 35221 | 36679 | 1.07 | 1.04 |
-| box2d | 1765 | 1675 | 12191 | 0.95 | 7.28 |
-| geomean | 1400 | 1412 | 7640 | 1.01 | 5.41 |
+| bench | interp | baseline, B4 | baseline, B5 | legacy BBV | B5/interp | B5/B4 | legacy/B5 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| richards | 292 | 388 | 426 | 1087 | 1.46 | 1.10 | 2.55 |
+| deltablue | 292 | 536 | 600 | 5799 | 2.05 | 1.12 | 9.66 |
+| crypto | 863 | 443 | 3180 | 15419 | 3.68 | 7.18 | 4.85 |
+| raytrace | 831 | 1128 | 1173 | 4006 | 1.41 | 1.04 | 3.42 |
+| earley-boyer | 1187 | 1535 | 1694 | 12255 | 1.43 | 1.10 | 7.23 |
+| navier-stokes | 1463 | 616 | 4058 | 20586 | 2.77 | 6.59 | 5.07 |
+| splay | 4642 | 5053 | 4922 | 7764 | 1.06 | 0.97 | 1.58 |
+| regexp | 521 | 788 | 978 | 2209 | 1.88 | 1.24 | 2.26 |
+| pdfjs | 3963 | 3344 | 5114 | 21262 | 1.29 | 1.53 | 4.16 |
+| mandreel | 887 | 817 | 1028 | 2543 | 1.16 | 1.26 | 2.47 |
+| code-load | 32852 | 35221 | 34304 | 35589 | 1.04 | 0.97 | 1.04 |
+| box2d | 1716 | 1675 | 1963 | 11416 | 1.14 | 1.17 | 5.82 |
+| geomean | 1387 | 1412 | 2174 | 7598 | 1.57 | 1.54 | 3.49 |
 
-- **Overall**, baseline is at parity with the interpreter.
-- **Object- and call-heavy code** gains 1.1–1.8×: no dispatch loop, and
-  direct compiled-to-compiled calls.
-- **Arithmetic-heavy code** (crypto, navier-stokes) runs at about 0.4–0.5×
-  the interpreter. Every `Add`/`Lt`/`BitAnd` is a boxed helper call with
-  memory round trips, where the interpreter has inline int32 fast paths.
-- **B5 would target that**: inline int32 fast paths for arithmetic,
-  compares and `ToBoolean`, taken only when both tags are int32, with the
-  helper as the fallback. It is left undone pending review, because §3.1
-  deliberately rules fast paths out of the design.
+- **B4 was at parity with the interpreter overall**, but ran
+  arithmetic-heavy code (crypto, navier-stokes) at 0.4–0.5× of it: every
+  `Add`/`Lt`/`BitAnd` was a boxed helper call, where the interpreter has
+  inline int32 cases.
+- **B5 is ahead of the interpreter on every bench** (1.57× geomean).
+  Most of the gain comes from three changes:
+  - the int32 and double arms (§3.1);
+  - the dense `GetElem` arm;
+  - the helper's in-bounds `SetElem` overwrite arm. Before it, baseline
+    stores went through `setOrExtendDenseElements` and a `memory_copy`
+    libcall per element, which cost about 40% of navier-stokes.
+- **Body size.** B5 grows baseline bodies by about 40% in blocks and 80%
+  in values: crypto from 13.0K blocks and 90.6K values to 21.2K and
+  162.1K, and navier-stokes from 5.0K and 37.5K to 9.0K and 73.8K.
+- **Splay and code-load** are within run-to-run noise of B4.
+- **Compile time.** The in-process batch runs the likely-types analysis
+  under every pipeline, though only BBV (and later MIR) consumes it.
+  About half of crypto's process time is that analysis, which is outside
+  the timed region.
+
+**Not adopted: an abstract operand stack.**
+- **The idea.** Keep operands and locals in SSA between ops, as
+  SpiderMonkey's native baseline compiler does. Write them back before
+  each call and at each block boundary, and merge the fast-path arms'
+  caches through block params.
+- **The result.** Implemented and measured on top of B5, it gained
+  about 1% geomean (crypto +4%, navier-stokes 0%) and cut body values
+  by 2–5%.
+- **Why so little.** The cache empties at every call and every bytecode
+  block, so few values survive long enough to save a load. Wasmtime's
+  own load forwarding already covers some of the rest.
+- **The decision.** The payoff does not justify the invariants it adds:
+  sync points, side-block isolation, and GC-safety of cached values.
+  Baseline stays "every value in the frame between ops" (decision 8).
 
 **Status (2026-09-26).** B0–B4 are implemented (`wasm/baseline/`).
 `--pipeline baseline --strict-coverage` passes the full jit-test lane.
@@ -625,3 +658,6 @@ Deviations from the plan above, and details it did not settle:
    use no facts, no speculation and no state between ops, and the helper
    remains the fallback. Without them baseline ran arithmetic-heavy code
    at 0.4–0.5× the interpreter, which has its own inline int32 cases.
+8. **Every JS value stays in the frame between ops** (§2). The abstract
+   operand stack was measured and rejected (§8). Baseline is meant to be
+   a simple, always-correct floor under MIR: good enough, not tuned.

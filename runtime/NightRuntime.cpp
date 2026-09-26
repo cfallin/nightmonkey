@@ -3073,6 +3073,27 @@ bool night_runtime_set_element(JSContext* cx, uint32_t top, uint64_t recv,
       }
     }
   }
+  // In-bounds overwrite of a dense element: an own, writable data property
+  // (not a hole, elements not frozen), so [[Set]] is the store itself, with
+  // its barriers. BBV's inline arm does this without a call; the baseline
+  // tier reaches it here. Same receiver gate as the append path below.
+  {
+    JS::Value rv = JS::Value::fromRawBits(recv);
+    JS::Value kv = JS::Value::fromRawBits(key);
+    if (rv.isObject() && kv.isInt32() && kv.toInt32() >= 0 &&
+        rv.toObject().is<js::NativeObject>() &&
+        (rv.toObject().is<js::ArrayObject>() ||
+         rv.toObject().getClass()->cOps == nullptr)) {
+      js::NativeObject* nobj = &rv.toObject().as<js::NativeObject>();
+      uint32_t idx = uint32_t(kv.toInt32());
+      if (idx < nobj->getDenseInitializedLength() &&
+          !nobj->getDenseElement(idx).isMagic(JS_ELEMENTS_HOLE) &&
+          !nobj->denseElementsAreFrozen()) {
+        nobj->setDenseElement(idx, JS::Value::fromRawBits(val));
+        return true;
+      }
+    }
+  }
   // Dense append/overwrite fast path: a contiguous int32-keyed store to a
   // dense receiver with no shadowing hazards (no own sparse elements, no
   // indexed protos/class hooks). Receivers: Array, or ANY native class with
