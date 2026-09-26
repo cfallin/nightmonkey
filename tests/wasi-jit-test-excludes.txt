@@ -1,6 +1,6 @@
 # jit-tests that cannot run on the wasm32-wasi shell NightMonkey builds
 # (spidermonkey/mozconfig: no shared memory or Atomics, no Intl, no
-# threads, a small native stack). Applied to BOTH lanes by
+# threads, a small native stack). Applied to EVERY lane by
 # scripts/run-jit-tests.sh; independent of the AOT tier. One path per line,
 # relative to js/src/jit-test/tests; the comment is the skip condition the
 # test would carry in-tree.

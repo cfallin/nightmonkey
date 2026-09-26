@@ -1,7 +1,8 @@
 # jit-tests that do not run under the NightMonkey AOT tier. Consumed by
 # jit_test.py --exclude-from (scripts/run-jit-tests.sh passes it only for
-# the AOT lane, so every test still runs in the AOT-off lane). One path per
-# line, relative to js/src/jit-test/tests; a comment gives the reason.
+# the compiled lanes, so every test still runs in the interpreter-only
+# lane). One path per line, relative to js/src/jit-test/tests; a comment
+# gives the reason.
 
 arguments/bug1227287.js
 arguments/bug1423937.js

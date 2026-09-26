@@ -215,9 +215,11 @@ build/bin/wasm-jit-runner --dir / --cache-dir ~/.cache/wjr \
 The script path must be **absolute**: the guest resolves paths against the
 runner's preopen root (`--dir /`). `--cache-dir` caches the compiled shell.
 Everything after `--` goes to the JS shell. Omitting `--night-inprocess` runs
-the same binary as a plain interpreter -- the differential baseline.
+the same binary as a plain interpreter -- the interpreter-only ("interp")
+lane, the differential reference for the compiled lanes.
 
-The jit-test suite in both lanes, from the SpiderMonkey checkout's harness:
+The jit-test suite in the default (legacy BBV) lane and the interp lane, from
+the SpiderMonkey checkout's harness:
 
 ```
 scripts/run-jit-tests.sh /path/to/firefox build -- -j16
@@ -238,19 +240,20 @@ NIGHT_OPTIONS="--pipeline baseline --strict-coverage" \
 declined (`docs/BASELINE.md`).
 
 `scripts/run-jstests.sh` does the same for jstests (hours for the full
-suite; append a path to scope). Both lanes are expected to pass completely.
-Both lanes skip `tests/wasi-jit-test-excludes.txt` and
+suite; append a path to scope). Every lane is expected to pass completely.
+Every lane skips `tests/wasi-jit-test-excludes.txt` and
 `tests/wasi-jstests-excludes.txt`: tests the wasm32-wasi shell cannot run at
 all (no Intl, no shared memory or Atomics, no threads, no time zone database,
-a small native stack), independent of the tier. The AOT lane additionally
+a small native stack), independent of the tier. The compiled lanes additionally
 skips `tests/jit-test-excludes.txt` and `tests/jstests-excludes.txt` (passed
 as `--exclude-from` / `--exclude-file`, so the same tests still run in the
-baseline lane): tests exercising designed-out capability -- the debugger /
+interp lane): tests exercising designed-out capability -- the debugger /
 frame-introspection / interrupt classes -- plus an annotated artifact class
 (GC-introspection tests sensitive to the tier's literal-string and
 allocation profile; each carries a comment). The SpiderMonkey tree carries
 no test annotations for NightMonkey. NightMonkey's own regression tests
-(`tests/jit-test/`) run in both lanes with `scripts/run-night-tests.sh`.
+(`tests/jit-test/`) run in the compiled and interp lanes with
+`scripts/run-night-tests.sh`.
 
 ## Build-system notes
 

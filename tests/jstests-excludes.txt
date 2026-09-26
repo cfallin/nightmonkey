@@ -1,5 +1,5 @@
 # jstests that do not run under the NightMonkey AOT tier. Consumed by
-# jstests.py --exclude-file (AOT lane only). Paths are relative to
+# jstests.py --exclude-file (compiled lanes only). Paths are relative to
 # js/src/tests.
 
 # The NightMonkey tier has no frame introspection: fun.caller and fun.arguments read null from a compiled frame.

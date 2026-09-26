@@ -1,6 +1,6 @@
 # jstests that cannot run on the wasm32-wasi shell NightMonkey builds
 # (no Intl, no shared memory, no threads, no time zone database, no
-# os.system, a small native stack). Applied to BOTH lanes by
+# os.system, a small native stack). Applied to EVERY lane by
 # scripts/run-jstests.sh; independent of the AOT tier. Paths are relative
 # to js/src/tests; a trailing slash excludes a directory.
 

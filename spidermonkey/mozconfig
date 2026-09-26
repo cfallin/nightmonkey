@@ -7,7 +7,7 @@
 #
 # Everything NightMonkey consumes lands under obj-nightmonkey-sm/dist:
 # include/ and include-private/ (headers, js-build-config.json), lib/ (the
-# archives), and bin/js (the plain wasm shell, used for the AOT-off lane).
+# archives), and bin/js (the plain wasm shell, used for the interpreter-only lane).
 ac_add_options --enable-project=js
 ac_add_options --target=wasm32-unknown-wasi
 ac_add_options --enable-js-shell

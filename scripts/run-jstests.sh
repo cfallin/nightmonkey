@@ -4,10 +4,10 @@
 #
 #   scripts/run-jstests.sh <firefox-checkout> [build-dir] [-- jstests.py args...]
 #
-# Both lanes skip tests/wasi-jstests-excludes.txt (tests the wasm32-wasi
-# shell cannot run at all). The AOT lane (default) also skips
-# tests/jstests-excludes.txt; NIGHT_INPROCESS_OFF=1 runs the tier-off
-# baseline lane.
+# Every lane skips tests/wasi-jstests-excludes.txt (tests the wasm32-wasi
+# shell cannot run at all). The compiled lanes (the default) also skip
+# tests/jstests-excludes.txt; NIGHT_INPROCESS_OFF=1 runs the
+# interpreter-only (interp) lane.
 # The full suite takes hours; pass a path filter to narrow it.
 set -euo pipefail
 

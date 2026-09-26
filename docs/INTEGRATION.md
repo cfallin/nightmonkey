@@ -107,9 +107,10 @@ engine sites that call them:
 The SpiderMonkey tree carries no test changes. NightMonkey keeps
 `tests/jit-test-excludes.txt` and `tests/jstests-excludes.txt` (tests that
 cannot run under the tier), passed to the harnesses' existing
-`--exclude-from` / `--exclude-file` options by the AOT lane only, so the
-same tests still run in the tier-off lane, and `tests/wasi-*-excludes.txt`
-(tests the wasm32-wasi shell cannot run at all), applied to both lanes.
+`--exclude-from` / `--exclude-file` options by the compiled lanes only, so
+the same tests still run in the interpreter-only lane, and
+`tests/wasi-*-excludes.txt` (tests the wasm32-wasi shell cannot run at
+all), applied to every lane.
 NightMonkey's own regression tests live in `tests/jit-test/`.
 
 ## 7. Porting checklist

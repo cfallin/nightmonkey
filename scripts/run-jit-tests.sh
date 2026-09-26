@@ -3,9 +3,9 @@
 #
 #   scripts/run-jit-tests.sh <firefox-checkout> [build-dir] [-- jit_test.py args...]
 #
-# Both lanes skip tests/wasi-jit-test-excludes.txt (tests the wasm32-wasi
-# shell cannot run at all). The AOT lane (default) compiles every test
-# in-process and also skips tests/jit-test-excludes.txt; NIGHT_INPROCESS_OFF=1
+# Every lane skips tests/wasi-jit-test-excludes.txt (tests the wasm32-wasi
+# shell cannot run at all). The compiled lanes (the default) compile every
+# test in-process and also skips tests/jit-test-excludes.txt; NIGHT_INPROCESS_OFF=1
 # runs the same shell with the tier off (the interpreter-only lane).
 # NIGHT_OPTIONS passes compiler flags; with `--pipeline baseline` or `mir` the
 # lane also skips tests/jit-test-excludes-baseline.txt.
