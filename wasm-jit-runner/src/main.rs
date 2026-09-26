@@ -9,6 +9,9 @@
 //! ```text
 //! wasm-jit-runner <module.wasm> [guest args...]
 //! ```
+//!
+//! `WJR_PERFMAP=1` writes a `/tmp/perf-<pid>.map` for the compiled code
+//! (the guest and the functions it adds), so `perf report` can name it.
 
 mod addfuncs;
 mod cache;
@@ -130,6 +133,9 @@ fn run() -> Result<()> {
     let mut config = Config::new();
     config.max_wasm_stack(MAX_WASM_STACK);
     config.async_stack_size(MAX_WASM_STACK + 16 * 1024 * 1024);
+    if std::env::var_os("WJR_PERFMAP").is_some() {
+        config.profiler(wasmtime::ProfilingStrategy::PerfMap);
+    }
     let engine = Engine::new(&config)?;
 
     // Load the guest module and rewrite it so all memories/tables/globals are
