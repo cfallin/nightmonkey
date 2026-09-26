@@ -27,6 +27,10 @@ pub const FORCE_INTERPRETER: &str = "ForceInterpreter";
 /// `bbv::translate_script`: `Outcome::Compiled` with a `night_abi_sig2`
 /// body, or `Outcome::Skipped` with the reason (the script is then
 /// interpreted).
+///
+/// `resumes` are the resume words a MIR body's exits and throws carry
+/// (`docs/BASELINE.md` §4): the body then also accepts an
+/// `ARGC_RESUME_BIT` entry that routes to them.
 pub fn translate_script(
     ctx: &TranslateCtx,
     m: &mut Module,
@@ -34,6 +38,7 @@ pub fn translate_script(
     _source_id: ScriptId,
     script: &Script,
     is_global: bool,
+    resumes: &[layout::ResumeWord],
 ) -> Result<Outcome, String> {
     if script
         .parser()
@@ -78,7 +83,7 @@ pub fn translate_script(
     }
     let sig = ctx.helpers.night_abi_sig2;
     let body = FunctionBody::new(m, sig);
-    let mut gen = match codegen::Gen::new(ctx, atoms, script, is_global, body, depths) {
+    let mut gen = match codegen::Gen::new(ctx, atoms, script, is_global, body, depths, resumes) {
         Ok(g) => g,
         Err(e) => return Ok(Outcome::Skipped(e)),
     };
@@ -117,6 +122,8 @@ pub fn translate_script(
         prop_ic_patches: vec![],
         body_off_patches,
         ctor_nslots_patches: vec![],
+        extra_bodies: vec![],
+        extra_call_patches: vec![],
     })
 }
 

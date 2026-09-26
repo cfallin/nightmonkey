@@ -45,7 +45,7 @@ pub const ARGC_FLAGS: u32 = 0x8000_0000 | ARGC_RESUME_BIT | ARGC_ONRAMP_BIT;
 pub const ERR_DEOPT: u32 = 2;
 
 /// What a resume does once it reaches its pc.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub enum ResumeMode {
     /// Continue executing at `pc`.
     Continue,
@@ -55,7 +55,7 @@ pub enum ResumeMode {
 
 /// The frame's resume word: a pc and a mode, stored as the payload of an
 /// int32 Value so the slot is always a valid GC root.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct ResumeWord {
     pub pc: Pc,
     pub mode: ResumeMode,

@@ -1,0 +1,68 @@
+; Lowering coverage: generic ops with managed values live across them
+; (rooted and reloaded), their dirty and error edges, a throw block, the
+; numeric guards and a loop with an exit.
+;
+;   function s3(o, x) { let i = 0; while (i < 10) i = i + x; return o; }
+
+func @s3 (formals=2, locals=1, depths={0:0, 10:0, 16:1, 20:0}) {
+  root entry b0
+  loop b3 preheader=b2
+
+b0(v0: obj{Function(s3)}, v1: val, v2: val, v3: val):
+  guard.unbox.obj v2 -> ok b1(v4: obj), fail b90
+b1(v4: obj):
+  v5 = const.val int32 0
+  jump b2(v4, v5)
+
+b2(v6: obj, v7: val):
+  jump b3(v6, v7)
+
+; The loop header.
+b3(v8: obj, v9: val):
+  v10 = const.val int32 10
+  js.compare.lt v9, v10 -> ok_clean b4(v11: bool), ok_dirty b10(v12: bool), err b91
+b4(v11: bool):
+  br v11 -> then b5, else b8
+b10(v12: bool):
+  br v12 -> then b5, else b8
+
+; i = i + x: an int32 fast path, and the generic add.
+b5:
+  guard.unbox.i32 v9 -> ok b6(v13: i32), fail b7
+b6(v13: i32):
+  guard.unbox.i32 v3 -> ok b11(v14: i32), fail b7
+b11(v14: i32):
+  i32.add.ovf v13, v14 -> ok b12(v15: i32), fail b7
+b12(v15: i32):
+  v16 = box v15
+  v17: val = weaken v16
+  jump b3(v8, v17)
+b7:
+  js.add v9, v3 -> ok_clean b13(v18: val), ok_dirty b14(v19: val), err b92
+b13(v18: val):
+  jump b3(v8, v18)
+b14(v19: val):
+  jump b3(v8, v19)
+
+b8:
+  v20 = box v8
+  v21: val = weaken v20
+  return v21
+
+b90:
+  v30 = const.val undefined
+  v31: val = weaken v30
+  exit pc=0 this=v1 args=[v2, v3] locals=[v31] rval=v31 stack=[]
+b91:
+  v32 = box v8
+  v33: val = weaken v32
+  v34 = const.val undefined
+  v35: val = weaken v34
+  exit.throw pc=16 this=v1 args=[v33, v3] locals=[v9] rval=v35 stack=[v9]
+b92:
+  v36 = box v8
+  v37: val = weaken v36
+  v38 = const.val undefined
+  v39: val = weaken v38
+  exit.throw pc=20 this=v1 args=[v37, v3] locals=[v9] rval=v39 stack=[]
+}

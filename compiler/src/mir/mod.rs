@@ -25,7 +25,7 @@ pub mod types;
 pub mod verify;
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 pub use entity::{Block, Inst, Value};
 pub use func::Func;

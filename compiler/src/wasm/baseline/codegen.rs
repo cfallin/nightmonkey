@@ -21,7 +21,9 @@ use waffle::{
     Block, BlockTarget, Func, FunctionBody, MemoryArg, Operator, Terminator, Type, Value, ValueDef,
 };
 
-use super::layout::{self, FrameLayout, StackDepths, ARGC_FLAGS};
+use super::layout::{
+    self, FrameLayout, ResumeMode, ResumeWord, StackDepths, ARGC_FLAGS, ARGC_RESUME_BIT,
+};
 use crate::bytecode::{BytecodeParser, JSOp, Script, TryNoteKind};
 use crate::ids::Pc;
 use crate::source::{ScopeData, SourceObject};
@@ -93,6 +95,14 @@ pub(super) struct Gen<'a> {
     loops: Vec<(Pc, Pc)>,
     /// Every pc a resume may land on (`docs/BASELINE.md` §4).
     resume_targets: BTreeSet<Pc>,
+    /// Every resume word a resume may carry: the generator landings and
+    /// the MIR body's exit and throw pcs (`resumes`).
+    resume_words: BTreeSet<ResumeWord>,
+    /// Resume words the caller asked for (a MIR body's exits), entered
+    /// through the `ARGC_RESUME_BIT` fork.
+    ext_resumes: Vec<ResumeWord>,
+    /// `argc` as passed, flags included.
+    argc_raw: Value,
     /// Loop headers that dispatch resumes: header pc -> (dispatch block,
     /// the header's own code block). Every branch to the header goes to the
     /// dispatch block, which is therefore the loop's header node.
@@ -152,6 +162,7 @@ impl<'a> Gen<'a> {
         is_global: bool,
         body: FunctionBody,
         depths: StackDepths,
+        resumes: &[ResumeWord],
     ) -> R<Gen<'a>> {
         let layout = FrameLayout::of(script);
         let needs_env = needs_env(script);
@@ -189,6 +200,9 @@ impl<'a> Gen<'a> {
             gen_resume: vec![],
             loops: vec![],
             resume_targets: BTreeSet::new(),
+            resume_words: BTreeSet::new(),
+            ext_resumes: resumes.to_vec(),
+            argc_raw: argc,
             dispatch: BTreeMap::new(),
             gen_dispatch_blk: None,
             body_off_patches: vec![],
@@ -861,6 +875,13 @@ impl<'a> Gen<'a> {
             .collect();
         self.loops.sort();
         self.frame_regs();
+        for w in self.ext_resumes.clone() {
+            if self.depths.at(w.pc).is_none() {
+                return Err(format!("resume at pc {} with no stack depth", w.pc));
+            }
+            self.resume_targets.insert(w.pc);
+            self.resume_words.insert(w);
+        }
         if self.is_gen {
             self.scan_resumes()?;
             // Fresh call or resume: a resume stages the generator-closing
@@ -875,6 +896,20 @@ impl<'a> Gen<'a> {
             self.cur = fresh;
             self.live = true;
         }
+        let resume_blk = if self.ext_resumes.is_empty() {
+            None
+        } else {
+            // A resume (from a MIR exit) finds the frame already written:
+            // it skips the prologue and routes by the resume word.
+            let bit = self.i32c(ARGC_RESUME_BIT);
+            let is_resume = self.binop(Operator::I32And, self.argc_raw, bit, Type::I32);
+            let disp = self.body.add_block();
+            let fresh = self.body.add_block();
+            self.cond_br(is_resume, Self::goto(disp), Self::goto(fresh));
+            self.cur = fresh;
+            self.live = true;
+            Some(disp)
+        };
         self.prologue();
         let mut leaders = layout::leaders(self.script);
         // A suspend returns, so the code after it is entered only by a
@@ -921,6 +956,9 @@ impl<'a> Gen<'a> {
         }
         self.finalize_dispatch();
         self.finalize_gen_dispatch();
+        if let Some(disp) = resume_blk {
+            self.finalize_resume_dispatch(disp);
+        }
         // Every block must end somewhere: an unterminated one would be
         // emitted as a trap. Declining is always safe; trapping is not.
         for (b, data) in self.body.blocks.entries() {
@@ -946,6 +984,10 @@ impl<'a> Gen<'a> {
                     let landing = pc + op.len();
                     self.gen_resume.push((k, landing, d - popped));
                     self.resume_targets.insert(landing);
+                    self.resume_words.insert(ResumeWord {
+                        pc: landing,
+                        mode: ResumeMode::Continue,
+                    });
                 }
             } else {
                 skip(&mut p, op);
@@ -963,25 +1005,35 @@ impl<'a> Gen<'a> {
         self.store_i64(self.vp, self.layout.resume(), v);
     }
 
-    /// The first hop toward resume target `t` from outside every loop:
-    /// the outermost dispatching header enclosing it, or its landing.
-    fn resume_route(&mut self, t: Pc) -> Block {
-        match self.dispatch_chain(t).first() {
+    /// The first hop toward resume word `w` from outside every loop: the
+    /// outermost dispatching header enclosing its pc, or its landing.
+    fn resume_route(&mut self, w: ResumeWord) -> Block {
+        match self.dispatch_chain(w.pc).first() {
             Some(&h) => self.block(h),
-            None => self.resume_landing(t),
+            None => self.resume_landing(w),
         }
     }
 
-    /// The last hop to resume target `t`: clear the resume word, then enter
-    /// `t` -- through its own dispatch block if it is a dispatching header,
-    /// so no loop is entered anywhere but its header node.
-    fn resume_landing(&mut self, t: Pc) -> Block {
-        let saved = (self.cur, self.live);
+    /// The last hop for resume word `w`: clear the resume word, then
+    /// - `Continue`: enter `w.pc`, through its own dispatch block if it is
+    ///   a dispatching header, so no loop is entered anywhere but its
+    ///   header node;
+    /// - `Throw` (a MIR throw exit, the exception pending): take `w.pc`'s
+    ///   exception landing, as the op there would have on failure.
+    fn resume_landing(&mut self, w: ResumeWord) -> Block {
+        let saved = (self.cur, self.live, self.pc, self.d);
         let l = self.fresh();
         self.set_resume_word(RESUME_NONE);
-        let target = self.block(t);
-        self.br(Self::goto(target));
-        (self.cur, self.live) = saved;
+        let target = match w.mode {
+            ResumeMode::Continue => Self::goto(self.block(w.pc)),
+            ResumeMode::Throw => {
+                let d = self.depths.at(w.pc).expect("resume pcs have a depth");
+                (self.pc, self.d) = (w.pc, d);
+                self.exc_target(w.pc, d)
+            }
+        };
+        self.br(target);
+        (self.cur, self.live, self.pc, self.d) = saved;
         l
     }
 
@@ -993,11 +1045,11 @@ impl<'a> Gen<'a> {
             .iter()
             .map(|(&h, &(d, c))| (h, d, c))
             .collect();
-        let targets: Vec<Pc> = self.resume_targets.iter().copied().collect();
+        let targets: Vec<ResumeWord> = self.resume_words.iter().copied().collect();
         for (h, disp, code) in headers {
             let mut hops = vec![];
             for &t in &targets {
-                let chain = self.dispatch_chain(t);
+                let chain = self.dispatch_chain(t.pc);
                 if let Some(i) = chain.iter().position(|&x| x == h) {
                     let next = match chain.get(i + 1) {
                         Some(&inner) => self.block(inner),
@@ -1009,21 +1061,41 @@ impl<'a> Gen<'a> {
             self.cur = disp;
             self.live = true;
             let w = self.resume_word();
-            for (t, next) in hops {
-                let enc = layout::ResumeWord {
-                    pc: t,
-                    mode: layout::ResumeMode::Continue,
-                }
-                .encode() as u32;
-                let k = self.i32c(enc);
-                let hit = self.binop(Operator::I32Eq, w, k, Type::I32);
-                let no = self.body.add_block();
-                self.cond_br(hit, Self::goto(next), Self::goto(no));
-                self.cur = no;
-                self.live = true;
-            }
-            self.br(Self::goto(code));
+            self.dispatch_on(w, hops, Self::goto(code));
         }
+    }
+
+    /// Branch on the resume word `w` to each hop's block; anything else
+    /// goes to `default`.
+    fn dispatch_on(&mut self, w: Value, hops: Vec<(ResumeWord, Block)>, default: BlockTarget) {
+        for (t, next) in hops {
+            let k = self.i32c(t.encode() as u32);
+            let hit = self.binop(Operator::I32Eq, w, k, Type::I32);
+            let no = self.body.add_block();
+            self.cond_br(hit, Self::goto(next), Self::goto(no));
+            self.cur = no;
+            self.live = true;
+        }
+        self.br(default);
+    }
+
+    /// The `ARGC_RESUME_BIT` entry (a MIR exit): route by the resume word
+    /// to one of `ext_resumes`. The MIR body wrote the whole frame, so the
+    /// prologue does not run. A word outside the set is a compiler bug.
+    fn finalize_resume_dispatch(&mut self, disp: Block) {
+        self.cur = disp;
+        self.live = true;
+        let bad = self.body.add_block();
+        let words = self.ext_resumes.clone();
+        let hops: Vec<(ResumeWord, Block)> =
+            words.iter().map(|&w| (w, self.resume_route(w))).collect();
+        self.cur = disp;
+        self.live = true;
+        let w = self.resume_word();
+        self.dispatch_on(w, hops, Self::goto(bad));
+        self.cur = bad;
+        self.live = true;
+        self.terminate(Terminator::Unreachable);
     }
 
     /// The generator resume entry: read the descriptor `EnterNightResume`
@@ -1082,7 +1154,10 @@ impl<'a> Gen<'a> {
             }
             .encode() as u32;
             self.set_resume_word(enc);
-            let first = self.resume_route(landing);
+            let first = self.resume_route(ResumeWord {
+                pc: landing,
+                mode: ResumeMode::Continue,
+            });
             self.br(Self::goto(first));
             targets[k as usize] = Self::goto(pre);
         }

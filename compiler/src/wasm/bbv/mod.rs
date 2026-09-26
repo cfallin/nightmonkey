@@ -1112,6 +1112,8 @@ pub fn translate_script(
                     prop_ic_patches: t.prop_ic_patches,
                     body_off_patches: t.body_off_patches,
                     ctor_nslots_patches: t.ctor_nslots_patches,
+                    extra_bodies: vec![],
+                    extra_call_patches: vec![],
                 });
             }
             Err(reason) => return Ok(Outcome::Skipped(reason)),

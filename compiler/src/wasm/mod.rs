@@ -19,6 +19,7 @@ use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 pub mod baseline;
 pub(crate) mod bbv;
+pub mod mir;
 pub mod tier;
 pub use bbv::EARLY_KEY_MAX;
 
@@ -1921,16 +1922,20 @@ fn translate_for_pipeline(
             Tier::Legacy,
             bbv::translate_script(ctx, m, atoms, sid, script, is_global)?,
         ),
-        Pipeline::Baseline | Pipeline::Mir => {
-            if ctx.opts.pipeline == Pipeline::Mir {
-                // There is no MIR builder yet (M2).
-                declines.push(Decline::new(Tier::Mir, "no builder"));
+        Pipeline::Mir => match mir::translate_script(ctx, m, atoms, sid, script, is_global)? {
+            Ok(outcome) => (Tier::Mir, outcome),
+            Err(reason) => {
+                declines.push(Decline::new(Tier::Mir, reason));
+                (
+                    Tier::Baseline,
+                    baseline::translate_script(ctx, m, atoms, sid, script, is_global, &[])?,
+                )
             }
-            (
-                Tier::Baseline,
-                baseline::translate_script(ctx, m, atoms, sid, script, is_global)?,
-            )
-        }
+        },
+        Pipeline::Baseline => (
+            Tier::Baseline,
+            baseline::translate_script(ctx, m, atoms, sid, script, is_global, &[])?,
+        ),
     };
     let tier = match &outcome {
         translate::Outcome::Compiled { .. } => first,
@@ -1982,6 +1987,13 @@ pub fn translate_all(
     let mut sid_to_index: HashMap<u32, u32> = HashMap::default();
     let mut pending_adapters: Vec<(SourceObjectId, Func)> = Vec::new();
     let mut body_off_patch_sites: Vec<(Func, waffle::Value)> = Vec::new();
+    #[allow(clippy::type_complexity)]
+    let mut pending_extras: Vec<(
+        SourceObjectId,
+        Func,
+        Vec<translate::ExtraBody>,
+        Vec<(waffle::Value, usize)>,
+    )> = Vec::new();
     let mut ctor_nslots_patch_sites: Vec<(Func, waffle::Value, u32)> = Vec::new();
     let mut likely_patches: Vec<(Func, waffle::Value, waffle::Value, u32)> = Vec::new();
     let mut fuse_call_patches: Vec<(Func, translate::FuseCallPatch)> = Vec::new();
@@ -2060,6 +2072,8 @@ pub fn translate_all(
                 prop_ic_patches: icp2,
                 body_off_patches: bop,
                 ctor_nslots_patches: cnp,
+                extra_bodies,
+                extra_call_patches,
             } => {
                 let f = m.funcs.push(FuncDecl::Body(
                     sig,
@@ -2120,6 +2134,9 @@ pub fn translate_all(
                 for v in cnp {
                     ctor_nslots_patch_sites.push((f, v, 0));
                 }
+                if !extra_bodies.is_empty() {
+                    pending_extras.push((id, f, extra_bodies, extra_call_patches));
+                }
                 n_compiled += 1;
             }
             translate::Outcome::Skipped(reason) => {
@@ -2142,6 +2159,33 @@ pub fn translate_all(
         on_compiled(id, index);
         source_id_to_table_func.insert(id.id(), a);
         sid_to_index.insert(id.id(), index);
+    }
+    // Extra bodies (a MIR script's baseline body) after the adapter block,
+    // so the body/adapter offset above still holds; then point the direct
+    // calls between a script's bodies at their functions.
+    for (id, main, extras, calls) in pending_extras {
+        let mut funcs = vec![];
+        for (i, x) in extras.into_iter().enumerate() {
+            let mut body = x.body;
+            for v in x.main_call_patches {
+                translate::patch_call(&mut body, v, main);
+            }
+            let f = m.funcs.push(FuncDecl::Body(
+                x.sig,
+                format!("night_script_{}_{i}", id.id()),
+                body,
+            ));
+            place_in_table(m, f)?;
+            for v in x.body_off_patches {
+                body_off_patch_sites.push((f, v));
+            }
+            funcs.push(f);
+        }
+        if let FuncDecl::Body(_, _, body) = &mut m.funcs[main] {
+            for (v, i) in calls {
+                translate::patch_call(body, v, funcs[i]);
+            }
+        }
     }
     for (f, v) in body_off_patch_sites {
         if let FuncDecl::Body(_, _, body) = &mut m.funcs[f] {

@@ -105,6 +105,9 @@ pub struct Diagnostics {
     /// decline on the way, and a summary. Coverage is measured, never
     /// assumed.
     pub tiers: bool,
+    /// Print each MIR body the builder produces (and an invalid one in
+    /// full when the validator rejects it).
+    pub mir: bool,
 }
 
 impl Diagnostics {
@@ -128,6 +131,7 @@ impl Diagnostics {
             || self.trace_field.is_some()
             || self.trace_site.is_some()
             || self.tiers
+            || self.mir
     }
 
     /// Whether `source_id`'s bytecode should be disassembled.
@@ -234,6 +238,7 @@ impl Options {
             "--dump-peel" => d.peel = true,
             "--dump-redundant" => d.redundant = true,
             "--dump-tiers" => d.tiers = true,
+            "--dump-mir" => d.mir = true,
             "--trace-cell" => d.trace_cell = Some(arg(flag)?),
             "--trace-field" => d.trace_field = Some(arg(flag)?),
             "--trace-site" => d.trace_site = Some(arg(flag)?),

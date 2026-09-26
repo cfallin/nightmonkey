@@ -10,10 +10,11 @@ use crate::mir::print::print_module;
 use crate::mir::verify::{verify_module, Check};
 use crate::mir::Module;
 
-const FIXTURES: &[(&str, &str)] = &[
+pub(crate) const FIXTURES: &[(&str, &str)] = &[
     ("basic.mir", include_str!("basic.mir")),
     ("fence_rejoin.mir", include_str!("fence_rejoin.mir")),
     ("ops.mir", include_str!("ops.mir")),
+    ("lower.mir", include_str!("lower.mir")),
 ];
 
 fn parse_ok(src: &str) -> Module {

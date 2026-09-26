@@ -1364,12 +1364,41 @@ pub enum Outcome {
         /// region is placed; the production caller fills the content from
         /// `ctor_nslots` x `sid_to_index`.
         ctor_nslots_patches: Vec<Value>,
+        /// Further bodies of the same script (`docs/BASELINE.md` §5): under
+        /// `pipeline=mir`, the baseline body behind the MIR body. Each takes
+        /// a table slot after the adapter block (the in-process runner
+        /// appends every function to the table) but is called only
+        /// directly.
+        extra_bodies: Vec<ExtraBody>,
+        /// Direct-call placeholders in `body` for the extra bodies: `(Call
+        /// value, extra index)`. Post-placement the caller sets each
+        /// `Call`'s target to that extra body's function.
+        extra_call_patches: Vec<(Value, usize)>,
     },
     /// Not compiled -- the script is left interpreted (the always-safe
     /// fallback). The reason (first unsupported op, or a type the fast path
     /// cannot yet handle) is reported for the coverage line. Skipping is sound;
     /// it is never a silent miscompile.
     Skipped(String),
+}
+
+/// A script's second function (`Outcome::Compiled::extra_bodies`).
+pub struct ExtraBody {
+    pub sig: Signature,
+    pub body: FunctionBody,
+    /// Adapter-offset placeholders in this body, as `body_off_patches`.
+    pub body_off_patches: Vec<Value>,
+    /// Direct-call placeholders in this body for the script's main body
+    /// (a baseline onramp into MIR); patched like `extra_call_patches`.
+    pub main_call_patches: Vec<Value>,
+}
+
+/// Point the placeholder `Call` at `v` in `body` to `target`.
+pub(crate) fn patch_call(body: &mut FunctionBody, v: Value, target: waffle::Func) {
+    match &mut body.values[v] {
+        ValueDef::Operator(Operator::Call { function_index }, _, _) => *function_index = target,
+        d => panic!("patch_call: {v} is not a call ({d:?})"),
+    }
 }
 
 /// Every primitive bit set (`PRIM_INT32 .. PRIM_BIGINT`).
@@ -6101,6 +6130,16 @@ mod tests {
     /// Compile `s` with the baseline tier and assert the emitted module
     /// validates.
     fn baseline_compile_and_validate(s: Script) {
+        baseline_compile_and_validate_resumes(s, &[]);
+    }
+
+    /// `baseline_compile_and_validate`, with MIR resume words (the
+    /// `ARGC_RESUME_BIT` entry). Baseline declines an irreducible body, so
+    /// this also checks the resume routing stays reducible.
+    fn baseline_compile_and_validate_resumes(
+        s: Script,
+        resumes: &[crate::wasm::baseline::layout::ResumeWord],
+    ) {
         let (mut m, helpers) = module_with_helpers();
         let source = Source {
             objects: vec![],
@@ -6118,6 +6157,7 @@ mod tests {
             ScriptId::new(1),
             &s,
             false,
+            resumes,
         )
         .expect("translate")
         {
@@ -6174,6 +6214,108 @@ mod tests {
             code.push(op_byte(Return));
             baseline_compile_and_validate(script(code, 2));
         }
+    }
+
+    /// The MIR fixtures that use only lowered ops lower to a valid module:
+    /// guards, overflow checks, generic ops with rooted live values and
+    /// their clean/dirty/err edges, loops, returns, exits and throws.
+    #[test]
+    fn mir_fixtures_lower_and_validate() {
+        use crate::wasm::baseline::layout::FrameLayout;
+        for name in ["basic.mir", "lower.mir"] {
+            let src = crate::mir::tests::FIXTURES
+                .iter()
+                .find(|(n, _)| *n == name)
+                .unwrap()
+                .1;
+            let mm = crate::mir::parse(src).expect("parse");
+            let (mut m, helpers) = module_with_helpers();
+            for f in &mm.funcs {
+                let layout = FrameLayout {
+                    nargs: f.frame.formals,
+                    nlocals: f.frame.locals,
+                    rebase_vp: false,
+                };
+                let lowered = crate::wasm::mir::lower::lower(&mut m, helpers, &mm, f, layout)
+                    .unwrap_or_else(|e| panic!("{name}: {e}"));
+                let mut body = lowered.body;
+                // The exits' baseline body: the function itself stands in
+                // (same signature).
+                let fid = m.funcs.push(waffle::FuncDecl::None);
+                for v in lowered.baseline_calls {
+                    patch_call(&mut body, v, fid);
+                }
+                m.funcs[fid] = waffle::FuncDecl::Body(helpers.night_abi_sig2, name.into(), body);
+            }
+            let bytes = m.to_wasm_bytes().unwrap_or_else(|e| panic!("{name}: {e}"));
+            waffle::wasmparser::validate(&bytes).unwrap_or_else(|e| panic!("{name}: {e}"));
+        }
+    }
+
+    /// Resume words at the function start, a loop header, inside nested
+    /// loops and inside a try, in both modes: the `ARGC_RESUME_BIT` entry
+    /// routes through the loop headers' dispatch and stays reducible.
+    #[test]
+    fn baseline_resume_entry_validates() {
+        use crate::wasm::baseline::layout::{ResumeMode, ResumeWord};
+        use JSOp::*;
+        let w = |pc: u32, throw: bool| ResumeWord {
+            pc: Pc::new(pc),
+            mode: if throw {
+                ResumeMode::Throw
+            } else {
+                ResumeMode::Continue
+            },
+        };
+        // for (;;) { for (;;) { if (!a0) break; } if (!a0) return; }
+        // @0 LoopHead; @6 LoopHead; @12 GetArg 0; @15 JumpIfFalse +10 (-> @25);
+        // @20 Goto -14 (-> @6); @25 GetArg 0; @28 JumpIfFalse +10 (-> @38);
+        // @33 Goto -33 (-> @0); @38 RetRval
+        let mut code = vec![op_byte(LoopHead), 0, 0, 0, 0, 0];
+        code.extend([op_byte(LoopHead), 0, 0, 0, 0, 0]);
+        code.extend([op_byte(GetArg), 0, 0, op_byte(JumpIfFalse), 10, 0, 0, 0]);
+        code.extend([op_byte(Goto)]);
+        code.extend((-14i32).to_le_bytes());
+        code.extend([op_byte(GetArg), 0, 0, op_byte(JumpIfFalse), 10, 0, 0, 0]);
+        code.extend([op_byte(Goto)]);
+        code.extend((-33i32).to_le_bytes());
+        code.push(op_byte(RetRval));
+        let resumes = [
+            w(0, false),
+            w(0, true),
+            w(6, false),
+            w(12, false),
+            w(15, true),
+            w(25, false),
+            w(28, true),
+            w(38, false),
+        ];
+        baseline_compile_and_validate_resumes(script(code, 1), &resumes);
+
+        // try { a0(); } catch { return exception }, in a loop:
+        // @0 LoopHead; @6 Try; @7 GetArg 0; @10 Undefined; @11 Call 0;
+        // @14 Pop; @15 Goto -15 (-> @0); @20 Exception; @21 Return
+        let mut code = vec![op_byte(LoopHead), 0, 0, 0, 0, 0, op_byte(Try)];
+        code.extend([
+            op_byte(GetArg),
+            0,
+            0,
+            op_byte(Undefined),
+            op_byte(Call),
+            0,
+            0,
+        ]);
+        code.extend([op_byte(Pop), op_byte(Goto)]);
+        code.extend((-15i32).to_le_bytes());
+        code.extend([op_byte(Exception), op_byte(Return)]);
+        let mut s = script(code, 1);
+        s.try_notes = vec![crate::bytecode::TryNote {
+            kind: crate::bytecode::TryNoteKind::Catch,
+            stack_depth: 0,
+            start: Pc::new(7),
+            length: 13,
+        }];
+        baseline_compile_and_validate_resumes(s, &[w(11, true), w(11, false), w(14, false)]);
     }
 
     #[test]
