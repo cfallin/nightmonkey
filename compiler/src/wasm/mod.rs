@@ -17,6 +17,7 @@ use crate::region_shape as shape;
 use crate::source::{ObjectData, ObjectKind, Source, SourceObject, SourceObjectId};
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
+pub mod baseline;
 pub(crate) mod bbv;
 pub use bbv::EARLY_KEY_MAX;
 
