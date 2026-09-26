@@ -286,6 +286,27 @@ fn falls_through(op: JSOp) -> bool {
     )
 }
 
+/// The pcs that start a basic block: pc 0, every branch target, every
+/// catch/finally handler, and the fall-through of every op that branches.
+/// Computed over all ops, reachable or not.
+pub fn leaders(script: &Script) -> std::collections::BTreeSet<Pc> {
+    let ops = script.parser().visit(Collect { ops: vec![] }).ops;
+    let mut out = std::collections::BTreeSet::new();
+    out.insert(Pc::new(0));
+    for o in &ops {
+        out.extend(o.targets.iter().copied());
+        if !o.targets.is_empty() && falls_through(o.op) {
+            out.insert(o.pc + o.len);
+        }
+    }
+    for n in &script.try_notes {
+        if matches!(n.kind, TryNoteKind::Catch | TryNoteKind::Finally) {
+            out.insert(n.start + n.length);
+        }
+    }
+    out
+}
+
 /// The static operand-stack depth at every reachable pc, computed the way
 /// SpiderMonkey's own `BytecodeParser::parse` does (`vm/BytecodeUtil.cpp`):
 /// forward from pc 0, with the depth *before* each op.

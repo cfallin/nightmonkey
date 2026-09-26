@@ -6020,6 +6020,129 @@ mod tests {
         }
     }
 
+    /// Compile `s` with the baseline tier and assert the emitted module
+    /// validates.
+    fn baseline_compile_and_validate(s: Script) {
+        let (mut m, helpers) = module_with_helpers();
+        let source = Source {
+            objects: vec![],
+            global_object: None,
+            selfhosted: Vec::new(),
+            regex_programs: Vec::new(),
+        };
+        let mut atoms = AtomTable::new(Names::default());
+        let opts = Options::default();
+        let ctx = empty_ctx(helpers, &source, &opts);
+        match crate::wasm::baseline::translate_script(
+            &ctx,
+            &mut m,
+            &mut atoms,
+            ScriptId::new(1),
+            &s,
+            false,
+        )
+        .expect("translate")
+        {
+            Outcome::Compiled { sig, body, .. } => {
+                m.funcs
+                    .push(waffle::FuncDecl::Body(sig, "f".to_string(), body));
+                let bytes = m.to_wasm_bytes().expect("serialize");
+                waffle::wasmparser::validate(&bytes).expect("emitted module validates");
+            }
+            Outcome::Skipped(reason) => panic!("unexpectedly skipped: {reason}"),
+        }
+    }
+
+    #[test]
+    fn baseline_branches_calls_and_handlers_validate() {
+        // `if (1) return 42; return 99;`
+        let code = vec![
+            op_byte(JSOp::One),
+            op_byte(JSOp::JumpIfFalse),
+            8,
+            0,
+            0,
+            0,
+            op_byte(JSOp::Int8),
+            42,
+            op_byte(JSOp::Return),
+            op_byte(JSOp::Int8),
+            99,
+            op_byte(JSOp::Return),
+        ];
+        baseline_compile_and_validate(script(code, 0));
+
+        // try { throw 0 } catch { return exception }
+        let code = vec![
+            op_byte(JSOp::Try),
+            op_byte(JSOp::Zero),
+            op_byte(JSOp::Throw),
+            op_byte(JSOp::Nop),
+            op_byte(JSOp::Exception),
+            op_byte(JSOp::Return),
+        ];
+        let mut s = script(code, 0);
+        s.try_notes = vec![crate::bytecode::TryNote {
+            kind: crate::bytecode::TryNoteKind::Catch,
+            stack_depth: 0,
+            start: Pc::new(1),
+            length: 3,
+        }];
+        baseline_compile_and_validate(s);
+
+        // try { throw 0 } finally { ... }: the landing pushes three values.
+        let code = vec![
+            op_byte(JSOp::Try),
+            op_byte(JSOp::Zero),
+            op_byte(JSOp::Throw),
+            op_byte(JSOp::Nop),
+            op_byte(JSOp::PopN),
+            3,
+            0,
+            op_byte(JSOp::RetRval),
+        ];
+        let mut s = script(code, 0);
+        s.try_notes = vec![crate::bytecode::TryNote {
+            kind: crate::bytecode::TryNoteKind::Finally,
+            stack_depth: 0,
+            start: Pc::new(1),
+            length: 3,
+        }];
+        baseline_compile_and_validate(s);
+
+        // A loop calling its argument: `for (;;) { if (!a0()) return; }`
+        // @0 LoopHead; @6 GetArg 0; @9 Undefined; @10 Call 0;
+        // @13 JumpIfFalse +10 (-> @23); @18 Goto -18 (-> @0); @23 RetRval
+        let code = vec![
+            op_byte(JSOp::LoopHead),
+            0,
+            0,
+            0,
+            0,
+            0,
+            op_byte(JSOp::GetArg),
+            0,
+            0,
+            op_byte(JSOp::Undefined),
+            op_byte(JSOp::Call),
+            0,
+            0,
+            op_byte(JSOp::JumpIfFalse),
+            10,
+            0,
+            0,
+            0,
+            op_byte(JSOp::Goto),
+            (-18i32) as u8,
+            0xff,
+            0xff,
+            0xff,
+            op_byte(JSOp::RetRval),
+        ];
+        assert_eq!(JSOp::LoopHead.len(), 6);
+        baseline_compile_and_validate(script(code, 1));
+    }
+
     /// Compile `code` and assert the emitted module validates (exercises the
     /// CFG: blocks, terminators, blockparams).
     fn compile_and_validate(code: Vec<u8>, nargs: u16, source_id: u32) {

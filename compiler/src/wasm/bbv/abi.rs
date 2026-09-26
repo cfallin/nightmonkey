@@ -38,7 +38,7 @@ pub(crate) const SHAPE_OFFSET: u32 = 0;
 pub(super) const OBJ_CLASS_IDX_OFFSET: u32 = 4;
 pub(super) const OBJ_SLOTS_OFFSET: u32 = 8;
 pub(super) const OBJ_ELEMENTS_OFFSET: u32 = 12;
-pub(super) const FIXED_SLOTS_BASE: u32 = 16;
+pub(crate) const FIXED_SLOTS_BASE: u32 = 16;
 /// `slots_` again, reached from a `NativeObject*` in the slot-address
 /// decoder rather than from the object header walk.
 pub(super) const NATIVE_SLOTS_OFFSET: u32 = 8;
@@ -158,8 +158,8 @@ pub(super) const STRING_LATIN1_CHARS_BIT: u32 = 1 << 10;
 // build adds to BaseScript.
 
 pub(super) const FUNC_FLAGS_SLOT_OFFSET: u32 = 16;
-pub(super) const FUNC_ENV_SLOT_OFFSET: u32 = 24;
-pub(super) const FUNC_SCRIPT_SLOT_OFFSET: u32 = 32;
+pub(crate) const FUNC_ENV_SLOT_OFFSET: u32 = 24;
+pub(crate) const FUNC_SCRIPT_SLOT_OFFSET: u32 = 32;
 pub(super) const FUNCTION_FLAGS_BASESCRIPT: u32 = 1 << 5;
 pub(super) const FUNCTION_FLAGS_CONSTRUCTOR: u32 = 1 << 8;
 pub(super) const FUNCTION_KIND_MASK: u32 = 0x0007;
@@ -223,7 +223,7 @@ pub(super) const FLAG_STAMPS: u32 = 4;
 /// no stamp and no epoch can see -- a binding is a slot of the global
 /// object, not a claimed class layout.
 pub(super) const FLAG_BIND: u32 = 8;
-pub(super) const FLAGS_ALL: u32 = FLAG_MUT_THIS | FLAG_MUT_OTHER | FLAG_STAMPS | FLAG_BIND;
+pub(crate) const FLAGS_ALL: u32 = FLAG_MUT_THIS | FLAG_MUT_OTHER | FLAG_STAMPS | FLAG_BIND;
 
 // --- reserved-region cells the emitter addresses --------------------------
 //
@@ -365,35 +365,35 @@ pub(super) use crate::region_shape::{
 // constants rather than a Rust `enum`.
 
 /// `InitProp`/`InitElem` attribute selector.
-pub(super) const INIT_ATTR_ENUMERATE: u32 = 0;
-pub(super) const INIT_ATTR_HIDDEN: u32 = 1;
-pub(super) const INIT_ATTR_LOCKED: u32 = 2;
+pub(crate) const INIT_ATTR_ENUMERATE: u32 = 0;
+pub(crate) const INIT_ATTR_HIDDEN: u32 = 1;
+pub(crate) const INIT_ATTR_LOCKED: u32 = 2;
 
 /// Operation selector for the generic boxed binop helper.
-pub(super) const BINOP_SUB: u32 = 0;
-pub(super) const BINOP_MUL: u32 = 1;
-pub(super) const BINOP_DIV: u32 = 2;
-pub(super) const BINOP_MOD: u32 = 3;
-pub(super) const BINOP_BITOR: u32 = 4;
-pub(super) const BINOP_BITAND: u32 = 5;
-pub(super) const BINOP_BITXOR: u32 = 6;
-pub(super) const BINOP_LSH: u32 = 7;
-pub(super) const BINOP_RSH: u32 = 8;
-pub(super) const BINOP_URSH: u32 = 9;
-pub(super) const BINOP_INC: u32 = 10;
-pub(super) const BINOP_DEC: u32 = 11;
-pub(super) const BINOP_BITNOT: u32 = 12;
+pub(crate) const BINOP_SUB: u32 = 0;
+pub(crate) const BINOP_MUL: u32 = 1;
+pub(crate) const BINOP_DIV: u32 = 2;
+pub(crate) const BINOP_MOD: u32 = 3;
+pub(crate) const BINOP_BITOR: u32 = 4;
+pub(crate) const BINOP_BITAND: u32 = 5;
+pub(crate) const BINOP_BITXOR: u32 = 6;
+pub(crate) const BINOP_LSH: u32 = 7;
+pub(crate) const BINOP_RSH: u32 = 8;
+pub(crate) const BINOP_URSH: u32 = 9;
+pub(crate) const BINOP_INC: u32 = 10;
+pub(crate) const BINOP_DEC: u32 = 11;
+pub(crate) const BINOP_BITNOT: u32 = 12;
 
 /// Operation selector for the generic boxed compare helper.
-pub(super) const CMP_LT: u32 = 0;
-pub(super) const CMP_LE: u32 = 1;
-pub(super) const CMP_GT: u32 = 2;
-pub(super) const CMP_GE: u32 = 3;
-pub(super) const CMP_EQ: u32 = 4;
-pub(super) const CMP_NE: u32 = 5;
-pub(super) const CMP_STRICTEQ: u32 = 6;
-pub(super) const CMP_STRICTNE: u32 = 7;
+pub(crate) const CMP_LT: u32 = 0;
+pub(crate) const CMP_LE: u32 = 1;
+pub(crate) const CMP_GT: u32 = 2;
+pub(crate) const CMP_GE: u32 = 3;
+pub(crate) const CMP_EQ: u32 = 4;
+pub(crate) const CMP_NE: u32 = 5;
+pub(crate) const CMP_STRICTEQ: u32 = 6;
+pub(crate) const CMP_STRICTNE: u32 = 7;
 
 /// Sentinel `ctor_nslots` value: the ctor's layout is unknown, so
 /// `create_this` sizes generically.
-pub(super) const NO_NSLOTS: u32 = 0xFFFF_FFFF;
+pub(crate) const NO_NSLOTS: u32 = 0xFFFF_FFFF;
