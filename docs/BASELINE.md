@@ -476,10 +476,13 @@ Deviations from the plan above, and details it did not settle:
   `this`-magic fork, the staged descriptor, `gen_restore`, then the
   `[value, gen, kind]` triple is written at the label's depth and routed
   through the dispatch.
-- **Every body is checked at translation time** with waffle's
-  `validate` and `verify_reducible`. A failure declines that one script
-  with a `BUG:` reason; one invalid body would otherwise fail the whole
-  in-process batch.
+- **Every body's reducibility is checked at translation time**
+  (`verify_reducible`); a failure declines that one script with a `BUG:`
+  reason. There is no explicit `validate()`. waffle's backend runs it on
+  every function, and it is quadratic on long block chains (waffle's
+  `DOMTREE-TODO.md`). So an invalid body fails the whole in-process
+  batch, with a strict-coverage abort or a fall back to the interpreter,
+  instead of declining alone.
 - **The generator gate is narrower than "generator using arguments".**
   It declines only when actuals are read after the first suspend. The
   frontend reads them in the prologue, and the resume path stages
@@ -500,10 +503,11 @@ Deviations from the plan above, and details it did not settle:
   1.07M blocks and 8M values. waffle's backend `validate()` then walks
   the dominator tree once per value use, which is quadratic on long block
   chains, and the engine would have to compile it as a single Wasm
-  function. The same quadratic `validate` is why baseline gives each
-  throwing pc its own error-return block instead of one shared block
-  with a predecessor per helper call. Fixing waffle's `validate` would
-  make this bound a code-size policy rather than a necessity.
+  function. Separately, waffle's dominator construction degrades with
+  high fan-in, which is why baseline gives each throwing pc its own
+  error-return block instead of one shared block with a predecessor per
+  helper call. Both are written up in waffle's `DOMTREE-TODO.md`; fixing
+  them would make this bound a code-size policy rather than a necessity.
 - **The baseline-tier lane excludes ten more tests**
   (`tests/jit-test-excludes-baseline.txt`). They are frame-introspection
   and decompiled-message tests that pass in the legacy lane only because

@@ -85,23 +85,11 @@ pub fn translate_script(
     if let Err(e) = gen.run() {
         return Ok(Outcome::Skipped(e));
     }
-    // One invalid body would fail the whole batch at serialization, and the
-    // design promises reducibility by construction (docs/BASELINE.md §4):
-    // check both here, so a violation declines just this script, loudly.
-    // waffle's `validate` walks the dominator tree once per value use,
-    // which is quadratic on the long block chains a big body has, so it
-    // runs only below a size bound (every test-sized body is checked).
-    const VALIDATE_MAX_BLOCKS: usize = 4096;
-    let validate = gen.body.blocks.len() <= VALIDATE_MAX_BLOCKS;
-    if let Err(e) = if validate {
-        gen.body.validate()
-    } else {
-        Ok(())
-    } {
-        let head = e.to_string();
-        let head = head.lines().next().unwrap_or("");
-        return Ok(Outcome::Skipped(format!("BUG: invalid body ({head})")));
-    }
+    // The design promises reducibility by construction (docs/BASELINE.md
+    // §4): check it, so a violation declines just this script, loudly.
+    // (No explicit `body.validate()`: waffle's backend runs it on every
+    // function anyway, and it is quadratic on long block chains; see
+    // waffle's DOMTREE-TODO.md.)
     if let Err(e) = gen.body.verify_reducible() {
         return Ok(Outcome::Skipped(format!("BUG: irreducible body ({e})")));
     }
