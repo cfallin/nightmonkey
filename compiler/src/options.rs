@@ -210,6 +210,10 @@ pub struct Options {
     /// for a reason other than an allowed one (`ForceInterpreter`). This
     /// is how a test lane proves it ran compiled code (`DESIGN.md` §12).
     pub strict_coverage: bool,
+    /// MIR guard-failure stress mode (`--mir-stress N`): every MIR guard
+    /// also fails on every `N`th guard executed, program-wide, to exercise
+    /// exits on code that would otherwise stay on the fast path. 0 = off.
+    pub mir_stress: u32,
     pub diagnostics: Diagnostics,
     pub instrument: Instrumentation,
 }
@@ -229,6 +233,11 @@ impl Options {
             "--force-interp" => self.force_interp = true,
             "--pipeline" => self.pipeline = arg(flag)?.parse()?,
             "--strict-coverage" => self.strict_coverage = true,
+            "--mir-stress" => {
+                self.mir_stress = arg(flag)?
+                    .parse()
+                    .map_err(|e| format!("--mir-stress: {e}"))?
+            }
             "--stats" => d.stats = true,
             "--dump-opsize" => d.opsize = true,
             "--dump-ctxedge" => d.ctxedge = true,

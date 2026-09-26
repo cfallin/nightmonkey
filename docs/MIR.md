@@ -1086,6 +1086,27 @@ total baseline to exit into.
   derived.
 - Gate: hand-written MIR for small scripts runs correctly, including
   forced exits into baseline.
+- **Done** (`wasm/mir/lower.rs`, with the driver in `wasm/mir/mod.rs`):
+  - **Values.** Each MIR value lowers to one waffle value of its
+    machine type. A managed value (`Val`, `Obj`, `Str`) that is live
+    into a block enters it as a waffle block param, because rooting
+    reloads it into a fresh value on some paths and not others.
+  - **Rooting.** Before a may-GC helper call, the managed values live
+    across it are stored boxed just above the padded formals, and the
+    helper's `top` sits above them. The entry pads the formals with
+    undefined first, so `[sp, top)` is always valid Values.
+  - **Generic ops** always take `ok_dirty` until helpers report
+    cleanliness (M4). That is sound, just conservative.
+  - **Exits** write the whole frame and call the baseline body with
+    `ARGC_RESUME_BIT`. The baseline side of M1 is in `BASELINE.md` §4
+    and §8: an entry fork that routes by the resume word, plus
+    throw-mode landings.
+  - **Two bodies per script.** `Outcome::Compiled` carries the baseline
+    body as an extra body, placed after the adapter block.
+  - The gate ran through M2's builder rather than through hand-written
+    MIR injected into a live script. The fixtures lower to valid Wasm
+    (unit tests), and the jit-test lanes and the stress mode exercise
+    them at runtime.
 
 **M2. JSOps-to-MIR builder** for the M1 subset (locals and args as SSA,
 guard-at-defs, `js.*` fallbacks for arithmetic and compare, and
@@ -1095,6 +1116,40 @@ declines for everything else).
 - Also add a **stress mode** that fails a fraction of guards (or every
   Nth one) at runtime. It exercises exits, throw exits and, later,
   onramps on code the tests would otherwise keep on the fast path.
+- **Done** (`wasm/mir/build.rs`):
+  - **Types.** Every frame slot (`this`, formals, locals, rval, stack)
+    has an abstract type: a raw `I32`, `F64` or `Bool`, or `Val` with a
+    tag set.
+  - **Block entry types** come from a fixpoint. The builder runs over
+    the whole script into a scratch function and records the types
+    reaching every block. Where they are wider than the block's entry
+    types, those widen (`I32 < F64`; anything else joins to `Val` of the
+    union of the tags), and the builder runs again. The run where
+    nothing widens is the result, so the type policy exists once, in
+    the emitting code.
+  - **Guard-at-defs** is applied to formals from `arg_types` at the
+    entry root. A failure exits at pc 0.
+  - **Numeric ops** take the int32 path (overflow-checked, exiting at
+    the op's pc) when both operands are int32, the f64 path when both
+    are numbers, and `js.*` otherwise. Compares follow the same rule.
+  - **Every fallible op** exits at its own pc with the state from before
+    the op. Every `js.*` op's `err` goes to its pc's throw block. Both
+    blocks are shared per pc.
+  - **Loops** get a preheader, and the builder declares them.
+  - **Declined:** global scripts, generators and async functions, class
+    constructors, scripts that read their actuals, scripts with an env
+    chain, and any op outside the subset. That includes
+    `Uninitialized`: MIR has no constant for the TDZ sentinel yet.
+  - **The stress mode** is `--mir-stress N`. Every lowered guard also
+    fails on every `N`th guard executed program-wide (a runtime counter,
+    `night_runtime_mir_stress`).
+  - **Gate met** (2026-09-26):
+    - `--pipeline mir --strict-coverage` passes the full jit-test lane;
+    - so does `--pipeline mir --mir-stress 3`;
+    - a `--dump-tiers` census over every jit-test file counts 3408 MIR
+      script compilations. The leading declines in user code are
+      `GetGName`, `Uninitialized`, reading actuals, `TypeofEq` and
+      string constants.
 
 **M3. Onramps**
 - Declared loops, preheaders `P`, and roots `O`, with the onramp-root

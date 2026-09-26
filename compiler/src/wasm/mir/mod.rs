@@ -59,6 +59,7 @@ pub fn translate_script(
         &mm,
         &f,
         baseline::layout::FrameLayout::of(script),
+        ctx.opts.mir_stress,
     ) {
         Ok(l) => l,
         Err(reason) => return Ok(Err(reason)),

@@ -170,6 +170,7 @@
   NIGHT_RUNTIME_HELPER(night_runtime_set_fun_name)                \
   NIGHT_RUNTIME_HELPER(night_runtime_no_extra_indexed)            \
   NIGHT_RUNTIME_HELPER(night_runtime_gen_is_closing)              \
+  NIGHT_RUNTIME_HELPER(night_runtime_mir_stress)                  \
   NIGHT_RUNTIME_HELPER(night_runtime_regex_ci_compare)
 
 namespace js {

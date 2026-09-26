@@ -10,6 +10,7 @@
 //! BBV bodies and the interpreter call one another freely.
 
 mod codegen;
+pub(crate) use codegen::needs_env;
 pub mod layout;
 
 use crate::bytecode::{JSOp, Script};

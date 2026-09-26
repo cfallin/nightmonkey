@@ -691,6 +691,7 @@ mod tests {
         "night_runtime_set_fun_name",
         "night_runtime_no_extra_indexed",
         "night_runtime_gen_is_closing",
+        "night_runtime_mir_stress",
         "night_runtime_bigint",
         "night_runtime_non_syntactic_global_this",
         "night_runtime_set_intrinsic",

@@ -241,6 +241,7 @@ fn helper_rows() -> Vec<Row> {
         (|h| h.optimize_get_iterator, "optimize_get_iterator", pure()),
         (|h| h.no_extra_indexed, "no_extra_indexed", pure()),
         (|h| h.gen_is_closing, "gen_is_closing", pure()),
+        (|h| h.mir_stress, "mir_stress", pure()),
         (|h| h.super_base, "super_base", pure()),
         (|h| h.super_fun, "super_fun", pure()),
         // engine-state writes without GC or user code

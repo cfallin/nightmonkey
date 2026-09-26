@@ -4158,6 +4158,14 @@ int32_t night_runtime_gen_is_closing(JSContext* cx) {
   return js::night::NightGenIsClosing(cx);
 }
 
+// The MIR guard-failure stress mode (`--mir-stress N`): every guard also
+// calls this, and fails when it returns 1, which it does on every
+// `period`-th call. Leaf.
+int32_t night_runtime_mir_stress(uint32_t period) {
+  static uint32_t count = 0;
+  return period != 0 && ++count % period == 0 ? 1 : 0;
+}
+
 // `FinalYieldRval`: close the completed generator.
 bool night_runtime_gen_final(JSContext* cx, uint32_t top, uint64_t gen) {
   SetNightTop(cx, top);

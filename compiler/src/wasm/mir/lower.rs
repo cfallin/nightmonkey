@@ -34,8 +34,8 @@ use waffle::{
 use crate::mir;
 use crate::mir::func::{Edge, EdgeArg, RootKind};
 use crate::mir::ops::{
-    frame_parts, ArithOp, BitOp, Cc, ConstVal, F64Op, JsBinop, JsCc, JsUnop, NumRepr, Opcode,
-    UnboxKind,
+    frame_parts, ArithOp, BitOp, Cc, ConstVal, F64Op, JsBinop, JsCc, JsUnop, MathFn, NumRepr,
+    Opcode, UnboxKind,
 };
 use crate::mir::types::{Machine, TagSet, Type as MType};
 use crate::opsem::{
@@ -123,6 +123,8 @@ struct Lower<'a> {
     /// padded formals.
     root_base: u32,
     baseline_calls: Vec<Value>,
+    /// The stress mode's period (`Options::mir_stress`); 0 = off.
+    stress: u32,
 }
 
 /// Lower `f` (a function of `mm`, whose baseline frame is `layout`) into a
@@ -133,6 +135,7 @@ pub fn lower(
     _mm: &mir::Module,
     f: &mir::Func,
     layout: FrameLayout,
+    stress: u32,
 ) -> R<Lowered> {
     if layout.rebase_vp {
         return Err("lowering: a script that reads its actuals".into());
@@ -160,6 +163,7 @@ pub fn lower(
         vmap: BTreeMap::new(),
         root_base,
         baseline_calls: vec![],
+        stress,
     };
     l.run()?;
     Ok(Lowered {
@@ -338,6 +342,22 @@ impl<'a> Lower<'a> {
         let fi = self.un(Operator::F64ConvertI32S, low, Type::F64);
         let fd = self.un(Operator::F64ReinterpretI64, v, Type::F64);
         self.select(Type::F64, fi, fd, is_int)
+    }
+
+    /// JS ToInt32 of an f64: its integer part modulo 2^32. `x - trunc(x /
+    /// 2^32) * 2^32` is exact for every finite `x` (scaling by a power of
+    /// two is exact, and the difference fits `x`'s precision), and brings
+    /// it within (-2^32, 2^32), where a saturating i64 truncation and a
+    /// wrap finish the job. NaN and the infinities come out as NaN, which
+    /// truncates to 0, as ToInt32 wants.
+    fn to_int32(&mut self, x: Value) -> Value {
+        let two32 = self.f64c(4294967296f64.to_bits());
+        let q = self.bin(Operator::F64Div, x, two32, Type::F64);
+        let qt = self.un(Operator::F64Trunc, q, Type::F64);
+        let m = self.bin(Operator::F64Mul, qt, two32, Type::F64);
+        let r = self.bin(Operator::F64Sub, x, m, Type::F64);
+        let i = self.un(Operator::I64TruncSatF64S, r, Type::I64);
+        self.un(Operator::I32WrapI64, i, Type::I32)
     }
 
     /// Whether `v`'s tag is in `tags`.
@@ -779,6 +799,18 @@ impl<'a> Lower<'a> {
                 let v = self.bin(o, a[0], a[1], Type::I32);
                 self.def(inst, v);
             }
+            Opcode::Math(MathFn::Abs) => {
+                let v = self.un(Operator::F64Abs, a[0], Type::F64);
+                self.def(inst, v);
+            }
+            Opcode::ToInt32 => {
+                let x = match at(0) {
+                    MType::Int(_) => self.un(Operator::F64ConvertI64S, a[0], Type::F64),
+                    _ => a[0],
+                };
+                let v = self.to_int32(x);
+                self.def(inst, v);
+            }
             Opcode::JsToBool => {
                 // A leaf: no GC, no JS.
                 let tb = self.h.to_boolean;
@@ -915,7 +947,17 @@ impl<'a> Lower<'a> {
     }
 
     /// A fallible check: `ok` to the `ok` edge with `outs`, else `fail`.
+    /// Under the stress mode, it also fails whenever the stress helper
+    /// says so.
     fn guard(&mut self, inst: mir::Inst, ok: Value, outs: &[Value]) -> R<()> {
+        let ok = if self.stress == 0 {
+            ok
+        } else {
+            let n = self.i32c(self.stress);
+            let fail = self.call1(self.h.mir_stress, &[n], Type::I32);
+            let pass = self.un(Operator::I32Eqz, fail, Type::I32);
+            self.bin(Operator::I32And, ok, pass, Type::I32)
+        };
         let t = self.edge(inst, 0, outs)?;
         let f = self.edge(inst, 1, &[])?;
         self.cond_br(ok, t, f);

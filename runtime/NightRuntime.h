@@ -391,6 +391,8 @@ int32_t night_runtime_no_extra_indexed(uint32_t obj);
 // the catch-pad closing split. Leaf.
 NIGHT_RUNTIME_EXPORT(night_runtime_gen_is_closing)
 int32_t night_runtime_gen_is_closing(JSContext* cx);
+NIGHT_RUNTIME_EXPORT(night_runtime_mir_stress)
+int32_t night_runtime_mir_stress(uint32_t period);
 
 // `key in obj` (JSOp::In): boxed boolean to the out-slot; throws when `obj`
 // is not an object. May GC (proxy hooks).

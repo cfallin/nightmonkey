@@ -695,6 +695,9 @@ pub struct Helpers {
     /// `night_runtime_gen_is_closing(cx) -> i32` (leaf): peek-only generator-closing
     /// check (the pending magic is not cleared) for the catch-pad split.
     pub gen_is_closing: Func,
+    /// `night_runtime_mir_stress(period i32) -> i32` (leaf): 1 on every
+    /// `period`-th call, the MIR guard-failure stress mode's trigger.
+    pub mir_stress: Func,
     /// `night_runtime_set_fun_name(cx, top, fun i64, name i64, prefixKind i32) -> ok`:
     /// `JSOp::SetFunName` -- set the inferred name on an anonymous function.
     /// Leaves `fun` on the stack (no out-slot).
@@ -3614,6 +3617,7 @@ mod tests {
         });
         let no_extra_indexed = stub(&mut m, nei_sig, true, "night_runtime_no_extra_indexed");
         let gen_is_closing = stub(&mut m, nei_sig, true, "night_runtime_gen_is_closing");
+        let mir_stress = stub(&mut m, nei_sig, true, "night_runtime_mir_stress");
         // math_unary: (kind i32, x f64) -> f64; math_pow: (x f64, y f64) -> f64.
         let mu_sig = m.signatures.push(SignatureData {
             params: vec![Type::I32, Type::F64],
@@ -3930,6 +3934,7 @@ mod tests {
                 resume,
                 no_extra_indexed,
                 gen_is_closing,
+                mir_stress,
             },
         )
     }
@@ -6236,7 +6241,7 @@ mod tests {
                     nlocals: f.frame.locals,
                     rebase_vp: false,
                 };
-                let lowered = crate::wasm::mir::lower::lower(&mut m, helpers, &mm, f, layout)
+                let lowered = crate::wasm::mir::lower::lower(&mut m, helpers, &mm, f, layout, 3)
                     .unwrap_or_else(|e| panic!("{name}: {e}"));
                 let mut body = lowered.body;
                 // The exits' baseline body: the function itself stands in

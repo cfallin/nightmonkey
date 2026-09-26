@@ -1013,6 +1013,7 @@ pub fn resolve_helpers(
         resume: resolve(m, "night_runtime_resume")?,
         no_extra_indexed: resolve(m, "night_runtime_no_extra_indexed")?,
         gen_is_closing: resolve(m, "night_runtime_gen_is_closing")?,
+        mir_stress: resolve(m, "night_runtime_mir_stress")?,
     })
 }
 

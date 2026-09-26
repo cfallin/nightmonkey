@@ -576,6 +576,14 @@ Deviations from the plan above, and details it did not settle:
   (`tests/jit-test-excludes-baseline.txt`). They are frame-introspection
   and decompiled-message tests that pass in the legacy lane only because
   BBV leaves their eval-using scripts interpreted.
+- **The resume entry (for M1).** `translate_script` takes a MIR body's
+  resume words.
+  - With any, the body gains an `ARGC_RESUME_BIT` fork ahead of the
+    prologue. It routes by the frame's resume word, through the same
+    loop-header dispatch that generator resumes use.
+  - A `continue` word lands on the pc's block; a `throw` word lands on
+    the pc's exception landing, with the exception pending.
+  - A resume word outside the set traps: that is a compiler bug.
 - **Then MIR, revised (§9):**
   - M0b: the small M0 follow-ups of §9 (the `magic` tag, the rval
     operand, declared loops);

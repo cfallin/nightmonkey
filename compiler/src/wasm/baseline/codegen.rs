@@ -2994,7 +2994,7 @@ impl<'a> Gen<'a> {
 /// Whether the body keeps an env chain in its frame: it has env ops, or an
 /// op whose helper reads the chain (direct eval, `EnvCallee`, module and
 /// resource-management ops).
-pub(super) fn needs_env(script: &Script) -> bool {
+pub(crate) fn needs_env(script: &Script) -> bool {
     crate::wasm::translate::uses_env_ops(script)
         || script.parser().opcodes().any(|op| {
             matches!(
