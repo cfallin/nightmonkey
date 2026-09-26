@@ -378,12 +378,21 @@ bool NightEnvSetup(JSContext* cx, void* spPtr, void* scriptPtr, uint64_t* out) {
   }
   JS::Value* frame = reinterpret_cast<JS::Value*>(spPtr);
   RootedFunction callee(cx, &frame[0].toObject().as<JSFunction>());
-  // Named-lambda / extra-body-var environments are gated out at compile time
-  // (translate.rs `env_unsupported`); assert the model holds.
-  MOZ_RELEASE_ASSERT(!callee->needsNamedLambdaEnvironment(),
-                     "AOT env model does not handle named-lambda environments");
+  RootedObject enclosing(cx, callee->environment());
+  // A named lambda that captures its own name gets that binding's
+  // environment first, as js::InitFunctionEnvironmentObjects does. (BBV
+  // gates such functions out at compile time, translate.rs
+  // `env_unsupported`; the baseline tier compiles them.)
+  if (callee->needsNamedLambdaEnvironment()) {
+    NamedLambdaObject* declEnv = NamedLambdaObject::createWithoutEnclosing(
+        cx, callee, gc::Heap::Default);
+    if (!declEnv) {
+      return false;
+    }
+    declEnv->initEnclosingEnvironment(enclosing);
+    enclosing = declEnv;
+  }
   if (callee->needsCallObject()) {
-    RootedObject enclosing(cx, callee->environment());
     RootedScript script(cx, callee->nonLazyScript());
     // createTemplateObject builds the CallObject with the FunctionScope's
     // environment shape (bindings undefined); the callee slot and the aliased
@@ -397,7 +406,7 @@ bool NightEnvSetup(JSContext* cx, void* spPtr, void* scriptPtr, uint64_t* out) {
     callobj->initFixedSlot(CallObject::calleeSlot(), ObjectValue(*callee));
     *out = ObjectValue(*callobj).asRawBits();
   } else {
-    *out = ObjectValue(*callee->environment()).asRawBits();
+    *out = ObjectValue(*enclosing).asRawBits();
   }
   return true;
 }

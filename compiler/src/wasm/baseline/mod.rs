@@ -50,12 +50,16 @@ pub fn translate_script(
         return Ok(Outcome::Skipped(format!("BUG: try notes ({e})")));
     }
     // The generator state saved across a suspend holds locals and
-    // operands, not the actuals or the arguments object.
-    if script.is_generator_or_async && layout::reads_actuals(script) {
-        return Ok(Outcome::Skipped("generator using arguments".into()));
+    // operands, not the actuals or the arguments object: those may be read
+    // only before the first suspend (the frontend reads them in the
+    // prologue and keeps the results in bindings).
+    if script.is_generator_or_async && reads_actuals_after_yield(script) {
+        return Ok(Outcome::Skipped(
+            "generator reads actuals after a yield".into(),
+        ));
     }
-    if crate::wasm::translate::uses_env_ops(script) {
-        if let Some(reason) = crate::wasm::translate::env_unsupported(ctx.source, script) {
+    if codegen::needs_env(script) {
+        if let Some(reason) = env_unsupported(ctx.source, script) {
             return Ok(Outcome::Skipped(reason));
         }
     }
@@ -67,6 +71,17 @@ pub fn translate_script(
     };
     if let Err(e) = gen.run() {
         return Ok(Outcome::Skipped(e));
+    }
+    // One invalid body would fail the whole batch at serialization, and the
+    // design promises reducibility by construction (docs/BASELINE.md §4):
+    // check both here, so a violation declines just this script, loudly.
+    if let Err(e) = gen.body.validate() {
+        let head = e.to_string();
+        let head = head.lines().next().unwrap_or("");
+        return Ok(Outcome::Skipped(format!("BUG: invalid body ({head})")));
+    }
+    if let Err(e) = gen.body.verify_reducible() {
+        return Ok(Outcome::Skipped(format!("BUG: irreducible body ({e})")));
     }
     let body_off_patches = std::mem::take(&mut gen.body_off_patches);
     Ok(Outcome::Compiled {
@@ -84,4 +99,44 @@ pub fn translate_script(
         body_off_patches,
         ctor_nslots_patches: vec![],
     })
+}
+
+/// The env shapes the baseline prologue can build (`NightEnvSetup`): a
+/// Function body (with its optional named-lambda and call objects) or a
+/// Global one.
+fn env_unsupported(source: &crate::source::Source, script: &Script) -> Option<String> {
+    use crate::source::{ScopeData, SourceObject};
+    let bs = script.body_scope?;
+    match source.object(bs) {
+        // ScopeKind::Function == 0, ScopeKind::Global == 12 (vm/Scope.h).
+        SourceObject::Scope(ScopeData { kind: 0 | 12, .. }) => None,
+        SourceObject::Scope(ScopeData { kind, .. }) => {
+            Some(format!("env under body scope kind {kind}"))
+        }
+        _ => Some("body scope is not a Scope".into()),
+    }
+}
+
+/// Whether any op reading the frame's actuals or arguments object follows
+/// (in bytecode order) the first suspend point.
+fn reads_actuals_after_yield(script: &Script) -> bool {
+    let mut yielded = false;
+    let mut p = script.parser();
+    while let Some(op) = p.next_op() {
+        match op {
+            JSOp::InitialYield | JSOp::Yield | JSOp::Await => yielded = true,
+            JSOp::Arguments | JSOp::Rest | JSOp::GetActualArg | JSOp::ArgumentsLength
+                if yielded =>
+            {
+                return true;
+            }
+            JSOp::GetArg | JSOp::SetArg if yielded && script.has_mapped_args => return true,
+            _ => {}
+        }
+        let imm = usize::try_from(op.len()).unwrap() - 1;
+        if imm > 0 && p.advance(imm).is_none() {
+            break;
+        }
+    }
+    false
 }

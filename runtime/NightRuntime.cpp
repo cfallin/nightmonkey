@@ -54,11 +54,13 @@
 #include "runtime/NightInlineCaches.h"  // js::night::NightPopulate* (IC populate)
 #include "runtime/NightInlineHeap.h"  // js::night::NightAllocCell, the barriers
 #include "runtime/NightOps.h"  // js::night::Night* (bytecode-op engine half)
+#include "runtime/NightOpsInterp.h"  // js::night::NightDirectEval (baseline)
 #include "runtime/NightRegionShape.h"   // Night_* region shape constants
 #include "runtime/NightRegistration.h"  // js::night::gNightActivated
 #include "runtime/NightRuntimeData.h"  // js::night::NightRuntimeData (regex table)
 #include "runtime/NightRuntimeSlots.h"  // js::night::NightGet/SetHomeObject (isolated -inl TU)
 #include "runtime/NightStack.h"
+#include "builtin/ModuleObject.h"  // js::StartDynamicModuleImport (baseline)
 #include "vm/ArgumentsObject.h"     // js::MappedArgumentsObject, Unmapped
 #include "vm/ArrayBufferObject.h"   // js::ArrayBufferObject::byteLength
 #include "vm/ArrayObject.h"         // js::ArrayObject
@@ -70,6 +72,8 @@
 #include "vm/FunctionPrefixKind.h"  // js::FunctionPrefixKind (JSOp::SetFunName)
 #include "vm/GlobalObject.h"        // GlobalObject::lexicalEnvironment
 #include "vm/Interpreter.h"         // js::AddValues, SubValues, LessThan, ...
+#include "vm/GeneratorObject.h"  // js::ResumeKindToAtom (JSOp::Resume)
+#include "vm/SelfHosting.h"      // js::CallSelfHostedFunction (JSOp::Resume)
 #include "vm/Iteration.h"    // js::ValueToIterator, IteratorMore, CloseIterator
 #include "vm/JSAtomState.h"  // JSAtomState (cx->names())
 #include "vm/JSAtomUtils.h"  // js::AtomizeChars (selfhosted patch arming)
@@ -5775,4 +5779,230 @@ void js::night::NightAddPropCheck(JSObject* obj, JS::PropertyKey id,
   if (clear) {
     js::night::NightClearSlotsBit(obj, js::night::NightBumpSite::SlotsAddMismatch4);
   }
+}
+
+
+// --- baseline-tier helpers -------------------------------------------------
+//
+// The ops no other lowering needed a helper for (docs/BASELINE.md §6). Each
+// is the interpreter's case for the op, with the frame state it reads from
+// `REGS` passed in: the env chain, the script, and the pc offset.
+
+static jsbytecode* NightPcOf(JSScript* script, uint32_t pcOffset) {
+  return script->offsetToPC(pcOffset);
+}
+
+// `BigInt`: the script's BigInt literal at `gcthingIndex`.
+bool night_runtime_bigint(JSContext* cx, uint32_t top, uint32_t script,
+                          uint32_t gcthingIndex) {
+  SetNightTop(cx, top);
+  JSScript* s = LinMem<JSScript>(script);
+  WriteNightOut(
+      top,
+      JS::BigIntValue(s->getBigInt(js::GCThingIndex(gcthingIndex))).asRawBits());
+  return true;
+}
+
+// `NonSyntacticGlobalThis`.
+bool night_runtime_non_syntactic_global_this(JSContext* cx, uint32_t top,
+                                             uint64_t env) {
+  SetNightTop(cx, top);
+  JS::RootedObject envChain(cx, &JS::Value::fromRawBits(env).toObject());
+  JS::RootedValue res(cx);
+  js::GetNonSyntacticGlobalThis(cx, envChain, &res);
+  WriteNightOut(top, res.get().asRawBits());
+  return true;
+}
+
+// `SetIntrinsic` (self-hosted code only).
+bool night_runtime_set_intrinsic(JSContext* cx, uint32_t top, uint32_t script,
+                                 uint32_t pcOffset, uint64_t val) {
+  SetNightTop(cx, top);
+  JSScript* s = LinMem<JSScript>(script);
+  JS::RootedValue v(cx, JS::Value::fromRawBits(val));
+  return js::SetIntrinsicOperation(cx, s, NightPcOf(s, pcOffset), v);
+}
+
+// `EnvCallee`: the callee of the CallObject `hops` up the env chain. Leaf.
+uint64_t night_runtime_env_callee(JSContext* cx, uint64_t env, uint32_t hops) {
+  (void)cx;
+  JSObject* e = &JS::Value::fromRawBits(env).toObject();
+  for (uint32_t i = 0; i < hops; i++) {
+    e = &e->as<js::EnvironmentObject>().enclosingEnvironment();
+  }
+  return JS::ObjectValue(e->as<js::CallObject>().callee()).asRawBits();
+}
+
+// `Eval`/`StrictEval`: `[callee, this, args...]` at `sp`. A direct eval when
+// the callee is this realm's `eval`, run against the frame's env chain; any
+// other callee is an ordinary call.
+bool night_runtime_eval(JSContext* cx, uint32_t top, uint32_t sp,
+                        uint32_t argc, uint64_t env, uint32_t script,
+                        uint32_t pcOffset) {
+  SetNightTop(cx, top);
+  JS::Value* frame = LinMem<JS::Value>(sp);
+  if (!cx->global()->valueIsEval(frame[0])) {
+    return night_runtime_call(cx, top, sp, argc);
+  }
+  JS::RootedValue arg(cx, argc > 0 ? frame[2] : JS::UndefinedValue());
+  JS::RootedObject envChain(cx, &JS::Value::fromRawBits(env).toObject());
+  JS::RootedScript s(cx, LinMem<JSScript>(script));
+  JS::RootedValue res(cx);
+  if (!js::night::NightDirectEval(cx, arg, envChain, s,
+                                  NightPcOf(s, pcOffset), &res)) {
+    return false;
+  }
+  WriteNightOut(top, res.get().asRawBits());
+  return true;
+}
+
+// `SpreadEval`/`StrictSpreadEval`: `[callee, this, args array]`. A direct
+// eval of the array's first element when the callee is `eval`, else an
+// ordinary spread call.
+bool night_runtime_spread_eval(JSContext* cx, uint32_t top, uint64_t callee,
+                               uint64_t thisv, uint64_t arr, uint64_t env,
+                               uint32_t script, uint32_t pcOffset) {
+  SetNightTop(cx, top);
+  if (!cx->global()->valueIsEval(JS::Value::fromRawBits(callee))) {
+    return night_runtime_spread_call(cx, top, callee, thisv, arr,
+                                     JS::NullValue().asRawBits(), 0);
+  }
+  JS::RootedObject arrObj(cx, &JS::Value::fromRawBits(arr).toObject());
+  JS::RootedValue arg(cx);
+  if (!JS_GetElement(cx, arrObj, 0, &arg)) {
+    return false;
+  }
+  JS::RootedObject envChain(cx, &JS::Value::fromRawBits(env).toObject());
+  JS::RootedScript s(cx, LinMem<JSScript>(script));
+  JS::RootedValue res(cx);
+  if (!js::night::NightDirectEval(cx, arg, envChain, s,
+                                  NightPcOf(s, pcOffset), &res)) {
+    return false;
+  }
+  WriteNightOut(top, res.get().asRawBits());
+  return true;
+}
+
+// `DynamicImport`: `[specifier, options] -> [promise]`.
+bool night_runtime_dynamic_import(JSContext* cx, uint32_t top, uint32_t script,
+                                  uint64_t specifier, uint64_t options) {
+  SetNightTop(cx, top);
+  JS::RootedScript s(cx, LinMem<JSScript>(script));
+  JS::RootedValue spec(cx, JS::Value::fromRawBits(specifier));
+  JS::RootedValue opts(cx, JS::Value::fromRawBits(options));
+  JSObject* promise = js::StartDynamicModuleImport(cx, s, spec, opts);
+  if (!promise) {
+    return false;
+  }
+  WriteNightOut(top, JS::ObjectValue(*promise).asRawBits());
+  return true;
+}
+
+// `ImportMeta`.
+bool night_runtime_import_meta(JSContext* cx, uint32_t top, uint32_t script) {
+  SetNightTop(cx, top);
+  JS::RootedScript s(cx, LinMem<JSScript>(script));
+  JSObject* meta = js::ImportMetaOperation(cx, s);
+  if (!meta) {
+    return false;
+  }
+  WriteNightOut(top, JS::ObjectValue(*meta).asRawBits());
+  return true;
+}
+
+// `GetImport`.
+bool night_runtime_get_import(JSContext* cx, uint32_t top, uint64_t env,
+                              uint32_t script, uint32_t pcOffset) {
+  SetNightTop(cx, top);
+  JS::RootedObject envChain(cx, &JS::Value::fromRawBits(env).toObject());
+  JS::RootedScript s(cx, LinMem<JSScript>(script));
+  JS::RootedValue res(cx);
+  if (!js::GetImportOperation(cx, envChain, s, NightPcOf(s, pcOffset), &res)) {
+    return false;
+  }
+  WriteNightOut(top, res.get().asRawBits());
+  return true;
+}
+
+// The explicit-resource-management ops exist only when the engine enables
+// the proposal; without it the helpers are unreachable but still exported,
+// so the helper table is the same either way.
+
+// `AddDisposable`: `[val, method, needsClosure] ->`.
+bool night_runtime_add_disposable(JSContext* cx, uint32_t top, uint64_t env,
+                                  uint64_t val, uint64_t method,
+                                  uint64_t needsClosure, uint32_t hint) {
+  SetNightTop(cx, top);
+#ifndef ENABLE_EXPLICIT_RESOURCE_MANAGEMENT
+  MOZ_CRASH("AddDisposable without explicit resource management");
+#else
+  JS::RootedObject envObj(cx, &JS::Value::fromRawBits(env).toObject());
+  JS::RootedValue v(cx, JS::Value::fromRawBits(val));
+  JS::RootedValue m(cx, JS::Value::fromRawBits(method));
+  return js::AddDisposableResourceToCapability(
+      cx, envObj, v, m, JS::Value::fromRawBits(needsClosure).toBoolean(),
+      js::UsingHint(uint8_t(hint)));
+#endif
+}
+
+// `TakeDisposeCapability`: `-> [disposables or undefined]`.
+bool night_runtime_take_dispose_capability(JSContext* cx, uint32_t top,
+                                           uint64_t env) {
+  SetNightTop(cx, top);
+#ifndef ENABLE_EXPLICIT_RESOURCE_MANAGEMENT
+  MOZ_CRASH("TakeDisposeCapability without explicit resource management");
+#else
+  JSObject* envObj = &JS::Value::fromRawBits(env).toObject();
+  auto& denv = envObj->as<js::DisposableEnvironmentObject>();
+  JS::Value maybe = denv.getDisposables();
+  if (maybe.isUndefined()) {
+    WriteNightOut(top, JS::UndefinedValue().asRawBits());
+  } else {
+    WriteNightOut(top, JS::ObjectValue(maybe.toObject()).asRawBits());
+    denv.clearDisposables();
+  }
+  return true;
+#endif
+}
+
+// `CreateSuppressedError`: `[error, suppressed] -> [SuppressedError]`.
+bool night_runtime_create_suppressed_error(JSContext* cx, uint32_t top,
+                                           uint64_t error,
+                                           uint64_t suppressed) {
+  SetNightTop(cx, top);
+#ifndef ENABLE_EXPLICIT_RESOURCE_MANAGEMENT
+  MOZ_CRASH("CreateSuppressedError without explicit resource management");
+#else
+  JS::RootedValue e(cx, JS::Value::fromRawBits(error));
+  JS::RootedValue sup(cx, JS::Value::fromRawBits(suppressed));
+  js::ErrorObject* obj = js::CreateSuppressedError(cx, e, sup);
+  if (!obj) {
+    return false;
+  }
+  WriteNightOut(top, JS::ObjectValue(*obj).asRawBits());
+  return true;
+#endif
+}
+
+// `Resume`: `[gen, val, kind] -> [result]`, the way the JITs do it
+// (jit::InterpretResume): through the self-hosted InterpretGeneratorResume,
+// which runs in the interpreter (it is ForceInterpreter) and whose own
+// `Resume` re-enters a NightMonkey generator through the resume hook.
+bool night_runtime_resume(JSContext* cx, uint32_t top, uint64_t gen,
+                          uint64_t val, uint64_t kind) {
+  SetNightTop(cx, top);
+  js::GeneratorResumeKind rk =
+      js::IntToResumeKind(JS::Value::fromRawBits(kind).toInt32());
+  JSAtom* kindAtom = js::ResumeKindToAtom(cx, rk);
+  js::FixedInvokeArgs<3> args(cx);
+  args[0].set(JS::Value::fromRawBits(gen));
+  args[1].set(JS::Value::fromRawBits(val));
+  args[2].setString(kindAtom);
+  JS::RootedValue res(cx);
+  if (!js::CallSelfHostedFunction(cx, cx->names().InterpretGeneratorResume,
+                                  JS::UndefinedHandleValue, args, &res)) {
+    return false;
+  }
+  WriteNightOut(top, res.get().asRawBits());
+  return true;
 }

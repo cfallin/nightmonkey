@@ -870,6 +870,49 @@ NIGHT_RUNTIME_EXPORT(night_runtime_regex_ci_compare)
 int32_t night_runtime_regex_ci_compare(uint32_t a_ptr, uint32_t b_ptr,
                                        uint32_t byte_len, uint32_t unicode);
 
+// Baseline-tier helpers (docs/BASELINE.md §6): the interpreter's cases for
+// the ops no other lowering covers, with the frame state passed in.
+NIGHT_RUNTIME_EXPORT(night_runtime_bigint)
+bool night_runtime_bigint(JSContext* cx, uint32_t top, uint32_t script,
+                          uint32_t gcthingIndex);
+NIGHT_RUNTIME_EXPORT(night_runtime_non_syntactic_global_this)
+bool night_runtime_non_syntactic_global_this(JSContext* cx, uint32_t top,
+                                             uint64_t env);
+NIGHT_RUNTIME_EXPORT(night_runtime_set_intrinsic)
+bool night_runtime_set_intrinsic(JSContext* cx, uint32_t top, uint32_t script,
+                                 uint32_t pcOffset, uint64_t val);
+NIGHT_RUNTIME_EXPORT(night_runtime_env_callee)
+uint64_t night_runtime_env_callee(JSContext* cx, uint64_t env, uint32_t hops);
+NIGHT_RUNTIME_EXPORT(night_runtime_eval)
+bool night_runtime_eval(JSContext* cx, uint32_t top, uint32_t sp,
+                        uint32_t argc, uint64_t env, uint32_t script,
+                        uint32_t pcOffset);
+NIGHT_RUNTIME_EXPORT(night_runtime_spread_eval)
+bool night_runtime_spread_eval(JSContext* cx, uint32_t top, uint64_t callee,
+                               uint64_t thisv, uint64_t arr, uint64_t env,
+                               uint32_t script, uint32_t pcOffset);
+NIGHT_RUNTIME_EXPORT(night_runtime_dynamic_import)
+bool night_runtime_dynamic_import(JSContext* cx, uint32_t top, uint32_t script,
+                                  uint64_t specifier, uint64_t options);
+NIGHT_RUNTIME_EXPORT(night_runtime_import_meta)
+bool night_runtime_import_meta(JSContext* cx, uint32_t top, uint32_t script);
+NIGHT_RUNTIME_EXPORT(night_runtime_get_import)
+bool night_runtime_get_import(JSContext* cx, uint32_t top, uint64_t env,
+                              uint32_t script, uint32_t pcOffset);
+NIGHT_RUNTIME_EXPORT(night_runtime_add_disposable)
+bool night_runtime_add_disposable(JSContext* cx, uint32_t top, uint64_t env,
+                                  uint64_t val, uint64_t method,
+                                  uint64_t needsClosure, uint32_t hint);
+NIGHT_RUNTIME_EXPORT(night_runtime_take_dispose_capability)
+bool night_runtime_take_dispose_capability(JSContext* cx, uint32_t top,
+                                           uint64_t env);
+NIGHT_RUNTIME_EXPORT(night_runtime_create_suppressed_error)
+bool night_runtime_create_suppressed_error(JSContext* cx, uint32_t top,
+                                           uint64_t error, uint64_t suppressed);
+NIGHT_RUNTIME_EXPORT(night_runtime_resume)
+bool night_runtime_resume(JSContext* cx, uint32_t top, uint64_t gen,
+                          uint64_t val, uint64_t kind);
+
 }  // extern "C"
 
 #endif  // night_runtime_NightRuntime_h

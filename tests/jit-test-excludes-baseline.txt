@@ -1,0 +1,25 @@
+# jit-tests excluded only when the baseline tier compiles scripts
+# (NIGHT_OPTIONS selecting `--pipeline baseline` or `--pipeline mir`), on top
+# of jit-test-excludes.txt. They exercise the same designed-out capability
+# as that list's frame-introspection and decompiled-message classes, and
+# pass in the legacy lane only because legacy BBV declines their scripts
+# (they use eval), which leaves the frames interpreted. The baseline tier
+# compiles every script except ForceInterpreter ones, so here their frames
+# are compiled frames, which frame introspection cannot see.
+
+# evalInFrame / Debugger.Frame on a compiled frame.
+baseline/bug1024444.js
+basic/bug646968-7.js
+basic/bug646968-8.js
+debug/Frame-onStack-01.js
+jaeger/bug563000/eif-call-newvar.js
+saved-stacks/caching-and-ccws.js
+# `fun.arguments` of an active compiled frame reads as null.
+basic/testBug668479.js
+# Decompiled operand names in error messages.
+heap-analysis/shortestPaths.js
+# Indirect eval / Function() find their introducing script by walking to
+# the scripted caller frame, so a relative import() in that code has no
+# referencing script.
+modules/dynamic-import-module.js
+modules/dynamic-import-script.js

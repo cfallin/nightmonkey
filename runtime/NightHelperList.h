@@ -136,6 +136,19 @@
   NIGHT_RUNTIME_HELPER(night_runtime_spread_call)                 \
   NIGHT_RUNTIME_HELPER(night_runtime_optimize_spread_call)        \
   NIGHT_RUNTIME_HELPER(night_runtime_object)                      \
+  NIGHT_RUNTIME_HELPER(night_runtime_bigint)                      \
+  NIGHT_RUNTIME_HELPER(night_runtime_non_syntactic_global_this)   \
+  NIGHT_RUNTIME_HELPER(night_runtime_set_intrinsic)               \
+  NIGHT_RUNTIME_HELPER(night_runtime_env_callee)                  \
+  NIGHT_RUNTIME_HELPER(night_runtime_eval)                        \
+  NIGHT_RUNTIME_HELPER(night_runtime_spread_eval)                 \
+  NIGHT_RUNTIME_HELPER(night_runtime_dynamic_import)              \
+  NIGHT_RUNTIME_HELPER(night_runtime_import_meta)                 \
+  NIGHT_RUNTIME_HELPER(night_runtime_get_import)                  \
+  NIGHT_RUNTIME_HELPER(night_runtime_add_disposable)              \
+  NIGHT_RUNTIME_HELPER(night_runtime_take_dispose_capability)     \
+  NIGHT_RUNTIME_HELPER(night_runtime_create_suppressed_error)     \
+  NIGHT_RUNTIME_HELPER(night_runtime_resume)                      \
   NIGHT_RUNTIME_HELPER(night_runtime_post_write_barrier)          \
   NIGHT_RUNTIME_HELPER(night_runtime_post_write_barrier_elem)     \
   NIGHT_RUNTIME_HELPER(night_runtime_pre_write_barrier)           \

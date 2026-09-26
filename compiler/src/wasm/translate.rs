@@ -699,6 +699,34 @@ pub struct Helpers {
     /// `JSOp::SetFunName` -- set the inferred name on an anonymous function.
     /// Leaves `fun` on the stack (no out-slot).
     pub set_fun_name: Func,
+    // Baseline-tier helpers (docs/BASELINE.md §6).
+    /// `(cx, top, script, gcthingIndex) -> ok`; the BigInt literal.
+    pub bigint: Func,
+    /// `(cx, top, env i64) -> ok`.
+    pub non_syntactic_global_this: Func,
+    /// `(cx, top, script, pcOffset, val i64) -> ok`.
+    pub set_intrinsic: Func,
+    /// Leaf `(cx, env i64, hops) -> callee i64`.
+    pub env_callee: Func,
+    /// `(cx, top, sp, argc, env i64, script, pcOffset) -> ok`: direct eval
+    /// when the callee is `eval`, else an ordinary call.
+    pub eval: Func,
+    /// `(cx, top, callee, this, arr, env i64, script, pcOffset) -> ok`.
+    pub spread_eval: Func,
+    /// `(cx, top, script, specifier i64, options i64) -> ok`.
+    pub dynamic_import: Func,
+    /// `(cx, top, script) -> ok`.
+    pub import_meta: Func,
+    /// `(cx, top, env i64, script, pcOffset) -> ok`.
+    pub get_import: Func,
+    /// `(cx, top, env i64, val, method, needsClosure, hint) -> ok`.
+    pub add_disposable: Func,
+    /// `(cx, top, env i64) -> ok`.
+    pub take_dispose_capability: Func,
+    /// `(cx, top, error i64, suppressed i64) -> ok`.
+    pub create_suppressed_error: Func,
+    /// `(cx, top, gen i64, val i64, kind i64) -> ok`: `JSOp::Resume`.
+    pub resume: Func,
 }
 
 /// A monotonically-incrementing dense-index allocator: `next()` claims the next
@@ -3499,6 +3527,43 @@ mod tests {
         // set_fun_name: (cx, top, fun i64, name i64, prefixKind i32) -> ok
         // (= iof_sig shape).
         let set_fun_name = stub(&mut m, iof_sig, true, "night_runtime_set_fun_name");
+        // Baseline-tier helpers, with their real signatures (the module
+        // must validate the calls baseline bodies make).
+        let sig = |m: &mut Module, params: &[Type], ret: Type| {
+            m.signatures.push(SignatureData {
+                params: params.to_vec(),
+                returns: vec![ret],
+            })
+        };
+        use Type::{I32 as W, I64 as J};
+        let s = sig(&mut m, &[W, W, W, W], W);
+        let bigint = stub(&mut m, s, true, "night_runtime_bigint");
+        let s = sig(&mut m, &[W, W, J], W);
+        let non_syntactic_global_this =
+            stub(&mut m, s, true, "night_runtime_non_syntactic_global_this");
+        let take_dispose_capability =
+            stub(&mut m, s, true, "night_runtime_take_dispose_capability");
+        let s = sig(&mut m, &[W, W, W, W, J], W);
+        let set_intrinsic = stub(&mut m, s, true, "night_runtime_set_intrinsic");
+        let s = sig(&mut m, &[W, J, W], J);
+        let env_callee = stub_i64(&mut m, s, "night_runtime_env_callee");
+        let s = sig(&mut m, &[W, W, W, W, J, W, W], W);
+        let eval = stub(&mut m, s, true, "night_runtime_eval");
+        let s = sig(&mut m, &[W, W, J, J, J, J, W, W], W);
+        let spread_eval = stub(&mut m, s, true, "night_runtime_spread_eval");
+        let s = sig(&mut m, &[W, W, W, J, J], W);
+        let dynamic_import = stub(&mut m, s, true, "night_runtime_dynamic_import");
+        let s = sig(&mut m, &[W, W, W], W);
+        let import_meta = stub(&mut m, s, true, "night_runtime_import_meta");
+        let s = sig(&mut m, &[W, W, J, W, W], W);
+        let get_import = stub(&mut m, s, true, "night_runtime_get_import");
+        let s = sig(&mut m, &[W, W, J, J, J, J, W], W);
+        let add_disposable = stub(&mut m, s, true, "night_runtime_add_disposable");
+        let s = sig(&mut m, &[W, W, J, J], W);
+        let create_suppressed_error =
+            stub(&mut m, s, true, "night_runtime_create_suppressed_error");
+        let s = sig(&mut m, &[W, W, J, J, J], W);
+        let resume = stub(&mut m, s, true, "night_runtime_resume");
         // fun_with_proto: (cx, top, env i64, proto i64, script i32, funcIndex i32)
         // -> ok.
         let fwp_sig = m.signatures.push(SignatureData {
@@ -3821,6 +3886,19 @@ mod tests {
                 obj_with_proto,
                 fun_with_proto,
                 set_fun_name,
+                bigint,
+                non_syntactic_global_this,
+                set_intrinsic,
+                env_callee,
+                eval,
+                spread_eval,
+                dynamic_import,
+                import_meta,
+                get_import,
+                add_disposable,
+                take_dispose_capability,
+                create_suppressed_error,
+                resume,
                 no_extra_indexed,
                 gen_is_closing,
             },

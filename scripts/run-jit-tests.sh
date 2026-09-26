@@ -6,7 +6,9 @@
 # Both lanes skip tests/wasi-jit-test-excludes.txt (tests the wasm32-wasi
 # shell cannot run at all). The AOT lane (default) compiles every test
 # in-process and also skips tests/jit-test-excludes.txt; NIGHT_INPROCESS_OFF=1
-# runs the same shell with the tier off (the baseline lane).
+# runs the same shell with the tier off (the interpreter-only lane).
+# NIGHT_OPTIONS passes compiler flags; with `--pipeline baseline` or `mir` the
+# lane also skips tests/jit-test-excludes-baseline.txt.
 set -euo pipefail
 
 if [ $# -lt 1 ]; then
@@ -31,6 +33,11 @@ trap 'rm -f "$combined"' EXIT
 cat "$here/tests/wasi-jit-test-excludes.txt" > "$combined"
 if [ "${NIGHT_INPROCESS_OFF:-0}" != 1 ]; then
   cat "$here/tests/jit-test-excludes.txt" >> "$combined"
+  # The baseline-tier lane: see tests/jit-test-excludes-baseline.txt.
+  case " ${NIGHT_OPTIONS:-} " in
+    *" --pipeline baseline "* | *" --pipeline mir "*)
+      cat "$here/tests/jit-test-excludes-baseline.txt" >> "$combined" ;;
+  esac
 fi
 
 python3 "$firefox/js/src/jit-test/jit_test.py" \

@@ -118,7 +118,7 @@ impl<'a> Gen<'a> {
         depths: StackDepths,
     ) -> R<Gen<'a>> {
         let layout = FrameLayout::of(script);
-        let needs_env = crate::wasm::translate::uses_env_ops(script);
+        let needs_env = needs_env(script);
         let frame_top = layout.top(depths.max + 3);
         if frame_top > MAX_FRAME_BYTES {
             return Err(format!("frame too large ({frame_top} bytes)"));
@@ -705,17 +705,32 @@ impl<'a> Gen<'a> {
         let Some(bs) = self.script.body_scope else {
             return false;
         };
-        matches!(
-            self.ctx.source.object(bs),
-            SourceObject::Scope(ScopeData {
-                kind: 0,
-                has_environment: false,
-                ..
-            })
-        )
+        let SourceObject::Scope(ScopeData {
+            kind: 0,
+            has_environment: false,
+            enclosing,
+            ..
+        }) = self.ctx.source.object(bs)
+        else {
+            return false;
+        };
+        // A named lambda's own-name environment is built by the setup.
+        !enclosing.is_some_and(|e| {
+            matches!(
+                self.ctx.source.object(e),
+                SourceObject::Scope(ScopeData {
+                    is_named_lambda: true,
+                    has_environment: true,
+                    ..
+                })
+            )
+        })
     }
 
-    fn prologue(&mut self) {
+    /// `argc` without its flag bits, and `vp`. Emitted in the entry block,
+    /// ahead of any fork, so every path (fresh call or resume) sees them. A
+    /// generator resume passes `argc = 0`, so its `vp` is `sp`.
+    fn frame_regs(&mut self) {
         let nargs = u32::from(self.script.nargs);
         let flags = self.i32c(!ARGC_FLAGS);
         self.argc = self.binop(Operator::I32And, self.argc, flags, Type::I32);
@@ -729,6 +744,10 @@ impl<'a> Gen<'a> {
             let bytes = self.binop(Operator::I32Mul, extra, eight, Type::I32);
             self.vp = self.binop(Operator::I32Add, self.sp, bytes, Type::I32);
         }
+    }
+
+    fn prologue(&mut self) {
+        let nargs = u32::from(self.script.nargs);
         // Formals the caller did not pass read as undefined.
         let undef = self.i64c(UNDEF);
         for i in 0..nargs {
@@ -785,6 +804,7 @@ impl<'a> Gen<'a> {
             .map(|(h, e)| (Pc::new(h), Pc::new(e)))
             .collect();
         self.loops.sort();
+        self.frame_regs();
         if self.is_gen {
             self.scan_resumes()?;
             // Fresh call or resume: a resume stages the generator-closing
@@ -1328,6 +1348,7 @@ impl<'a> Gen<'a> {
                 self.set_env(r);
             }
             FreshenLexicalEnv | RecreateLexicalEnv => {
+                skip(p, op);
                 let f = if op == FreshenLexicalEnv {
                     h.freshen_lexical_env
                 } else {
@@ -1965,23 +1986,105 @@ impl<'a> Gen<'a> {
                 self.set_slot(d - 2, r);
             }
 
-            // Not yet: the ops no helper covers yet (B4).
-            BigInt
-            | NonSyntacticGlobalThis
-            | SetIntrinsic
-            | EnvCallee
-            | Eval
-            | SpreadEval
-            | StrictEval
-            | StrictSpreadEval
-            | DynamicImport
-            | ImportMeta
-            | GetImport
-            | AddDisposable
-            | TakeDisposeCapability
-            | CreateSuppressedError
-            | Resume => {
-                return Err(format!("unsupported op {op:?}"));
+            // --- the rest (docs/BASELINE.md §6) ---
+            BigInt => {
+                let idx = p.next_uint32().unwrap();
+                let script = self.script_ptr();
+                let iv = self.i32c(idx);
+                let r = self.rt(h.bigint, &[script, iv]);
+                self.set_slot(d, r);
+            }
+            NonSyntacticGlobalThis => {
+                let env = self.env();
+                let r = self.rt(h.non_syntactic_global_this, &[env]);
+                self.set_slot(d, r);
+            }
+            SetIntrinsic => {
+                skip(p, op);
+                let script = self.script_ptr();
+                let pcv = self.i32c(self.pc.get());
+                let v = self.slot(d - 1);
+                self.rt(h.set_intrinsic, &[script, pcv, v]);
+            }
+            EnvCallee => {
+                let hops = match op.len() {
+                    2 => u32::from(p.next_uint8().unwrap()),
+                    _ => u32::from(p.next_uint16().unwrap()),
+                };
+                let env = self.env();
+                let hv = self.i32c(hops);
+                let r = self
+                    .call(h.env_callee, &[self.cx, env, hv], Some(Type::I64))
+                    .unwrap();
+                self.set_slot(d, r);
+            }
+            Eval | StrictEval => {
+                let argc = u32::from(p.next_uint16().unwrap());
+                let need = argc + 2;
+                let base = self.top_addr(d - need);
+                let av = self.i32c(argc);
+                let env = self.env();
+                let script = self.script_ptr();
+                let pcv = self.i32c(self.pc.get());
+                let r = self.rt(h.eval, &[base, av, env, script, pcv]);
+                self.set_slot(d - need, r);
+            }
+            SpreadEval | StrictSpreadEval => {
+                let callee = self.slot(d - 3);
+                let thisv = self.slot(d - 2);
+                let arr = self.slot(d - 1);
+                let env = self.env();
+                let script = self.script_ptr();
+                let pcv = self.i32c(self.pc.get());
+                let r = self.rt(h.spread_eval, &[callee, thisv, arr, env, script, pcv]);
+                self.set_slot(d - 3, r);
+            }
+            DynamicImport => {
+                let spec = self.slot(d - 2);
+                let opts = self.slot(d - 1);
+                let script = self.script_ptr();
+                let r = self.rt(h.dynamic_import, &[script, spec, opts]);
+                self.set_slot(d - 2, r);
+            }
+            ImportMeta => {
+                let script = self.script_ptr();
+                let r = self.rt(h.import_meta, &[script]);
+                self.set_slot(d, r);
+            }
+            GetImport => {
+                skip(p, op);
+                let env = self.env();
+                let script = self.script_ptr();
+                let pcv = self.i32c(self.pc.get());
+                let r = self.rt(h.get_import, &[env, script, pcv]);
+                self.set_slot(d, r);
+            }
+            AddDisposable => {
+                let hint = p.next_uint8().unwrap();
+                let env = self.env();
+                let v = self.slot(d - 3);
+                let method = self.slot(d - 2);
+                let nc = self.slot(d - 1);
+                let hv = self.i32c(u32::from(hint));
+                self.rt(h.add_disposable, &[env, v, method, nc, hv]);
+            }
+            TakeDisposeCapability => {
+                let env = self.env();
+                let r = self.rt(h.take_dispose_capability, &[env]);
+                self.set_slot(d, r);
+            }
+            CreateSuppressedError => {
+                let e = self.slot(d - 2);
+                let sup = self.slot(d - 1);
+                let r = self.rt(h.create_suppressed_error, &[e, sup]);
+                self.set_slot(d - 2, r);
+            }
+            Resume => {
+                let g = self.slot(d - 3);
+                let v = self.slot(d - 2);
+                let k = self.slot(d - 1);
+                let r = self.rt(h.resume, &[g, v, k]);
+                self.set_slot(d - 3, r);
             }
             ForceInterpreter => return Err(super::FORCE_INTERPRETER.into()),
         }
@@ -2258,6 +2361,27 @@ impl<'a> Gen<'a> {
         });
         Ok(())
     }
+}
+
+/// Whether the body keeps an env chain in its frame: it has env ops, or an
+/// op whose helper reads the chain (direct eval, `EnvCallee`, module and
+/// resource-management ops).
+pub(super) fn needs_env(script: &Script) -> bool {
+    crate::wasm::translate::uses_env_ops(script)
+        || script.parser().opcodes().any(|op| {
+            matches!(
+                op,
+                JSOp::Eval
+                    | JSOp::StrictEval
+                    | JSOp::SpreadEval
+                    | JSOp::StrictSpreadEval
+                    | JSOp::NonSyntacticGlobalThis
+                    | JSOp::EnvCallee
+                    | JSOp::GetImport
+                    | JSOp::AddDisposable
+                    | JSOp::TakeDisposeCapability
+            )
+        })
 }
 
 fn skip(p: &mut BytecodeParser, op: JSOp) {

@@ -36,6 +36,14 @@ bool NightSetNameOperation(JSContext* cx, JS::HandleObject env,
                            JS::Handle<JS::PropertyKey> id, JS::HandleValue val,
                            bool strict);
 
+// Direct eval of `v` in the frame whose env chain is `env`, running
+// `script` at `pc` (an Eval/StrictEval/SpreadEval/StrictSpreadEval op): the
+// interpreter's EvalKernel for DIRECT_EVAL, taking the caller's state as
+// arguments instead of from an interpreter frame.
+bool NightDirectEval(JSContext* cx, JS::HandleValue v, JS::HandleObject env,
+                     JS::HandleScript script, jsbytecode* pc,
+                     JS::MutableHandleValue vp);
+
 }  // namespace night
 }  // namespace js
 
