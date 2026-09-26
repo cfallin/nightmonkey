@@ -1,6 +1,11 @@
-- async/generator codegen
-- remaining unsupported opcodes: `Eval`, `BigInt`, ES module import ops,
-  `using`
+- async/generator codegen (legacy BBV; the baseline tier has it)
+- remaining unsupported opcodes in legacy BBV: `Eval`, `BigInt`, ES module
+  import ops, `using` (the baseline tier compiles all of these)
+- module scripts are never compiled by any tier: the shell loads a root
+  module through the module loader, which never calls the `scriptCompiled`
+  extension hook, so neither the in-process batch nor snapshot
+  registration sees module scripts (pre-existing, not new with baseline).
+  Register module roots in both flows; needed for full AOT under MIR too.
 - move abstract-interpretation transfer func for ops to types analysis
   (currently in emitter for historical reasons)
 - use a DSL to write lowering cases and type transfer functions for each op?
