@@ -28,14 +28,15 @@ use crate::source::{ScopeData, SourceObject};
 use crate::wasm::bbv::abi::{
     BINOP_BITAND, BINOP_BITNOT, BINOP_BITOR, BINOP_BITXOR, BINOP_DEC, BINOP_DIV, BINOP_INC,
     BINOP_LSH, BINOP_MOD, BINOP_MUL, BINOP_RSH, BINOP_SUB, BINOP_URSH, CMP_EQ, CMP_GE, CMP_GT,
-    CMP_LE, CMP_LT, CMP_NE, CMP_STRICTEQ, CMP_STRICTNE, FIXED_SLOTS_BASE, FLAGS_ALL,
-    FUNC_ENV_SLOT_OFFSET, FUNC_SCRIPT_SLOT_OFFSET, INIT_ATTR_ENUMERATE, INIT_ATTR_HIDDEN,
-    INIT_ATTR_LOCKED, NO_NSLOTS,
+    CMP_LE, CMP_LT, CMP_NE, CMP_STRICTEQ, CMP_STRICTNE, ELEMENTS_INITLEN_BACK, FIXED_SLOTS_BASE,
+    FLAGS_ALL, FUNC_ENV_SLOT_OFFSET, FUNC_SCRIPT_SLOT_OFFSET, INIT_ATTR_ENUMERATE,
+    INIT_ATTR_HIDDEN, INIT_ATTR_LOCKED, NO_NSLOTS, OBJ_ELEMENTS_OFFSET,
+    SHAPE_IMMUTABLE_FLAGS_OFFSET, SHAPE_IS_NATIVE_BIT, SHAPE_OFFSET,
 };
 use crate::wasm::translate::{
     AtomTable, Helpers, TranslateCtx, MAGIC_ELEMENTS_HOLE, MAGIC_GENERATOR_CLOSING,
     MAGIC_IS_CONSTRUCTING, MAGIC_NO_ITER_VALUE, MAGIC_UNINITIALIZED_LEXICAL, TAG_BOOLEAN,
-    TAG_INT32, TAG_MAGIC, TAG_NULL, TAG_OBJECT, TAG_UNDEFINED,
+    TAG_CLEAR, TAG_INT32, TAG_MAGIC, TAG_NULL, TAG_OBJECT, TAG_UNDEFINED,
 };
 
 /// The most frame a baseline body may use above `sp`, in bytes. Runtime
@@ -107,6 +108,41 @@ pub(super) struct Gen<'a> {
 }
 
 type R<T> = Result<T, String>;
+
+/// An inline int32 operation: the raw i32 result of two raw i32 operands,
+/// or a branch to the slow block (the op's helper call) when the result is
+/// not an int32.
+type Int32Op<'a> = fn(&mut Gen<'a>, Value, Value, Block) -> Value;
+
+/// `number_arms`' int32 arm: raw i32 operands to a boxed result, or a
+/// branch to the block given (the next arm).
+type IntArm<'s, 'a> = dyn Fn(&mut Gen<'a>, &[Value], Block) -> Value + 's;
+
+/// `number_arms`' number arm: f64 operands to a boxed result.
+type NumArm<'s, 'a> = dyn Fn(&mut Gen<'a>, &[Value]) -> Value + 's;
+
+/// `JS::GenericNaN()`'s bits.
+const CANONICAL_NAN_BITS: u64 = 0x7FF8_0000_0000_0000;
+
+/// The `night_runtime_binop` kind of an arithmetic op.
+fn binop_kind(op: JSOp) -> u32 {
+    match op {
+        JSOp::Sub => BINOP_SUB,
+        JSOp::Mul => BINOP_MUL,
+        JSOp::Div => BINOP_DIV,
+        JSOp::Mod => BINOP_MOD,
+        JSOp::BitAnd => BINOP_BITAND,
+        JSOp::BitOr => BINOP_BITOR,
+        JSOp::BitXor => BINOP_BITXOR,
+        JSOp::Lsh => BINOP_LSH,
+        JSOp::Rsh => BINOP_RSH,
+        JSOp::Ursh => BINOP_URSH,
+        JSOp::Inc => BINOP_INC,
+        JSOp::Dec => BINOP_DEC,
+        JSOp::BitNot => BINOP_BITNOT,
+        _ => unreachable!("{op:?} is not a binop kind"),
+    }
+}
 
 impl<'a> Gen<'a> {
     pub(super) fn new(
@@ -1185,9 +1221,18 @@ impl<'a> Gen<'a> {
             }
             ToString => self.unary(h.tostring, d),
             ToPropertyKey => self.unary(h.to_property_key, d),
-            ToNumeric => self.unary(h.tonumeric, d),
-            Pos => self.unary(h.pos, d),
-            Neg => self.unary(h.neg, d),
+            ToNumeric => {
+                // Identity on a number (int32 or double).
+                let v = self.slot(d - 1);
+                let is_num = self.is_number(v);
+                self.fast_path(is_num, |_, _| {}, |g| g.unary(h.tonumeric, d));
+            }
+            Pos => {
+                // Identity on a number.
+                let v = self.slot(d - 1);
+                let is_num = self.is_number(v);
+                self.fast_path(is_num, |_, _| {}, |g| g.unary(h.pos, d));
+            }
             ImplicitThis => self.unary(h.implicit_this, d),
             ObjWithProto => self.unary(h.obj_with_proto, d),
             OptimizeSpreadCall => self.unary(h.optimize_spread_call, d),
@@ -1508,62 +1553,204 @@ impl<'a> Gen<'a> {
             }
 
             // --- arithmetic and comparison ---
-            Add => self.binary(h.add, &[], d),
-            Sub | Mul | Div | Mod | BitAnd | BitOr | BitXor | Lsh | Rsh | Ursh => {
-                let kind = match op {
-                    Sub => BINOP_SUB,
-                    Mul => BINOP_MUL,
-                    Div => BINOP_DIV,
-                    Mod => BINOP_MOD,
-                    BitAnd => BINOP_BITAND,
-                    BitOr => BINOP_BITOR,
-                    BitXor => BINOP_BITXOR,
-                    Lsh => BINOP_LSH,
-                    Rsh => BINOP_RSH,
-                    _ => BINOP_URSH,
-                };
-                let k = self.i32c(kind);
+            // Inline arms as in the portable baseline interpreter: int32
+            // operands, then any numbers (as doubles), then the helper
+            // (`number_arms`).
+            Add | Sub | Mul | Div | Mod | BitAnd | BitOr | BitXor | Lsh | Rsh | Ursh => {
                 let a = self.slot(d - 2);
                 let b = self.slot(d - 1);
-                let r = self.rt(h.binop, &[k, a, b]);
-                self.set_slot(d - 2, r);
-            }
-            Inc | Dec | BitNot => {
-                let kind = match op {
-                    Inc => BINOP_INC,
-                    Dec => BINOP_DEC,
-                    _ => BINOP_BITNOT,
+                let int: Option<Int32Op<'a>> = match op {
+                    Add => Some(Self::add_i32),
+                    Sub => Some(Self::sub_i32),
+                    Mul => Some(Self::mul_i32),
+                    Mod => Some(Self::mod_i32),
+                    BitAnd => Some(|g, x, y, _| g.binop(Operator::I32And, x, y, Type::I32)),
+                    BitOr => Some(|g, x, y, _| g.binop(Operator::I32Or, x, y, Type::I32)),
+                    BitXor => Some(|g, x, y, _| g.binop(Operator::I32Xor, x, y, Type::I32)),
+                    // Wasm masks shift counts to 5 bits, as JS does.
+                    Lsh => Some(|g, x, y, _| g.binop(Operator::I32Shl, x, y, Type::I32)),
+                    Rsh => Some(|g, x, y, _| g.binop(Operator::I32ShrS, x, y, Type::I32)),
+                    Ursh => Some(Self::ursh_i32),
+                    _ => None,
                 };
-                let k = self.i32c(kind);
+                // Double `%` is fmod, which Wasm lacks: the helper does it.
+                let num = match op {
+                    Add => Some(Operator::F64Add),
+                    Sub => Some(Operator::F64Sub),
+                    Mul => Some(Operator::F64Mul),
+                    Div => Some(Operator::F64Div),
+                    _ => None,
+                };
+                let int_arm = int.map(|f| {
+                    move |g: &mut Self, v: &[Value], bail| {
+                        let r = f(g, v[0], v[1], bail);
+                        g.boxed_int32(r)
+                    }
+                });
+                let num_arm = num.map(|o| {
+                    move |g: &mut Self, v: &[Value]| {
+                        let r = g.binop(o, v[0], v[1], Type::F64);
+                        g.box_number(r)
+                    }
+                });
+                self.number_arms(
+                    &[a, b],
+                    int_arm.as_ref().map(|f| f as &IntArm<'_, 'a>),
+                    num_arm.as_ref().map(|f| f as &NumArm<'_, 'a>),
+                    |g| {
+                        let r = if op == Add {
+                            g.rt(h.add, &[a, b])
+                        } else {
+                            let k = g.i32c(binop_kind(op));
+                            g.rt(h.binop, &[k, a, b])
+                        };
+                        g.set_slot(d - 2, r);
+                    },
+                );
+            }
+            Inc | Dec | Neg | BitNot => {
                 let a = self.slot(d - 1);
-                let r = self.rt(h.binop, &[k, a, a]);
-                self.set_slot(d - 1, r);
+                let int_arm = |g: &mut Self, v: &[Value], bail| {
+                    let x = v[0];
+                    let r = if op == BitNot {
+                        let m1 = g.i32c(u32::MAX);
+                        g.binop(Operator::I32Xor, x, m1, Type::I32)
+                    } else {
+                        // Inc and Dec overflow only from the extreme value;
+                        // Neg of 0 is -0 and of INT32_MIN overflows.
+                        let (limit, bin) = match op {
+                            Inc => (i32::MAX as u32, Operator::I32Add),
+                            Dec => (i32::MIN as u32, Operator::I32Sub),
+                            _ => (i32::MIN as u32, Operator::I32Sub),
+                        };
+                        let l = g.i32c(limit);
+                        let ovf = g.binop(Operator::I32Eq, x, l, Type::I32);
+                        g.bail_if(ovf, bail);
+                        if op == Neg {
+                            let zero = g.unop(Operator::I32Eqz, x, Type::I32);
+                            g.bail_if(zero, bail);
+                            let z = g.i32c(0);
+                            g.binop(Operator::I32Sub, z, x, Type::I32)
+                        } else {
+                            let one = g.i32c(1);
+                            g.binop(bin, x, one, Type::I32)
+                        }
+                    };
+                    g.boxed_int32(r)
+                };
+                let num_arm = |g: &mut Self, v: &[Value]| {
+                    let r = match op {
+                        Neg => g.unop(Operator::F64Neg, v[0], Type::F64),
+                        _ => {
+                            let one = g.f64c(1.0);
+                            let bin = if op == Inc {
+                                Operator::F64Add
+                            } else {
+                                Operator::F64Sub
+                            };
+                            g.binop(bin, v[0], one, Type::F64)
+                        }
+                    };
+                    g.box_number(r)
+                };
+                self.number_arms(
+                    &[a],
+                    Some(&int_arm),
+                    (op != BitNot).then_some(&num_arm as &NumArm<'_, 'a>),
+                    |g| {
+                        let r = match op {
+                            Neg => g.rt(h.neg, &[a]),
+                            _ => {
+                                let k = g.i32c(binop_kind(op));
+                                g.rt(h.binop, &[k, a, a])
+                            }
+                        };
+                        g.set_slot(d - 1, r);
+                    },
+                );
             }
             Pow => self.binary(h.pow, &[], d),
-            Lt | Gt | Le | Ge | Eq | Ne | StrictEq | StrictNe => {
-                let kind = match op {
-                    Lt => CMP_LT,
-                    Gt => CMP_GT,
-                    Le => CMP_LE,
-                    Ge => CMP_GE,
-                    Eq => CMP_EQ,
-                    Ne => CMP_NE,
-                    StrictEq => CMP_STRICTEQ,
-                    _ => CMP_STRICTNE,
+            Lt | Gt | Le | Ge => {
+                let (kind, icmp, fcmp) = match op {
+                    Lt => (CMP_LT, Operator::I32LtS, Operator::F64Lt),
+                    Gt => (CMP_GT, Operator::I32GtS, Operator::F64Gt),
+                    Le => (CMP_LE, Operator::I32LeS, Operator::F64Le),
+                    _ => (CMP_GE, Operator::I32GeS, Operator::F64Ge),
                 };
-                let k = self.i32c(kind);
                 let a = self.slot(d - 2);
                 let b = self.slot(d - 1);
-                let r = self.rt(h.compare, &[k, a, b]);
-                self.set_slot(d - 2, r);
+                self.number_arms(
+                    &[a, b],
+                    Some(&|g: &mut Self, v: &[Value], _| {
+                        let r = g.binop(icmp, v[0], v[1], Type::I32);
+                        g.boxed_bool(r)
+                    }),
+                    Some(&|g: &mut Self, v: &[Value]| {
+                        // False on NaN, as JS wants.
+                        let r = g.binop(fcmp, v[0], v[1], Type::I32);
+                        g.boxed_bool(r)
+                    }),
+                    |g| g.compare(kind, a, b),
+                );
+            }
+            Eq | Ne | StrictEq | StrictNe => {
+                let (kind, negate) = match op {
+                    Eq => (CMP_EQ, false),
+                    Ne => (CMP_NE, true),
+                    StrictEq => (CMP_STRICTEQ, false),
+                    _ => (CMP_STRICTNE, true),
+                };
+                let a = self.slot(d - 2);
+                let b = self.slot(d - 1);
+                let (inline, eq) = self.equality_inline(a, b);
+                self.fast_path(
+                    inline,
+                    |g, _| {
+                        let r = if negate {
+                            g.unop(Operator::I32Eqz, eq, Type::I32)
+                        } else {
+                            eq
+                        };
+                        let r = g.boxed_bool(r);
+                        g.set_slot(d - 2, r);
+                    },
+                    // Two numbers (at least one a double): loose and strict
+                    // equality are both IEEE equality (NaN unequal, -0 == 0).
+                    |g| {
+                        g.number_arms(
+                            &[a, b],
+                            None,
+                            Some(&|g: &mut Self, v: &[Value]| {
+                                let o = if negate {
+                                    Operator::F64Ne
+                                } else {
+                                    Operator::F64Eq
+                                };
+                                let r = g.binop(o, v[0], v[1], Type::I32);
+                                g.boxed_bool(r)
+                            }),
+                            |g| g.compare(kind, a, b),
+                        )
+                    },
+                );
             }
             Not => {
                 let v = self.slot(d - 1);
-                let t = self.truthy(v);
-                let z = self.i32c(0);
-                let n = self.binop(Operator::I32Eq, t, z, Type::I32);
-                let r = self.boxed_bool(n);
-                self.set_slot(d - 1, r);
+                let (fast, truth) = self.truthy_inline(v);
+                self.fast_path(
+                    fast,
+                    |g, _| {
+                        let n = g.unop(Operator::I32Eqz, truth, Type::I32);
+                        let r = g.boxed_bool(n);
+                        g.set_slot(d - 1, r);
+                    },
+                    |g| {
+                        let t = g.truthy(v);
+                        let n = g.unop(Operator::I32Eqz, t, Type::I32);
+                        let r = g.boxed_bool(n);
+                        g.set_slot(d - 1, r);
+                    },
+                );
             }
             Typeof | TypeofExpr => {
                 let v = self.slot(d - 1);
@@ -1606,22 +1793,20 @@ impl<'a> Gen<'a> {
             JumpIfFalse | JumpIfTrue | And | Or => {
                 let off = p.next_int32().unwrap();
                 let v = self.slot(d - 1);
-                let c = self.truthy(v);
                 let taken = self.branch_to(off);
                 let next = Self::goto(self.block(self.next_pc(op)));
                 if matches!(op, JumpIfTrue | Or) {
-                    self.cond_br(c, taken, next);
+                    self.branch_truthy(v, taken, next);
                 } else {
-                    self.cond_br(c, next, taken);
+                    self.branch_truthy(v, next, taken);
                 }
             }
             Case => {
                 let off = p.next_int32().unwrap();
                 let v = self.slot(d - 1);
-                let c = self.truthy(v);
                 let taken = self.branch_to(off);
                 let next = Self::goto(self.block(self.next_pc(op)));
-                self.cond_br(c, taken, next);
+                self.branch_truthy(v, taken, next);
             }
             Coalesce => {
                 let off = p.next_int32().unwrap();
@@ -1696,7 +1881,24 @@ impl<'a> Gen<'a> {
                 let v = self.slot(d - 1);
                 self.set_slot(d - 2, v);
             }
-            GetElem => self.binary(h.get_element, &[], d),
+            GetElem => {
+                let a = self.slot(d - 2);
+                let b = self.slot(d - 1);
+                let obj = self.tag_eq(a, TAG_OBJECT);
+                let int = self.tag_eq(b, TAG_INT32);
+                let cond = self.binop(Operator::I32And, obj, int, Type::I32);
+                self.fast_path(
+                    cond,
+                    |g, slow| {
+                        let v = g.dense_element(a, b, slow);
+                        g.set_slot(d - 2, v);
+                    },
+                    |g| {
+                        let r = g.rt(h.get_element, &[a, b]);
+                        g.set_slot(d - 2, r);
+                    },
+                );
+            }
             SetElem | StrictSetElem => {
                 let recv = self.slot(d - 3);
                 let key = self.slot(d - 2);
@@ -2137,6 +2339,330 @@ impl<'a> Gen<'a> {
         self.ret(rv);
     }
 
+    // --- inline fast paths ------------------------------------------------------
+
+    /// An inline fast path (`docs/BASELINE.md` §3.1): `fast` runs when
+    /// `cond` holds and may branch to the slow block it is given, which
+    /// runs `slow`, the op's ordinary lowering. Both arms leave their result
+    /// in the frame and rejoin at a fresh block with no params, so nothing
+    /// either arm computes is live after the op. Each op gets its own slow
+    /// block, never a shared one (fan-in; see `error_return`).
+    fn fast_path(
+        &mut self,
+        cond: Value,
+        fast: impl FnOnce(&mut Self, Block),
+        slow: impl FnOnce(&mut Self),
+    ) {
+        let fast_b = self.body.add_block();
+        let slow_b = self.body.add_block();
+        let join = self.body.add_block();
+        self.cond_br(cond, Self::goto(fast_b), Self::goto(slow_b));
+        (self.cur, self.live) = (fast_b, true);
+        fast(self, slow_b);
+        self.br(Self::goto(join));
+        (self.cur, self.live) = (slow_b, true);
+        slow(self);
+        if self.live {
+            self.br(Self::goto(join));
+        }
+        (self.cur, self.live) = (join, true);
+    }
+
+    /// Leave the fast path for `slow` when `cond` holds.
+    fn bail_if(&mut self, cond: Value, slow: Block) {
+        let cont = self.body.add_block();
+        self.cond_br(cond, Self::goto(slow), Self::goto(cont));
+        (self.cur, self.live) = (cont, true);
+    }
+
+    /// Leave the fast path for `slow` unless `cond` holds.
+    fn bail_unless(&mut self, cond: Value, slow: Block) {
+        let cont = self.body.add_block();
+        self.cond_br(cond, Self::goto(cont), Self::goto(slow));
+        (self.cur, self.live) = (cont, true);
+    }
+
+    /// Element `key` of `obj` (an object and an int32) when it is an
+    /// initialized, non-hole dense element of a native object; else
+    /// branches to `slow`. Pure reads: a typed array's dense
+    /// initializedLength is 0, and a proxy fails the native check before
+    /// `elements_` is read.
+    fn dense_element(&mut self, obj: Value, key: Value, slow: Block) -> Value {
+        let objptr = self.unop(Operator::I32WrapI64, obj, Type::I32);
+        let shape = self.load_i32(objptr, SHAPE_OFFSET);
+        let flags = self.load_i32(shape, SHAPE_IMMUTABLE_FLAGS_OFFSET);
+        let bit = self.i32c(SHAPE_IS_NATIVE_BIT);
+        let native = self.binop(Operator::I32And, flags, bit, Type::I32);
+        self.bail_unless(native, slow);
+        let elements = self.load_i32(objptr, OBJ_ELEMENTS_OFFSET);
+        let back = self.i32c(ELEMENTS_INITLEN_BACK);
+        let header = self.binop(Operator::I32Sub, elements, back, Type::I32);
+        let initlen = self.load_i32(header, 0);
+        // Unsigned, so a negative index fails too.
+        let idx = self.unop(Operator::I32WrapI64, key, Type::I32);
+        let in_bounds = self.binop(Operator::I32LtU, idx, initlen, Type::I32);
+        self.bail_unless(in_bounds, slow);
+        let eight = self.i32c(8);
+        let off = self.binop(Operator::I32Mul, idx, eight, Type::I32);
+        let addr = self.binop(Operator::I32Add, elements, off, Type::I32);
+        let v = self.load_i64(addr, 0);
+        let hole = self.tag_eq(v, TAG_MAGIC);
+        self.bail_if(hole, slow);
+        v
+    }
+
+    /// Whether `v` is a number: an int32, or a double (every high word
+    /// below `TAG_CLEAR`).
+    fn is_number(&mut self, v: Value) -> Value {
+        let t = self.tag_of(v);
+        let k = self.i32c(TAG_INT32 as u32);
+        self.binop(Operator::I32LeU, t, k, Type::I32)
+    }
+
+    /// A numeric op's inline arms, in order: `int` on the int32 payloads
+    /// when every operand is an int32 (it may bail to the next arm), `num`
+    /// on the operands as doubles when every operand is a number, else
+    /// `slow`, the op's helper call. The arms return the boxed result,
+    /// stored over the operands. Each arm is optional.
+    fn number_arms(
+        &mut self,
+        ops: &[Value],
+        int: Option<&IntArm<'_, 'a>>,
+        num: Option<&NumArm<'_, 'a>>,
+        slow: impl FnOnce(&mut Self),
+    ) {
+        let k = self.d - u32::try_from(ops.len()).unwrap();
+        let join = self.body.add_block();
+        let slow_b = self.body.add_block();
+        let num_b = if num.is_some() {
+            self.body.add_block()
+        } else {
+            slow_b
+        };
+        if let Some(int) = int {
+            let mut all = None;
+            for &v in ops {
+                let t = self.tag_eq(v, TAG_INT32);
+                all = Some(match all {
+                    Some(a) => self.binop(Operator::I32And, a, t, Type::I32),
+                    None => t,
+                });
+            }
+            let int_b = self.body.add_block();
+            self.cond_br(all.unwrap(), Self::goto(int_b), Self::goto(num_b));
+            (self.cur, self.live) = (int_b, true);
+            let raw: Vec<Value> = ops
+                .iter()
+                .map(|&v| self.unop(Operator::I32WrapI64, v, Type::I32))
+                .collect();
+            let r = int(self, &raw, num_b);
+            self.set_slot(k, r);
+            self.br(Self::goto(join));
+        } else {
+            self.br(Self::goto(num_b));
+        }
+        if let Some(num) = num {
+            (self.cur, self.live) = (num_b, true);
+            let mut all = None;
+            for &v in ops {
+                let t = self.is_number(v);
+                all = Some(match all {
+                    Some(a) => self.binop(Operator::I32And, a, t, Type::I32),
+                    None => t,
+                });
+            }
+            self.bail_unless(all.unwrap(), slow_b);
+            let fs: Vec<Value> = ops.iter().map(|&v| self.to_f64(v)).collect();
+            let r = num(self, &fs);
+            self.set_slot(k, r);
+            self.br(Self::goto(join));
+        }
+        (self.cur, self.live) = (slow_b, true);
+        slow(self);
+        if self.live {
+            self.br(Self::goto(join));
+        }
+        (self.cur, self.live) = (join, true);
+    }
+
+    fn f64c(&mut self, x: f64) -> Value {
+        let ty = self.body.single_type_list(Type::F64);
+        self.push_val(ValueDef::Operator(
+            Operator::F64Const {
+                value: x.to_bits(),
+            },
+            Default::default(),
+            ty,
+        ))
+    }
+
+    /// A number (int32 or double) as an f64.
+    fn to_f64(&mut self, v: Value) -> Value {
+        let is_int = self.tag_eq(v, TAG_INT32);
+        let low = self.unop(Operator::I32WrapI64, v, Type::I32);
+        let fi = self.unop(Operator::F64ConvertI32S, low, Type::F64);
+        let fd = self.unop(Operator::F64ReinterpretI64, v, Type::F64);
+        self.select(Type::F64, fi, fd, is_int)
+    }
+
+    /// Box an f64 as the engine's `NumberValue` does: an int32 when it is
+    /// one exactly (not -0), else a double, with NaN canonicalized (a
+    /// non-canonical NaN could alias a boxed tag).
+    fn box_number(&mut self, x: Value) -> Value {
+        let i = self.unop(Operator::I32TruncSatF64S, x, Type::I32);
+        let back = self.unop(Operator::F64ConvertI32S, i, Type::F64);
+        let exact = self.binop(Operator::F64Eq, back, x, Type::I32);
+        let bits = self.unop(Operator::I64ReinterpretF64, x, Type::I64);
+        let negz = self.i64c(1 << 63);
+        let not_negz = self.binop(Operator::I64Ne, bits, negz, Type::I32);
+        let is_int = self.binop(Operator::I32And, exact, not_negz, Type::I32);
+        let nan = self.binop(Operator::F64Ne, x, x, Type::I32);
+        let canon = self.i64c(CANONICAL_NAN_BITS);
+        let dbl = self.select(Type::I64, canon, bits, nan);
+        let int = self.boxed_int32(i);
+        self.select(Type::I64, int, dbl, is_int)
+    }
+
+    /// Whether the sign bit of `v` is set.
+    fn is_neg(&mut self, v: Value) -> Value {
+        let z = self.i32c(0);
+        self.binop(Operator::I32LtS, v, z, Type::I32)
+    }
+
+    fn add_i32(&mut self, x: Value, y: Value, slow: Block) -> Value {
+        let r = self.binop(Operator::I32Add, x, y, Type::I32);
+        // Signed overflow: both operands' signs differ from the result's.
+        let xr = self.binop(Operator::I32Xor, x, r, Type::I32);
+        let yr = self.binop(Operator::I32Xor, y, r, Type::I32);
+        let both = self.binop(Operator::I32And, xr, yr, Type::I32);
+        let ovf = self.is_neg(both);
+        self.bail_if(ovf, slow);
+        r
+    }
+
+    fn sub_i32(&mut self, x: Value, y: Value, slow: Block) -> Value {
+        let r = self.binop(Operator::I32Sub, x, y, Type::I32);
+        // Signed overflow: the operands' signs differ, and the result's
+        // differs from x's.
+        let xy = self.binop(Operator::I32Xor, x, y, Type::I32);
+        let xr = self.binop(Operator::I32Xor, x, r, Type::I32);
+        let both = self.binop(Operator::I32And, xy, xr, Type::I32);
+        let ovf = self.is_neg(both);
+        self.bail_if(ovf, slow);
+        r
+    }
+
+    fn mul_i32(&mut self, x: Value, y: Value, slow: Block) -> Value {
+        let x64 = self.unop(Operator::I64ExtendI32S, x, Type::I64);
+        let y64 = self.unop(Operator::I64ExtendI32S, y, Type::I64);
+        let p = self.binop(Operator::I64Mul, x64, y64, Type::I64);
+        let r = self.unop(Operator::I32WrapI64, p, Type::I32);
+        let r64 = self.unop(Operator::I64ExtendI32S, r, Type::I64);
+        let ovf = self.binop(Operator::I64Ne, p, r64, Type::I32);
+        self.bail_if(ovf, slow);
+        // A zero product with a negative operand is -0, a double.
+        let z = self.i32c(0);
+        let is_zero = self.binop(Operator::I32Eq, r, z, Type::I32);
+        let xy = self.binop(Operator::I32Or, x, y, Type::I32);
+        let neg = self.is_neg(xy);
+        let neg_zero = self.binop(Operator::I32And, is_zero, neg, Type::I32);
+        self.bail_if(neg_zero, slow);
+        r
+    }
+
+    /// `x % y` for a non-negative `x` and a positive `y`: an int32, never
+    /// -0 (the other signs are left to the next arm).
+    fn mod_i32(&mut self, x: Value, y: Value, slow: Block) -> Value {
+        let xn = self.is_neg(x);
+        let z = self.i32c(0);
+        let yp = self.binop(Operator::I32GtS, y, z, Type::I32);
+        let bad = self.unop(Operator::I32Eqz, yp, Type::I32);
+        let bad = self.binop(Operator::I32Or, xn, bad, Type::I32);
+        self.bail_if(bad, slow);
+        self.binop(Operator::I32RemS, x, y, Type::I32)
+    }
+
+    fn ursh_i32(&mut self, x: Value, y: Value, slow: Block) -> Value {
+        let r = self.binop(Operator::I32ShrU, x, y, Type::I32);
+        // A result of 2^31 or more is not an int32.
+        let big = self.is_neg(r);
+        self.bail_if(big, slow);
+        r
+    }
+
+    /// ToBoolean's inline cases, decided from the tag: int32, boolean,
+    /// undefined and null (the contiguous tags `TAG_INT32..=TAG_NULL`), and
+    /// doubles. Returns (whether `v` is one of them, its truth value if so).
+    fn truthy_inline(&mut self, v: Value) -> (Value, Value) {
+        const _: () = assert!(
+            TAG_BOOLEAN == TAG_INT32 + 1
+                && TAG_UNDEFINED == TAG_INT32 + 2
+                && TAG_NULL == TAG_INT32 + 3
+        );
+        let t = self.tag_of(v);
+        let base = self.i32c(TAG_INT32 as u32);
+        let rel = self.binop(Operator::I32Sub, t, base, Type::I32);
+        let four = self.i32c(4);
+        let tagged = self.binop(Operator::I32LtU, rel, four, Type::I32);
+        // Int32 and boolean: a nonzero payload. Undefined and null: false.
+        let two = self.i32c(2);
+        let has_payload = self.binop(Operator::I32LtU, rel, two, Type::I32);
+        let low = self.unop(Operator::I32WrapI64, v, Type::I32);
+        let z = self.i32c(0);
+        let nz = self.binop(Operator::I32Ne, low, z, Type::I32);
+        let tagged_truth = self.binop(Operator::I32And, has_payload, nz, Type::I32);
+        // A double: neither ±0 nor NaN, i.e. |x| > 0.
+        let clear = self.i32c(TAG_CLEAR);
+        let is_double = self.binop(Operator::I32LtU, t, clear, Type::I32);
+        let x = self.unop(Operator::F64ReinterpretI64, v, Type::F64);
+        let ax = self.unop(Operator::F64Abs, x, Type::F64);
+        let fz = self.f64c(0.0);
+        let double_truth = self.binop(Operator::F64Gt, ax, fz, Type::I32);
+        let inline = self.binop(Operator::I32Or, tagged, is_double, Type::I32);
+        let truth = self.select(Type::I32, double_truth, tagged_truth, is_double);
+        (inline, truth)
+    }
+
+    /// Branch on ToBoolean(`v`): inline for the `truthy_inline` tags, else
+    /// through the `to_boolean` helper.
+    fn branch_truthy(&mut self, v: Value, if_true: BlockTarget, if_false: BlockTarget) {
+        let (inline, truth) = self.truthy_inline(v);
+        let fast_b = self.body.add_block();
+        let slow_b = self.body.add_block();
+        self.cond_br(inline, Self::goto(fast_b), Self::goto(slow_b));
+        (self.cur, self.live) = (fast_b, true);
+        self.cond_br(truth, if_true.clone(), if_false.clone());
+        (self.cur, self.live) = (slow_b, true);
+        let t = self.truthy(v);
+        self.cond_br(t, if_true, if_false);
+    }
+
+    /// `==`/`===` decided inline: both values have the same tag, and it is
+    /// int32, boolean, undefined, null or object. With one tag, loose and
+    /// strict equality agree, and are identity of the raw bits (payloads
+    /// of undefined and null are not compared). Doubles (NaN, -0),
+    /// strings and BigInts are left to the helper. Returns (whether
+    /// inline, equal if so).
+    fn equality_inline(&mut self, a: Value, b: Value) -> (Value, Value) {
+        let ta = self.tag_of(a);
+        let tb = self.tag_of(b);
+        let same = self.binop(Operator::I32Eq, ta, tb, Type::I32);
+        let base = self.i32c(TAG_INT32 as u32);
+        let rel = self.binop(Operator::I32Sub, ta, base, Type::I32);
+        let four = self.i32c(4);
+        let prim = self.binop(Operator::I32LtU, rel, four, Type::I32);
+        let obj_k = self.i32c(TAG_OBJECT as u32);
+        let obj = self.binop(Operator::I32Eq, ta, obj_k, Type::I32);
+        let kind_ok = self.binop(Operator::I32Or, prim, obj, Type::I32);
+        let inline = self.binop(Operator::I32And, same, kind_ok, Type::I32);
+        let bits_eq = self.binop(Operator::I64Eq, a, b, Type::I32);
+        let two = self.i32c(2);
+        let unit = self.binop(Operator::I32GeU, rel, two, Type::I32);
+        let unit = self.binop(Operator::I32And, unit, prim, Type::I32);
+        let eq = self.binop(Operator::I32Or, bits_eq, unit, Type::I32);
+        (inline, eq)
+    }
+
     fn push_const(&mut self, k: u32, bits: u64) {
         let v = self.i64c(bits);
         self.set_slot(k, v);
@@ -2157,6 +2683,13 @@ impl<'a> Gen<'a> {
         args.extend_from_slice(extra);
         let r = self.rt(f, &args);
         self.set_slot(d - 2, r);
+    }
+
+    /// `[a, b] -> [compare(kind, a, b)]` through the helper.
+    fn compare(&mut self, kind: u32, a: Value, b: Value) {
+        let k = self.i32c(kind);
+        let r = self.rt(self.h.compare, &[k, a, b]);
+        self.set_slot(self.d - 2, r);
     }
 
     /// A check on the top value, which stays: `helper(top value, extra...)`.

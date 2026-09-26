@@ -6131,6 +6131,51 @@ mod tests {
         }
     }
 
+    /// Every op with an inline int32 or ToBoolean fast path
+    /// (`docs/BASELINE.md` §3.1) compiles, fast and slow arms, into a valid
+    /// module.
+    #[test]
+    fn baseline_fast_paths_validate() {
+        use JSOp::*;
+        let get_arg = |n: u8| [op_byte(GetArg), n, 0];
+        // `return a0 OP a1` (`a0[a1]` for GetElem)
+        for op in [
+            Add, Sub, Mul, Div, Mod, BitAnd, BitOr, BitXor, Lsh, Rsh, Ursh, Lt, Gt, Le, Ge, Eq, Ne,
+            StrictEq, StrictNe, GetElem,
+        ] {
+            let mut code = get_arg(0).to_vec();
+            code.extend(get_arg(1));
+            code.extend([op_byte(op), op_byte(Return)]);
+            baseline_compile_and_validate(script(code, 2));
+        }
+        // `return OP a0`
+        for op in [Inc, Dec, Neg, Pos, BitNot, Not, ToNumeric] {
+            let mut code = get_arg(0).to_vec();
+            code.extend([op_byte(op), op_byte(Return)]);
+            baseline_compile_and_validate(script(code, 1));
+        }
+        // `if (a0) return a0; return a1;`, both polarities: @0 GetArg 0;
+        // @3 JumpIf* +9 (-> @12); @8 GetArg 0; @11 Return; @12 GetArg 1 ...
+        for op in [JumpIfFalse, JumpIfTrue] {
+            let mut code = get_arg(0).to_vec();
+            code.extend([op_byte(op), 9, 0, 0, 0]);
+            code.extend(get_arg(0));
+            code.push(op_byte(Return));
+            code.extend(get_arg(1));
+            code.push(op_byte(Return));
+            baseline_compile_and_validate(script(code, 2));
+        }
+        // `return a0 && a1` / `a0 || a1`:
+        // @0 GetArg 0; @3 And/Or +9 (-> @12); @8 Pop; @9 GetArg 1; @12 Return
+        for op in [And, Or] {
+            let mut code = get_arg(0).to_vec();
+            code.extend([op_byte(op), 9, 0, 0, 0, op_byte(Pop)]);
+            code.extend(get_arg(1));
+            code.push(op_byte(Return));
+            baseline_compile_and_validate(script(code, 2));
+        }
+    }
+
     #[test]
     fn baseline_branches_calls_and_handlers_validate() {
         // `if (1) return 42; return 99;`

@@ -37,7 +37,7 @@ pub(super) const VAL_GCTHING_TAG_MIN: u32 = 0xFFFF_FF86;
 pub(crate) const SHAPE_OFFSET: u32 = 0;
 pub(super) const OBJ_CLASS_IDX_OFFSET: u32 = 4;
 pub(super) const OBJ_SLOTS_OFFSET: u32 = 8;
-pub(super) const OBJ_ELEMENTS_OFFSET: u32 = 12;
+pub(crate) const OBJ_ELEMENTS_OFFSET: u32 = 12;
 pub(crate) const FIXED_SLOTS_BASE: u32 = 16;
 /// `slots_` again, reached from a `NativeObject*` in the slot-address
 /// decoder rather than from the object header walk.
@@ -95,7 +95,7 @@ pub const EARLY_KEY_MAX: u32 = 0x0FFF;
 
 pub(super) const SHAPE_BASESHAPE_OFFSET: u32 = 0;
 pub(crate) const SHAPE_IMMUTABLE_FLAGS_OFFSET: u32 = 4;
-pub(super) const SHAPE_IS_NATIVE_BIT: u32 = 1 << 4;
+pub(crate) const SHAPE_IS_NATIVE_BIT: u32 = 1 << 4;
 pub(crate) const SHAPE_FIXED_SLOTS_SHIFT: u32 = 6;
 pub(crate) const SHAPE_FIXED_SLOTS_MASK_BITS: u32 = 0x1f;
 pub(super) const SHAPE_SMALL_SLOTSPAN_SHIFT: u32 = 11;
@@ -115,7 +115,7 @@ pub(super) const JSCLASS_EMULATES_UNDEFINED: u32 = 1 << 6;
 
 pub(super) const ELEMENTS_HEADER_BYTES: u32 = 16;
 pub(super) const ELEMENTS_FLAGS_BACK: u32 = 16;
-pub(super) const ELEMENTS_INITLEN_BACK: u32 = 12;
+pub(crate) const ELEMENTS_INITLEN_BACK: u32 = 12;
 pub(super) const ELEMENTS_CAPACITY_BACK: u32 = 8;
 pub(super) const ELEMENTS_LENGTH_BACK: u32 = 4;
 pub(super) const ELEMENTS_FLAG_FIXED: u32 = 0x1;

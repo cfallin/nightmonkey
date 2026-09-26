@@ -148,9 +148,40 @@ Only these are inline: constants (boxed immediates), `Pop`/`Dup`/`Swap`/
 `Pick`/`Unpick`/`DupAt`/`PopN`, `Get`/`Set` for locals, args and rval,
 `Goto`/`TableSwitch`, `Return`/`RetRval`, and the no-ops. Conditional
 jumps call the leaf `to_boolean` helper and branch on its result.
-**Nothing else is special-cased: not int32 add, not ToBoolean tag tests.**
-Fast paths are a later, measured decision (§8, B5), not part of the
-design.
+
+**Fast paths (B5, decision 7).** A few ops also get an inline fast path
+that decides from the operands' tags alone, with the op's ordinary helper
+call as the fallback. It uses no analysis facts and carries no state
+between ops, so it is the compiled analogue of the portable baseline
+interpreter's inline cases (`PortableBaselineInterpret.cpp`), and the
+tier stays non-speculative. The ops:
+- **ToBoolean** in `JumpIfFalse`/`JumpIfTrue`/`And`/`Or`/`Case`/`Not`:
+  int32, boolean, undefined, null and double.
+- **Arithmetic**, as PBL does it: an int32 arm, then a number arm on the
+  operands as doubles, then the helper.
+  - `Add Sub Mul` get both arms. The int32 arm is overflow-checked, and
+    `Mul` also bails on a −0 product.
+  - `Div` gets the number arm only.
+  - `Mod` gets the int32 arm only, for a non-negative dividend and a
+    positive divisor. Double `%` is fmod, which Wasm lacks.
+  - The bitwise ops and shifts get the int32 arm only. `Ursh` bails when
+    the result is 2³¹ or more.
+  - `Inc Dec Neg` get both arms; `BitNot` gets the int32 arm.
+  - `Pos` and `ToNumeric` are the identity on a number.
+  - A number-arm result is boxed as `NumberValue` boxes it: an integral
+    double becomes an int32, and NaN is canonicalized.
+- **Compares.** `Lt Le Gt Ge` get an int32 arm and a number arm.
+  `Eq Ne StrictEq StrictNe` decide inline when both tags are equal and
+  are int32, boolean, undefined, null or object. With one tag, loose and
+  strict equality are both identity of the bits. Two numbers otherwise
+  compare as doubles.
+- **`GetElem`** on an object and an int32 key: an in-bounds, non-hole
+  dense element of a native object. The helper itself has no dense arm;
+  BBV inlines one, so without this baseline's element reads took the
+  generic lookup.
+
+Each fast path is a diamond with its own slow block (§8's fan-in note).
+The slow path sees exactly the frame the plain lowering sees.
 
 ### 3.2 Immediates and helpers
 
@@ -589,3 +620,8 @@ Deviations from the plan above, and details it did not settle:
 6. **Baseline is total** except for `ForceInterpreter` (§6). Scripts
    that call eval are compiled, and the eval'd code is interpreted.
    Module ops are in B4.
+7. **Inline fast paths that decide from tags alone** (§3.1, B5). This
+   amends the original "nothing else is special-cased" rule. The paths
+   use no facts, no speculation and no state between ops, and the helper
+   remains the fallback. Without them baseline ran arithmetic-heavy code
+   at 0.4–0.5× the interpreter, which has its own inline int32 cases.
