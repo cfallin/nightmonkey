@@ -19,6 +19,7 @@ module {
 func @s20 (formals=2, locals=1, depths={0:0, 10:0, 12:0, 14:1, 16:0, 20:1, 22:0, 24:1, 26:0}) {
   root entry b0
   root onramp(pc=10) b20
+  loop b4 preheader=b3
 
 ; Function entry: callee, this, a, f. `i` starts undefined.
 b0(v0: obj{Function(s20)}, v1: val, v2: val, v3: val):
@@ -68,7 +69,7 @@ b30:
   return v40
 
 ; The onramp root O: guard the frame up to P's param types.
-b20(v70: val, v71: val, v72: val, v73: val):
+b20(v70: val, v71: val, v72: val, v73: val, v77: val):
   guard.unbox.obj v71 -> ok b21(v74: obj), fail b44
 b21(v74: obj):
   guard.layout v74 L3 types -> ok b22(v75: obj{L3 types}), fail b44
@@ -77,39 +78,49 @@ b22(v75: obj{L3 types}):
 b23(v76: i32):
   jump b3(v70, v75, v72, v76)
 b44:
-  exit pc=10 this=v70 args=[v71, v72] locals=[v73] stack=[]
+  exit pc=10 this=v70 args=[v71, v72] locals=[v73] rval=v77 stack=[]
 
 ; Exits. Each upcasts its operands to val first.
 b90:
   v60 = const.val undefined
   v61: val = weaken v60
-  exit pc=0 this=v1 args=[v2, v3] locals=[v61] stack=[]
+  v800 = const.val undefined
+  v801: val = weaken v800
+  exit pc=0 this=v1 args=[v2, v3] locals=[v61] rval=v801 stack=[]
 b40(v18: val{int32}, v19: obj):
   v80: val = weaken v18
   v81 = box v19
   v82: val = weaken v81
   v83 = box v14
   v84: val = weaken v83
-  exit pc=14 this=v11 args=[v82, v13] locals=[v84] stack=[v80]
+  v802 = const.val undefined
+  v803: val = weaken v802
+  exit pc=14 this=v11 args=[v82, v13] locals=[v84] rval=v803 stack=[v80]
 b41:
   v85 = box v28
   v86: val = weaken v85
   v87 = box v14
   v88: val = weaken v87
-  exit pc=20 this=v11 args=[v86, v13] locals=[v88] stack=[v27]
+  v804 = const.val undefined
+  v805: val = weaken v804
+  exit pc=20 this=v11 args=[v86, v13] locals=[v88] rval=v805 stack=[v27]
 b42(v32: val{int32}, v33: obj):
   v89: val = weaken v32
   v90 = box v33
   v91: val = weaken v90
   v92 = box v14
   v93: val = weaken v92
-  exit pc=24 this=v11 args=[v91, v13] locals=[v93] stack=[v89]
+  v806 = const.val undefined
+  v807: val = weaken v806
+  exit pc=24 this=v11 args=[v91, v13] locals=[v93] rval=v807 stack=[v89]
 b43:
   v94 = box v30
   v95: val = weaken v94
   v96 = box v14
   v97: val = weaken v96
-  exit pc=26 this=v11 args=[v95, v13] locals=[v97] stack=[]
+  v808 = const.val undefined
+  v809: val = weaken v808
+  exit pc=26 this=v11 args=[v95, v13] locals=[v97] rval=v809 stack=[]
 
 ; Throw blocks: one per pc, the state before the op.
 b91:
@@ -117,17 +128,23 @@ b91:
   v101: val = weaken v100
   v102 = box v14
   v103: val = weaken v102
-  exit.throw pc=12 this=v11 args=[v101, v13] locals=[v103] stack=[]
+  v810 = const.val undefined
+  v811: val = weaken v810
+  exit.throw pc=12 this=v11 args=[v101, v13] locals=[v103] rval=v811 stack=[]
 b92:
   v104 = box v12
   v105: val = weaken v104
   v106 = box v14
   v107: val = weaken v106
-  exit.throw pc=16 this=v11 args=[v105, v13] locals=[v107] stack=[]
+  v812 = const.val undefined
+  v813: val = weaken v812
+  exit.throw pc=16 this=v11 args=[v105, v13] locals=[v107] rval=v813 stack=[]
 b93:
   v108 = box v30
   v109: val = weaken v108
   v110 = box v14
   v111: val = weaken v110
-  exit.throw pc=22 this=v11 args=[v109, v13] locals=[v111] stack=[]
+  v814 = const.val undefined
+  v815: val = weaken v814
+  exit.throw pc=22 this=v11 args=[v109, v13] locals=[v111] rval=v815 stack=[]
 }

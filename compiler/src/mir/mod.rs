@@ -4,9 +4,10 @@
 //! block params, where a type is representation × refinement; per-object
 //! facts live in the types of object references and global facts are
 //! ghost values, so the invariants the optimizer relies on are structural
-//! and a validator can check them without flow typing. GEN -- today's
-//! `Dirty`-track lowering in `wasm::bbv` -- stays outside the MIR: it is
-//! where exits land and where onramps come from.
+//! and a validator can check them without flow typing. The baseline tier
+//! (`wasm::baseline`, `docs/BASELINE.md`) stays outside the MIR: it is
+//! where exits land and where onramps come from, and its frame format is
+//! the whole interface between the two.
 //!
 //! - [`types`]: the lattice (subtyping, join, killable components);
 //! - [`ops`]: opcodes, signatures, successor shapes and effect summaries;

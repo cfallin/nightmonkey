@@ -18,7 +18,8 @@
 //!   v4 = box v3
 //!   return v4
 //! b9:
-//!   exit pc=0 this=v1 args=[v2] locals=[] stack=[]
+//!   v5 = const.val undefined
+//!   exit pc=0 this=v1 args=[v2] locals=[] rval=v5 stack=[]
 //! }
 //! ```
 //!
@@ -541,6 +542,9 @@ pub fn print_func(m: &Module, f: &Func) -> String {
             RootKind::Onramp(pc) => writeln!(out, "  root onramp(pc={pc}) {}", r.block).unwrap(),
         }
     }
+    for l in &f.loops {
+        writeln!(out, "  loop {} preheader={}", l.header, l.preheader).unwrap();
+    }
     for &b in &f.layout {
         out.push('\n');
         let params: Vec<_> = f.blocks[b]
@@ -577,21 +581,21 @@ pub fn print_func(m: &Module, f: &Func) -> String {
             }
             out.push_str(&mnemonic(&d.op));
             if let Some((pc, nargs, nlocals)) = d.op.exit_shape() {
-                let (this, rest) = d
-                    .args
-                    .split_first()
-                    .map_or((None, &d.args[..]), |(t, r)| (Some(t), r));
-                let na = (nargs as usize).min(rest.len());
-                let nl = (nlocals as usize).min(rest.len() - na);
-                write!(
-                    out,
-                    " pc={pc} this={} args={} locals={} stack={}",
-                    this.map_or("?".into(), |v| v.to_string()),
-                    vlist(&rest[..na]),
-                    vlist(&rest[na..na + nl]),
-                    vlist(&rest[na + nl..])
-                )
-                .unwrap();
+                match crate::mir::ops::frame_parts(&d.args, nargs, nlocals) {
+                    Some(fp) => write!(
+                        out,
+                        " pc={pc} this={} args={} locals={} rval={} stack={}",
+                        fp.this,
+                        vlist(fp.args),
+                        vlist(fp.locals),
+                        fp.rval,
+                        vlist(fp.stack)
+                    )
+                    .unwrap(),
+                    // Malformed (too few operands): print them raw, so the
+                    // validator's complaint can be read against the text.
+                    None => write!(out, " pc={pc} raw={}", vlist(&d.args)).unwrap(),
+                }
             } else {
                 let args: Vec<_> = d.args.iter().map(|v| v.to_string()).collect();
                 if !args.is_empty() {

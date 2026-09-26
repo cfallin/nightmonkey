@@ -870,6 +870,13 @@ impl Parser {
             let b = st.block(self.prefixed("b", "a block")?);
             st.func.roots.push(Root { kind, block: b });
         }
+        while self.eat_word("loop") {
+            let header = st.block(self.prefixed("b", "a block")?);
+            self.expect_word("preheader")?;
+            self.expect_punct("=")?;
+            let preheader = st.block(self.prefixed("b", "a block")?);
+            st.func.loops.push(LoopDecl { header, preheader });
+        }
         let mut cur: Option<Block> = None;
         loop {
             if self.eat_punct("}") {
@@ -1002,12 +1009,16 @@ impl Parser {
             self.expect_word("locals")?;
             self.expect_punct("=")?;
             let l = self.value_list(st)?;
+            self.expect_word("rval")?;
+            self.expect_punct("=")?;
+            let r = st.value(self.prefixed("v", "a value")?, line);
             self.expect_word("stack")?;
             self.expect_punct("=")?;
             let s = self.value_list(st)?;
             let (nargs, nlocals) = (a.len() as u32, l.len() as u32);
             args.extend(a);
             args.extend(l);
+            args.push(r);
             args.extend(s);
             op = if matches!(template, Opcode::Exit { .. }) {
                 Opcode::Exit { pc, nargs, nlocals }

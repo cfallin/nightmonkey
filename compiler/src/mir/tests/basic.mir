@@ -6,6 +6,7 @@
 func @s12 (formals=1, locals=2, depths={0:0, 9:0, 24:0, 30:0}) {
   root entry b0
   root onramp(pc=9) b20
+  loop b3 preheader=b2
 
 b0(v0: obj{Function(s12)}, v1: val, v2: val):          ; callee, this, n
   guard.unbox.i32 v2 -> ok b1(v3: i32), fail b90
@@ -37,7 +38,7 @@ b10:
   return v18
 
 ; O: the onramp root at the loop header.
-b20(v30: val, v31: val, v32: val, v33: val):
+b20(v30: val, v31: val, v32: val, v33: val, v37: val):   ; this, n, s, i, rval
   guard.unbox.i32 v31 -> ok b21(v34: i32), fail b93
 b21(v34: i32):
   guard.unbox.i32 v32 -> ok b22(v35: i32), fail b93
@@ -46,12 +47,14 @@ b22(v35: i32):
 b23(v36: i32):
   jump b2(v30, v34, v35, v36)
 b93:
-  exit pc=9 this=v30 args=[v31] locals=[v32, v33] stack=[]
+  exit pc=9 this=v30 args=[v31] locals=[v32, v33] rval=v37 stack=[]
 
 b90:
   v40 = const.val undefined
   v41: val = weaken v40
-  exit pc=0 this=v1 args=[v2] locals=[v41, v41] stack=[]
+  v800 = const.val undefined
+  v801: val = weaken v800
+  exit pc=0 this=v1 args=[v2] locals=[v41, v41] rval=v801 stack=[]
 b91:
   v42 = box v10
   v43: val = weaken v42
@@ -59,7 +62,9 @@ b91:
   v45: val = weaken v44
   v46 = box v12
   v47: val = weaken v46
-  exit pc=24 this=v9 args=[v43] locals=[v45, v47] stack=[]
+  v802 = const.val undefined
+  v803: val = weaken v802
+  exit pc=24 this=v9 args=[v43] locals=[v45, v47] rval=v803 stack=[]
 b92:
   v48 = box v10
   v49: val = weaken v48
@@ -67,5 +72,7 @@ b92:
   v51: val = weaken v50
   v52 = box v12
   v53: val = weaken v52
-  exit pc=30 this=v9 args=[v49] locals=[v51, v53] stack=[]
+  v804 = const.val undefined
+  v805: val = weaken v804
+  exit pc=30 this=v9 args=[v49] locals=[v51, v53] rval=v805 stack=[]
 }

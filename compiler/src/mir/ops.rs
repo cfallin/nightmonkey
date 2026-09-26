@@ -257,8 +257,8 @@ pub enum Opcode {
     /// Dense switch over `0..n`, plus a default.
     Switch(u32),
     Return,
-    /// Operands: `this`, `nargs` args, `nlocals` locals, then the operand
-    /// stack (the rest). All `Val(⊤)`.
+    /// Operands: `this`, `nargs` args, `nlocals` locals, the rval, then
+    /// the operand stack (the rest). All `Val(⊤)`.
     Exit {
         pc: Pc,
         nargs: u32,
@@ -424,6 +424,32 @@ impl Opcode {
             _ => None,
         }
     }
+}
+
+/// An exit's (or onramp root's) operands split into the frame's parts.
+#[derive(Clone, Copy, Debug)]
+pub struct FrameParts<'a, T> {
+    pub this: &'a T,
+    pub args: &'a [T],
+    pub locals: &'a [T],
+    pub rval: &'a T,
+    pub stack: &'a [T],
+}
+
+/// Split `ops` (`this`, args, locals, rval, stack) by `nargs` and
+/// `nlocals`; `None` if there are too few.
+pub fn frame_parts<T>(ops: &[T], nargs: u32, nlocals: u32) -> Option<FrameParts<'_, T>> {
+    let (na, nl) = (nargs as usize, nlocals as usize);
+    if ops.len() < 2 + na + nl {
+        return None;
+    }
+    Some(FrameParts {
+        this: &ops[0],
+        args: &ops[1..1 + na],
+        locals: &ops[1 + na..1 + na + nl],
+        rval: &ops[1 + na + nl],
+        stack: &ops[2 + na + nl..],
+    })
 }
 
 /// An op's typing: the types of its (non-terminator) results and of its
@@ -798,8 +824,8 @@ pub fn signature(op: &Opcode, args: &[Type], m: &Module) -> SigResult {
             Sig::none()
         }
         Exit { nargs, nlocals, .. } | ExitThrow { nargs, nlocals, .. } => {
-            want(args.len() > (*nargs + *nlocals) as usize, || {
-                "exit: fewer operands than this + args + locals".into()
+            want(frame_parts(args, *nargs, *nlocals).is_some(), || {
+                "exit: fewer operands than this + args + locals + rval".into()
             })?;
             for (i, t) in args.iter().enumerate() {
                 val(t, &format!("exit operand {i}"))?;
@@ -1537,6 +1563,27 @@ mod tests {
         let b = signature(&Opcode::Box, &[Type::i32_range(0, 9)], &m).unwrap();
         let u = signature(&Opcode::Unbox(UnboxKind::I32), &b.results, &m).unwrap();
         assert_eq!(u.results, vec![Type::i32_range(0, 9)]);
+    }
+
+    #[test]
+    fn magic_is_boundary_only() {
+        // `Val(⊤)` includes magic values (a frame slot can hold one):
+        // nothing unboxes it, and a tag guard without `magic` removes it.
+        let m = m();
+        assert!(TagSet::MAGIC.subset_of(VSet::TOP.tags));
+        let js = Type::val(TagSet::JS);
+        assert!(is_subtype(&js, &Type::VAL_TOP));
+        assert!(!is_subtype(&Type::VAL_TOP, &js));
+        let g = signature(&Opcode::GuardTags(TagSet::JS), &[Type::VAL_TOP], &m).unwrap();
+        assert_eq!(g.outputs, vec![js]);
+        for k in UnboxKind::ALL {
+            assert!(signature(&Opcode::Unbox(k), &[Type::val(TagSet::MAGIC)], &m).is_err());
+            let g = signature(&Opcode::GuardUnbox(k), &[Type::VAL_TOP], &m).unwrap();
+            assert!(!matches!(g.outputs[0], Type::Val(v) if v.tags.magic));
+        }
+        // Boxing never yields magic.
+        let b = signature(&Opcode::Box, &[Type::I32_TOP], &m).unwrap();
+        assert!(!matches!(b.results[0], Type::Val(v) if v.tags.magic));
     }
 
     #[test]

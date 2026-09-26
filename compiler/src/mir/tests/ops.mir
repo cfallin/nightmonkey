@@ -129,13 +129,19 @@ b30:
 b23:
   v70 = box v69
   v71: val = weaken v70
-  exit pc=8 this=v1 args=[v2, v3] locals=[] stack=[v71]
+  v800 = const.val undefined
+  v801: val = weaken v800
+  exit pc=8 this=v1 args=[v2, v3] locals=[] rval=v801 stack=[v71]
 b24:
   v72 = box v49
   v78: val = weaken v72
   return v78
 b90:
-  exit pc=0 this=v1 args=[v2, v3] locals=[] stack=[]
+  v802 = const.val undefined
+  v803: val = weaken v802
+  exit pc=0 this=v1 args=[v2, v3] locals=[] rval=v803 stack=[]
 b92:
-  exit.throw pc=4 this=v1 args=[v2, v3] locals=[] stack=[]
+  v804 = const.val undefined
+  v805: val = weaken v804
+  exit.throw pc=4 this=v1 args=[v2, v3] locals=[] rval=v805 stack=[]
 }

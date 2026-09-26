@@ -113,7 +113,7 @@ fn with_module(module: &str, body: &str) -> String {
     format!("module {{\n{module}\n}}\n{}", func(body))
 }
 
-const EXIT0: &str = "b99:\n  exit pc=0 this=v1 args=[] locals=[] stack=[]\n";
+const EXIT0: &str = "b99:\n  exit pc=0 this=v1 args=[] locals=[] rval=v1 stack=[]\n";
 
 // --- 1. structure -------------------------------------------------------
 
@@ -165,14 +165,41 @@ fn structure() {
 
 #[test]
 fn irreducible() {
-    // b1 and b2 each enter the other's cycle.
+    // b1 and b2 each enter the other's cycle. MIR has no reducibility
+    // invariant (§5.4): with no dominating header, there is no natural
+    // loop to declare, and the function is valid.
+    verify_ok(&func(
+        "b0(v0: obj{Function(s1)}, v1: val):\n  v2 = const.bool true\n  br v2 -> then b1, else b2\n\
+         b1:\n  jump b2\nb2:\n  br v2 -> then b1, else b3\nb3:\n  return v1\n",
+    ));
+    // A natural loop must be declared.
     verify_err(
         &func(
-            "b0(v0: obj{Function(s1)}, v1: val):\n  v2 = const.bool true\n  br v2 -> then b1, else b2\n\
-             b1:\n  jump b2\nb2:\n  br v2 -> then b1, else b3\nb3:\n  return v1\n",
+            "b0(v0: obj{Function(s1)}, v1: val):\n  v2 = const.bool true\n  jump b3\n\
+             b3:\n  br v2 -> then b3, else b4\nb4:\n  return v1\n",
         ),
         Check::Structure,
-        "irreducible",
+        "b3 is not a declared loop header",
+    );
+}
+
+/// An onramp into an inner loop side-enters the outer one: the outer
+/// header no longer dominates its latch, and the function is irreducible,
+/// but both loops are declared and each has its preheader.
+#[test]
+fn onramp_side_entry() {
+    verify_ok(
+        "func @s1 (formals=0, locals=0, depths={0:0, 8:0}) {\n  root entry b0\n  root onramp(pc=8) b9\n\
+           loop b2 preheader=b1\n  loop b4 preheader=b3\n\
+         b0(v0: obj{Function(s1)}, v1: val):\n  jump b1(v1)\n\
+         b1(v2: val):\n  jump b2(v2)\n\
+         b2(v3: val):\n  v4 = const.bool true\n  br v4 -> then b3(v3), else b6(v3)\n\
+         b3(v5: val):\n  jump b4(v5)\n\
+         b4(v6: val):\n  v7 = const.bool true\n  br v7 -> then b4(v6), else b5(v6)\n\
+         b5(v8: val):\n  jump b2(v8)\n\
+         b6(v9: val):\n  return v9\n\
+         b9(v10: val, v11: val):\n  v12 = const.bool true\n  br v12 -> then b3(v10), else b10\n\
+         b10:\n  exit pc=8 this=v10 args=[] locals=[] rval=v11 stack=[]\n}\n",
     );
 }
 
@@ -322,7 +349,7 @@ fn fences() {
             "{guarded}b2(v3: obj{{L3 types}}):\n  v4 = const.val undefined\n  \
              call v1, v4 -> ok_clean b3(v3), ok_dirty b3(v3), err b98\n\
              b3(v5: obj):\n  v6 = box v5\n  return v6\n{EXIT0}\
-             b98:\n  exit.throw pc=0 this=v1 args=[] locals=[] stack=[]\n"
+             b98:\n  exit.throw pc=0 this=v1 args=[] locals=[] rval=v1 stack=[]\n"
         ),
     ));
     // A throw block may box a value whose claim the op killed; any
@@ -334,7 +361,7 @@ fn fences() {
                 "{guarded}b2(v3: obj{{L3 types}}):\n  v4 = const.val undefined\n  \
                  call v1, v4 -> ok_clean b3(v3), ok_dirty b3(v3), err {target}\n\
                  b3(v5: obj):\n  v6 = box v5\n  return v6\n{EXIT0}\
-                 b98:\n  v7 = box v3\n  v8: val = weaken v7\n  exit.throw pc=4 this=v1 args=[] locals=[] stack=[v8]\n\
+                 b98:\n  v7 = box v3\n  v8: val = weaken v7\n  exit.throw pc=4 this=v1 args=[] locals=[] rval=v1 stack=[v8]\n\
                  b97:\n  guard.layout v3 L3 -> ok b98, fail b98\n"
             ),
         )
@@ -384,7 +411,7 @@ fn predictions() {
     let getname = |w: &str| {
         func(&format!(
             "b0(v0: obj{{Function(s1)}}, v1: val):\n  js.getname g{w} -> ok b1(v2: val), err b98\n\
-             b1(v2: val):\n  return v2\nb98:\n  exit.throw pc=0 this=v1 args=[] locals=[] stack=[]\n"
+             b1(v2: val):\n  return v2\nb98:\n  exit.throw pc=0 this=v1 args=[] locals=[] rval=v1 stack=[]\n"
         ))
     };
     verify_ok(&getname(
@@ -440,7 +467,7 @@ fn boundary_exits() {
     let exit = |this: &str, stack: &str| {
         func(&format!(
             "b0(v0: obj{{Function(s1)}}, v1: val):\n  v2 = const.val int32 1\n  v3: val = weaken v2\n  \
-             exit pc=4 this={this} args=[] locals=[] stack=[{stack}]\n"
+             exit pc=4 this={this} args=[] locals=[] rval={this} stack=[{stack}]\n"
         ))
     };
     verify_ok(&exit("v1", "v3"));
@@ -452,17 +479,17 @@ fn boundary_exits() {
     verify_err(
         &exit("v1", ""),
         Check::Boundary,
-        "the frame needs 2 (stack depth 1)",
+        "the frame needs 3 (stack depth 1)",
     );
     verify_err(
         &func(
-            "b0(v0: obj{Function(s1)}, v1: val):\n  exit pc=9 this=v1 args=[] locals=[] stack=[]\n",
+            "b0(v0: obj{Function(s1)}, v1: val):\n  exit pc=9 this=v1 args=[] locals=[] rval=v1 stack=[]\n",
         ),
         Check::Boundary,
         "no stack depth is recorded for pc 9",
     );
     verify_err(
-        &func("b0(v0: obj{Function(s1)}, v1: val):\n  exit pc=0 this=v1 args=[v1] locals=[] stack=[]\n"),
+        &func("b0(v0: obj{Function(s1)}, v1: val):\n  exit pc=0 this=v1 args=[v1] locals=[] rval=v1 stack=[]\n"),
         Check::Boundary,
         "carries 1 arg(s)",
     );
@@ -492,33 +519,37 @@ fn boundary_roots() {
              b5({params}):\n  unreachable\n}}\n"
         )
     };
-    verify_ok(&onramp("v5: val, v6: val"));
+    // this, the local, rval.
+    verify_ok(&onramp("v5: val, v6: val, v7: val"));
     verify_err(
-        &onramp("v5: val, v6: val{int32}"),
+        &onramp("v5: val, v6: val{int32}, v7: val"),
         Check::Boundary,
         "onramp param v6 (val{int32}) must be val",
     );
     verify_err(
-        &onramp("v5: val"),
+        &onramp("v5: val, v6: val"),
         Check::Boundary,
-        "takes 1 param(s); the frame needs 2",
+        "takes 2 param(s); the frame needs 3",
     );
 }
 
 #[test]
 fn boundary_preheaders() {
-    // Two entries into the loop header: no unique preheader.
-    let two_entries = func(
+    let with_loop = |decl: &str, body: &str| format!("{HEAD}  {decl}\n{body}}}\n");
+    // Two entries into the loop header: b2 is not its preheader.
+    let two_entries = with_loop(
+        "loop b3 preheader=b1",
         "b0(v0: obj{Function(s1)}, v1: val):\n  v2 = const.bool true\n  br v2 -> then b1, else b2\n\
          b1:\n  jump b3\nb2:\n  jump b3\nb3:\n  br v2 -> then b3, else b4\nb4:\n  return v1\n",
     );
     verify_err(
         &two_entries,
         Check::Boundary,
-        "needs a unique preheader; its entries are [b1, b2]",
+        "entered from outside the loop by [b2], not only by its preheader b1",
     );
     // A preheader that also branches elsewhere is not one.
-    let branchy = func(
+    let branchy = with_loop(
+        "loop b3 preheader=b0",
         "b0(v0: obj{Function(s1)}, v1: val):\n  v2 = const.bool true\n  br v2 -> then b3, else b4\n\
          b3:\n  br v2 -> then b3, else b4\nb4:\n  return v1\n",
     );
@@ -527,7 +558,19 @@ fn boundary_preheaders() {
         Check::Boundary,
         "preheader b0 must jump only to its header b3",
     );
-    verify_ok(&func(
+    // A latch declared as the preheader: the real entry is then outside.
+    let latch = with_loop(
+        "loop b3 preheader=b5",
+        "b0(v0: obj{Function(s1)}, v1: val):\n  v2 = const.bool true\n  jump b3\n\
+         b3:\n  br v2 -> then b5, else b4\nb5:\n  jump b3\nb4:\n  return v1\n",
+    );
+    verify_err(
+        &latch,
+        Check::Boundary,
+        "entered from outside the loop by [b0]",
+    );
+    verify_ok(&with_loop(
+        "loop b3 preheader=b0",
         "b0(v0: obj{Function(s1)}, v1: val):\n  v2 = const.bool true\n  jump b3\n\
          b3:\n  br v2 -> then b3, else b4\nb4:\n  return v1\n",
     ));

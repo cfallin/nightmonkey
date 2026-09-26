@@ -1067,6 +1067,15 @@ total baseline to exit into.
 - Loops are declared (header, preheader). The validator's
   "irreducible" error goes, and its preheader check keys off the
   declared loops.
+- **Done.** The text format spells an exit `exit pc=N this=… args=[…]
+  locals=[…] rval=… stack=[…]`, and a loop `loop bH preheader=bP` in the
+  function header. The validator's loop rules:
+  - a latch is a predecessor of the header, other than the preheader,
+    that the header reaches;
+  - any other predecessor enters the loop from outside and is an error;
+  - the preheader jumps only to its header;
+  - an edge to a block that dominates its source (a natural loop) must
+    target a declared header.
 
 **M1. Minimal lowering, MIR to its own waffle function**
 - The function-entry root, and the entry dispatch.

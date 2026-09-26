@@ -7,7 +7,8 @@
 //! families, in the order they run:
 //!
 //! 1. **Structure**: one terminator per block, at the end; successors
-//!    exist and match the op's shape; edge arity; roots; reducibility.
+//!    exist and match the op's shape; edge arity; roots; every natural
+//!    loop declared. (Reducibility is not required: §5.4.)
 //! 2. **Dominance**, over every root at once (a virtual super-root).
 //! 3. **Edge subtyping**: args and outputs within the param's type.
 //! 4. **Operand types**: the op's rule accepts its operands, and declared
@@ -18,7 +19,7 @@
 //!    prediction witness; kills on `ok_dirty` edges are exempt.
 //! 7. **Raw across GC**: no `Raw` value is live across a may-GC op.
 //! 8. **Boundary**: exits and onramp roots carry exactly the frame, all
-//!    `Val(⊤)`; every loop has a unique preheader.
+//!    `Val(⊤)`; every declared loop has a unique preheader.
 //!
 //! A structural failure stops the run (later checks assume a well-formed
 //! CFG); the other families all run and report every error they find.
@@ -398,56 +399,95 @@ impl<'a> Verifier<'a> {
         }
     }
 
-    /// Back edges must go to dominating headers (reducibility), and each
-    /// header has exactly one other predecessor, which jumps only to it.
+    /// Loops are declared, not inferred (§5.2), and the CFG need not be
+    /// reducible (§5.4). Each declared loop's preheader jumps only to its
+    /// header and is its only predecessor from outside the loop body; and
+    /// every natural loop (an edge to a dominating block) is declared, so
+    /// LICM never meets an undeclared one.
     fn loops(&mut self) {
-        let mut headers: BTreeMap<Block, Vec<Block>> = BTreeMap::new();
-        for &b in &self.rpo.clone() {
-            for s in self.f.succs(b) {
-                if self.rpo_index[&s] <= self.rpo_index[&b] {
-                    if self.dominates(s, b) {
-                        headers.entry(s).or_default().push(b);
-                    } else {
-                        self.err(
-                            Check::Structure,
-                            Some(b),
-                            format!("edge {b} -> {s} makes the CFG irreducible"),
-                        );
-                    }
-                }
+        let f = self.f;
+        let mut declared: BTreeMap<Block, Block> = BTreeMap::new();
+        for l in &f.loops {
+            if declared.insert(l.header, l.preheader).is_some() {
+                self.err(
+                    Check::Structure,
+                    Some(l.header),
+                    format!("loop header {} is declared twice", l.header),
+                );
             }
         }
-        for (h, latches) in headers {
-            let entries: Vec<Block> = self.preds[&h]
-                .iter()
-                .copied()
-                .filter(|p| self.reachable(*p) && !latches.contains(p))
-                .collect::<BTreeSet<_>>()
-                .into_iter()
-                .collect();
-            match entries.as_slice() {
-                [p] => {
-                    if self.f.succs(*p) != vec![h] {
-                        self.err(
-                            Check::Boundary,
-                            Some(h),
-                            format!("loop preheader {p} must jump only to its header {h}"),
-                        );
-                    }
-                }
-                _ => {
-                    let names: Vec<String> = entries.iter().map(|b| b.to_string()).collect();
+        for &b in &self.rpo.clone() {
+            for s in f.succs(b) {
+                if self.dominates(s, b) && !declared.contains_key(&s) {
                     self.err(
-                        Check::Boundary,
-                        Some(h),
+                        Check::Structure,
+                        Some(b),
                         format!(
-                            "loop header {h} needs a unique preheader; its entries are [{}]",
-                            names.join(", ")
+                            "edge {b} -> {s} closes a loop, but {s} is not a declared loop header"
                         ),
                     );
                 }
             }
         }
+        for (h, p) in declared {
+            if !self.reachable(h) {
+                continue;
+            }
+            let body = self.loop_body(h, p);
+            if f.succs(p) != vec![h] {
+                self.err(
+                    Check::Boundary,
+                    Some(h),
+                    format!("loop preheader {p} must jump only to its header {h}"),
+                );
+            }
+            // A predecessor other than `p` that `h` cannot reach enters the
+            // loop from outside. (One that `h` can reach is a latch, even
+            // when an onramp side-enters the loop elsewhere.)
+            let outside: Vec<String> = self.preds[&h]
+                .iter()
+                .filter(|&&q| q != p && self.reachable(q) && !body.contains(&q))
+                .map(|q| q.to_string())
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect();
+            if !outside.is_empty() {
+                self.err(
+                    Check::Boundary,
+                    Some(h),
+                    format!(
+                        "loop header {h} is entered from outside the loop by [{}], not only by its preheader {p}",
+                        outside.join(", ")
+                    ),
+                );
+            }
+        }
+    }
+
+    /// The body of the loop headed by `h` with preheader `p`: its latches
+    /// (predecessors of `h` other than `p` that `h` reaches) and every block
+    /// that reaches a latch without passing through `h`, plus `h` itself.
+    pub(crate) fn loop_body(&self, h: Block, p: Block) -> BTreeSet<Block> {
+        let f = self.f;
+        let mut fwd = BTreeSet::new();
+        let mut work = f.succs(h);
+        while let Some(b) = work.pop() {
+            if fwd.insert(b) {
+                work.extend(f.succs(b));
+            }
+        }
+        let mut body = BTreeSet::from([h]);
+        let mut work: Vec<Block> = self.preds[&h]
+            .iter()
+            .copied()
+            .filter(|&q| q != p && fwd.contains(&q))
+            .collect();
+        while let Some(b) = work.pop() {
+            if body.insert(b) {
+                work.extend(self.preds[&b].iter().copied());
+            }
+        }
+        body
     }
 
     // --- 3, 4. types ------------------------------------------------------

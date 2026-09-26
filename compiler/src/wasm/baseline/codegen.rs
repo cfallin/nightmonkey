@@ -2488,9 +2488,7 @@ impl<'a> Gen<'a> {
     fn f64c(&mut self, x: f64) -> Value {
         let ty = self.body.single_type_list(Type::F64);
         self.push_val(ValueDef::Operator(
-            Operator::F64Const {
-                value: x.to_bits(),
-            },
+            Operator::F64Const { value: x.to_bits() },
             Default::default(),
             ty,
         ))

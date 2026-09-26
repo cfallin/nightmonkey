@@ -31,10 +31,11 @@ pub struct FrameShape {
 }
 
 impl FrameShape {
-    /// Operand count of an exit at `pc`: `this`, formals, locals, stack.
+    /// Operand count of an exit at `pc`: `this`, formals, locals, rval,
+    /// stack.
     pub fn exit_arity(&self, pc: Pc) -> Option<usize> {
         let d = *self.depths.get(&pc)?;
-        Some(1 + (self.formals + self.locals + d) as usize)
+        Some(2 + (self.formals + self.locals + d) as usize)
     }
 }
 
@@ -101,6 +102,17 @@ pub struct Root {
     pub block: Block,
 }
 
+/// A declared loop (§5.2): its header and its canonical preheader `P`,
+/// the header's only predecessor from outside the loop and the block LICM
+/// hoists to. The loop's body is every block that reaches one of its
+/// latches without passing through the header; that is well-defined even
+/// where onramps make the CFG irreducible (§5.4).
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct LoopDecl {
+    pub header: Block,
+    pub preheader: Block,
+}
+
 /// What the lowering needs from the analysis and the translator's site
 /// tables that is neither an operand nor derivable from operand types.
 #[derive(Clone, PartialEq, Eq, Debug, Default)]
@@ -134,6 +146,7 @@ pub struct Func {
     pub insts: EntityVec<Inst, InstData>,
     pub values: EntityVec<Value, ValueData>,
     pub roots: Vec<Root>,
+    pub loops: Vec<LoopDecl>,
     pub attachments: EntityVec<AttachId, Attachment>,
     pub witnesses: EntityMap<Inst, Option<Witness>>,
 }
@@ -148,6 +161,7 @@ impl Func {
             insts: EntityVec::new(),
             values: EntityVec::new(),
             roots: vec![],
+            loops: vec![],
             attachments: EntityVec::new(),
             witnesses: EntityMap::new(),
         }

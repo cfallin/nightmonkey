@@ -31,21 +31,36 @@ pub const I32_MAX: i64 = i32::MAX as i64;
 pub const INT_LIM: i64 = 1 << 53;
 
 /// A value's possible JS type tags: the seven primitive classes (as
-/// `opsem::Prims`) plus object. More tags is a weaker claim.
+/// `opsem::Prims`), object, and magic. More tags is a weaker claim.
+///
+/// `magic` covers the engine's magic values (the TDZ sentinel, element
+/// holes, generator-closing, ...). They are never JS-visible values, but a
+/// baseline frame slot can hold one (`docs/BASELINE.md` §2), so `Val(⊤)`,
+/// the boundary type, includes it. Nothing unboxes a magic value, and
+/// `guard.tags` without `magic` removes it.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
 pub struct TagSet {
     pub prims: Prims,
     pub object: bool,
+    pub magic: bool,
 }
 
 impl TagSet {
     pub const NONE: TagSet = TagSet {
         prims: Prims::EMPTY,
         object: false,
+        magic: false,
     };
     pub const ALL: TagSet = TagSet {
         prims: ALL_PRIMS,
         object: true,
+        magic: true,
+    };
+    /// Every JS-visible value: all but `magic`.
+    pub const JS: TagSet = TagSet {
+        prims: ALL_PRIMS,
+        object: true,
+        magic: false,
     };
     pub const INT32: TagSet = TagSet::prims(PRIM_INT32);
     pub const DOUBLE: TagSet = TagSet::prims(PRIM_DOUBLE);
@@ -55,17 +70,24 @@ impl TagSet {
     pub const OBJECT: TagSet = TagSet {
         prims: Prims::EMPTY,
         object: true,
+        magic: false,
+    };
+    pub const MAGIC: TagSet = TagSet {
+        prims: Prims::EMPTY,
+        object: false,
+        magic: true,
     };
 
     pub const fn prims(prims: Prims) -> TagSet {
         TagSet {
             prims,
             object: false,
+            magic: false,
         }
     }
 
     /// The text-format names, in printing order.
-    pub const NAMES: [(&'static str, TagSet); 9] = [
+    pub const NAMES: [(&'static str, TagSet); 10] = [
         ("undefined", TagSet::prims(PRIM_UNDEFINED)),
         ("null", TagSet::prims(PRIM_NULL)),
         ("boolean", TagSet::prims(PRIM_BOOLEAN)),
@@ -75,12 +97,14 @@ impl TagSet {
         ("symbol", TagSet::prims(PRIM_SYMBOL)),
         ("bigint", TagSet::prims(PRIM_BIGINT)),
         ("object", TagSet::OBJECT),
+        ("magic", TagSet::MAGIC),
     ];
 
     pub fn union(self, o: TagSet) -> TagSet {
         TagSet {
             prims: self.prims | o.prims,
             object: self.object || o.object,
+            magic: self.magic || o.magic,
         }
     }
 
@@ -88,15 +112,16 @@ impl TagSet {
         TagSet {
             prims: self.prims & o.prims,
             object: self.object && o.object,
+            magic: self.magic && o.magic,
         }
     }
 
     pub fn subset_of(self, o: TagSet) -> bool {
-        self.prims.subset_of(o.prims) && (!self.object || o.object)
+        self.prims.subset_of(o.prims) && (!self.object || o.object) && (!self.magic || o.magic)
     }
 
     pub fn is_empty(self) -> bool {
-        self.prims.is_empty() && !self.object
+        self.prims.is_empty() && !self.object && !self.magic
     }
 
     /// Nonempty and within `o`: what an infallible unbox requires.
