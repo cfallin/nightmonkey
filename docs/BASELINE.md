@@ -416,8 +416,98 @@ byte-identical.
   `pipeline=baseline --strict-coverage`, whose allowlist is only
   scripts containing `ForceInterpreter`. Record the performance
   datapoint against the interpreter-only lane and legacy BBV.
-- **B5 (optional, measured).** The compiled-callee call path (§3.4),
-  then any inline fast path whose win shows up in the numbers.
+- **B5 (optional, measured).** Any inline fast path whose win shows up
+  in the numbers. The compiled-callee call path moved into B3 (see
+  below).
+
+**Performance (2026-09-26).** Octane score, best of 2, one core each,
+all lanes through the same in-process runner (`inproc-shell.sh`):
+
+| bench | interp | baseline | legacy BBV | baseline/interp | legacy/baseline |
+|---|---:|---:|---:|---:|---:|
+| richards | 291 | 388 | 1059 | 1.33 | 2.73 |
+| deltablue | 291 | 536 | 5772 | 1.84 | 10.77 |
+| crypto | 866 | 443 | 14951 | 0.51 | 33.75 |
+| raytrace | 880 | 1128 | 3998 | 1.28 | 3.54 |
+| earley-boyer | 1192 | 1535 | 12070 | 1.29 | 7.86 |
+| navier-stokes | 1506 | 616 | 20989 | 0.41 | 34.07 |
+| splay | 4563 | 5053 | 8074 | 1.11 | 1.60 |
+| regexp | 521 | 788 | 2121 | 1.51 | 2.69 |
+| pdfjs | 3994 | 3344 | 21817 | 0.84 | 6.52 |
+| mandreel | 882 | 817 | 2559 | 0.93 | 3.13 |
+| code-load | 33066 | 35221 | 36679 | 1.07 | 1.04 |
+| box2d | 1765 | 1675 | 12191 | 0.95 | 7.28 |
+| geomean | 1400 | 1412 | 7640 | 1.01 | 5.41 |
+
+- **Overall**, baseline is at parity with the interpreter.
+- **Object- and call-heavy code** gains 1.1–1.8×: no dispatch loop, and
+  direct compiled-to-compiled calls.
+- **Arithmetic-heavy code** (crypto, navier-stokes) runs at about 0.4–0.5×
+  the interpreter. Every `Add`/`Lt`/`BitAnd` is a boxed helper call with
+  memory round trips, where the interpreter has inline int32 fast paths.
+- **B5 would target that**: inline int32 fast paths for arithmetic,
+  compares and `ToBoolean`, taken only when both tags are int32, with the
+  helper as the fallback. It is left undone pending review, because §3.1
+  deliberately rules fast paths out of the design.
+
+**Status (2026-09-26).** B0–B4 are implemented (`wasm/baseline/`).
+`--pipeline baseline --strict-coverage` passes the full jit-test lane.
+Every script in each test's batch compiles with baseline, and a census
+over every jit-test file finds no decline.
+
+Deviations from the plan above, and details it did not settle:
+- **Direct compiled-to-compiled calls are in B3, not B5.** With every
+  call going through `night_runtime_call` → `JS::Call` → `EnterNight`, a
+  JS call costs several native frames. Deep-recursion tests then fail
+  with "too much recursion" well before the NightStack fills. Ordinary
+  calls now classify the callee (`call_classify`, no call cell) and
+  enter a compiled body with a sig2 `call_indirect`, as BBV's generic
+  path does. Construct and iterator calls stay generic.
+- **Exceptions follow BBV's static model rather than a new `unwind_to`
+  helper.** The handler, the iterator closes and the number of env pops
+  are all static (try notes and scope notes). The landing runs them
+  inline.
+- **Resume dispatch keeps the target in memory.** The dispatch block at
+  a loop header reads the frame's resume word, not a block param:
+  `u32::MAX` means "not resuming", and a landing block clears it before
+  entering the target. So back edges need no args, and the steady-state
+  cost is one load and compare per iteration.
+- **Generators keep `EnterNightResume` unchanged.** Resume: the
+  `this`-magic fork, the staged descriptor, `gen_restore`, then the
+  `[value, gen, kind]` triple is written at the label's depth and routed
+  through the dispatch.
+- **Every body is checked at translation time** with waffle's
+  `validate` and `verify_reducible`. A failure declines that one script
+  with a `BUG:` reason; one invalid body would otherwise fail the whole
+  in-process batch.
+- **The generator gate is narrower than "generator using arguments".**
+  It declines only when actuals are read after the first suspend. The
+  frontend reads them in the prologue, and the resume path stages
+  undefined formals.
+- **Direct eval** is `NightDirectEval`, a copy of the engine's
+  `EvalKernel` (DIRECT_EVAL) in the MPL `NightOpsInterp.cpp` that takes
+  the caller's script, pc and env as arguments. It omits the eval cache
+  and the JSON fast path.
+- **`NightEnvSetup` builds named-lambda environments.** BBV still gates
+  them out.
+- **Modules.** The module ops compile, but the in-process batch compiles
+  only the positional classic script, so module *scripts* never reach
+  the compiler in the test lanes. Compiling them needs the batch to
+  register module roots.
+- **Size bound.** Scripts over 1 MiB of bytecode are declined. BBV's
+  bound is 128 KiB, and at least one jit-test has a 174 KB top-level
+  script that baseline compiles fine. Octane's mandreel has a 2 MB function that becomes
+  1.07M blocks and 8M values. waffle's backend `validate()` then walks
+  the dominator tree once per value use, which is quadratic on long block
+  chains, and the engine would have to compile it as a single Wasm
+  function. The same quadratic `validate` is why baseline gives each
+  throwing pc its own error-return block instead of one shared block
+  with a predecessor per helper call. Fixing waffle's `validate` would
+  make this bound a code-size policy rather than a necessity.
+- **The baseline-tier lane excludes ten more tests**
+  (`tests/jit-test-excludes-baseline.txt`). They are frame-introspection
+  and decompiled-message tests that pass in the legacy lane only because
+  BBV leaves their eval-using scripts interpreted.
 - **Then MIR, revised (§9):**
   - M0b: the small M0 follow-ups of §9 (the `magic` tag, the rval
     operand, declared loops);

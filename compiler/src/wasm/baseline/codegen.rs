@@ -399,6 +399,26 @@ impl<'a> Gen<'a> {
         self.live = true;
     }
 
+    /// Where an exception with no handler goes. Outside a generator, each
+    /// throwing pc gets its own two-instruction return block rather than a
+    /// shared one: a shared block would have one predecessor per helper
+    /// call in the body, and on a huge body that fan-in makes dominator
+    /// computation (here, and in waffle's backend) quadratic.
+    fn error_return(&mut self) -> Block {
+        if self.is_gen {
+            return self.error_block();
+        }
+        let saved = (self.cur, self.live);
+        let b = self.fresh();
+        let one = self.i32c(1);
+        let flags = self.i32c(FLAGS_ALL);
+        self.terminate(Terminator::Return {
+            values: vec![one, flags],
+        });
+        (self.cur, self.live) = saved;
+        b
+    }
+
     fn error_block(&mut self) -> Block {
         if let Some(b) = self.error_blk {
             return b;
@@ -560,7 +580,7 @@ impl<'a> Gen<'a> {
     /// environments the handler does not see.
     fn handler_dest(&mut self, pc: Pc, handler: Option<(Pc, u32, bool)>) -> BlockTarget {
         let dest = match handler {
-            None => return Self::goto(self.error_block()),
+            None => return Self::goto(self.error_return()),
             Some((hpc, _, false)) => self.block(hpc),
             Some((hpc, hd, true)) => self.finally_landing(hpc, hd),
         };
@@ -2151,9 +2171,11 @@ impl<'a> Gen<'a> {
     /// `typeof` does (so an unbound name reads as undefined, not a
     /// ReferenceError).
     fn next_is_typeof(&self, op: JSOp) -> bool {
-        let mut p = self.script.parser();
-        p.advance(usize::try_from(self.next_pc(op).get()).unwrap())
-            .and_then(|_| p.next_op())
+        let next = usize::try_from(self.next_pc(op).get()).unwrap();
+        self.script
+            .bytecode
+            .get(next)
+            .and_then(|&b| JSOp::from_byte(b))
             .is_some_and(|o| matches!(o, JSOp::Typeof | JSOp::TypeofEq))
     }
 

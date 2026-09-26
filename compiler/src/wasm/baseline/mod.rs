@@ -42,6 +42,19 @@ pub fn translate_script(
     {
         return Ok(Outcome::Skipped(FORCE_INTERPRETER.into()));
     }
+    // Code size is linear in bytecode size, but a multi-megabyte script
+    // (an Emscripten-style giant function) becomes a function of millions
+    // of blocks: waffle's backend validation walks the dominator tree per
+    // value use, and the engine then compiles it as one Wasm function. Such
+    // scripts stay interpreted. The bound is looser than BBV's 128 KiB: a
+    // few-hundred-KiB script compiles fine here.
+    const MAX_BASELINE_BYTECODE: usize = 1024 * 1024;
+    if script.bytecode.len() > MAX_BASELINE_BYTECODE {
+        return Ok(Outcome::Skipped(format!(
+            "script too large ({} bytecode bytes)",
+            script.bytecode.len()
+        )));
+    }
     let depths = match StackDepths::compute(script) {
         Ok(d) => d,
         Err(e) => return Ok(Outcome::Skipped(format!("stack depths ({e})"))),
@@ -75,13 +88,31 @@ pub fn translate_script(
     // One invalid body would fail the whole batch at serialization, and the
     // design promises reducibility by construction (docs/BASELINE.md §4):
     // check both here, so a violation declines just this script, loudly.
-    if let Err(e) = gen.body.validate() {
+    // waffle's `validate` walks the dominator tree once per value use,
+    // which is quadratic on the long block chains a big body has, so it
+    // runs only below a size bound (every test-sized body is checked).
+    const VALIDATE_MAX_BLOCKS: usize = 4096;
+    let validate = gen.body.blocks.len() <= VALIDATE_MAX_BLOCKS;
+    if let Err(e) = if validate {
+        gen.body.validate()
+    } else {
+        Ok(())
+    } {
         let head = e.to_string();
         let head = head.lines().next().unwrap_or("");
         return Ok(Outcome::Skipped(format!("BUG: invalid body ({head})")));
     }
     if let Err(e) = gen.body.verify_reducible() {
         return Ok(Outcome::Skipped(format!("BUG: irreducible body ({e})")));
+    }
+    if ctx.opts.diagnostics.stats {
+        crate::diag_line!(
+            "night: baseline body sid#{} blocks {} values {} bytecode {}",
+            _source_id,
+            gen.body.blocks.len(),
+            gen.body.values.len(),
+            script.bytecode.len()
+        );
     }
     let body_off_patches = std::mem::take(&mut gen.body_off_patches);
     Ok(Outcome::Compiled {
