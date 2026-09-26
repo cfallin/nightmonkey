@@ -71,9 +71,11 @@ Output
 
 Compilation
   --force-interp           leave every script interpreted
-  --mir <off|on|only>      the MIR tier: off (default), on (MIR where the
-                           builder accepts, legacy elsewhere), or only (MIR
-                           or GEN-only, never legacy OPT; coverage testing)
+  --pipeline <p>           which tiers compile scripts: legacy (default; BBV),
+                           baseline (baseline only), or mir (MIR over
+                           baseline); a script no tier takes is interpreted
+  --strict-coverage        fail if any script ends up interpreted for a
+                           reason other than ForceInterpreter
 
 Diagnostics
   --stats                  report phase timings and counts
@@ -93,8 +95,8 @@ Diagnostics
                            arrival (the peel rule's census)
   --dump-redundant         per-op census of box round trips, dead boxes and
                            frame round trips in the emitted IR
-  --dump-mir               per-script MIR coverage (compiled, declined with
-                           a reason, or legacy) and a summary
+  --dump-tiers             per-script tier coverage (the tier that compiled
+                           it, or interp, and every decline) and a summary
 
 Instrumentation (CHANGES the generated code; never on in production)
   --census                 emit night_runtime_census calls: per-track version
@@ -149,44 +151,9 @@ fn parse_args() -> Result<Args> {
             }
             "--keep-names" => keep_names = true,
             "--dump-graph" => dump_graph = true,
-            "--force-interp" => opts.force_interp = true,
-            "--mir" => opts.mir = val(&mut it, "--mir")?.parse().map_err(anyhow::Error::msg)?,
-            "--dump-mir" => opts.diagnostics.mir = true,
-            "--stats" => opts.diagnostics.stats = true,
-            "--dump-opsize" => opts.diagnostics.opsize = true,
-            "--dump-ctxedge" => opts.diagnostics.ctxedge = true,
-            "--dump-clsfact" => opts.diagnostics.clsfact = true,
-            "--dump-propgap" => opts.diagnostics.propgap = true,
-            "--dump-cfg" => opts.diagnostics.cfg = true,
-            "--dump-peel" => opts.diagnostics.peel = true,
-            "--dump-redundant" => opts.diagnostics.redundant = true,
-            "--trace-cell" => opts.diagnostics.trace_cell = Some(val(&mut it, "--trace-cell")?),
-            "--trace-field" => opts.diagnostics.trace_field = Some(val(&mut it, "--trace-field")?),
-            "--trace-site" => opts.diagnostics.trace_site = Some(val(&mut it, "--trace-site")?),
-            "--census" => opts.instrument.census = true,
-            "--guard-census" => opts.instrument.guards = true,
-            "--block-census" => opts.instrument.blocks = true,
-            "--dump-bytecode" => opts.diagnostics.disasm = Some(Vec::new()),
-            _ if a.starts_with("--dump-bytecode=") => {
-                let list = &a["--dump-bytecode=".len()..];
-                let ids = list
-                    .split(',')
-                    .filter(|s| !s.is_empty())
-                    .map(|s| {
-                        s.parse::<u32>()
-                            .with_context(|| format!("bad source id `{s}` in `{a}`"))
-                    })
-                    .collect::<Result<Vec<u32>>>()?;
-                opts.diagnostics.disasm = Some(ids);
-            }
-            "--dump-bbv" => opts.diagnostics.bbv = true,
-            "--dump-facts" => opts.diagnostics.facts = Some(val(&mut it, "--dump-facts")?),
-            "--viz" => opts.diagnostics.viz = true,
-            "--viz-facts" => opts.diagnostics.viz_facts = Some(val(&mut it, "--viz-facts")?),
-            "--viz-lower" => {
-                opts.diagnostics.viz = true;
-                opts.diagnostics.viz_lower = true;
-            }
+            _ if opts
+                .apply_flag(&a, &mut || it.next())
+                .map_err(anyhow::Error::msg)? => {}
             _ if a.starts_with('-') && a != "-" => {
                 bail!("unknown option `{a}`\n\n{}", usage())
             }

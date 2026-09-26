@@ -198,7 +198,7 @@ nightmonkey snap.wasm -o out.wasm      # recompile without re-wizening
 `nightmonkey --help` lists the diagnostics (`--stats`, `--dump-bytecode`,
 `--dump-bbv`, `--dump-facts`, `--dump-graph`, `--viz`, `--viz-lower`,
 `--viz-facts`) and the compilation options (`--force-interp`,
-`--keep-names`). `--dump-bytecode`
+`--keep-names`, `--pipeline`, `--strict-coverage`). `--dump-bytecode`
 takes an optional comma-separated source-id list
 (`--dump-bytecode=145,153`); a whole-bundle disassembly is megabytes.
 Debug sections are stripped by default; `--keep-names` retains them.
@@ -223,6 +223,19 @@ The jit-test suite in both lanes, from the SpiderMonkey checkout's harness:
 scripts/run-jit-tests.sh /path/to/firefox build -- -j16
 NIGHT_INPROCESS_OFF=1 scripts/run-jit-tests.sh /path/to/firefox build -- -j16
 ```
+
+Compiler flags for the in-process batch (the same ones `nightmonkey`
+takes) go in `NIGHT_OPTIONS`, which the wrapper passes to the shell as
+`--night-options`. For example, the baseline-tier lane, failing any test
+whose script ends up interpreted:
+
+```
+NIGHT_OPTIONS="--pipeline baseline --strict-coverage" \
+    scripts/run-jit-tests.sh /path/to/firefox build -- -j16
+```
+
+`--dump-tiers` reports, per script, which tier compiled it and why others
+declined (`docs/BASELINE.md`).
 
 `scripts/run-jstests.sh` does the same for jstests (hours for the full
 suite; append a path to scope). Both lanes are expected to pass completely.

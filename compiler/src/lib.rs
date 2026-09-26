@@ -72,7 +72,7 @@ pub mod source;
 pub mod view;
 pub mod wasm;
 
-pub use options::{Diagnostics, MirMode, Options};
+pub use options::{Diagnostics, Options, Pipeline};
 
 /// Build an in-process AOT batch for the `Source` graph at `analysis_source`
 /// (root `root_id`): compiled function blobs in wasm-jit-runner format, the
@@ -83,12 +83,17 @@ pub use options::{Diagnostics, MirMode, Options};
 /// index. `table_base` is the current table size (`wasm_table_size()`);
 /// blob `i` is predicted at `table_base + i`. `alloc` is called exactly
 /// twice and must return zeroed, 8-aligned, non-null memory (calloc-style;
-/// it may be called with size 0). Returns null on failure (message on
-/// stderr); free with `night_inproc_delete`.
+/// it may be called with size 0). `options` is null or a NUL-terminated,
+/// whitespace-separated string of compiler flags, as the `nightmonkey` CLI
+/// takes them (`Options::parse_str`). Returns null on failure (message on
+/// stderr); free with `night_inproc_delete`. Under `--strict-coverage` a
+/// failed build aborts the process instead, so a test lane cannot pass by
+/// silently interpreting.
 ///
 /// # Safety
 /// `helper_names`/`helper_sigs` must point to `n_helpers` valid
-/// NUL-terminated strings and `helper_funcptrs` to `n_helpers` u32s.
+/// NUL-terminated strings and `helper_funcptrs` to `n_helpers` u32s;
+/// `options` must be null or a valid NUL-terminated string.
 #[no_mangle]
 pub unsafe extern "C" fn night_inproc_build(
     analysis_source: &source::Source,
@@ -99,6 +104,7 @@ pub unsafe extern "C" fn night_inproc_build(
     n_helpers: u32,
     table_base: u32,
     alloc: extern "C" fn(usize) -> u32,
+    options: *const core::ffi::c_char,
 ) -> *mut wasm::inprocess::InprocOut {
     let n = usize::try_from(n_helpers).unwrap();
     let mut specs = Vec::with_capacity(n);
@@ -131,7 +137,22 @@ pub unsafe extern "C" fn night_inproc_build(
         });
     }
     let root_id = source::SourceObjectId::new(root_id);
-    let opts = Options::default();
+    let opts = if options.is_null() {
+        Options::default()
+    } else {
+        let parsed = core::ffi::CStr::from_ptr(options)
+            .to_str()
+            .map_err(|e| e.to_string())
+            .and_then(Options::parse_str);
+        match parsed {
+            Ok(o) => o,
+            Err(e) => {
+                crate::diag_line!("night: inprocess: bad options: {e}");
+                return core::ptr::null_mut();
+            }
+        }
+    };
+    let strict = opts.strict_coverage;
     let build = move || {
         wasm::inprocess::build_inprocess_batch(
             analysis_source,
@@ -176,6 +197,9 @@ pub unsafe extern "C" fn night_inproc_build(
             let head = e.lines().next().unwrap_or("");
             crate::diag_line!("night: inprocess: {head}");
             log::error!("night_inproc_build: {e}");
+            if strict {
+                std::process::abort();
+            }
             core::ptr::null_mut()
         }
     }

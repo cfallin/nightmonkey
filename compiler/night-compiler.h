@@ -199,6 +199,10 @@ void night_source_script_set_body_scope(night_source_t* source,
 // header word order is documented in wasm/inprocess.rs (ENV_DESC_WORDS).
 // The string-literal payload at [strlit_off, strlit_off+strlit_len) must be
 // copied to linear address strlit_addr before compiled code runs.
+//
+// `options` is null or a NUL-terminated string of compiler flags, as the
+// nightmonkey CLI takes them, separated by whitespace. An unparseable
+// string fails the build.
 typedef uint32_t (*night_alloc_fn)(size_t size);
 typedef void night_inproc_out_t;
 night_inproc_out_t* night_inproc_build(night_source_t* analysis_source,
@@ -207,7 +211,8 @@ night_inproc_out_t* night_inproc_build(night_source_t* analysis_source,
                                        const char* const* helper_sigs,
                                        const uint32_t* helper_funcptrs,
                                        uint32_t n_helpers, uint32_t table_base,
-                                       night_alloc_fn alloc);
+                                       night_alloc_fn alloc,
+                                       const char* options);
 uint32_t night_inproc_num_blobs(night_inproc_out_t* out);
 const uint8_t* night_inproc_blob_ptr(night_inproc_out_t* out, uint32_t i);
 uint32_t night_inproc_blob_len(night_inproc_out_t* out, uint32_t i);

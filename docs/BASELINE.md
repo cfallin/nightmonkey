@@ -384,6 +384,18 @@ byte-identical.
     `inproc-shell.sh`).
   - Write down the frame format and resume protocol in this document as
     final.
+  - **Done** (`wasm/baseline/layout.rs`, `wasm/tier.rs`):
+    - The flags are `--pipeline legacy|baseline|mir`,
+      `--strict-coverage` and `--dump-tiers`, parsed by
+      `Options::apply_flag` for both the CLI and the in-process option
+      string.
+    - The in-process channel is `NIGHT_OPTIONS`, passed through
+      `inproc-shell.sh` to the shell's `--night-options` and on to
+      `night_inproc_build`. Under strict coverage, a failed in-process
+      build aborts.
+    - `baseline::translate_script` checks the frame contract on every
+      script (layout, depths, try-note agreement) and then declines
+      with "not implemented" until B1.
 - **B1. Straight-line baseline.**
   - Ops: prologue, constants, stack ops, locals/args/rval, arithmetic
     and compares via helpers, `to_boolean` branches, loops, return,

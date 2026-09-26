@@ -55,6 +55,10 @@ static bool InprocFail(const char* what) {
   return true;
 }
 
+static const char* gInprocOptions = nullptr;
+
+void js::SetInprocOptions(const char* options) { gInprocOptions = options; }
+
 bool js::CompileInProcess(JSContext* cx, JS::Handle<JSScript*> script) {
   // Single batch: only the first registered tree compiles; everything else
   // (eval, -f prologues, other realms) stays interpreted.
@@ -150,7 +154,7 @@ bool js::CompileInProcess(JSContext* cx, JS::Handle<JSScript*> script) {
   night_inproc_out_t* out = night_inproc_build(
       walkSource, night_snapshot_walk_root(walk), names, sigs, funcptrs,
       static_cast<uint32_t>(night::kNightHelperCount),
-      static_cast<uint32_t>(tableBase), InprocAlloc);
+      static_cast<uint32_t>(tableBase), InprocAlloc, gInprocOptions);
   if (!out) {
     night_snapshot_walk_delete(walk);
     return InprocFail("batch build failed");

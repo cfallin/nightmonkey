@@ -85,6 +85,12 @@ static constexpr size_t kWizenThisSlots = 8;
 // process; later calls are no-ops. Failures degrade to the interpreter
 // (returning true); false means a real error (pending exception).
 bool CompileInProcess(JSContext* cx, JS::Handle<JSScript*> script);
+
+// Compiler options for the in-process batch: the nightmonkey CLI's
+// compiler flags, space-separated (e.g. "--pipeline baseline
+// --dump-tiers"). Null or empty means the defaults. The string must outlive
+// the batch build.
+void SetInprocOptions(const char* options);
 #endif
 
 }  // namespace js

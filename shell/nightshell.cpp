@@ -62,6 +62,12 @@ static bool AddOptions(OptionParser& op) {
                         "bodies (requires the wasm-jit-runner hostcalls)")) {
     return false;
   }
+  if (!op.addStringOption('\0', "night-options", "FLAGS",
+                          "Compiler flags for --night-inprocess, as the "
+                          "nightmonkey CLI takes them, space-separated "
+                          "(e.g. \"--pipeline baseline --dump-tiers\")")) {
+    return false;
+  }
 #endif
   return true;
 }
@@ -71,6 +77,8 @@ static bool OptionsParsed(OptionParser& op) {
   night::NightSetWizening(enableNightSnapshot);
 #ifdef ENABLE_JS_NIGHTMONKEY_INPROCESS
   enableNightInprocess = op.getBoolOption("night-inprocess");
+  // The option parser owns the string for the life of the process.
+  SetInprocOptions(op.getStringOption("night-options"));
 #endif
   return true;
 }

@@ -5,8 +5,13 @@
 //! produces output without changing codegen. There are deliberately no
 //! switches that select between codegen designs: the compiler has one
 //! lowering strategy and one analysis, and they are not configurable. The
-//! one exception is [`MirMode`], which gates the MIR tier (`docs/MIR.md`)
-//! while it replaces the legacy OPT path and is removed with it.
+//! one exception is [`Pipeline`], which selects between the legacy BBV
+//! path and the baseline/MIR tiers (`docs/BASELINE.md`, `docs/MIR.md`)
+//! while the latter replace the former, and is removed with it.
+//!
+//! [`Options::apply_flag`] is the one parser for compiler flags: the
+//! `nightmonkey` CLI and the in-process build's option string both go
+//! through it.
 
 /// Write one line of diagnostic output.
 ///
@@ -95,10 +100,11 @@ pub struct Diagnostics {
     pub trace_field: Option<String>,
     /// Trace the per-context evaluation of one read site, `<sid>:<pc>`.
     pub trace_site: Option<String>,
-    /// MIR coverage: one `night: mir <sid> <status>` line per script
-    /// (`compiled`, `declined:<reason>`, or `legacy` when MIR is off), and
-    /// a summary. Coverage is measured, never assumed.
-    pub mir: bool,
+    /// Tier coverage: one `night: tier <sid> <tier>` line per translated
+    /// script, naming the tier that compiled it (or `interp`) and every
+    /// decline on the way, and a summary. Coverage is measured, never
+    /// assumed.
+    pub tiers: bool,
 }
 
 impl Diagnostics {
@@ -121,7 +127,7 @@ impl Diagnostics {
             || self.trace_cell.is_some()
             || self.trace_field.is_some()
             || self.trace_site.is_some()
-            || self.mir
+            || self.tiers
     }
 
     /// Whether `source_id`'s bytecode should be disassembled.
@@ -162,26 +168,29 @@ pub struct Instrumentation {
     pub blocks: bool,
 }
 
-/// Which OPT tier compiles a script (`docs/MIR.md` §13).
+/// Which compiled tiers a script may use (`docs/BASELINE.md` §5).
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
-pub enum MirMode {
-    /// The legacy OPT+GEN lowering only.
+pub enum Pipeline {
+    /// The legacy BBV lowering (OPT+GEN tracks).
     #[default]
-    Off,
-    /// MIR for the scripts the builder accepts, legacy for the rest.
-    On,
-    /// MIR or GEN-only, never legacy OPT: for coverage testing.
-    Only,
+    Legacy,
+    /// The baseline tier only. A script baseline declines is interpreted.
+    Baseline,
+    /// MIR where the builder accepts, over baseline; baseline alone where
+    /// it declines; the interpreter where baseline declines too.
+    Mir,
 }
 
-impl std::str::FromStr for MirMode {
+impl std::str::FromStr for Pipeline {
     type Err = String;
-    fn from_str(s: &str) -> Result<MirMode, String> {
+    fn from_str(s: &str) -> Result<Pipeline, String> {
         match s {
-            "off" => Ok(MirMode::Off),
-            "on" => Ok(MirMode::On),
-            "only" => Ok(MirMode::Only),
-            _ => Err(format!("bad MIR mode `{s}` (expected off, on or only)")),
+            "legacy" => Ok(Pipeline::Legacy),
+            "baseline" => Ok(Pipeline::Baseline),
+            "mir" => Ok(Pipeline::Mir),
+            _ => Err(format!(
+                "bad pipeline `{s}` (expected legacy, baseline or mir)"
+            )),
         }
     }
 }
@@ -192,7 +201,108 @@ pub struct Options {
     /// Leave every script interpreted. A triage switch: it isolates whether
     /// a failure comes from compiled code without rebuilding.
     pub force_interp: bool,
-    pub mir: MirMode,
+    pub pipeline: Pipeline,
+    /// Fail the compilation if any translated script ends up interpreted
+    /// for a reason other than an allowed one (`ForceInterpreter`). This
+    /// is how a test lane proves it ran compiled code (`DESIGN.md` §12).
+    pub strict_coverage: bool,
     pub diagnostics: Diagnostics,
     pub instrument: Instrumentation,
+}
+
+impl Options {
+    /// Apply one compiler flag. `next` yields the flag's argument, for the
+    /// flags that take one. Returns `Ok(false)` for a flag that is not a
+    /// compiler flag (the caller may own it).
+    pub fn apply_flag(
+        &mut self,
+        flag: &str,
+        next: &mut dyn FnMut() -> Option<String>,
+    ) -> Result<bool, String> {
+        let mut arg = |flag: &str| next().ok_or_else(|| format!("{flag} needs an argument"));
+        let d = &mut self.diagnostics;
+        match flag {
+            "--force-interp" => self.force_interp = true,
+            "--pipeline" => self.pipeline = arg(flag)?.parse()?,
+            "--strict-coverage" => self.strict_coverage = true,
+            "--stats" => d.stats = true,
+            "--dump-opsize" => d.opsize = true,
+            "--dump-ctxedge" => d.ctxedge = true,
+            "--dump-clsfact" => d.clsfact = true,
+            "--dump-propgap" => d.propgap = true,
+            "--dump-cfg" => d.cfg = true,
+            "--dump-peel" => d.peel = true,
+            "--dump-redundant" => d.redundant = true,
+            "--dump-tiers" => d.tiers = true,
+            "--trace-cell" => d.trace_cell = Some(arg(flag)?),
+            "--trace-field" => d.trace_field = Some(arg(flag)?),
+            "--trace-site" => d.trace_site = Some(arg(flag)?),
+            "--dump-bytecode" => d.disasm = Some(Vec::new()),
+            "--dump-bbv" => d.bbv = true,
+            "--dump-facts" => d.facts = Some(arg(flag)?),
+            "--viz" => d.viz = true,
+            "--viz-facts" => d.viz_facts = Some(arg(flag)?),
+            "--viz-lower" => {
+                d.viz = true;
+                d.viz_lower = true;
+            }
+            "--census" => self.instrument.census = true,
+            "--guard-census" => self.instrument.guards = true,
+            "--block-census" => self.instrument.blocks = true,
+            _ if flag.starts_with("--dump-bytecode=") => {
+                let list = &flag["--dump-bytecode=".len()..];
+                let ids = list
+                    .split(',')
+                    .filter(|s| !s.is_empty())
+                    .map(|s| {
+                        s.parse::<u32>()
+                            .map_err(|_| format!("bad source id `{s}` in `{flag}`"))
+                    })
+                    .collect::<Result<Vec<u32>, String>>()?;
+                d.disasm = Some(ids);
+            }
+            _ => return Ok(false),
+        }
+        Ok(true)
+    }
+
+    /// Options from a whitespace-separated string of compiler flags (the
+    /// in-process build's option channel). Every word must be a compiler
+    /// flag or a flag's argument.
+    pub fn parse_str(s: &str) -> Result<Options, String> {
+        let mut opts = Options::default();
+        let mut words = s.split_whitespace().map(str::to_string);
+        while let Some(w) = words.next() {
+            if !opts.apply_flag(&w, &mut || words.next())? {
+                return Err(format!("unknown compiler option `{w}`"));
+            }
+        }
+        Ok(opts)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_option_strings() {
+        let o =
+            Options::parse_str("  --pipeline baseline --dump-tiers\t--strict-coverage ").unwrap();
+        assert_eq!(o.pipeline, Pipeline::Baseline);
+        assert!(o.diagnostics.tiers && o.strict_coverage);
+        let o = Options::parse_str("--dump-bytecode=3,4 --trace-site 1:2").unwrap();
+        assert_eq!(o.diagnostics.disasm, Some(vec![3, 4]));
+        assert_eq!(o.diagnostics.trace_site.as_deref(), Some("1:2"));
+        assert_eq!(Options::parse_str("").unwrap().pipeline, Pipeline::Legacy);
+        assert!(Options::parse_str("--pipeline")
+            .unwrap_err()
+            .contains("needs an argument"));
+        assert!(Options::parse_str("--pipeline fast")
+            .unwrap_err()
+            .contains("bad pipeline"));
+        assert!(Options::parse_str("-o x")
+            .unwrap_err()
+            .contains("unknown compiler option"));
+    }
 }

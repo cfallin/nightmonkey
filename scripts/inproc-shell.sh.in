@@ -8,7 +8,8 @@
 # (execution order is preserved: the positional runs after all options).
 #
 # Env: NIGHT_RUNNER, NIGHT_WASM_SHELL, NIGHT_CACHE_DIR override the defaults;
-#      NIGHT_INPROCESS_OFF=1 omits --night-inprocess (the AOT-off lane).
+#      NIGHT_INPROCESS_OFF=1 omits --night-inprocess (the AOT-off lane);
+#      NIGHT_OPTIONS passes compiler flags to the in-process batch.
 set -u
 
 here=$(cd "$(dirname "$0")" && pwd)
@@ -47,6 +48,11 @@ fi
 aot=()
 if [ "${NIGHT_INPROCESS_OFF:-0}" != 1 ]; then
   aot=(--night-inprocess)
+  # NIGHT_OPTIONS: compiler flags for the in-process batch, as the
+  # nightmonkey CLI takes them (e.g. "--pipeline baseline --dump-tiers").
+  if [ -n "${NIGHT_OPTIONS:-}" ]; then
+    aot+=("--night-options=$NIGHT_OPTIONS")
+  fi
 fi
 
 exec "$RUNNER" --dir / --cache-dir "$CACHE" "$SHELL_WASM" -- \

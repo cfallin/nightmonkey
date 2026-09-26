@@ -19,6 +19,7 @@ use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 pub mod baseline;
 pub(crate) mod bbv;
+pub mod tier;
 pub use bbv::EARLY_KEY_MAX;
 
 /// The image-patch constants for snapshot-object stamping (nightmonkey's
@@ -1889,6 +1890,48 @@ pub struct TranslateOut {
     pub ctor_nslots_size: usize,
 }
 
+/// Translate one script with the tiers `opts.pipeline` allows, in order,
+/// and report which one took it (`docs/BASELINE.md` §5).
+fn translate_for_pipeline(
+    ctx: &translate::TranslateCtx,
+    m: &mut Module,
+    atoms: &mut translate::AtomTable,
+    sid: ScriptId,
+    script: &crate::bytecode::Script,
+    is_global: bool,
+) -> Result<(translate::Outcome, tier::TierStatus), String> {
+    use crate::options::Pipeline;
+    use tier::{Decline, Tier, TierStatus};
+    let mut declines = vec![];
+    let (first, outcome) = match ctx.opts.pipeline {
+        Pipeline::Legacy => (
+            Tier::Legacy,
+            bbv::translate_script(ctx, m, atoms, sid, script, is_global)?,
+        ),
+        Pipeline::Baseline | Pipeline::Mir => {
+            if ctx.opts.pipeline == Pipeline::Mir {
+                // There is no MIR builder yet (M2).
+                declines.push(Decline::new(Tier::Mir, "no builder"));
+            }
+            (
+                Tier::Baseline,
+                baseline::translate_script(ctx, m, atoms, sid, script, is_global)?,
+            )
+        }
+    };
+    let tier = match &outcome {
+        translate::Outcome::Compiled { .. } => first,
+        translate::Outcome::Skipped(reason) => {
+            declines.push(Decline {
+                allowed: first == Tier::Baseline && reason == baseline::FORCE_INTERPRETER,
+                ..Decline::new(first, reason.clone())
+            });
+            Tier::Interp
+        }
+    };
+    Ok((outcome, TierStatus { tier, declines }))
+}
+
 /// Translate every compilable script (and regex program) into an appended
 /// body, then arm the likely-callee / fuse-call sites and patch the cell-region
 /// placeholder consts. `skip` and `on_compiled` are the caller's per-script
@@ -1976,7 +2019,7 @@ pub fn translate_all(
         likely_elems: &env.likely_elems,
         fused_gnames: &env.fused_gnames_tx,
     };
-    let mut mir_census = crate::mir::gate::MirCensus::default();
+    let mut tier_census = tier::TierCensus::default();
     for id in script_ids {
         let SourceObject::Script(script) = source.object(id) else {
             unreachable!()
@@ -1985,19 +2028,11 @@ pub fn translate_all(
             n_skipped += 1;
             continue;
         }
-        mir_census.record(
-            ScriptId::new(id.id()),
-            &crate::mir::gate::status(opts.mir),
-            opts.diagnostics.mir,
-        );
-        match bbv::translate_script(
-            &tx_ctx,
-            m,
-            &mut atoms,
-            ScriptId::new(id.id()),
-            script,
-            id == root_id,
-        )? {
+        let sid = ScriptId::new(id.id());
+        let (outcome, status) =
+            translate_for_pipeline(&tx_ctx, m, &mut atoms, sid, script, id == root_id)?;
+        tier_census.record(sid, status, opts.diagnostics.tiers);
+        match outcome {
             translate::Outcome::Compiled {
                 sig,
                 body,
@@ -2105,8 +2140,11 @@ pub fn translate_all(
     if opts.diagnostics.stats {
         crate::diag_line!("night: {n_compiled} scripts compiled, {n_skipped} skipped");
     }
-    if opts.diagnostics.mir {
-        crate::diag_line!("{}", mir_census.summary());
+    if opts.diagnostics.tiers {
+        crate::diag_line!("{}", tier_census.summary());
+    }
+    if opts.strict_coverage {
+        tier_census.check_strict()?;
     }
 
     // ---- Regex AOT: compile each snapshotted irregexp bytecode program to a

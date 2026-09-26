@@ -659,11 +659,7 @@ pub fn translate_script(
     // body entirely, so a resume has no arriving version to name. On the GEN
     // rung there is one version per pc, which a resume can name by pc alone
     // (generator.rs).
-    // `MirMode::Only` never uses legacy OPT: a script the MIR builder
-    // declines is GEN-only.
-    let gen_only_forced = ctx.opts.mir == crate::options::MirMode::Only
-        && crate::mir::gate::status(ctx.opts.mir) != crate::mir::gate::MirStatus::Compiled;
-    let rungs: &[(bool, bool)] = if script.is_generator_or_async || gen_only_forced {
+    let rungs: &[(bool, bool)] = if script.is_generator_or_async {
         &[(true, true)]
     } else {
         &[(false, false), (true, false), (true, true)]
