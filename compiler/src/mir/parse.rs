@@ -1177,6 +1177,14 @@ impl Parser {
             JsTypeofEq(_) => JsTypeofEq(self.int()?),
             JsConstantStrictEq(_) => JsConstantStrictEq(self.int()?),
             JsGetName(_) => JsGetName(self.atom()?),
+            JsRt(RtOp::DelProp(_, strict)) => JsRt(RtOp::DelProp(self.atom()?, strict)),
+            JsRt(RtOp::NewArray(_)) => JsRt(RtOp::NewArray(self.int()?)),
+            JsRt(RtOp::InitElem(_)) => JsRt(RtOp::InitElem(self.int()?)),
+            JsRt(RtOp::InitProp(..)) => {
+                let a = self.atom()?;
+                self.expect_punct(",")?;
+                JsRt(RtOp::InitProp(a, self.int()?))
+            }
             JsBindGName(_) => JsBindGName(self.atom()?),
             JsSetName(_, strict) => JsSetName(self.atom()?, strict),
             LoadField(_) => LoadField(self.atom()?),
@@ -1431,6 +1439,18 @@ fn template(mn: &str) -> Option<Opcode> {
         JsBoxThis,
         JsBindGName(placeholder_atom),
         JsLambda(0),
+        JsThrow,
+        JsRt(RtOp::Instanceof),
+        JsRt(RtOp::In),
+        JsRt(RtOp::HasOwn),
+        JsRt(RtOp::DelProp(placeholder_atom, false)),
+        JsRt(RtOp::DelProp(placeholder_atom, true)),
+        JsRt(RtOp::DelElem(false)),
+        JsRt(RtOp::DelElem(true)),
+        JsRt(RtOp::NewObject),
+        JsRt(RtOp::NewArray(0)),
+        JsRt(RtOp::InitProp(placeholder_atom, 0)),
+        JsRt(RtOp::InitElem(0)),
         FrameStore(0),
         JsSetName(placeholder_atom, false),
         JsSetName(placeholder_atom, true),

@@ -32,7 +32,8 @@ use crate::ids::{ArgIndex, Pc, ScriptId};
 use crate::mir;
 use crate::mir::func::{Edge, EdgeArg, FrameShape, LoopDecl, Root, RootKind};
 use crate::mir::ops::{
-    ArithOp, BitOp, Cc, ConstVal, F64Op, JsBinop, JsCc, JsUnop, MathFn, NumRepr, Opcode, UnboxKind,
+    ArithOp, BitOp, Cc, ConstVal, F64Op, JsBinop, JsCc, JsUnop, MathFn, NumRepr, Opcode, RtOp,
+    UnboxKind,
 };
 use crate::mir::types::{
     KeyRange, LayoutClaim, LayoutState, ObjInfo, ObjKind, TagSet, Type as MType,
@@ -113,18 +114,27 @@ impl Ty {
 }
 
 /// The representation a numeric claim is speculated in (§8's
-/// guard-at-defs): int32 for an int32-only claim, and also for a number
-/// claim the analysis says is mostly int32 (int32 in it, not flagged
-/// double-first: the order bbv's typed-load ladder tries), exiting on a
-/// double; f64 for other number claims. `None` for anything else.
-const SPECULATE_INT_FIRST: bool = false;
+/// guard-at-defs): int32 for an int32-only claim; with `int_first`, also
+/// for a number claim with int32 in it that is not flagged double-first
+/// (the order bbv's typed-load ladder tries), exiting on a double; f64
+/// for other number claims. `None` for anything else. Int-first suits
+/// formals, element and name reads (indices, digits, counters: crypto's
+/// am3 gains 17%); property reads and call results often hold doubles
+/// the claim does not flag (raytrace's vectors), and an exit per double
+/// costs far more than the ToInt32s int-first saves.
+const SPECULATE_INT_FIRST: bool = true;
 
-fn num_claim_ty(claim: crate::facts::Claim) -> Option<Ty> {
+/// Whether the generic runtime ops (`js.rt`, `js.throw`, `js.typeof`)
+/// are built.
+const RT_OPS: bool = false;
+
+fn num_claim_ty(claim: crate::facts::Claim, int_first: bool) -> Option<Ty> {
     let prims = claim.prims();
     if claim.is_none() || claim.is_object() || prims.is_empty() {
         None
     } else if prims.subset_of(PRIM_INT32)
         || (SPECULATE_INT_FIRST
+            && int_first
             && prims.subset_of(crate::opsem::NUM)
             && prims.intersects(PRIM_INT32)
             && !claim.double_first())
@@ -193,14 +203,13 @@ impl<'a> Shape<'a> {
 }
 
 /// A property access the analysis predicts: the receiver's layouts
-/// `[lo, hi]`, whether the field's claim is backed by the stamp's TYPES
-/// bit (a number), and whether it is int32-only.
+/// `[lo, hi]`, and whether the field's claim is backed by the stamp's
+/// TYPES bit (a number).
 #[derive(Clone, Copy, Debug)]
 struct TypedSite {
     lo: u32,
     hi: u32,
     types: bool,
-    int32: bool,
     /// The analysis's value claim, to guard at the def when the stamp
     /// does not back it (`!types`).
     claim: crate::facts::Claim,
@@ -593,7 +602,7 @@ impl<'a> Shape<'a> {
             .get(&(self.sid, ArgIndex::new(i + 1)))
             .copied()
             .unwrap_or(Claim::NONE);
-        num_claim_ty(claim).unwrap_or(Ty::Val(TagSet::ALL))
+        num_claim_ty(claim, true).unwrap_or(Ty::Val(TagSet::ALL))
     }
 }
 
@@ -860,12 +869,12 @@ impl<'s, 'a> Run<'s, 'a> {
     /// the stack: guard it to the analysis's prediction `claim`. The op has
     /// happened, so a failure exits at `next`, the successor pc, with the
     /// result unguarded on the stack (§5.1's resume rule).
-    fn guard_result(&mut self, claim: crate::facts::Claim, next: Pc) {
+    fn guard_result(&mut self, claim: crate::facts::Claim, next: Pc, int_first: bool) {
         let prims = claim.prims();
         if claim.is_none() || claim.is_object() || prims.is_empty() {
             return;
         }
-        let (op, ty) = match num_claim_ty(claim) {
+        let (op, ty) = match num_claim_ty(claim, int_first) {
             Some(Ty::I32) => (Opcode::GuardUnbox(UnboxKind::I32), Ty::I32),
             Some(Ty::F64) => (Opcode::GuardUnbox(UnboxKind::F64Num), Ty::F64),
             _ => return,
@@ -1017,7 +1026,6 @@ impl<'s, 'a> Run<'s, 'a> {
             lo: ps.layout_id,
             hi: ps.hi_layout_id,
             types,
-            int32: types && prims.subset_of(PRIM_INT32),
             claim: ps.claim,
         };
         let claim = site.claim_ty();
@@ -1042,12 +1050,24 @@ impl<'s, 'a> Run<'s, 'a> {
         Some(site)
     }
 
-    /// Guard a receiver to an object of the site's layouts (§4.3): an
-    /// object tag test, then the stamp compare, both exiting at the op's
-    /// pc on failure.
-    fn guard_layout(&mut self, recv: Slot, site: &TypedSite) -> mir::Value {
-        let x = self.boxed(recv);
-        let o = self.guard(Opcode::GuardUnbox(UnboxKind::Obj), vec![x], MType::OBJ_TOP);
+    /// Guard boxed receiver `x` to an object of the site's layouts (§4.3):
+    /// an object tag test, then the stamp compare, branching to `fallback`
+    /// (no params) when either fails.
+    fn guard_layout_or(&mut self, x: mir::Value, site: &TypedSite, fallback: mir::Block) -> mir::Value {
+        let ob = self.new_block();
+        let o = self.f.add_param(ob, MType::OBJ_TOP);
+        self.term(
+            Opcode::GuardUnbox(UnboxKind::Obj),
+            vec![x],
+            vec![
+                Edge {
+                    block: ob,
+                    args: vec![EdgeArg::Out(0)],
+                },
+                Self::goto(fallback),
+            ],
+        );
+        self.at(ob);
         let keys = KeyRange {
             lo: crate::ids::LayoutKey::new(site.lo),
             hi: crate::ids::LayoutKey::new(site.hi),
@@ -1060,14 +1080,24 @@ impl<'s, 'a> Run<'s, 'a> {
             }),
             ..ObjInfo::TOP
         });
-        self.guard(
+        let lb = self.new_block();
+        let lo = self.f.add_param(lb, t);
+        self.term(
             Opcode::GuardLayout {
                 keys,
                 types: site.types,
             },
             vec![o],
-            t,
-        )
+            vec![
+                Edge {
+                    block: lb,
+                    args: vec![EdgeArg::Out(0)],
+                },
+                Self::goto(fallback),
+            ],
+        );
+        self.at(lb);
+        lo
     }
 
     /// A generic op with a static kill (`ok`, `err`): the builder attaches
@@ -1111,8 +1141,6 @@ impl<'s, 'a> Run<'s, 'a> {
         self.at(ok);
     }
 
-    /// A generic op: both success edges continue with its output (of type
-    /// `out`); an exception goes to the op's throw block.
     /// A call whose predicted targets are inlined (§5.5): the callee
     /// guarded to each target's script in turn, each target's MIR spliced
     /// in on its hit; the ordinary call when none matches. Returns the
@@ -1189,6 +1217,8 @@ impl<'s, 'a> Run<'s, 'a> {
         result
     }
 
+    /// A generic op: both success edges continue with its output (of type
+    /// `out`); an exception goes to the op's throw block.
     fn js(&mut self, op: Opcode, args: Vec<mir::Value>, out: MType) -> mir::Value {
         let ok = self.new_block();
         let p = self.f.add_param(ok, out);
@@ -1771,7 +1801,7 @@ impl<'s, 'a> Run<'s, 'a> {
                 );
                 self.push(v, Ty::Val(TagSet::ALL));
                 let claim = self.s.ctx.facts.aliased_sites.get(&self.site(pc)).copied();
-                self.guard_result(claim.unwrap_or_default(), pc + op.len());
+                self.guard_result(claim.unwrap_or_default(), pc + op.len(), true);
             }
             SetAliasedVar | InitAliasedLexical => {
                 let hops = p.next_uint16().unwrap();
@@ -2362,7 +2392,7 @@ impl<'s, 'a> Run<'s, 'a> {
                 let r = self.js_static(Opcode::JsGetName(a), vec![], MType::VAL_TOP);
                 self.push(r, Ty::Val(TagSet::ALL));
                 if let Some(&claim) = self.s.gname_types.get(&index) {
-                    self.guard_result(claim, pc + op.len());
+                    self.guard_result(claim, pc + op.len(), true);
                 }
             }
             GetProp => {
@@ -2370,26 +2400,45 @@ impl<'s, 'a> Run<'s, 'a> {
                 let recv = self.pop();
                 if let Some(site) = self.typed_site(pc, a) {
                     // The predicted layout: guard the receiver's class
-                    // locally, then load the field (§4.3).
-                    let o = self.guard_layout(recv, &site);
-                    let claim = site.claim_ty();
-                    let r = self.js(Opcode::LoadField(a), vec![o], claim);
-                    if site.int32 {
-                        let v =
-                            self.guard(Opcode::GuardUnbox(UnboxKind::I32), vec![r], MType::I32_TOP);
-                        self.push(v, Ty::I32);
-                    } else if site.types {
-                        self.push(r, Ty::Val(TagSet::NUMBER));
-                    } else {
-                        self.push(r, Ty::Val(TagSet::ALL));
-                        self.guard_result(site.claim, pc + op.len());
-                    }
+                    // locally, then load the field (§4.3). A receiver of
+                    // another layout reads through the IC instead of
+                    // exiting: a prediction that is wrong for some receivers
+                    // must not send the rest of the activation to baseline
+                    // every time. The claim is guarded after the join.
+                    let x = self.boxed(recv);
+                    let join = self.new_block();
+                    let jr = self.f.add_param(join, MType::VAL_TOP);
+                    let generic = self.new_block();
+                    let o = self.guard_layout_or(x, &site, generic);
+                    let r = self.js(Opcode::LoadField(a), vec![o], site.claim_ty());
+                    let r = self.weaken(r, MType::VAL_TOP);
+                    self.term(
+                        Opcode::Jump,
+                        vec![],
+                        vec![Edge {
+                            block: join,
+                            args: vec![EdgeArg::Value(r)],
+                        }],
+                    );
+                    self.at(generic);
+                    let r = self.js(Opcode::JsGetProp(a), vec![x], MType::VAL_TOP);
+                    self.term(
+                        Opcode::Jump,
+                        vec![],
+                        vec![Edge {
+                            block: join,
+                            args: vec![EdgeArg::Value(r)],
+                        }],
+                    );
+                    self.at(join);
+                    self.push(jr, Ty::Val(TagSet::ALL));
+                    self.guard_result(site.claim, pc + op.len(), false);
                 } else {
                     let x = self.boxed(recv);
                     let r = self.js(Opcode::JsGetProp(a), vec![x], MType::VAL_TOP);
                     self.push(r, Ty::Val(TagSet::ALL));
                     let claim = self.s.ctx.facts.field_sites.get(&self.site(pc)).copied();
-                    self.guard_result(claim.unwrap_or_default(), pc + op.len());
+                    self.guard_result(claim.unwrap_or_default(), pc + op.len(), false);
                 }
             }
             SetProp | StrictSetProp => {
@@ -2404,12 +2453,23 @@ impl<'s, 'a> Run<'s, 'a> {
                 // store's own check keeps the object's bits.
                 match self.typed_site(pc, a).filter(|s| num || !s.types) {
                     Some(site) => {
-                        let o = self.guard_layout(recv, &site);
+                        // As for a typed read: another layout's receiver
+                        // stores through the IC rather than exiting.
+                        let r = self.boxed(recv);
+                        let join = self.new_block();
+                        let generic = self.new_block();
+                        let o = self.guard_layout_or(r, &site, generic);
                         let mut x = self.boxed(v);
                         if site.types {
                             x = self.weaken(x, MType::val(TagSet::NUMBER));
                         }
                         self.js_void(Opcode::StoreField(a), vec![o, x]);
+                        self.term(Opcode::Jump, vec![], vec![Self::goto(join)]);
+                        self.at(generic);
+                        let y = self.boxed(v);
+                        self.js_void(Opcode::JsSetProp(a, op == StrictSetProp), vec![r, y]);
+                        self.term(Opcode::Jump, vec![], vec![Self::goto(join)]);
+                        self.at(join);
                     }
                     None => {
                         let (x, y) = (self.boxed(recv), self.boxed(v));
@@ -2425,7 +2485,7 @@ impl<'s, 'a> Run<'s, 'a> {
                 let r = self.js(Opcode::JsGetElem, vec![x, k], MType::VAL_TOP);
                 self.push(r, Ty::Val(TagSet::ALL));
                 let claim = self.s.ctx.facts.elem_sites.get(&self.site(pc)).copied();
-                self.guard_result(claim.unwrap_or_default(), pc + op.len());
+                self.guard_result(claim.unwrap_or_default(), pc + op.len(), true);
             }
             SetElem | StrictSetElem => {
                 let v = self.pop();
@@ -2434,6 +2494,94 @@ impl<'s, 'a> Run<'s, 'a> {
                 let (x, k, y) = (self.boxed(recv), self.boxed(key), self.boxed(v));
                 self.js_void(Opcode::JsSetElem(op == StrictSetElem), vec![x, k, y]);
                 self.st.push(v);
+            }
+            // Generic operations through their runtime helpers.
+            Instanceof | In | HasOwn if RT_OPS => {
+                let b = self.pop();
+                let a = self.pop();
+                let (x, y) = (self.boxed(a), self.boxed(b));
+                let r = match op {
+                    Instanceof => RtOp::Instanceof,
+                    In => RtOp::In,
+                    _ => RtOp::HasOwn,
+                };
+                let v = self.js(Opcode::JsRt(r), vec![x, y], MType::val(TagSet::BOOLEAN));
+                self.push(v, Ty::Val(TagSet::BOOLEAN));
+            }
+            DelProp | StrictDelProp if RT_OPS => {
+                let a = self.atom(p.next_uint32().unwrap())?;
+                let o = self.pop();
+                let x = self.boxed(o);
+                let r = RtOp::DelProp(a, op == StrictDelProp);
+                let v = self.js(Opcode::JsRt(r), vec![x], MType::val(TagSet::BOOLEAN));
+                self.push(v, Ty::Val(TagSet::BOOLEAN));
+            }
+            DelElem | StrictDelElem if RT_OPS => {
+                let k = self.pop();
+                let o = self.pop();
+                let (x, y) = (self.boxed(o), self.boxed(k));
+                let r = RtOp::DelElem(op == StrictDelElem);
+                let v = self.js(Opcode::JsRt(r), vec![x, y], MType::val(TagSet::BOOLEAN));
+                self.push(v, Ty::Val(TagSet::BOOLEAN));
+            }
+            NewInit | NewObject if RT_OPS => {
+                let v = self.js(Opcode::JsRt(RtOp::NewObject), vec![], MType::val(TagSet::OBJECT));
+                self.push(v, Ty::Val(TagSet::OBJECT));
+            }
+            NewArray if RT_OPS => {
+                let len = p.next_uint32().unwrap();
+                let v = self.js(Opcode::JsRt(RtOp::NewArray(len)), vec![], MType::val(TagSet::OBJECT));
+                self.push(v, Ty::Val(TagSet::OBJECT));
+            }
+            InitProp | InitHiddenProp | InitLockedProp if RT_OPS => {
+                // [obj, v] -> [obj]
+                use crate::wasm::bbv::abi::{INIT_ATTR_ENUMERATE, INIT_ATTR_HIDDEN, INIT_ATTR_LOCKED};
+                let a = self.atom(p.next_uint32().unwrap())?;
+                let attrs = match op {
+                    InitProp => INIT_ATTR_ENUMERATE,
+                    InitHiddenProp => INIT_ATTR_HIDDEN,
+                    _ => INIT_ATTR_LOCKED,
+                };
+                let v = self.pop();
+                let o = self.top();
+                let (x, y) = (self.boxed(o), self.boxed(v));
+                self.js_void(Opcode::JsRt(RtOp::InitProp(a, attrs)), vec![x, y]);
+            }
+            InitElem | InitHiddenElem | InitLockedElem if RT_OPS => {
+                // [obj, key, v] -> [obj]
+                use crate::wasm::bbv::abi::{INIT_ATTR_ENUMERATE, INIT_ATTR_HIDDEN, INIT_ATTR_LOCKED};
+                let attrs = match op {
+                    InitElem => INIT_ATTR_ENUMERATE,
+                    InitHiddenElem => INIT_ATTR_HIDDEN,
+                    _ => INIT_ATTR_LOCKED,
+                };
+                let v = self.pop();
+                let k = self.pop();
+                let o = self.top();
+                let (x, y, z) = (self.boxed(o), self.boxed(k), self.boxed(v));
+                self.js_void(Opcode::JsRt(RtOp::InitElem(attrs)), vec![x, y, z]);
+            }
+            InitElemArray if RT_OPS => {
+                // [obj, v] -> [obj]
+                let index = p.next_uint32().unwrap();
+                let v = self.pop();
+                let o = self.top();
+                let k = self.const_val(ConstVal::Int32(index as i32));
+                let (x, z) = (self.boxed(o), self.boxed(v));
+                let e = crate::wasm::bbv::abi::INIT_ATTR_ENUMERATE;
+                self.js_void(Opcode::JsRt(RtOp::InitElem(e)), vec![x, k, z]);
+            }
+            Typeof | TypeofExpr if RT_OPS => {
+                let a = self.pop();
+                let x = self.boxed(a);
+                let v = self.inst(Opcode::JsTypeof, vec![x], Some(MType::val(TagSet::STRING)));
+                self.push(v, Ty::Val(TagSet::STRING));
+            }
+            Throw if RT_OPS => {
+                let a = self.pop();
+                let x = self.boxed(a);
+                let err = self.exit_block(true);
+                self.term(Opcode::JsThrow, vec![x], vec![Self::goto(err)]);
             }
             IsConstructing => {
                 let v = self.const_val(ConstVal::IsConstructing);
@@ -2476,7 +2624,7 @@ impl<'s, 'a> Run<'s, 'a> {
                 };
                 self.push(r, Ty::Val(TagSet::ALL));
                 let claim = self.s.ctx.facts.call_types.get(&self.site(pc)).copied();
-                self.guard_result(claim.unwrap_or_default(), pc + op.len());
+                self.guard_result(claim.unwrap_or_default(), pc + op.len(), false);
             }
 
             op => return Err(format!("{op:?}")),

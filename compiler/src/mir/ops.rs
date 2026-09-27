@@ -201,6 +201,30 @@ pub enum JsBinop {
     Ursh,
 }
 
+/// The generic operations `js.rt` runs through their runtime helpers,
+/// with their operands (all boxed).
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum RtOp {
+    /// `lhs instanceof rhs` -> boolean.
+    Instanceof,
+    /// `key in obj` -> boolean.
+    In,
+    /// `obj.hasOwnProperty(key)` (the `HasOwn` op), `key, obj` -> boolean.
+    HasOwn,
+    /// `delete obj.name` -> boolean (strict or not).
+    DelProp(AtomId, bool),
+    /// `delete obj[key]` -> boolean.
+    DelElem(bool),
+    /// `{}` -> object.
+    NewObject,
+    /// `new Array(len)` for a literal of `len` elements -> object.
+    NewArray(u32),
+    /// Define own property `name` of `obj` to `v`, with the attributes.
+    InitProp(AtomId, u32),
+    /// Define own element `key` of `obj` to `v`, with the attributes.
+    InitElem(u32),
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum JsUnop {
     Neg,
@@ -336,6 +360,10 @@ pub enum Opcode {
     /// `env.name = v` for a global or name assignment (`SetGName`), strict
     /// or sloppy.
     JsSetName(AtomId, bool),
+    /// A generic operation through its runtime helper (see [`RtOp`]).
+    JsRt(RtOp),
+    /// `throw args[0]`: the only successor is `err`.
+    JsThrow,
     /// Write `args[0]` (a `Val`, or an i32, f64 or bool, stored as the
     /// Value it is) to baseline frame slot `k` (0 `this`, then the
     /// formals, the locals, the rval): the write-through that keeps the
@@ -457,6 +485,8 @@ impl Opcode {
             | CallNative(_) => CLEAN_DIRTY_ERR.to_vec(),
             // No dynamic effect report: the kill is static, on `ok`.
             JsGetName(_) | JsLambda(_) | ExitInline { .. } => OK_ERR.to_vec(),
+            JsRt(_) => CLEAN_DIRTY_ERR.to_vec(),
+            JsThrow => vec![SuccRole::Err],
             _ => vec![],
         }
     }
@@ -1043,7 +1073,31 @@ pub fn signature(op: &Opcode, args: &[Type], m: &Module) -> SigResult {
         JsTypeof => {
             arity(args, 1)?;
             val(&args[0], "js.typeof")?;
-            Sig::result(Type::STR_TOP)
+            Sig::result(Type::val(TagSet::STRING))
+        }
+        JsRt(r) => {
+            let (n, out) = match r {
+                RtOp::Instanceof | RtOp::In | RtOp::HasOwn | RtOp::DelElem(_) => {
+                    (2, Some(Type::val(TagSet::BOOLEAN)))
+                }
+                RtOp::DelProp(..) => (1, Some(Type::val(TagSet::BOOLEAN))),
+                RtOp::NewObject | RtOp::NewArray(_) => (0, Some(Type::val(TagSet::OBJECT))),
+                RtOp::InitProp(..) => (2, None),
+                RtOp::InitElem(_) => (3, None),
+            };
+            arity(args, n)?;
+            for t in args {
+                val(t, "js.rt operand")?;
+            }
+            match out {
+                Some(t) => Sig::output(t),
+                None => Sig::none(),
+            }
+        }
+        JsThrow => {
+            arity(args, 1)?;
+            val(&args[0], "js.throw")?;
+            Sig::none()
         }
         JsToBool => {
             arity(args, 1)?;
@@ -1522,6 +1576,8 @@ pub fn effects(op: &Opcode, args: &[Type], m: &Module) -> Effects {
             return Effects::generic(FlagsEffect::Dynamic)
         }
         JsGetName(_) => return Effects::generic(FlagsEffect::Bits(FlagBits::ALL)),
+        JsRt(_) => return Effects::generic(FlagsEffect::Dynamic),
+        JsThrow => return Effects::generic(FlagsEffect::Bits(FlagBits::ALL)),
         // An allocation, but reported as generic: it runs no JS, yet a GC
         // may move anything.
         JsLambda(_) => return Effects::generic(FlagsEffect::Bits(FlagBits::ALL)),

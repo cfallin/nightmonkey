@@ -69,7 +69,7 @@ use crate::wasm::translate::{
 type R<T> = Result<T, String>;
 
 /// Whether global binding writes get their inline arm.
-const INLINE_GNAME_SETS: bool = false;
+const INLINE_GNAME_SETS: bool = true;
 
 const UNDEF: u64 = TAG_UNDEFINED << 32;
 
@@ -1569,6 +1569,56 @@ impl<'a> Lower<'a> {
                 self.terminate(Terminator::Br { target: e });
             }
             Opcode::InlineEnter => self.inline_enter(&d, &a)?,
+            Opcode::JsRt(r) => {
+                use crate::mir::ops::RtOp;
+                let h = self.h;
+                let z = self.i32c(0);
+                let (f, args) = match r {
+                    RtOp::Instanceof => (h.instanceof_, vec![a[0], a[1], z]),
+                    RtOp::In => (h.in_, vec![a[0], a[1]]),
+                    RtOp::HasOwn => (h.has_own, vec![a[0], a[1]]),
+                    RtOp::DelProp(name, strict) => {
+                        let (at, sv) = (self.atom(name), self.i32c(u32::from(strict)));
+                        (h.del_prop, vec![a[0], at, sv])
+                    }
+                    RtOp::DelElem(strict) => {
+                        let sv = self.i32c(u32::from(strict));
+                        (h.del_elem, vec![a[0], a[1], sv])
+                    }
+                    RtOp::NewObject => (h.new_object, vec![z]),
+                    RtOp::NewArray(len) => {
+                        let lv = self.i32c(len);
+                        (h.new_array, vec![lv, z])
+                    }
+                    RtOp::InitProp(name, attrs) => {
+                        let (at, av, none) = (self.atom(name), self.i32c(attrs), self.i32c(u32::MAX));
+                        (h.init_prop, vec![a[0], at, a[1], av, none])
+                    }
+                    RtOp::InitElem(attrs) => {
+                        let av = self.i32c(attrs);
+                        (h.init_elem, vec![a[0], a[1], a[2], av])
+                    }
+                };
+                self.js_call(inst, f, &args, false)?;
+            }
+            Opcode::JsThrow => {
+                // The helper sets the pending exception and always fails.
+                // It may GC (capturing the stack): root what its throw exit
+                // reads.
+                let live = self.live_across(inst);
+                self.spill(&live)?;
+                let top_off = self.top_off(live.len());
+                let top = self.add_off(self.sp, top_off);
+                self.call(self.h.throw, &[self.cx, top, a[0]], &[]);
+                self.reload(&live)?;
+                let e = self.edge(inst, 0, &[])?;
+                self.terminate(Terminator::Br { target: e });
+            }
+            Opcode::JsTypeof => {
+                // A leaf: the type's name is an atom.
+                let v = self.call(self.h.typeof_, &[self.cx, a[0]], &[Type::I64]);
+                self.def(inst, v);
+            }
             Opcode::ExitInline { pc, nargs, nlocals, throw } => {
                 self.exit_inline(inst, &d, &a, pc, nargs, nlocals, throw)?
             }
