@@ -25,3 +25,19 @@ for (var n = 0; n < 40; n++) {
 // An exit mid-loop (a double and a string reach `a[i]`).
 assertEq(list(1.5, "s", 3).cdr.car, "s");
 assertEq(list(1.5).car, 1.5);
+
+// With a call object too (a closure over a local): the arguments object
+// records the activation's call object, not the callee's environment,
+// and survives a GC.
+function withEnv() {
+  var a = arguments;
+  var k = 3;
+  var f = function () { return a.length * k; };
+  if (a.length > 2) gc();
+  return f() + (a[0] | 0);
+}
+for (var n = 0; n < 60; n++) {
+  assertEq(withEnv(), 0);
+  assertEq(withEnv(1, 2), 7);
+}
+assertEq(withEnv(1, 2, 3), 10);

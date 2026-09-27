@@ -531,7 +531,9 @@ exit pc, this, [args…], [locals…], rval, [stack…]   -- any boxable reprs
   each once, writes the frame, and calls baseline (or returns DEOPT).
   An exit is a branch to its hub.
 - **The env slot is not an operand.** The env chain is fixed for the
-  whole activation, and the fresh entry writes it once.
+  whole activation, and the fresh entry writes it once: the callee's
+  environment, or the one `env_setup` makes (a call object, a named
+  lambda's scope). Ops that push a scope decline.
 - **Resume rule:** an exit to an op's own PC is allowed only if no
   observable part of the op has happened. Otherwise it targets the
   successor PC, with the op's result on the stack.
@@ -1468,6 +1470,36 @@ methods, and MIR calls them, paying `night_call_classify` and a
   `WasmBlock` tree) is now iterative. MIR's guard chains nest deep
   enough to overflow a rayon worker's stack (pdfjs).
 - AOT richards: 3318 → 7442 (legacy bbv: 11886).
+
+**M5d. Toward bbv parity (2026-09-27).** Driven by AOT Octane profiles
+and exit censuses against bbv, not by op coverage.
+- **Speculation.** Number claims without a double history are int32
+  first (formals, elements, aliased vars, globals; not fields or call
+  results, where it cost double exits). A typed field whose layout guard
+  fails falls back to the site's IC instead of exiting.
+- **Globals and ops.** Syntactic global writes are inline; `instanceof`,
+  `in`, own-property tests, deletes and object/array literals are
+  `js.rt` leaves or may-GC calls; `throw` and `typeof` are ops.
+  `instanceof` walks the prototype chain inline from the site's cell.
+- **Actuals.** Scripts reading `arguments`, rest or the actual count
+  compile, with `vp` as baseline's. They are not inlined. A sloppy
+  script with no formals may use `arguments` (nothing to map).
+  `T.apply(this, arguments)` at bbv's proven sites does not make the
+  object: known targets are inlined over the frame's actuals, else the
+  runtime forwards them; an exit while it is elided makes it first.
+- **Construction.** `new` of a compiled constructor is direct:
+  `this` is a nursery bump from the site's construct cell (while the
+  callee's shape, IC generation and `.prototype` match), else
+  `create_this`; then a `call_indirect` of the body. Init-delegate
+  restamps run as in bbv.
+- **Property ICs.** The set IC replays its add-transition row inline
+  when the add cannot falsify the class-word bits.
+- **Environments and try.** Scripts with their own call object compile
+  (`env_setup` at entry). Try/catch compiles as designed in §5.3; the
+  catch code is baseline's.
+- AOT, MIR vs legacy bbv: richards 7248/11886, deltablue 3782/6175,
+  crypto 7422/15502, raytrace 6332/11754, earley-boyer 5162/13224,
+  navier-stokes 11619/22660, splay 5906/7653, pdfjs 7700/20484.
 
 **M6. The rest of §10**: box/unbox cleanup, memory optimizations, and
 numeric optimizations, each with its guard-count and instruction-count

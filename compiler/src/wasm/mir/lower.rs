@@ -1708,7 +1708,15 @@ impl<'a> Lower<'a> {
                 self.terminate(Terminator::Br { target: t });
                 self.cur = build;
                 let live = self.live_across(inst);
-                let (ok, r) = self.gc_call(self.h.arguments_, &[self.sp, self.argc], &live)?;
+                // With an environment, the runtime is given it, as
+                // baseline's prologue does: a mapped object in a function
+                // with a call object records it (`MaybeForwardToCallObject`).
+                let (ok, r) = if self.plain_env || self.own_env {
+                    let env = self.load_i64(self.vp, l.env());
+                    self.gc_call(self.h.arguments_env, &[self.sp, self.argc, env], &live)?
+                } else {
+                    self.gc_call(self.h.arguments_, &[self.sp, self.argc], &live)?
+                };
                 let (store, e) = (self.body.add_block(), self.edge(inst, 1, &[])?);
                 self.cond_br(ok, Self::to(store), e);
                 self.cur = store;

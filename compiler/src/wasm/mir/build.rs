@@ -1859,6 +1859,10 @@ impl<'s, 'a> Run<'s, 'a> {
             // environments, which MIR declines.)
             Nop | Lineno | JumpTarget | LoopHead | NopDestructuring | NopIsAssignOp
             | DebugLeaveLexicalEnv => {}
+            // A try block's code is ordinary code: a throw in it exits
+            // (`exit.throw`) and baseline takes the pc's handler. The catch
+            // code, entered only by a throw, is never reached here.
+            Try | TryDestructuring => {}
 
             Undefined => {
                 let v = self.const_val(ConstVal::Undefined);
