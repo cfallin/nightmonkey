@@ -157,11 +157,11 @@ pub(super) const STRING_LATIN1_CHARS_BIT: u32 = 1 << 10;
 // and the compiled-body index the classify resolves to is a field the night
 // build adds to BaseScript.
 
-pub(super) const FUNC_FLAGS_SLOT_OFFSET: u32 = 16;
+pub(crate) const FUNC_FLAGS_SLOT_OFFSET: u32 = 16;
 pub(crate) const FUNC_ENV_SLOT_OFFSET: u32 = 24;
 pub(crate) const FUNC_SCRIPT_SLOT_OFFSET: u32 = 32;
 pub(super) const FUNCTION_FLAGS_BASESCRIPT: u32 = 1 << 5;
-pub(super) const FUNCTION_FLAGS_CONSTRUCTOR: u32 = 1 << 8;
+pub(crate) const FUNCTION_FLAGS_CONSTRUCTOR: u32 = 1 << 8;
 pub(super) const FUNCTION_KIND_MASK: u32 = 0x0007;
 pub(super) const FUNCTION_KIND_CLASS_CTOR: u32 = 3;
 pub(crate) const BASESCRIPT_NIGHTFUNCINDEX_OFFSET: u32 = 56;

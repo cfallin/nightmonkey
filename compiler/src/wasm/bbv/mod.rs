@@ -217,7 +217,7 @@ pub(crate) fn ctor_stamp_keep_bits(si: &StampCtorIn) -> u32 {
 }
 
 /// Whether the baseline and MIR tiers restamp at init delegates' returns.
-const RESTAMPS: bool = false;
+const RESTAMPS: bool = true;
 
 /// The arguments after `this` of `night_runtime_ctor_restamp` for init
 /// delegate `si`: layout, field count, kept bits, then up to four prefix

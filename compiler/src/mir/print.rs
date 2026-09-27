@@ -363,6 +363,9 @@ pub fn mnemonic(op: &Opcode) -> String {
         RestArray(_) => "args.rest".into(),
         ArgsLength => "args.length".into(),
         ActualArg => "args.actual".into(),
+        ActualArgOr(_) => "args.actual_or".into(),
+        JsIsBuiltin(_) => "js.is_builtin".into(),
+        ApplyFwd => "js.apply_fwd".into(),
         JsRt(r) => match r {
             RtOp::Instanceof => "js.rt.instanceof",
             RtOp::In => "js.rt.in",
@@ -453,7 +456,9 @@ fn immediates(m: &Module, op: &Opcode) -> Option<String> {
         CheckNative(n) | CallNative(n) => n.to_string(),
         NewObject(k) => format!("L{k}"),
         EnvLoad(s) | EnvStore(s) => s.to_string(),
-        JsLambda(k) | FrameStore(k) | RestArray(k) => k.to_string(),
+        JsLambda(k) | FrameStore(k) | RestArray(k) | ActualArgOr(k) | JsIsBuiltin(k) => {
+            k.to_string()
+        }
         JsRt(RtOp::DelProp(a, _)) => atom(Some(m), *a),
         JsRt(RtOp::NewArray(n)) | JsRt(RtOp::InitElem(n)) => n.to_string(),
         JsRt(RtOp::InitProp(a, attrs)) => format!("{}, {attrs}", atom(Some(m), *a)),

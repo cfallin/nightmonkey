@@ -1209,6 +1209,8 @@ impl Parser {
             EnvStore(_) => EnvStore(EnvSlot::new(self.int()?)),
             JsLambda(_) => JsLambda(self.int()?),
             RestArray(_) => RestArray(self.int()?),
+            ActualArgOr(_) => ActualArgOr(self.int()?),
+            JsIsBuiltin(_) => JsIsBuiltin(self.int()?),
             FrameStore(_) => FrameStore(self.int()?),
             Construct(..) => {
                 let n = self.int()?;
@@ -1445,6 +1447,9 @@ fn template(mn: &str) -> Option<Opcode> {
         RestArray(0),
         ArgsLength,
         ActualArg,
+        ActualArgOr(0),
+        JsIsBuiltin(0),
+        ApplyFwd,
         JsRt(RtOp::Instanceof),
         JsRt(RtOp::In),
         JsRt(RtOp::HasOwn),

@@ -128,8 +128,11 @@ const SPECULATE_INT_FIRST: bool = true;
 /// are built.
 const RT_OPS: bool = true;
 
+/// Whether `T.apply(this, arguments)` forwards the actuals.
+const APPLY_FWD: bool = false;
+
 /// Whether scripts that read their actuals are built.
-const ACTUALS: bool = false;
+const ACTUALS: bool = true;
 
 fn num_claim_ty(claim: crate::facts::Claim, int_first: bool) -> Option<Ty> {
     let prims = claim.prims();
@@ -314,6 +317,8 @@ fn build_at<'a>(
     let depths = StackDepths::compute(script).map_err(|e| format!("stack depths ({e})"))?;
     let mut shape = Shape::of(ctx, sid, script, fl, depths)?;
     shape.names = Some(names);
+    shape.apply_fwd = crate::wasm::translate::compute_apply_fwd_pcs(script, &ctx.facts.apply_sites, sid.get())
+        .filter(|s| APPLY_FWD && !s.is_empty());
     shape.inline_depth = depth;
     for (i, &gc) in script.gcthings.iter().enumerate() {
         if gc.is_other() {
@@ -533,6 +538,10 @@ struct Shape<'a> {
     /// (`gname_types`), guarded at the def.
     gname_types: BTreeMap<u32, crate::facts::Claim>,
     names: Option<&'a crate::ids::Names>,
+    /// The `T.apply(this, arguments)` sites whose arguments object is
+    /// never observed (bbv's `compute_apply_fwd_pcs`), if the script has
+    /// them.
+    apply_fwd: Option<rustc_hash::FxHashSet<Pc>>,
     /// How deep in inlining this build is (0: a script's own).
     inline_depth: u32,
     /// Callees built for inlining, by script; `None` if one cannot be.
@@ -580,6 +589,7 @@ impl<'a> Shape<'a> {
             fused: BTreeMap::new(),
             gname_types: BTreeMap::new(),
             names: None,
+            apply_fwd: None,
             inline_depth: 0,
             callees: Default::default(),
         })
@@ -1160,6 +1170,7 @@ impl<'s, 'a> Run<'s, 'a> {
         &mut self,
         targets: &[(ScriptId, std::rc::Rc<super::inline::Callee>)],
         vals: &[mir::Value],
+        fallback: Option<(Opcode, Vec<mir::Value>)>,
     ) -> mir::Value {
         let join = self.new_block();
         let result = self.f.add_param(join, MType::VAL_TOP);
@@ -1223,7 +1234,68 @@ impl<'s, 'a> Run<'s, 'a> {
             block: join,
             args: vec![EdgeArg::Out(0)],
         };
-        self.term(Opcode::Call, vals.to_vec(), vec![e.clone(), e, Self::goto(err)]);
+        let (op, args) = fallback.unwrap_or((Opcode::Call, vals.to_vec()));
+        self.term(op, args, vec![e.clone(), e, Self::goto(err)]);
+        self.at(join);
+        result
+    }
+
+    /// `target.apply(this, arguments)` at a proven forward site (bbv's
+    /// `compute_apply_fwd_pcs`: the arguments object feeds only such calls,
+    /// so it was never made), operands `apply, target, this, placeholder`.
+    /// With the `.apply` the pristine builtin, the site's known targets
+    /// are inlined, their formals read from this frame's actuals; any other
+    /// target, or another `.apply`, forwards through the runtime.
+    fn apply_forward(&mut self, vals: &[mir::Value]) -> mir::Value {
+        let site = self.site(self.pc);
+        let facts = &self.s.ctx.facts;
+        let sids: Vec<ScriptId> = match facts.apply_targets.get(&site) {
+            Some(&k) => vec![k],
+            None => facts.apply_target_sets.get(&site).cloned().unwrap_or_default(),
+        };
+        let targets: Vec<(ScriptId, std::rc::Rc<super::inline::Callee>)> = sids
+            .iter()
+            .take(MAX_INLINE_TARGETS + 1)
+            .filter_map(|&k| Some((k, self.s.callee(k)?)))
+            .collect();
+        let helper = (Opcode::ApplyFwd, vec![vals[0], vals[1], vals[2]]);
+        if targets.is_empty() || targets.len() > MAX_INLINE_TARGETS {
+            return self.js(helper.0, helper.1, MType::VAL_TOP);
+        }
+        let join = self.new_block();
+        let result = self.f.add_param(join, MType::VAL_TOP);
+        let (fast, slow) = (self.new_block(), self.new_block());
+        let is_apply = self.inst(
+            Opcode::JsIsBuiltin(crate::wasm::translate::BC_FUN_APPLY),
+            vec![vals[0]],
+            Some(MType::Bool),
+        );
+        self.term(Opcode::Br, vec![is_apply], vec![Self::goto(fast), Self::goto(slow)]);
+        self.at(fast);
+        let n = targets.iter().map(|(_, c)| c.f.frame.formals).max().unwrap_or(0);
+        let mut call = vec![vals[1], vals[2]];
+        for k in 0..n {
+            call.push(self.inst(Opcode::ActualArgOr(k), vec![], Some(MType::VAL_TOP)));
+        }
+        let r = self.inline_call(&targets, &call, Some(helper.clone()));
+        self.term(
+            Opcode::Jump,
+            vec![],
+            vec![Edge {
+                block: join,
+                args: vec![EdgeArg::Value(r)],
+            }],
+        );
+        self.at(slow);
+        let r = self.js(helper.0, helper.1, MType::VAL_TOP);
+        self.term(
+            Opcode::Jump,
+            vec![],
+            vec![Edge {
+                block: join,
+                args: vec![EdgeArg::Value(r)],
+            }],
+        );
         self.at(join);
         result
     }
@@ -2601,8 +2673,14 @@ impl<'s, 'a> Run<'s, 'a> {
             // The actuals (the frame's variable region is past them: the
             // lowering's `vp`).
             Arguments => {
-                let v = self.js_static(Opcode::ArgsObject, vec![], MType::val(TagSet::OBJECT));
-                self.push(v, Ty::Val(TagSet::OBJECT));
+                if self.s.apply_fwd.is_some() {
+                    // Only forwarded (`apply_forward`): never made.
+                    let v = self.const_val(ConstVal::Undefined);
+                    self.push(v, Ty::Val(TagSet::prims(PRIM_UNDEFINED)));
+                } else {
+                    let v = self.js_static(Opcode::ArgsObject, vec![], MType::val(TagSet::OBJECT));
+                    self.push(v, Ty::Val(TagSet::OBJECT));
+                }
             }
             Rest => {
                 let nformal = self.s.nargs.saturating_sub(1);
@@ -2655,10 +2733,12 @@ impl<'s, 'a> Run<'s, 'a> {
                     .take(MAX_INLINE_TARGETS + 1)
                     .filter_map(|&k| Some((k, self.s.callee(k)?)))
                     .collect();
-                let r = if targets.is_empty() || targets.len() > MAX_INLINE_TARGETS {
+                let r = if argc == 2 && self.s.apply_fwd.as_ref().is_some_and(|f| f.contains(&pc)) {
+                    self.apply_forward(&vals)
+                } else if targets.is_empty() || targets.len() > MAX_INLINE_TARGETS {
                     self.js(Opcode::Call, vals, MType::VAL_TOP)
                 } else {
-                    self.inline_call(&targets, &vals)
+                    self.inline_call(&targets, &vals, None)
                 };
                 self.push(r, Ty::Val(TagSet::ALL));
                 let claim = self.s.ctx.facts.call_types.get(&self.site(pc)).copied();

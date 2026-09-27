@@ -54,7 +54,7 @@ use crate::wasm::bbv::abi::{
     CLASS_WORD_RANGES, CLASS_WORD_SLOTS, IC_SET_ABSSLOT, IC_SET_RECVSHAPE, IC_SET_SLOTENC,
     IC_WAY_HOLDERPTR, IC_WAY_MONO_OFF, IC_WAY_RECVSHAPE,
     IC_WAY_ADDR_PLACEHOLDER, NATIVE_SLOTS_OFFSET, SHAPE_BASESHAPE_OFFSET, BASESHAPE_CLASP_OFFSET,
-    BASESCRIPT_NIGHTFUNCINDEX_OFFSET, FUNC_ENV_SLOT_OFFSET, FUNC_SCRIPT_SLOT_OFFSET,
+    BASESCRIPT_NIGHTFUNCINDEX_OFFSET, FUNC_FLAGS_SLOT_OFFSET, FUNCTION_FLAGS_CONSTRUCTOR, FUNC_ENV_SLOT_OFFSET, FUNC_SCRIPT_SLOT_OFFSET,
     SHAPE_FIXED_SLOTS_MASK_BITS, SHAPE_FIXED_SLOTS_SHIFT, JSCONTEXT_REALM_OFFSET,
     REALM_GLOBAL_OFFSET, CHUNK_STORE_BUFFER_OFFSET, CMP_EQ, CMP_GE, CMP_GT, CMP_LE, CMP_LT, CMP_NE, CMP_STRICTEQ, CMP_STRICTNE,
     ELEMENTS_FLAGS_BACK, ELEMENTS_FROZEN_FLAG, ELEMENTS_INITLEN_BACK, FIXED_SLOTS_BASE, FLAGS_ALL, OBJ_CLASS_IDX_OFFSET, OBJ_ELEMENTS_OFFSET,
@@ -67,6 +67,9 @@ use crate::wasm::translate::{
 };
 
 type R<T> = Result<T, String>;
+
+/// Whether `new` of a compiled constructor calls it directly.
+const DIRECT_CONSTRUCT: bool = false;
 
 /// Whether global binding writes get their inline arm.
 const INLINE_GNAME_SETS: bool = true;
@@ -1673,6 +1676,23 @@ impl<'a> Lower<'a> {
                 self.cond_br(ok, t, e);
             }
             Opcode::ArgsLength => self.def(inst, self.argc),
+            Opcode::ActualArgOr(k) => {
+                let v = self.load_i64(self.sp, FrameLayout::ARGS + 8 * k);
+                let kv = self.i32c(k);
+                let have = self.bin(Operator::I32LtU, kv, self.argc, Type::I32);
+                let undef = self.i64c(UNDEF);
+                let r = self.select(Type::I64, v, undef, have);
+                self.def(inst, r);
+            }
+            Opcode::JsIsBuiltin(k) => {
+                let cell = self.i32c(self.h.builtin_cells_base + 8 * k);
+                let bits = self.load_i64(cell, 0);
+                let r = self.bin(Operator::I64Eq, a[0], bits, Type::I32);
+                self.def(inst, r);
+            }
+            Opcode::ApplyFwd => {
+                self.js_call(inst, self.h.apply_fwd, &[a[0], a[1], a[2], self.sp, self.argc], false)?;
+            }
             Opcode::ActualArg => {
                 let eight = self.i32c(8);
                 let off = self.bin(Operator::I32Mul, a[0], eight, Type::I32);
@@ -1703,13 +1723,102 @@ impl<'a> Lower<'a> {
                 let top_off = frame + 8 * u32::try_from(a.len()).unwrap();
                 let base = self.add_off(self.vp, frame);
                 let top = self.add_off(self.vp, top_off);
+                let (callee, new_target) = (a[0], a[a.len() - 1]);
+                let join = self.body.add_block();
+                let ok_p = self.body.add_blockparam(join, Type::I32);
+                let res_p = self.body.add_blockparam(join, Type::I64);
+                // Direct: a compiled constructor gets its `this` from
+                // `create_this` (sized and stamped for the site) and runs
+                // by a direct call, with no trip through the engine's
+                // construct (bbv's direct construct, without its inline
+                // allocation cell).
+                const HEADROOM: u32 = 64 * 1024;
+                let (funcidx, script) = self.classify(callee);
+                let z = self.i32c(0);
+                let compiled = self.bin(Operator::I32Ne, funcidx, z, Type::I32);
+                let limit_addr = self.i32c(self.h.night_stack_limit_base);
+                let limit = self.load_i32(limit_addr, 0);
+                let hi = self.add_off(top, HEADROOM);
+                let fits = self.bin(Operator::I32LeU, hi, limit, Type::I32);
+                let maybe = self.bin(Operator::I32And, compiled, fits, Type::I32);
+                let enabled = self.i32c(u32::from(DIRECT_CONSTRUCT));
+                let maybe = self.bin(Operator::I32And, maybe, enabled, Type::I32);
+                let (chk, generic) = (self.body.add_block(), self.body.add_block());
+                self.cond_br(maybe, Self::to(chk), Self::to(generic));
+                self.cur = chk;
+                let fun = self.un(Operator::I32WrapI64, callee, Type::I32);
+                let flags = self.load_i32(fun, FUNC_FLAGS_SLOT_OFFSET);
+                let cbit = self.i32c(FUNCTION_FLAGS_CONSTRUCTOR);
+                let is_ctor = self.bin(Operator::I32And, flags, cbit, Type::I32);
+                let direct = self.body.add_block();
+                self.cond_br(is_ctor, Self::to(direct), Self::to(generic));
+                self.cur = direct;
+                let (nv, wv, zc) = (self.i32c(nslots), self.i32c(word), self.i32c(0));
+                let made = self.call1(
+                    self.h.create_this,
+                    &[self.cx, top, callee, new_target, nv, zc, wv],
+                    Type::I32,
+                );
+                let call_b = self.body.add_block();
+                let undef = self.i64c(UNDEF);
+                self.cond_br(
+                    made,
+                    Self::to(call_b),
+                    BlockTarget {
+                        block: join,
+                        args: vec![made, undef],
+                    },
+                );
+                self.cur = call_b;
+                let thisv = self.load_i64(top, 0);
+                self.store_i64(base, FrameLayout::THIS, thisv);
+                let off = self.i32c(u32::MAX);
+                self.body_off_patches.push(off);
+                let body_idx = self.bin(Operator::I32Sub, funcidx, off, Type::I32);
+                let av = self.i32c(argc);
+                let args = self
+                    .body
+                    .arg_pool
+                    .from_iter([self.cx, base, av, top, script, new_target, body_idx].into_iter());
+                let tys = self.body.type_pool.from_iter([Type::I32, Type::I32].into_iter());
+                let call = self.push_val(ValueDef::Operator(
+                    Operator::CallIndirect {
+                        sig_index: self.h.night_abi_sig2,
+                        table_index: self.h.indirect_table,
+                    },
+                    args,
+                    tys,
+                ));
+                let err = self.push_val(ValueDef::PickOutput(call, 0, Type::I32));
+                let ok_d = self.un(Operator::I32Eqz, err, Type::I32);
+                // The constructor's result if an object, else its `this`
+                // (reread: the GC updates the frame).
+                let r = self.load_i64(top, 0);
+                let rt = self.tag_of(r);
+                let obj = self.tag_is(rt, TAG_OBJECT as u32);
+                let th = self.load_i64(base, FrameLayout::THIS);
+                let res = self.select(Type::I64, r, th, obj);
+                self.terminate(Terminator::Br {
+                    target: BlockTarget {
+                        block: join,
+                        args: vec![ok_d, res],
+                    },
+                });
+                self.cur = generic;
                 let (av, nv, wv) = (self.i32c(argc), self.i32c(nslots), self.i32c(word));
                 let ok = self.call1(self.h.construct, &[self.cx, top, base, av, nv, wv], Type::I32);
+                let r = self.load_i64(top, 0);
+                self.terminate(Terminator::Br {
+                    target: BlockTarget {
+                        block: join,
+                        args: vec![ok, r],
+                    },
+                });
+                self.cur = join;
                 self.reload(&live)?;
-                let r = self.load_i64(self.vp, top_off);
-                let t = self.edge(inst, 1, &[r])?;
+                let t = self.edge(inst, 1, &[res_p])?;
                 let e = self.edge(inst, 2, &[])?;
-                self.cond_br(ok, t, e);
+                self.cond_br(ok_p, t, e);
             }
             Opcode::GuardLayout { keys, types } => {
                 // The stamp word (`JSObject*+4`): identity is layout key + 1

@@ -371,6 +371,14 @@ pub enum Opcode {
     ArgsLength,
     /// Actual argument `args[0]` (an i32 index below the count).
     ActualArg,
+    /// Actual argument `k`, or undefined if there are not that many.
+    ActualArgOr(u32),
+    /// Whether boxed `args[0]` is the builtin in cell `k` (the runtime's
+    /// pristine-builtin cells, e.g. `Function.prototype.apply`).
+    JsIsBuiltin(u32),
+    /// `target.apply(this, arguments)` forwarding the frame's own actuals
+    /// (operands `apply`, `target`, `this`), through the runtime.
+    ApplyFwd,
     /// `throw args[0]`: the only successor is `err`.
     JsThrow,
     /// Write `args[0]` (a `Val`, or an i32, f64 or bool, stored as the
@@ -494,7 +502,7 @@ impl Opcode {
             | CallNative(_) => CLEAN_DIRTY_ERR.to_vec(),
             // No dynamic effect report: the kill is static, on `ok`.
             JsGetName(_) | JsLambda(_) | ExitInline { .. } => OK_ERR.to_vec(),
-            JsRt(_) => CLEAN_DIRTY_ERR.to_vec(),
+            JsRt(_) | ApplyFwd => CLEAN_DIRTY_ERR.to_vec(),
             ArgsObject | RestArray(_) => OK_ERR.to_vec(),
             JsThrow => vec![SuccRole::Err],
             _ => vec![],
@@ -1122,6 +1130,22 @@ pub fn signature(op: &Opcode, args: &[Type], m: &Module) -> SigResult {
             i32r(&args[0], "args.actual")?;
             Sig::result(Type::VAL_TOP)
         }
+        ActualArgOr(_) => {
+            arity(args, 0)?;
+            Sig::result(Type::VAL_TOP)
+        }
+        JsIsBuiltin(_) => {
+            arity(args, 1)?;
+            val(&args[0], "js.is_builtin")?;
+            Sig::result(Type::Bool)
+        }
+        ApplyFwd => {
+            arity(args, 3)?;
+            for t in args {
+                val(t, "js.apply_fwd operand")?;
+            }
+            Sig::output(Type::VAL_TOP)
+        }
         JsToBool => {
             arity(args, 1)?;
             val(&args[0], "js.tobool")?;
@@ -1600,6 +1624,7 @@ pub fn effects(op: &Opcode, args: &[Type], m: &Module) -> Effects {
         }
         JsGetName(_) => return Effects::generic(FlagsEffect::Bits(FlagBits::ALL)),
         JsRt(_) => return Effects::generic(FlagsEffect::Dynamic),
+        ApplyFwd => return Effects::generic(FlagsEffect::Callee),
         // Allocations; conservatively generic.
         ArgsObject | RestArray(_) => return Effects::generic(FlagsEffect::Bits(FlagBits::ALL)),
         JsThrow => return Effects::generic(FlagsEffect::Bits(FlagBits::ALL)),
