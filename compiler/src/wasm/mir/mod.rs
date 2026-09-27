@@ -65,6 +65,14 @@ pub fn translate_script(
             Ok(b) => b,
             Err(reason) => return Ok(Err(format!("baseline declined: {reason}"))),
         };
+    let gname_bids = mm
+        .atoms
+        .iter()
+        .filter_map(|(a, s)| {
+            let n = atoms.names.lookup(s.chars())?;
+            Some((a, *ctx.syn_gnames.get(&n)?))
+        })
+        .collect();
     let lowered = match lower::lower(
         m,
         ctx.helpers,
@@ -86,10 +94,19 @@ pub fn translate_script(
                 ]
             }),
         },
+        gname_bids,
     ) {
         Ok(l) => l,
         Err(reason) => return Ok(Err(reason)),
     };
+    if ctx.opts.diagnostics.stats {
+        crate::diag_line!(
+            "night: mir body sid#{sid} blocks {} values {} bytecode {}",
+            lowered.body.blocks.len(),
+            lowered.body.values.len(),
+            script.bytecode.len()
+        );
+    }
     Ok(Ok(Outcome::Compiled {
         sig: ctx.helpers.night_abi_sig2,
         body: lowered.body,

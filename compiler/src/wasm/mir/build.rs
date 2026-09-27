@@ -183,11 +183,14 @@ pub fn build(
     if is_global {
         return Err("global script".into());
     }
-    // A MIR script carries two bodies (MIR and baseline), and MIR bodies
-    // are larger than baseline's per bytecode byte (exit blocks, block
-    // params). An Emscripten-sized function would dominate the batch's
-    // memory and compile time for little gain, so it stays in baseline.
-    const MAX_MIR_BYTECODE: usize = 32 * 1024;
+    // A MIR script carries two bodies (MIR and baseline), and a MIR body
+    // grows about quadratically with the function: every exit boxes every
+    // live frame slot, and both counts grow with its size (mandreel's
+    // seven functions of 16-32 KiB lowered to 660K values each, and
+    // its module outgrew the in-process compiler's memory). An
+    // Emscripten-sized function would dominate the batch's memory and
+    // compile time for little gain, so it stays in baseline.
+    const MAX_MIR_BYTECODE: usize = 8 * 1024;
     if script.bytecode.len() > MAX_MIR_BYTECODE {
         return Err(format!(
             "too large for MIR ({} bytecode bytes)",

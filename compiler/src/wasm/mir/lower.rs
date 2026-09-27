@@ -53,7 +53,8 @@ use crate::wasm::bbv::abi::{
     BINOP_LSH, BINOP_MOD, BINOP_MUL, BINOP_RSH, BINOP_SUB, BINOP_URSH, CLASS_WORD_SHALLOW,
     CLASS_WORD_RANGES, CLASS_WORD_SLOTS, IC_SET_ABSSLOT, IC_SET_RECVSHAPE, IC_SET_SLOTENC,
     IC_WAY_ADDR_PLACEHOLDER, NATIVE_SLOTS_OFFSET, FUNC_ENV_SLOT_OFFSET, FUNC_SCRIPT_SLOT_OFFSET,
-    SHAPE_FIXED_SLOTS_MASK_BITS, SHAPE_FIXED_SLOTS_SHIFT, CHUNK_STORE_BUFFER_OFFSET, CMP_EQ, CMP_GE, CMP_GT, CMP_LE, CMP_LT, CMP_NE, CMP_STRICTEQ, CMP_STRICTNE,
+    SHAPE_FIXED_SLOTS_MASK_BITS, SHAPE_FIXED_SLOTS_SHIFT, JSCONTEXT_REALM_OFFSET,
+    REALM_GLOBAL_OFFSET, CHUNK_STORE_BUFFER_OFFSET, CMP_EQ, CMP_GE, CMP_GT, CMP_LE, CMP_LT, CMP_NE, CMP_STRICTEQ, CMP_STRICTNE,
     ELEMENTS_FLAGS_BACK, ELEMENTS_FROZEN_FLAG, ELEMENTS_INITLEN_BACK, FIXED_SLOTS_BASE, FLAGS_ALL, OBJ_CLASS_IDX_OFFSET, OBJ_ELEMENTS_OFFSET,
     JSCONTEXT_ZONE_OFFSET, NOT_CHUNK_MASK, SHAPE_IMMUTABLE_FLAGS_OFFSET, SHAPE_IS_NATIVE_BIT,
     SHAPE_OFFSET, VAL_GCTHING_TAG_MIN, ZONE_NEEDS_BARRIER_OFFSET,
@@ -183,6 +184,9 @@ struct Lower<'a> {
     ctor_stamp: Option<[u32; 3]>,
     strict: bool,
     plain_env: bool,
+    /// The syntactic global binding (`TranslateCtx::syn_gnames`) each
+    /// global name read names, for its inline arms.
+    gname_bids: BTreeMap<mir::entity::AtomId, u32>,
 }
 
 /// Per-script lowering choices besides the function itself.
@@ -212,6 +216,7 @@ pub fn lower<'a>(
     layout: FrameLayout,
     max_depth: u32,
     o: LowerOpts,
+    gname_bids: BTreeMap<mir::entity::AtomId, u32>,
 ) -> R<Lowered> {
     if layout.rebase_vp {
         return Err("lowering: a script that reads its actuals".into());
@@ -254,6 +259,7 @@ pub fn lower<'a>(
         ctor_stamp: o.ctor_stamp,
         strict: o.strict,
         plain_env: o.plain_env,
+        gname_bids,
     };
     l.run()?;
     Ok(Lowered {
@@ -1261,6 +1267,9 @@ impl<'a> Lower<'a> {
             }
             Opcode::JsGetName(name) => {
                 // `ok` and `err` (a static kill): not a clean/dirty op.
+                if let Some(&bid) = self.gname_bids.get(&name) {
+                    self.gname_fast_arms(inst, bid)?;
+                }
                 let at = self.atom(name);
                 let z = self.i32c(0);
                 let live = self.live_across(inst);
@@ -1519,6 +1528,68 @@ impl<'a> Lower<'a> {
             _ => unreachable!(),
         };
         self.js_call(inst, f, &args, false)
+    }
+
+    /// The inline arms of a read of syntactic global binding `bid` (bbv's
+    /// `emit_get_gname_inline_guarded`), each taking the op's `ok` edge:
+    /// the binding's value-fuse cell while armed; else its cached slot row
+    /// while the global's shape is the one the row was resolved against;
+    /// else the resolve leaf (no GC) and the slot. Falls through to the
+    /// generic helper when the binding is not cacheable (lexicals, TDZ).
+    fn gname_fast_arms(&mut self, inst: mir::Inst, bid: u32) -> R<()> {
+        let vals = self.i32c(self.h.global_vals_base + 16 * bid);
+        let fw = self.load_i32(vals, 8);
+        let one = self.i32c(1);
+        let armed = self.bin(Operator::I32Eq, fw, one, Type::I32);
+        let (hit_b, slots_b) = (self.body.add_block(), self.body.add_block());
+        self.cond_br(armed, Self::to(hit_b), Self::to(slots_b));
+        self.cur = hit_b;
+        let v = self.load_i64(vals, 0);
+        let t = self.edge(inst, 0, &[v])?;
+        self.terminate(Terminator::Br { target: t });
+
+        self.cur = slots_b;
+        let base = self.i32c(self.h.global_slots_base);
+        let entry0 = self.load_i32(base, 8 * bid);
+        let shape0 = self.load_i32(base, 8 * bid + 4);
+        let resolved0 = self.bin(Operator::I32And, entry0, one, Type::I32);
+        let realm = self.load_i32(self.cx, JSCONTEXT_REALM_OFFSET);
+        let global = self.load_i32(realm, REALM_GLOBAL_OFFSET);
+        let live = self.load_i32(global, SHAPE_OFFSET);
+        let same = self.bin(Operator::I32Eq, shape0, live, Type::I32);
+        let hit = self.bin(Operator::I32And, resolved0, same, Type::I32);
+        let use_b = self.body.add_block();
+        let entry = self.body.add_blockparam(use_b, Type::I32);
+        let resolve_b = self.body.add_block();
+        self.cond_br(hit, BlockTarget { block: use_b, args: vec![entry0] }, Self::to(resolve_b));
+
+        self.cur = resolve_b;
+        let b = self.i32c(bid);
+        let entry1 = self.call1(self.h.resolve_global_slot_guarded, &[self.cx, b], Type::I32);
+        let resolved1 = self.bin(Operator::I32And, entry1, one, Type::I32);
+        let slow = self.body.add_block();
+        self.cond_br(resolved1, BlockTarget { block: use_b, args: vec![entry1] }, Self::to(slow));
+
+        // The entry: bit 1 selects the dynamic slots, `entry & !7` is the
+        // byte offset from that base (past the fixed-slot header when
+        // fixed).
+        self.cur = use_b;
+        let sh = self.bin(Operator::I32ShrU, entry, one, Type::I32);
+        let dynamic = self.bin(Operator::I32And, sh, one, Type::I32);
+        let m = self.i32c(!7);
+        let idx8 = self.bin(Operator::I32And, entry, m, Type::I32);
+        let z = self.i32c(0);
+        let fb = self.i32c(FIXED_SLOTS_BASE);
+        let add = self.select(Type::I32, z, fb, dynamic);
+        let off = self.bin(Operator::I32Add, idx8, add, Type::I32);
+        let slots = self.load_i32(global, NATIVE_SLOTS_OFFSET);
+        let slot_base = self.select(Type::I32, slots, global, dynamic);
+        let addr = self.bin(Operator::I32Add, slot_base, off, Type::I32);
+        let v = self.load_i64(addr, 0);
+        let t = self.edge(inst, 0, &[v])?;
+        self.terminate(Terminator::Br { target: t });
+        self.cur = slow;
+        Ok(())
     }
 
     /// The inline arms of a generic numeric op, as baseline's (and the

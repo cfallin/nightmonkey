@@ -177,9 +177,9 @@ pub(super) const BASESCRIPT_NIGHTFUNCINDEX_OFFSET: u32 = 56;
 // Nursery allocations carry an 8-byte header before the object.
 
 pub(crate) const JSCONTEXT_ZONE_OFFSET: u32 = 84;
-pub(super) const JSCONTEXT_REALM_OFFSET: u32 = 88;
+pub(crate) const JSCONTEXT_REALM_OFFSET: u32 = 88;
 pub(crate) const ZONE_NEEDS_BARRIER_OFFSET: u32 = 8;
-pub(super) const REALM_GLOBAL_OFFSET: u32 = 72;
+pub(crate) const REALM_GLOBAL_OFFSET: u32 = 72;
 pub(crate) const NOT_CHUNK_MASK: u32 = !0xF_FFFF;
 pub(crate) const CHUNK_STORE_BUFFER_OFFSET: u32 = 0;
 pub(super) const NURSERY_HEADER_BYTES: u32 = 8;

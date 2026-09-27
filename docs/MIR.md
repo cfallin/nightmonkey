@@ -1165,7 +1165,11 @@ declines for everything else).
     converge on large functions.
   - **Size.** Scripts over 32 KiB of bytecode stay in baseline. A MIR
     script carries two bodies, and the gate keeps the batch's memory in
-    bounds.
+    bounds. (Later lowered to 8 KiB: a MIR body grows about
+    quadratically with its function, since every exit boxes every live
+    slot. With the inline arms added since, mandreel's module outgrew the
+    in-process compiler, and its 16-32 KiB functions averaged 660K
+    values each.)
   - **Gate met** (2026-09-26):
     - `--pipeline mir --strict-coverage` passes the full jit-test lane;
     - so does `--pipeline mir --mir-stress 3`;
@@ -1325,6 +1329,21 @@ the numbers call for it.
   - strictly, when neither operand is a double, string or BigInt;
   - loosely, for int32/int32 and boolean/boolean pairs, and for
     null/undefined/object pairs while that fuse is intact.
+- **Inline global reads.** A `js.getname` of a syntactic global
+  binding (`syn_gnames`, in functions MIR compiles) has bbv's arms
+  inline, each taking `ok`:
+  - the binding's value-fuse cell, while armed;
+  - else its cached slot row, while the global's shape is the one the
+    row was resolved against;
+  - else the resolve leaf (no GC), then the slot.
+  Anything else (lexicals, TDZ, accessors, deleted globals) goes through
+  the helper. deltablue under MIR: 1964 → 2682.
+- **Inline numeric arms for untyped ops**, as baseline has: int32, then
+  doubles, then the helper, so code whose types MIR does not know no
+  longer runs slower than in baseline.
+- **`new`.** `IsConstructing` is a magic constant, and `New` becomes
+  `construct(nslots, word)`, carrying the site's sized allocation and
+  early stamp word. It lowers to the runtime's construct.
 - **Property ICs for unpredicted sites (§4.3).**
   - A `js.getprop` calls the module's shared probe `night_ic_get` with
     the site's IC row. It covers the own and holder ways, then the
