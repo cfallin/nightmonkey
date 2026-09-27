@@ -231,6 +231,14 @@ pub enum RtOp {
     /// Define getter/setter `name` of `obj` to `f` (`kind`: 1 setter,
     /// 2 hidden).
     InitPropGetSet(AtomId, u32),
+    /// Self-hosted intrinsic `name` (`GetIntrinsic`) -> value.
+    Intrinsic(AtomId),
+    /// `ToString` of v -> string.
+    ToString,
+    /// Well-known symbol `code` (`JSOp::Symbol`) -> symbol.
+    Symbol(u32),
+    /// Builtin object `kind` (`JSOp::BuiltinObject`) -> object.
+    BuiltinObject(u32),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -1146,6 +1154,10 @@ pub fn signature(op: &Opcode, args: &[Type], m: &Module) -> SigResult {
                 RtOp::ToPropertyKey => (1, Some(Type::VAL_TOP)),
                 RtOp::RegExp(_) => (0, Some(Type::val(TagSet::OBJECT))),
                 RtOp::InitPropGetSet(..) => (2, None),
+                RtOp::Intrinsic(_) => (0, Some(Type::VAL_TOP)),
+                RtOp::ToString => (1, Some(Type::val(TagSet::STRING))),
+                RtOp::Symbol(_) => (0, Some(Type::val(TagSet::prims(crate::opsem::PRIM_SYMBOL)))),
+                RtOp::BuiltinObject(_) => (0, Some(Type::val(TagSet::OBJECT))),
             };
             arity(args, n)?;
             for t in args {

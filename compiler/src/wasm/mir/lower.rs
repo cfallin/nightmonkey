@@ -115,6 +115,7 @@ pub struct Lowered {
     pub construct_cell_patches: Vec<(Value, u32)>,
     pub call_cell_patches: Vec<(Value, u32)>,
     pub alloc_cell_patches: Vec<(Value, u32)>,
+    pub intrinsic_cell_patches: Vec<(Value, u32)>,
     /// Per mnemonic: how many instructions, and the wasm values they
     /// lowered to (`--dump-opsize`).
     pub opsize: BTreeMap<String, (u32, u32)>,
@@ -291,6 +292,7 @@ struct Lower<'a> {
     /// Call value cell placeholders (bbv's per-site cell; 0: the trash row).
     call_cell_patches: Vec<(Value, u32)>,
     alloc_cell_patches: Vec<(Value, u32)>,
+    intrinsic_cell_patches: Vec<(Value, u32)>,
     opsize: BTreeMap<String, (u32, u32)>,
     /// The census helper, when exits are counted (`--mir-exit-census`).
     exit_census: Option<Func>,
@@ -443,6 +445,7 @@ pub fn lower<'a>(
         construct_cell_patches: vec![],
         call_cell_patches: vec![],
         alloc_cell_patches: vec![],
+        intrinsic_cell_patches: vec![],
         opsize: BTreeMap::new(),
         exit_census: if o.exit_census { h.census } else { None },
         block_census: if o.block_census { h.census } else { None },
@@ -468,6 +471,7 @@ pub fn lower<'a>(
         construct_cell_patches: l.construct_cell_patches,
         call_cell_patches: l.call_cell_patches,
         alloc_cell_patches: l.alloc_cell_patches,
+        intrinsic_cell_patches: l.intrinsic_cell_patches,
         opsize: l.opsize,
     })
 }
@@ -2513,6 +2517,51 @@ impl<'a> Lower<'a> {
                         let script = self.script_ptr();
                         let iv = self.i32c(idx);
                         (h.regexp, vec![script, iv])
+                    }
+                    RtOp::ToString => {
+                        // A string is its own; else the helper.
+                        let tag = self.tag_of(a[0]);
+                        let s = self.tag_is(tag, TAG_STRING as u32);
+                        let (hit, miss) = (self.body.add_block(), self.body.add_block());
+                        self.cond_br(s, Self::to(hit), Self::to(miss));
+                        self.cur = hit;
+                        let t = self.edge(inst, 0, &[a[0]])?;
+                        self.terminate(Terminator::Br { target: t });
+                        self.cur = miss;
+                        (h.tostring, vec![a[0]])
+                    }
+                    RtOp::Symbol(code) => {
+                        // A well-known symbol: permanent, from a leaf.
+                        let cv = self.i32c(code);
+                        let r = self.call1(h.symbol, &[self.cx, cv], Type::I64);
+                        let t = self.edge(inst, 0, &[r])?;
+                        self.terminate(Terminator::Br { target: t });
+                        return Ok(());
+                    }
+                    RtOp::Intrinsic(_) | RtOp::BuiltinObject(_) => {
+                        // A realm constant: the cell once armed; the helper
+                        // resolves it and arms it.
+                        let (id, row, helper) = match r {
+                            RtOp::Intrinsic(name) => {
+                                let id = self.atoms.intern_chars(self.mm.atoms[name].chars());
+                                (id, self.atoms.intrinsic_cell(id), h.get_intrinsic_cell)
+                            }
+                            RtOp::BuiltinObject(kind) => (kind, self.atoms.builtin_object_cell(kind), h.builtin_object_cell),
+                            _ => unreachable!(),
+                        };
+                        let cell = self.i32c(crate::wasm::bbv::abi::INTRINSIC_CELL_ADDR_PLACEHOLDER);
+                        self.intrinsic_cell_patches.push((cell, row));
+                        let bits = self.load_i64(cell, 0);
+                        let z = self.i64c(0);
+                        let armed = self.bin(Operator::I64Ne, bits, z, Type::I32);
+                        let (hit, miss) = (self.body.add_block(), self.body.add_block());
+                        self.cond_br(armed, Self::to(hit), Self::to(miss));
+                        self.cur = hit;
+                        let t = self.edge(inst, 0, &[bits])?;
+                        self.terminate(Terminator::Br { target: t });
+                        self.cur = miss;
+                        let iv = self.i32c(id);
+                        (helper, vec![iv, cell])
                     }
                     RtOp::InitPropGetSet(name, kind) => {
                         let (at, kv) = (self.atom(name), self.i32c(kind));

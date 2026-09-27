@@ -383,6 +383,10 @@ pub fn mnemonic(op: &Opcode) -> String {
             RtOp::ToPropertyKey => "js.rt.topropertykey",
             RtOp::RegExp(_) => "js.rt.regexp",
             RtOp::InitPropGetSet(..) => "js.rt.initgetset",
+            RtOp::Intrinsic(_) => "js.rt.intrinsic",
+            RtOp::ToString => "js.rt.tostring",
+            RtOp::Symbol(_) => "js.rt.symbol",
+            RtOp::BuiltinObject(_) => "js.rt.builtinobject",
         }
         .into(),
         FrameStore(_) => "frame.store".into(),
@@ -469,8 +473,10 @@ fn immediates(m: &Module, op: &Opcode) -> Option<String> {
         JsLambda(k) | FrameStore(k) | RestArray(k) | ActualArgOr(k) | JsIsBuiltin(k) => {
             k.to_string()
         }
-        JsRt(RtOp::DelProp(a, _)) => atom(Some(m), *a),
-        JsRt(RtOp::NewArray(n)) | JsRt(RtOp::InitElem(n)) => n.to_string(),
+        JsRt(RtOp::DelProp(a, _)) | JsRt(RtOp::Intrinsic(a)) => atom(Some(m), *a),
+        JsRt(RtOp::NewArray(n)) | JsRt(RtOp::InitElem(n)) | JsRt(RtOp::Symbol(n)) | JsRt(RtOp::BuiltinObject(n)) => {
+            n.to_string()
+        }
         JsRt(RtOp::InitProp(a, attrs)) => format!("{}, {attrs}", atom(Some(m), *a)),
         Construct(n, w) | CreateThis(n, w) => format!("{n}, {w}"),
         CtorStamp(l, n, k) => format!("{l}, {n}, {k}"),

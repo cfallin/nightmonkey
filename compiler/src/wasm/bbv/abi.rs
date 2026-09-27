@@ -264,7 +264,7 @@ pub(crate) const IOF_CELL_SLOTENC: u32 = 8;
 pub(crate) const IOF_CELL_ADDR_PLACEHOLDER: u32 = 0xDEAD_BF80;
 
 pub(crate) const ALLOC_CELL_ADDR_PLACEHOLDER: u32 = 0xDEAD_BF00;
-pub(super) const INTRINSIC_CELL_ADDR_PLACEHOLDER: u32 = 0xDEAD_C100;
+pub(crate) const INTRINSIC_CELL_ADDR_PLACEHOLDER: u32 = 0xDEAD_C100;
 
 // --- the property inline caches -------------------------------------------
 //

@@ -2779,6 +2779,34 @@ impl<'s, 'a> Run<'s, 'a> {
                 let x = self.st[self.arg_ix(n)];
                 self.st.push(x);
             }
+            ToString if RT_OPS => {
+                // A string is its own ToString.
+                let v = self.top();
+                if !v.ty.tags().is_nonempty_subset_of(TagSet::STRING) {
+                    let v = self.pop();
+                    let x = self.boxed(v);
+                    let r = self.js(Opcode::JsRt(RtOp::ToString), vec![x], MType::val(TagSet::STRING));
+                    self.push(r, Ty::Val(TagSet::STRING));
+                }
+            }
+            BuiltinObject if RT_OPS => {
+                let kind = u32::from(p.next_uint8().unwrap());
+                let r = self.js(Opcode::JsRt(RtOp::BuiltinObject(kind)), vec![], MType::val(TagSet::OBJECT));
+                self.push(r, Ty::Val(TagSet::OBJECT));
+            }
+            Symbol if RT_OPS => {
+                let code = u32::from(p.next_uint8().unwrap());
+                let sym = TagSet::prims(crate::opsem::PRIM_SYMBOL);
+                let r = self.js(Opcode::JsRt(RtOp::Symbol(code)), vec![], MType::val(sym));
+                self.push(r, Ty::Val(sym));
+            }
+            GetIntrinsic if RT_OPS => {
+                // A realm constant, from its cell once armed (bbv's
+                // `emit_get_intrinsic`).
+                let a = self.atom(p.next_uint32().unwrap())?;
+                let r = self.js(Opcode::JsRt(RtOp::Intrinsic(a)), vec![], MType::VAL_TOP);
+                self.push(r, Ty::Val(TagSet::ALL));
+            }
             RegExp if RT_OPS => {
                 let idx = p.next_uint32().unwrap();
                 let r = self.js(Opcode::JsRt(RtOp::RegExp(idx)), vec![], MType::val(TagSet::OBJECT));

@@ -74,6 +74,7 @@ impl Maps {
             JsRt(mir::ops::RtOp::InitPropGetSet(a, k)) => {
                 JsRt(mir::ops::RtOp::InitPropGetSet(self.atom(a), k))
             }
+            JsRt(mir::ops::RtOp::Intrinsic(a)) => JsRt(mir::ops::RtOp::Intrinsic(self.atom(a))),
             ConstObj(_) | GuardSingleton(_) | CheckBinding(_) | CheckNative(_) | LoadGName(_)
             | StoreGName(_) | CallNative(_) => {
                 return Err(format!("inline: {} is not remapped", mir::print::mnemonic(&op)))
