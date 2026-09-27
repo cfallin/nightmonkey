@@ -118,7 +118,7 @@ pub(crate) const ELEMENTS_FLAGS_BACK: u32 = 16;
 pub(crate) const ELEMENTS_INITLEN_BACK: u32 = 12;
 pub(crate) const ELEMENTS_CAPACITY_BACK: u32 = 8;
 pub(crate) const ELEMENTS_LENGTH_BACK: u32 = 4;
-pub(super) const ELEMENTS_FLAG_FIXED: u32 = 0x1;
+pub(crate) const ELEMENTS_FLAG_FIXED: u32 = 0x1;
 pub(crate) const ELEMENTS_FROZEN_FLAG: u32 = 0x40;
 pub(super) const ELEMENTS_NON_PACKED_FLAG: u32 = 0x80;
 /// Any of these set means the dense append arm must bail to the helper.

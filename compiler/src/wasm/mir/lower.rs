@@ -1952,6 +1952,23 @@ impl<'a> Lower<'a> {
                         (h.init_prop, vec![a[0], at, a[1], av, sv])
                     }
                     RtOp::InitElem(attrs) => {
+                        let key = self.f.insts[inst].args[1];
+                        let index = match self.f.values[key].def {
+                            mir::func::ValueDef::Result(i, _) => match self.f.insts[i].op {
+                                Opcode::ConstVal(ConstVal::Int32(n)) => u32::try_from(n).ok(),
+                                _ => None,
+                            },
+                            _ => None,
+                        };
+                        match index {
+                            Some(i)
+                                if attrs == crate::wasm::bbv::abi::INIT_ATTR_ENUMERATE
+                                    && i < crate::constants::INLINE_INIT_ELEM_CAP =>
+                            {
+                                self.init_elem_inline(inst, a[0], i, a[2])?
+                            }
+                            _ => {}
+                        }
                         let av = self.i32c(attrs);
                         (h.init_elem, vec![a[0], a[1], a[2], av])
                     }
@@ -4090,6 +4107,51 @@ impl<'a> Lower<'a> {
         let b = self.box_number(res);
         let t = self.edge(inst, 0, &[b])?;
         self.terminate(Terminator::Br { target: t });
+        Ok(())
+    }
+
+    /// `InitElemArray index` filling an array literal (bbv's
+    /// `emit_init_elem_array`): with a value that is neither a GC thing
+    /// (no barrier) nor the hole, an unstamped array (no element claim to
+    /// keep), dense elements with no flag but FIXED, and the initialized
+    /// length at `index` with room, store and bump it, taking `ok_clean`;
+    /// `cur` is left on the miss.
+    fn init_elem_inline(&mut self, inst: mir::Inst, arr: Value, index: u32, val: Value) -> R<()> {
+        use crate::wasm::bbv::abi::ELEMENTS_FLAG_FIXED;
+        let slow = self.body.add_block();
+        let vt = self.tag_of(val);
+        let magic = self.i32c(TAG_MAGIC as u32);
+        let v_ok = self.bin(Operator::I32LtU, vt, magic, Type::I32);
+        let at = self.tag_of(arr);
+        let a_obj = self.tag_is(at, TAG_OBJECT as u32);
+        let ok = self.bin(Operator::I32And, v_ok, a_obj, Type::I32);
+        self.check(ok, slow);
+        let obj = self.un(Operator::I32WrapI64, arr, Type::I32);
+        let word = self.load_i32(obj, OBJ_CLASS_IDX_OFFSET);
+        let unstamped = self.un(Operator::I32Eqz, word, Type::I32);
+        self.check(unstamped, slow);
+        let elems = self.load_i32(obj, OBJ_ELEMENTS_OFFSET);
+        let flags = self.elem_header(elems, ELEMENTS_FLAGS_BACK);
+        let initlen = self.elem_header(elems, ELEMENTS_INITLEN_BACK);
+        let cap = self.elem_header(elems, ELEMENTS_CAPACITY_BACK);
+        let len = self.elem_header(elems, ELEMENTS_LENGTH_BACK);
+        let nf = self.i32c(!ELEMENTS_FLAG_FIXED);
+        let rest = self.bin(Operator::I32And, flags, nf, Type::I32);
+        let f_ok = self.un(Operator::I32Eqz, rest, Type::I32);
+        let iv = self.i32c(index);
+        let i_ok = self.bin(Operator::I32Eq, initlen, iv, Type::I32);
+        let c_ok = self.bin(Operator::I32GtU, cap, iv, Type::I32);
+        let l_ok = self.bin(Operator::I32GtU, len, iv, Type::I32);
+        let a = self.bin(Operator::I32And, f_ok, i_ok, Type::I32);
+        let b = self.bin(Operator::I32And, c_ok, l_ok, Type::I32);
+        let all = self.bin(Operator::I32And, a, b, Type::I32);
+        self.check(all, slow);
+        self.store_i64(elems, index * 8, val);
+        let nl = self.i32c(index + 1);
+        self.set_elem_header(elems, ELEMENTS_INITLEN_BACK, nl);
+        let t = self.edge(inst, 0, &[])?;
+        self.terminate(Terminator::Br { target: t });
+        self.cur = slow;
         Ok(())
     }
 
