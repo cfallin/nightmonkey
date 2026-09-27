@@ -2181,6 +2181,9 @@ pub fn translate_all(
             for v in x.body_off_patches {
                 body_off_patch_sites.push((f, v));
             }
+            for (addr, off) in x.prop_ic_patches {
+                prop_ic_patches.push((f, addr, off));
+            }
             funcs.push(f);
         }
         if let FuncDecl::Body(_, _, body) = &mut m.funcs[main] {

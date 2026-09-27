@@ -108,6 +108,7 @@ pub fn translate_script(
             body: base.body,
             body_off_patches: base.body_off_patches,
             main_call_patches: base.main_calls,
+            prop_ic_patches: base.prop_ic_patches,
         }],
         extra_call_patches: lowered.baseline_calls.into_iter().map(|v| (v, 0)).collect(),
     }))

@@ -187,6 +187,15 @@ tier stays non-speculative. The ops:
   inlining it in baseline too would need the GC barriers in Wasm, which
   is not worth it for this tier.
 
+- **`GetProp`** probes the site's property inline cache through the
+  module's shared, out-of-line `night_ic_get` (the probe bbv's fact-free
+  reads use: own and holder ways, then the megamorphic table). A miss
+  calls `get_prop_ic_miss`, which does the generic get and fills the
+  site's ways. The cache is runtime state, but only as a memo of the
+  generic lookup, so the tier stays non-speculative. It is the largest
+  single fast path: box2d 1970 → 5406, deltablue 597 → 1580, raytrace
+  1173 → 1810 (Octane, 2026-09-26).
+
 Each fast path is a diamond with its own slow block (§8's fan-in note).
 The slow path sees exactly the frame the plain lowering sees.
 

@@ -1397,6 +1397,9 @@ pub struct ExtraBody {
     /// Direct-call placeholders in this body for the script's main body
     /// (a baseline onramp into MIR); patched like `extra_call_patches`.
     pub main_call_patches: Vec<Value>,
+    /// Property-IC way-address placeholders in this body, as
+    /// `prop_ic_patches`.
+    pub prop_ic_patches: Vec<(Value, u32)>,
 }
 
 /// Point the placeholder `Call` at `v` in `body` to `target`.

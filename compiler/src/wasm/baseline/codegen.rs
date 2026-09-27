@@ -34,12 +34,12 @@ use crate::wasm::bbv::abi::{
     BINOP_BITAND, BINOP_BITNOT, BINOP_BITOR, BINOP_BITXOR, BINOP_DEC, BINOP_DIV, BINOP_INC,
     BINOP_LSH, BINOP_MOD, BINOP_MUL, BINOP_RSH, BINOP_SUB, BINOP_URSH, CMP_EQ, CMP_GE, CMP_GT,
     CMP_LE, CMP_LT, CMP_NE, CMP_STRICTEQ, CMP_STRICTNE, ELEMENTS_INITLEN_BACK, FIXED_SLOTS_BASE,
-    FLAGS_ALL, FUNC_ENV_SLOT_OFFSET, FUNC_SCRIPT_SLOT_OFFSET, INIT_ATTR_ENUMERATE,
+    FLAGS_ALL, FUNC_ENV_SLOT_OFFSET, IC_WAY_ADDR_PLACEHOLDER, FUNC_SCRIPT_SLOT_OFFSET, INIT_ATTR_ENUMERATE,
     INIT_ATTR_HIDDEN, INIT_ATTR_LOCKED, NO_NSLOTS, OBJ_ELEMENTS_OFFSET,
     SHAPE_IMMUTABLE_FLAGS_OFFSET, SHAPE_IS_NATIVE_BIT, SHAPE_OFFSET,
 };
 use crate::wasm::translate::{
-    AtomTable, Helpers, TranslateCtx, MAGIC_ELEMENTS_HOLE, MAGIC_GENERATOR_CLOSING,
+    AtomTable, Helpers, TranslateCtx, INLINE_IC_STRIDE, MAGIC_ELEMENTS_HOLE, MAGIC_GENERATOR_CLOSING,
     MAGIC_IS_CONSTRUCTING, MAGIC_NO_ITER_VALUE, MAGIC_UNINITIALIZED_LEXICAL, TAG_BOOLEAN,
     TAG_CLEAR, TAG_INT32, TAG_MAGIC, TAG_NULL, TAG_OBJECT, TAG_UNDEFINED,
 };
@@ -129,6 +129,9 @@ pub(super) struct Gen<'a> {
     /// Adapter-offset placeholders of direct calls (`Outcome::Compiled`'s
     /// `body_off_patches`).
     pub(super) body_off_patches: Vec<Value>,
+    /// Property-IC way-address placeholders, with their row offsets
+    /// (`Outcome::Compiled::prop_ic_patches`).
+    pub(super) prop_ic_patches: Vec<(Value, u32)>,
     /// The op being lowered and its entry depth.
     pc: Pc,
     d: u32,
@@ -238,6 +241,7 @@ impl<'a> Gen<'a> {
             dispatch: BTreeMap::new(),
             gen_dispatch_blk: None,
             body_off_patches: vec![],
+            prop_ic_patches: vec![],
             pc: Pc::new(0),
             d: 0,
         })
@@ -2120,11 +2124,28 @@ impl<'a> Gen<'a> {
 
             // --- properties and elements ---
             GetProp => {
+                // The site's inline cache: the module's shared probe
+                // `night_ic_get` (own and holder ways, then the megamorphic
+                // table), and on a miss the generic get, which fills the
+                // site's ways.
                 let a = self.atom(p.next_uint32().unwrap())?;
                 let recv = self.slot(d - 1);
                 let av = self.i32c(a);
-                let r = self.rt(h.get_property, &[recv, av]);
-                self.set_slot(d - 1, r);
+                let cache = self.atoms.next_prop_cache();
+                let way = self.i32c(IC_WAY_ADDR_PLACEHOLDER);
+                self.prop_ic_patches.push((way, cache * INLINE_IC_STRIDE));
+                let r = self.call(h.ic_get_poly, &[recv, av, way], Some(Type::I64)).unwrap();
+                let hit = self.tag_eq(r, TAG_MAGIC);
+                let hit = self.unop(Operator::I32Eqz, hit, Type::I32);
+                self.fast_path(
+                    hit,
+                    |g, _| g.set_slot(d - 1, r),
+                    |g| {
+                        let c = g.i32c(cache);
+                        let r = g.rt(h.get_prop_ic_miss, &[recv, av, c]);
+                        g.set_slot(d - 1, r);
+                    },
+                );
             }
             SetProp | StrictSetProp => {
                 let a = self.atom(p.next_uint32().unwrap())?;

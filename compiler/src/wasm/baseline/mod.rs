@@ -49,7 +49,7 @@ pub fn translate_script(
                 construct_cell_patches: vec![],
                 strlit_patches: vec![],
                 intrinsic_cell_patches: vec![],
-                prop_ic_patches: vec![],
+                prop_ic_patches: b.prop_ic_patches,
                 body_off_patches: b.body_off_patches,
                 ctor_nslots_patches: vec![],
                 extra_bodies: vec![],
@@ -68,6 +68,8 @@ pub struct Built {
     pub body_off_patches: Vec<waffle::Value>,
     /// Direct-call placeholders for the script's MIR body: the onramps.
     pub main_calls: Vec<waffle::Value>,
+    /// Property-IC way-address placeholders (`Outcome::Compiled::prop_ic_patches`).
+    pub prop_ic_patches: Vec<(waffle::Value, u32)>,
 }
 
 /// Build a script's baseline body; `Ok(Err(reason))` is a decline.
@@ -160,11 +162,13 @@ pub fn build_body(
     }
     let body_off_patches = std::mem::take(&mut gen.body_off_patches);
     let main_calls = std::mem::take(&mut gen.main_calls);
+    let prop_ic_patches = std::mem::take(&mut gen.prop_ic_patches);
     Ok(Ok(Built {
         sig,
         body: gen.body,
         body_off_patches,
         main_calls,
+        prop_ic_patches,
     }))
 }
 
