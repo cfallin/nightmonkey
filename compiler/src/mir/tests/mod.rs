@@ -472,11 +472,13 @@ fn boundary_exits() {
         ))
     };
     verify_ok(&exit("v1", "v3"));
-    verify_err(
-        &exit("v1", "v2"),
-        Check::Boundary,
-        "operand v2 (val{int32} range[1,1]) must be val",
-    );
+    // Narrower values and raw representations cross too: the lowering
+    // boxes them at the exit hub.
+    verify_ok(&exit("v1", "v2"));
+    verify_ok(&func(
+        "b0(v0: obj{Function(s1)}, v1: val):\n  v2 = const.i32 7\n  v3 = const.f64 1.5\n  \
+         exit pc=4 this=v1 args=[] locals=[] rval=v3 stack=[v2]\n",
+    ));
     verify_err(
         &exit("v1", ""),
         Check::Boundary,

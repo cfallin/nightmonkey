@@ -317,6 +317,9 @@ pub fn mnemonic(op: &Opcode) -> String {
         Return => "return".into(),
         Exit { .. } => "exit".into(),
         ExitThrow { .. } => "exit.throw".into(),
+        ExitInline { throw: false, .. } => "exit.inline".into(),
+        ExitInline { throw: true, .. } => "exit.inline.throw".into(),
+        InlineEnter => "inline.enter".into(),
         Unreachable => "unreachable".into(),
         I32Ovf(a) => format!("i32.{}.ovf", arith_name(*a)),
         I32Wrap(a) => format!("i32.{}.wrap", arith_name(*a)),
@@ -355,6 +358,7 @@ pub fn mnemonic(op: &Opcode) -> String {
         JsBoxThis => "js.box_this".into(),
         JsBindGName(_) => "js.bindgname".into(),
         JsLambda(_) => "js.lambda".into(),
+        FrameStore(_) => "frame.store".into(),
         JsSetName(_, false) => "js.setname".into(),
         JsSetName(_, true) => "js.setname.strict".into(),
         LoadField(_) => "load_field".into(),
@@ -430,7 +434,7 @@ fn immediates(m: &Module, op: &Opcode) -> Option<String> {
         CheckNative(n) | CallNative(n) => n.to_string(),
         NewObject(k) => format!("L{k}"),
         EnvLoad(s) | EnvStore(s) => s.to_string(),
-        JsLambda(k) => k.to_string(),
+        JsLambda(k) | FrameStore(k) => k.to_string(),
         Construct(n, w) => format!("{n}, {w}"),
         _ => return None,
     })
@@ -608,7 +612,7 @@ pub fn print_func(m: &Module, f: &Func) -> String {
                 write!(out, "{} = ", rs.join(", ")).unwrap();
             }
             out.push_str(&mnemonic(&d.op));
-            if let Some((pc, nargs, nlocals)) = d.op.exit_shape() {
+            if let Some((pc, nargs, nlocals)) = d.op.frame_operands() {
                 match crate::mir::ops::frame_parts(&d.args, nargs, nlocals) {
                     Some(fp) => write!(
                         out,

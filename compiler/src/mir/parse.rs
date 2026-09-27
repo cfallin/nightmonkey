@@ -1200,6 +1200,7 @@ impl Parser {
             EnvLoad(_) => EnvLoad(EnvSlot::new(self.int()?)),
             EnvStore(_) => EnvStore(EnvSlot::new(self.int()?)),
             JsLambda(_) => JsLambda(self.int()?),
+            FrameStore(_) => FrameStore(self.int()?),
             Construct(..) => {
                 let n = self.int()?;
                 self.expect_punct(",")?;
@@ -1404,6 +1405,7 @@ fn template(mn: &str) -> Option<Opcode> {
             nargs: 0,
             nlocals: 0,
         },
+        InlineEnter,
         ExitThrow {
             pc: Pc::new(0),
             nargs: 0,
@@ -1429,6 +1431,7 @@ fn template(mn: &str) -> Option<Opcode> {
         JsBoxThis,
         JsBindGName(placeholder_atom),
         JsLambda(0),
+        FrameStore(0),
         JsSetName(placeholder_atom, false),
         JsSetName(placeholder_atom, true),
         LoadField(placeholder_atom),

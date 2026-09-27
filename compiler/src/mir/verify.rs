@@ -838,28 +838,29 @@ impl<'a> Verifier<'a> {
         for &b in &self.rpo.clone() {
             for &inst in &f.blocks[b].insts {
                 let d = &f.insts[inst];
-                let Some((pc, nargs, nlocals)) = d.op.exit_shape() else {
+                let Some((pc, nargs, nlocals)) = d.op.frame_operands() else {
                     continue;
                 };
                 let name = mnemonic(&d.op);
-                if nargs != f.frame.formals || nlocals != f.frame.locals {
+                let frame = f.frame_shape(f.inst_frame[inst]);
+                if nargs != frame.formals || nlocals != frame.locals {
                     self.err(
                         Check::Boundary,
                         Some(b),
                         format!(
                             "{name} pc={pc} carries {nargs} arg(s) and {nlocals} local(s); the frame has {} and {}",
-                            f.frame.formals, f.frame.locals
+                            frame.formals, frame.locals
                         ),
                     );
                 }
-                match f.frame.exit_arity(pc) {
+                match frame.exit_arity(pc) {
                     None => self.err(
                         Check::Boundary,
                         Some(b),
                         format!("{name}: no stack depth is recorded for pc {pc}"),
                     ),
                     Some(n) if n != d.args.len() => {
-                        let depth = f.frame.depths[&pc];
+                        let depth = frame.depths[&pc];
                         self.err(
                             Check::Boundary,
                             Some(b),
@@ -871,15 +872,15 @@ impl<'a> Verifier<'a> {
                     }
                     Some(_) => {}
                 }
+                // Any representation the lowering can box: it boxes each
+                // operand at the exit hub for the frame's shape (§5.1).
                 for &v in &d.args {
-                    if !self.ty(v).is_val_top() {
+                    let t = self.ty(v);
+                    if !matches!(t, Type::Val(_)) && crate::mir::ops::box_type(&t).is_err() {
                         self.err(
                             Check::Boundary,
                             Some(b),
-                            format!(
-                                "{name} operand {} must be val (⊤); upcast it first",
-                                self.vt(v)
-                            ),
+                            format!("{name} operand {} cannot be boxed", self.vt(v)),
                         );
                     }
                 }

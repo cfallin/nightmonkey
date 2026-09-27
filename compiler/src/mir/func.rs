@@ -39,6 +39,28 @@ impl FrameShape {
     }
 }
 
+/// An inlined callee's baseline-format frame (§5.5): where it sits is
+/// the lowering's choice, above its parent's.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct InlineFrame {
+    pub script: ScriptId,
+    pub shape: FrameShape,
+    /// The frame the callee was inlined into.
+    pub parent: u32,
+    /// The callee's deepest operand stack (its baseline frame's size).
+    pub max_depth: u32,
+}
+
+impl Func {
+    /// The shape of frame `id` (0: the function's own).
+    pub fn frame_shape(&self, id: u32) -> &FrameShape {
+        match id {
+            0 => &self.frame,
+            i => &self.inline_frames[i as usize - 1].shape,
+        }
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
 pub enum ValueDef {
     /// Param `n` of a block.
@@ -139,6 +161,12 @@ pub struct Witness {
 pub struct Func {
     pub script: ScriptId,
     pub frame: FrameShape,
+    /// The frames of inlined callees (§5.5); frame id `i + 1` is entry
+    /// `i`, and id 0 is the function's own frame.
+    pub inline_frames: Vec<InlineFrame>,
+    /// Which frame each instruction runs in: the frame a `frame.store`,
+    /// `env.current`, `js.lambda` or exit addresses. Default 0.
+    pub inst_frame: EntityMap<Inst, u32>,
     pub blocks: EntityVec<Block, BlockData>,
     /// The blocks that make up the function, in print order. Blocks not in
     /// the layout (parser padding, deleted blocks) are not part of it.
@@ -156,6 +184,8 @@ impl Func {
         Func {
             script,
             frame,
+            inline_frames: vec![],
+            inst_frame: EntityMap::new(),
             blocks: EntityVec::new(),
             layout: vec![],
             insts: EntityVec::new(),

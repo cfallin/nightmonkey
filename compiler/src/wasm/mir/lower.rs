@@ -137,6 +137,34 @@ fn machine(t: &MType) -> Option<Type> {
     }
 }
 
+/// An exit operand's representation, as far as boxing it goes: exits
+/// whose operands agree on these share an exit hub.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+enum BoxKind {
+    Val,
+    I32,
+    Int,
+    F64,
+    Bool,
+    Obj,
+    Str,
+}
+
+impl BoxKind {
+    fn of(t: &MType) -> R<BoxKind> {
+        Ok(match t {
+            MType::Val(_) => BoxKind::Val,
+            MType::I32(_) => BoxKind::I32,
+            MType::Int(_) => BoxKind::Int,
+            MType::F64(_) => BoxKind::F64,
+            MType::Bool => BoxKind::Bool,
+            MType::Obj(_) => BoxKind::Obj,
+            MType::Str(_) => BoxKind::Str,
+            t => return Err(format!("exit: cannot box {}", mir::print::type_str(t))),
+        })
+    }
+}
+
 fn is_managed(t: &MType) -> bool {
     t.repr().is_managed()
 }
@@ -182,8 +210,11 @@ struct Lower<'a> {
     /// The census helper, when exits are counted (`--mir-exit-census`).
     exit_census: Option<Func>,
     ctor_stamp: Option<[u32; 3]>,
+    /// One exit hub per frame shape (`exit_hub`).
+    exit_hubs: BTreeMap<Vec<Option<BoxKind>>, Block>,
     strict: bool,
     plain_env: bool,
+    forward_resume: bool,
     /// The syntactic global binding (`TranslateCtx::syn_gnames`) each
     /// global name read names, for its inline arms.
     gname_bids: BTreeMap<mir::entity::AtomId, u32>,
@@ -203,6 +234,9 @@ pub struct LowerOpts {
     pub strict: bool,
     /// The activation's environment is its callee's (`baseline::env_is_plain`).
     pub plain_env: bool,
+    /// The script may be inlined: its entry forwards a resume to its
+    /// baseline body (§5.5).
+    pub forward_resume: bool,
 }
 
 /// Lower `f` (a function of `mm`, whose baseline frame is `layout`) into a
@@ -257,8 +291,10 @@ pub fn lower<'a>(
         prop_ic_patches: vec![],
         exit_census: if o.exit_census { h.census } else { None },
         ctor_stamp: o.ctor_stamp,
+        exit_hubs: BTreeMap::new(),
         strict: o.strict,
         plain_env: o.plain_env,
+        forward_resume: o.forward_resume,
         gname_bids,
     };
     l.run()?;
@@ -639,6 +675,19 @@ impl<'a> Lower<'a> {
     /// valid Values), then enter the entry root with callee, `this` and the
     /// formals.
     fn entry(&mut self) -> R<()> {
+        if self.forward_resume {
+            // An inlined copy's exit finishes the call in baseline through
+            // this entry (§5.5): hand the frame, as it is, to the baseline
+            // body.
+            let rb = self.i32c(ARGC_RESUME_BIT);
+            let resume = self.bin(Operator::I32And, self.argc, rb, Type::I32);
+            let (fwd, rest) = (self.body.add_block(), self.body.add_block());
+            self.cond_br(resume, Self::to(fwd), Self::to(rest));
+            self.cur = fwd;
+            let argc = self.argc;
+            self.tail_to_baseline(argc);
+            self.cur = rest;
+        }
         let bit = self.i32c(ARGC_ONRAMP_BIT);
         self.onramp_flag = self.bin(Operator::I32And, self.argc, bit, Type::I32);
         let flags = self.i32c(!ARGC_FLAGS);
@@ -1128,7 +1177,8 @@ impl<'a> Lower<'a> {
                         )
                     })
                     .collect();
-                self.exit(ResumeWord { pc, mode }, &a, &dead, nargs, nlocals)?;
+                let tys: Vec<MType> = d.args.iter().map(|&v| self.ty(v)).collect();
+                self.exit(ResumeWord { pc, mode }, &a, &tys, &dead, nargs, nlocals)?;
             }
             Opcode::GuardUnbox(k) => {
                 let v = a[0];
@@ -1254,6 +1304,29 @@ impl<'a> Lower<'a> {
                 let env = self.box_tagged(TAG_OBJECT, a[0]);
                 let (z, s) = (self.i32c(0), self.i32c(slot.get()));
                 self.call(self.h.set_aliased, &[self.cx, env, z, s, a[1]], &[]);
+            }
+            Opcode::FrameStore(k) => {
+                let (nargs, nlocals) = (self.f.frame.formals, self.f.frame.locals);
+                let l = self.layout;
+                let off = match k {
+                    0 => FrameLayout::THIS,
+                    k if k <= nargs => l.arg(k - 1),
+                    k if k <= nargs + nlocals => l.local(k - 1 - nargs),
+                    _ => l.rval(),
+                };
+                // The Value it is. A double goes in as a double (NaN made
+                // canonical, as any boxed double must be), not re-tagged
+                // as an int32: `box_number` is not needed for validity.
+                let v = match at(0) {
+                    MType::F64(_) => {
+                        let bits = self.un(Operator::I64ReinterpretF64, a[0], Type::I64);
+                        let nan = self.bin(Operator::F64Ne, a[0], a[0], Type::I32);
+                        let canon = self.i64c(CANONICAL_NAN_BITS);
+                        self.select(Type::I64, canon, bits, nan)
+                    }
+                    t => self.boxed(&t, a[0])?,
+                };
+                self.store_i64(self.sp, off, v);
             }
             Opcode::JsLambda(index) => {
                 let env = self.box_tagged(TAG_OBJECT, a[0]);
@@ -2285,19 +2358,19 @@ impl<'a> Lower<'a> {
         Ok(())
     }
 
-    /// Write the baseline frame for `w` from an exit's operands (`this`,
-    /// formals, locals, rval, stack; all boxed), then run the baseline body
-    /// from there and return its result.
+    /// Leave MIR at `w` with the frame state `ops` (this, formals,
+    /// locals, rval, stack; of types `tys`, `dead` ones left as the frame
+    /// has them): a branch to the function's exit hub for this shape of
+    /// frame, carrying the resume word and the operands as they are.
     fn exit(
         &mut self,
         w: ResumeWord,
         ops: &[Value],
+        tys: &[MType],
         dead: &[bool],
         nargs: u32,
         nlocals: u32,
     ) -> R<()> {
-        let fp = frame_parts(ops, nargs, nlocals).ok_or("lowering: malformed exit")?;
-        let dp = frame_parts(dead, nargs, nlocals).ok_or("lowering: malformed exit")?;
         if let Some(census) = self.exit_census {
             static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -2313,25 +2386,77 @@ impl<'a> Lower<'a> {
             );
             self.call1(census, &[k, i], Type::I32);
         }
+        let mut shape = Vec::with_capacity(ops.len());
+        for (t, &d) in tys.iter().zip(dead) {
+            shape.push(if d { None } else { Some(BoxKind::of(t)?) });
+        }
+        let hub = match self.exit_hubs.get(&shape) {
+            Some(&b) => b,
+            None => {
+                let b = self.exit_hub(&shape, tys, nargs, nlocals)?;
+                self.exit_hubs.insert(shape.clone(), b);
+                b
+            }
+        };
+        let mut args = vec![self.i32c(w.encode() as u32)];
+        args.extend(ops.iter().zip(dead).filter(|(_, &d)| !d).map(|(&v, _)| v));
+        self.terminate(Terminator::Br {
+            target: BlockTarget { block: hub, args },
+        });
+        Ok(())
+    }
+
+    /// The exit hub for frames of `shape` (§5.1): its params are the
+    /// resume word and the live operands in their own representations. It
+    /// boxes each once, writes the baseline frame, then runs the baseline
+    /// body from there (or returns DEOPT to an onramping baseline caller).
+    /// One hub serves every exit of the same shape, so a function's exit
+    /// code grows with its distinct frame shapes, not with its exits.
+    fn exit_hub(&mut self, shape: &[Option<BoxKind>], tys: &[MType], nargs: u32, nlocals: u32) -> R<Block> {
+        let saved = self.cur;
+        let hub = self.body.add_block();
+        let word = self.body.add_blockparam(hub, Type::I32);
+        let mut raw = vec![];
+        for (k, t) in shape.iter().zip(tys) {
+            if k.is_some() {
+                let m = machine(t).ok_or("lowering: an exit operand without a representation")?;
+                raw.push(Some(self.body.add_blockparam(hub, m)));
+            } else {
+                raw.push(None);
+            }
+        }
+        self.cur = hub;
+        let mut boxed = vec![];
+        for (v, t) in raw.iter().zip(tys) {
+            boxed.push(match v {
+                Some(v) => Some(self.boxed(t, *v)?),
+                None => None,
+            });
+        }
+        let fp = frame_parts(&boxed, nargs, nlocals).ok_or("lowering: malformed exit")?;
         let (sp, vp) = (self.sp, self.sp);
         let l = self.layout;
-        // A `dead` operand's slot keeps the frame's (valid) value.
-        self.store_i64(sp, FrameLayout::THIS, *fp.this);
-        for (i, (&v, &d)) in fp.args.iter().zip(dp.args).enumerate() {
-            if !d {
+        // A dead operand's slot keeps the frame's (valid) value.
+        if let Some(v) = *fp.this {
+            self.store_i64(sp, FrameLayout::THIS, v);
+        }
+        for (i, v) in fp.args.iter().enumerate() {
+            if let Some(v) = *v {
                 self.store_i64(sp, l.arg(u32::try_from(i).unwrap()), v);
             }
         }
-        for (j, (&v, &d)) in fp.locals.iter().zip(dp.locals).enumerate() {
-            if !d {
+        for (j, v) in fp.locals.iter().enumerate() {
+            if let Some(v) = *v {
                 self.store_i64(vp, l.local(u32::try_from(j).unwrap()), v);
             }
         }
-        if !*dp.rval {
-            self.store_i64(vp, l.rval(), *fp.rval);
+        if let Some(v) = *fp.rval {
+            self.store_i64(vp, l.rval(), v);
         }
-        for (k, &v) in fp.stack.iter().enumerate() {
-            self.store_i64(vp, l.operand(u32::try_from(k).unwrap()), v);
+        for (k, v) in fp.stack.iter().enumerate() {
+            if let Some(v) = *v {
+                self.store_i64(vp, l.operand(u32::try_from(k).unwrap()), v);
+            }
         }
         // The fixed slots, as the prologue would have set them. The env
         // slot is fixed for the activation and already set; MIR declines
@@ -2339,8 +2464,10 @@ impl<'a> Lower<'a> {
         let undef = self.i64c(UNDEF);
         self.store_i64(vp, l.args_obj(), undef);
         self.store_i64(vp, l.new_target(), self.new_target);
-        let word = self.i64c((TAG_INT32 << 32) | u64::from(w.encode() as u32));
-        self.store_i64(vp, l.resume(), word);
+        let w64 = self.un(Operator::I64ExtendI32U, word, Type::I64);
+        let tag = self.i64c(TAG_INT32 << 32);
+        let wv = self.bin(Operator::I64Or, w64, tag, Type::I64);
+        self.store_i64(vp, l.resume(), wv);
         // Baseline waits this many loop-header visits before it tries an
         // onramp again, so it makes progress from here.
         let backoff = self.i64c((TAG_INT32 << 32) | u64::from(ONRAMP_BACKOFF));
@@ -2356,6 +2483,14 @@ impl<'a> Lower<'a> {
         }
         let bit = self.i32c(ARGC_RESUME_BIT);
         let argc = self.bin(Operator::I32Or, self.argc, bit, Type::I32);
+        self.tail_to_baseline(argc);
+        self.cur = saved;
+        Ok(hub)
+    }
+
+    /// Run this script's baseline body on the frame at `sp` with `argc`
+    /// (resume and onramp bits included), and return its result.
+    fn tail_to_baseline(&mut self, argc: Value) {
         let call = self.call(
             Func::invalid(),
             &[
@@ -2374,6 +2509,5 @@ impl<'a> Lower<'a> {
         self.terminate(Terminator::Return {
             values: vec![err, eff],
         });
-        Ok(())
     }
 }

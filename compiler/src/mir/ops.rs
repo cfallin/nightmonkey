@@ -279,6 +279,20 @@ pub enum Opcode {
         nargs: u32,
         nlocals: u32,
     },
+    /// An exit from an inlined callee's code (§5.5), with an `exit`'s
+    /// operands for the callee's frame: finish the callee in its baseline
+    /// body from `pc` (with its exception pending if `throw`), and take
+    /// `ok` with its result or `err` with its exception.
+    ExitInline {
+        pc: Pc,
+        nargs: u32,
+        nlocals: u32,
+        throw: bool,
+    },
+    /// Write the inlined callee's frame (§5.5) from `callee, this, args`
+    /// (the callee's formals, padded), its other slots as its prologue
+    /// would. The instruction's frame is the callee's.
+    InlineEnter,
     Unreachable,
 
     // Numeric.
@@ -322,6 +336,12 @@ pub enum Opcode {
     /// `env.name = v` for a global or name assignment (`SetGName`), strict
     /// or sloppy.
     JsSetName(AtomId, bool),
+    /// Write `args[0]` (a `Val`, or an i32, f64 or bool, stored as the
+    /// Value it is) to baseline frame slot `k` (0 `this`, then the
+    /// formals, the locals, the rval): the write-through that keeps the
+    /// frame's copy of every formal, local and rval equal to the slot's
+    /// value, so exits need not carry them (§5.1).
+    FrameStore(u32),
     /// A closure of the script's inner function `index` (a gcthing index)
     /// over environment `args[0]` (`Lambda`).
     JsLambda(u32),
@@ -436,7 +456,7 @@ impl Opcode {
             | JsSetName(..) | LoadField(_) | StoreField(_) | Call | CallDirect | Construct(..)
             | CallNative(_) => CLEAN_DIRTY_ERR.to_vec(),
             // No dynamic effect report: the kill is static, on `ok`.
-            JsGetName(_) | JsLambda(_) => OK_ERR.to_vec(),
+            JsGetName(_) | JsLambda(_) | ExitInline { .. } => OK_ERR.to_vec(),
             _ => vec![],
         }
     }
@@ -448,7 +468,17 @@ impl Opcode {
         ) || !self.roles().is_empty()
     }
 
-    /// The frame-state split of an exit's operands, if this is one.
+    /// The frame-state split of the operands of an exit, a throw or an
+    /// inline exit.
+    pub fn frame_operands(&self) -> Option<(Pc, u32, u32)> {
+        match *self {
+            Opcode::ExitInline { pc, nargs, nlocals, .. } => Some((pc, nargs, nlocals)),
+            _ => self.exit_shape(),
+        }
+    }
+
+    /// The frame-state split of an exit's operands, if this is one: an
+    /// op that leaves the function for its own baseline body.
     pub fn exit_shape(&self) -> Option<(Pc, u32, u32)> {
         match *self {
             Opcode::Exit { pc, nargs, nlocals } | Opcode::ExitThrow { pc, nargs, nlocals } => {
@@ -858,12 +888,31 @@ pub fn signature(op: &Opcode, args: &[Type], m: &Module) -> SigResult {
             val(&args[0], "return")?;
             Sig::none()
         }
+        InlineEnter => {
+            want(args.len() >= 2, || "inline.enter: expected callee and this".into())?;
+            Sig::none()
+        }
+        ExitInline { nargs, nlocals, .. } => {
+            want(frame_parts(args, *nargs, *nlocals).is_some(), || {
+                "exit.inline: fewer operands than this + args + locals + rval".into()
+            })?;
+            for (i, t) in args.iter().enumerate() {
+                if !matches!(t, Type::Val(_)) {
+                    box_type(t).map_err(|e| format!("exit.inline operand {i}: {e}"))?;
+                }
+            }
+            Sig::output(Type::VAL_TOP)
+        }
         Exit { nargs, nlocals, .. } | ExitThrow { nargs, nlocals, .. } => {
             want(frame_parts(args, *nargs, *nlocals).is_some(), || {
                 "exit: fewer operands than this + args + locals + rval".into()
             })?;
+            // Any boxable representation: the lowering boxes each operand
+            // once per exit shape (§5.1), not once per exit.
             for (i, t) in args.iter().enumerate() {
-                val(t, &format!("exit operand {i}"))?;
+                if !matches!(t, Type::Val(_)) {
+                    box_type(t).map_err(|e| format!("exit operand {i}: {e}"))?;
+                }
             }
             Sig::none()
         }
@@ -1039,6 +1088,14 @@ pub fn signature(op: &Opcode, args: &[Type], m: &Module) -> SigResult {
         JsBindGName(_) => {
             arity(args, 0)?;
             Sig::output(Type::val(TagSet::OBJECT))
+        }
+        FrameStore(_) => {
+            arity(args, 1)?;
+            want(
+                matches!(args[0], Type::Val(_) | Type::I32(_) | Type::F64(_) | Type::Bool),
+                || "frame.store: expected a val, i32, f64 or bool".into(),
+            )?;
+            Sig::none()
         }
         JsLambda(_) => {
             arity(args, 1)?;
@@ -1468,6 +1525,8 @@ pub fn effects(op: &Opcode, args: &[Type], m: &Module) -> Effects {
         // An allocation, but reported as generic: it runs no JS, yet a GC
         // may move anything.
         JsLambda(_) => return Effects::generic(FlagsEffect::Bits(FlagBits::ALL)),
+        // The rest of the callee, in baseline: anything.
+        ExitInline { .. } => return Effects::generic(FlagsEffect::Bits(FlagBits::ALL)),
         Call | CallDirect | Construct(..) | CallNative(_) => {
             return Effects::generic(FlagsEffect::Callee)
         }

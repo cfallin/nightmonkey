@@ -497,52 +497,65 @@ values (TDZ, element holes), since frames hold them.
 ### 5.1 Exits
 
 ```
-exit pc, this, [args…], [locals…], rval, [stack…]   -- every operand : Val(⊤)
+exit pc, this, [args…], [locals…], rval, [stack…]   -- any boxable reprs
 ```
 
 - **The arity is fixed by the script:** all formals, all locals, the
-  rval, and the operand-stack depth at `pc`. v1 passes and stores every
-  one of them. A liveness analysis at the target PC can prune dead ones
-  as soon as IR size or exit cost warrants it. The builder inserts the
-  `box`/`weaken` upcasts explicitly. Boxing is thus visible to the
-  optimizer; for example, a box can be sunk into the exit path.
-- **The env slot is not an operand.** v1 declines env ops, so the env
-  chain is fixed for the whole activation, and the MIR prologue writes
-  it once.
+  rval, and the operand-stack depth at `pc`.
+- **The frame is written through (amended 2026-09-27).** Every write
+  of a formal, a local or the rval also stores it to its baseline frame
+  slot, as the Value it is: `frame.store k, v`. An i32 or bool is
+  tagged, and an f64 goes in as a double with NaN canonicalized (a
+  valid Value, if not the int32 `NumberValue` would pick). A merge that
+  changes a slot's representation keeps its JS value, so the frame
+  copy stays equal to the slot everywhere, and nothing is stored on
+  edges. The frame is thus the boxed truth for those slots, as in bbv.
+  An exit leaves them as the frame has them: they go as
+  `const.val dead`, like slots that are dead at the exit's pc. What an
+  exit carries is `this` (sloppy code boxes it in place, so it is not
+  written through) and the operand stack.
+  - **Why:** before this, every exit boxed every live slot. That was
+    O(exits × live slots) per function, and quadratic in function size.
+    Mandreel's 16–32 KiB functions lowered to about 660K waffle values
+    each, and the batch outgrew the in-process compiler. After it,
+    mandreel's MIR bodies total 6.3M values rather than 17.7M, and grow
+    linearly (about 5 values per bytecode byte). No Octane score moved,
+    because the stores are one per assignment.
+  - Sinking stores of loop-carried locals out of their loops (so exits
+    in the loop carry them) is the obvious refinement, if the stores
+    ever show up in a profile.
+- **Operands keep their representation.** The lowering boxes them, not
+  the builder. **One exit hub per frame shape:** the shape is each
+  operand's representation kind, with dead ones omitted. The hub's
+  params are the resume word and the operands as they are. It boxes
+  each once, writes the frame, and calls baseline (or returns DEOPT).
+  An exit is a branch to its hub.
+- **The env slot is not an operand.** The env chain is fixed for the
+  whole activation, and the fresh entry writes it once.
 - **Resume rule:** an exit to an op's own PC is allowed only if no
   observable part of the op has happened. Otherwise it targets the
   successor PC, with the op's result on the stack.
-- **Lowering writes a complete baseline frame and resumes baseline:**
-  1. Store every operand, plus the env, arguments-object and new.target
-     slots, into the frame layout at `pc`.
-  2. Write the resume word: `pc`, in mode `continue`.
+- **The hub writes a complete baseline frame and resumes baseline:**
+  1. Store every live operand, plus the arguments-object and
+     new.target slots.
+  2. Write the resume word: `pc`, in mode `continue` or `throw`.
   3. If this activation entered MIR at the function entry, call the
      baseline body with `ARGC_RESUME_BIT` and return its result. If it
      entered by an onramp from baseline, return `err = 2` (DEOPT) to
      that baseline caller, which resumes itself. A JS frame therefore
      never uses more than three native frames.
 
-  MIR does not maintain a baseline frame's *contents* while it runs.
-  It uses the NightStack for GC rooting and for callee frames, and
-  places both *above* the whole baseline frame (past its deepest
-  operand stack). The frame itself stays a set of valid Values:
+  MIR places its GC rooting slots and callee frames *above* the whole
+  baseline frame (past its deepest operand stack). The frame itself
+  stays a set of valid Values:
   - a fresh entry initializes it as baseline's prologue would;
   - an onramp entry finds it valid, and clears the operand slots above
     the header's depth.
 
-  The GC can therefore trace it at any time. An exit writes only the
-  slots live at its pc; a dead one is passed as `const.val dead` and
-  keeps the frame's value (the liveness pruning below).
-- **Each exit lowers its own stores.** Values reloaded after rooting are
-  different waffle values on different paths, so exit blocks are never
-  shared across predecessors in waffle.
+  The GC can therefore trace it at any time.
 - **Liveness pruning (implemented).** The builder computes the backward
   liveness of `this`, the formals, the locals and the rval over the
-  bytecode. A slot dead at a block's entry takes no block param, and one
-  dead at an exit's pc goes as `const.val dead`. Without this, a
-  function with hundreds of locals has blocks × locals params and
-  exits × locals stores; Octane's mandreel ran the in-process compiler
-  out of memory.
+  bytecode. A slot dead at a block's entry takes no block param.
 - **Reserved extensions:** a parent-frame chain (for inlining) and
   virtual-object recipes (for scalar replacement). v1's validator
   rejects both.
@@ -628,6 +641,45 @@ so it side-enters each of them.
   iteration is duplicated.
 - The cost is measured on real MIR after M3 (BASELINE.md §8, step W)
   before any change to waffle is considered.
+
+### 5.5 Inlining
+
+bbv inlines by splicing the callee's bytecode into the caller's pc space.
+Its guard failures inside the splice fall to GEN copies of the callee's
+blocks in the same wasm function. MIR has no GEN copies. Its exits resume
+baseline, and baseline has one body per script. The design:
+
+- **Splice the callee's MIR.** Build the callee `K` standalone (the same
+  builder, the same facts). Then copy its blocks into the caller at the
+  call site, renaming values and remapping module entities (atoms,
+  fuses). `K`'s entry root params become the call's callee, `this` and
+  arguments; `K`'s onramp roots are dropped. A `return` becomes an edge
+  to the call's continuation.
+- **The callee's frame is real.** `K` gets a baseline-format frame at a
+  fixed offset above the caller's (the *inline frame*). Write-through
+  (§5.1) keeps its formals, locals and rval current, so `K`'s frame is
+  exactly what baseline expects at every exit.
+- **An exit inside `K` finishes `K` in baseline** (`exit.inline`). It
+  writes `K`'s stack and resume word into the inline frame, then calls
+  `K`'s own entry with `ARGC_RESUME_BIT`. A MIR main body forwards such
+  a call to its baseline body. The call returns `K`'s result, or an
+  exception. The caller continues in MIR from there, as it would after
+  a generic call: a dirty `ok` edge to the continuation, or the `err`
+  edge (an `exit.throw` at the call's pc). No caller state is lost,
+  and no multi-frame deopt is needed.
+- **Baseline bodies of inline-eligible scripts accept a resume at every
+  op.** Whether a script is inline-eligible is a property of the script
+  alone (small, no try, no generators, …). So no compile of `K` needs
+  to know who inlines it, which also holds across in-process batches.
+- **The guard** is on the callee's script. `night_call_classify` yields
+  the callee's `JSScript*`, compared with `K`'s (the source's `addr`,
+  stable since compaction is off). A miss runs the ordinary call. Up to
+  a few targets get a dispatch chain (polymorphic inlining).
+- **Stack layout.** The caller frame comes first, then a rooting area
+  of fixed size (the most managed values live at any GC point), then
+  the inline frames, then the frames of real calls. The rooting area
+  and inline frames are initialized at entry, since the GC traces up to
+  `top`.
 
 ## 6. Effects and memory
 
@@ -1165,11 +1217,9 @@ declines for everything else).
     converge on large functions.
   - **Size.** Scripts over 32 KiB of bytecode stay in baseline. A MIR
     script carries two bodies, and the gate keeps the batch's memory in
-    bounds. (Later lowered to 8 KiB: a MIR body grows about
-    quadratically with its function, since every exit boxes every live
-    slot. With the inline arms added since, mandreel's module outgrew the
-    in-process compiler, and its 16-32 KiB functions averaged 660K
-    values each.)
+    bounds. (It was briefly 8 KiB, while exits were quadratic; see
+    §5.1's write-through. With 128 KiB, mandreel's four 32-128 KiB
+    functions still overrun the in-process compiler.)
   - **Gate met** (2026-09-26):
     - `--pipeline mir --strict-coverage` passes the full jit-test lane;
     - so does `--pipeline mir --mir-stress 3`;
@@ -1402,6 +1452,11 @@ the numbers call for it.
 - Gate: field-claim coverage counts (fields claimed per class, by
   category), and the guard census showing loads no longer tag-checking
   claimed fields.
+
+**M5c. Direct calls and inlining (2026-09-27; see §5.5).** Profiles of
+richards put the gap to bbv here: bbv's hot loop inlines the small task
+methods, and MIR calls them, paying `night_call_classify` and a
+`call_indirect` per call.
 
 **M6. The rest of §10**: box/unbox cleanup, memory optimizations, and
 numeric optimizations, each with its guard-count and instruction-count

@@ -183,14 +183,10 @@ pub fn build(
     if is_global {
         return Err("global script".into());
     }
-    // A MIR script carries two bodies (MIR and baseline), and a MIR body
-    // grows about quadratically with the function: every exit boxes every
-    // live frame slot, and both counts grow with its size (mandreel's
-    // seven functions of 16-32 KiB lowered to 660K values each, and
-    // its module outgrew the in-process compiler's memory). An
+    // A MIR script carries two bodies (MIR and baseline). An
     // Emscripten-sized function would dominate the batch's memory and
     // compile time for little gain, so it stays in baseline.
-    const MAX_MIR_BYTECODE: usize = 8 * 1024;
+    const MAX_MIR_BYTECODE: usize = 32 * 1024;
     if script.bytecode.len() > MAX_MIR_BYTECODE {
         return Err(format!(
             "too large for MIR ({} bytecode bytes)",
@@ -666,12 +662,6 @@ impl<'s, 'a> Run<'s, 'a> {
         self.weaken(v, MType::val(x.ty.tags()))
     }
 
-    /// `x` as `Val(⊤)`: what crosses into baseline.
-    fn val_top(&mut self, x: Slot) -> mir::Value {
-        let v = self.boxed(x);
-        self.weaken(v, MType::VAL_TOP)
-    }
-
     /// `x` converted to type `to`, which it fits.
     fn convert(&mut self, x: Slot, to: Ty) -> mir::Value {
         match (x.ty, to) {
@@ -738,12 +728,17 @@ impl<'s, 'a> Run<'s, 'a> {
         let mut dead = None;
         let mut ops = vec![];
         for (i, &x) in st.iter().enumerate() {
-            let is_dead = x.ty == Ty::Dead || live.as_ref().is_some_and(|l| i < l.len() && !l[i]);
+            // A written-through slot is already in the frame.
+            let in_frame = self.write_through(i);
+            let is_dead = in_frame
+                || x.ty == Ty::Dead
+                || live.as_ref().is_some_and(|l| i < l.len() && !l[i]);
             if is_dead {
                 let d = *dead.get_or_insert_with(|| self.const_val(ConstVal::Dead));
                 ops.push(d);
             } else {
-                ops.push(self.val_top(x));
+                // As it is: the lowering boxes it at the exit hub.
+                ops.push(x.v);
             }
         }
         ops
@@ -1143,8 +1138,9 @@ impl<'s, 'a> Run<'s, 'a> {
         let args = st
             .iter()
             .zip(&want)
-            .filter(|(_, &t)| t != Ty::Dead)
-            .map(|(&x, &t)| EdgeArg::Value(self.convert(x, t)))
+            .enumerate()
+            .filter(|(_, (_, &t))| t != Ty::Dead)
+            .map(|(_, (&x, &t))| EdgeArg::Value(self.convert(x, t)))
             .collect();
         Some(Edge { block, args })
     }
@@ -1263,6 +1259,22 @@ impl<'s, 'a> Run<'s, 'a> {
     /// Slots before the operand stack: `this`, formals, locals, rval.
     fn frame_len(&self) -> usize {
         (2 + self.s.nargs + self.s.nlocals) as usize
+    }
+
+    /// Whether frame slot `ix` is written through (formals, locals, rval;
+    /// not `this`, which sloppy code boxes in place): its frame copy then
+    /// always holds its value, whatever its representation here (a merge
+    /// that converts it keeps the JS value), so exits leave it (§5.1).
+    fn write_through(&self, ix: usize) -> bool {
+        ix >= 1 && ix < self.frame_len()
+    }
+
+    /// Assign frame slot `ix`, writing it through to the frame.
+    fn set_frame_slot(&mut self, ix: usize, x: Slot) {
+        if x.ty != Ty::Dead && self.write_through(ix) {
+            self.inst(Opcode::FrameStore(u32::try_from(ix).unwrap()), vec![x.v], None);
+        }
+        self.st[ix] = x;
     }
 
     fn arg_ix(&self, n: u32) -> usize {
@@ -1570,7 +1582,8 @@ impl<'s, 'a> Run<'s, 'a> {
             SetLocal | InitLexical => {
                 let n = p.next_uint24().unwrap();
                 let ix = self.local_ix(n);
-                self.st[ix] = self.top();
+                let x = self.top();
+                self.set_frame_slot(ix, x);
             }
             GetArg => {
                 let n = u32::from(p.next_uint16().unwrap());
@@ -1580,7 +1593,8 @@ impl<'s, 'a> Run<'s, 'a> {
             SetArg => {
                 let n = u32::from(p.next_uint16().unwrap());
                 let ix = self.arg_ix(n);
-                self.st[ix] = self.top();
+                let x = self.top();
+                self.set_frame_slot(ix, x);
             }
             GetRval => {
                 let x = self.st[self.rval_ix()];
@@ -1589,7 +1603,7 @@ impl<'s, 'a> Run<'s, 'a> {
             SetRval => {
                 let x = self.pop();
                 let ix = self.rval_ix();
-                self.st[ix] = x;
+                self.set_frame_slot(ix, x);
             }
             GetAliasedVar | GetAliasedDebugVar => {
                 let hops = p.next_uint16().unwrap();

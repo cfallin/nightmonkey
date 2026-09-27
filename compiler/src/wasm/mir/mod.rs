@@ -13,6 +13,30 @@ use crate::wasm::baseline::layout;
 use crate::wasm::translate::{AtomTable, ExtraBody, Outcome, TranslateCtx};
 use waffle::Module;
 
+/// Whether MIR inlines calls (§5.5; in progress).
+const INLINING: bool = false;
+
+/// The most bytecode a script may have to be inlined (§5.5).
+pub(crate) const INLINE_MAX_BYTECODE: usize = 200;
+
+/// Whether `script` may be inlined into a MIR caller (§5.5): small, and
+/// without the constructs an inline frame does not model. A property of
+/// the script alone, so a compile of it knows, with no word from its
+/// callers, that its baseline body must resume at any op.
+pub(crate) fn inline_eligible(ctx: &TranslateCtx, script: &Script) -> bool {
+    use crate::bytecode::TryNoteKind;
+    INLINING
+        && ctx.opts.pipeline == crate::options::Pipeline::Mir
+        && script.addr != 0
+        && script.bytecode.len() <= INLINE_MAX_BYTECODE
+        && !script.is_generator_or_async
+        && !script.is_class_ctor
+        && !script.has_mapped_args
+        && !baseline::layout::FrameLayout::of(script).rebase_vp
+        && script.try_notes.iter().all(|t| t.kind == TryNoteKind::Loop)
+        && (!baseline::needs_env(script) || baseline::env_is_plain(ctx.source, script))
+}
+
 /// Compile `script` as a MIR body plus its baseline body. `Ok(Err(reason))`
 /// is a decline: the caller falls back to baseline alone.
 pub fn translate_script(
@@ -86,6 +110,7 @@ pub fn translate_script(
             exit_census: ctx.opts.instrument.mir_exits,
             strict: script.strict,
             plain_env: baseline::needs_env(script) && baseline::env_is_plain(ctx.source, script),
+            forward_resume: inline_eligible(ctx, script),
             ctor_stamp: ctx.stamp_ctors_in.get(&sid).map(|si| {
                 [
                     si.layout_id,

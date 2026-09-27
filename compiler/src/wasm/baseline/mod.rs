@@ -132,6 +132,22 @@ pub fn build_body(
             return Ok(Err(reason));
         }
     }
+    // A script MIR callers may inline resumes at any op: an exit inside
+    // an inlined copy finishes the call in this body (docs/MIR.md §5.5).
+    let mut all_resumes;
+    let resumes = if crate::wasm::mir::inline_eligible(ctx, script) {
+        all_resumes = resumes.to_vec();
+        for (pc, _) in depths.iter() {
+            for mode in [layout::ResumeMode::Continue, layout::ResumeMode::Throw] {
+                all_resumes.push(layout::ResumeWord { pc, mode });
+            }
+        }
+        all_resumes.sort();
+        all_resumes.dedup();
+        &all_resumes[..]
+    } else {
+        resumes
+    };
     let sig = ctx.helpers.night_abi_sig2;
     let body = FunctionBody::new(m, sig);
     let mut gen = match codegen::Gen::new(
