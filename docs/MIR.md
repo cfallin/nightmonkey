@@ -1318,6 +1318,23 @@ the numbers call for it.
   fused to a primitive literal is `check.fuse F` (exit if the fuse word
   no longer reads 1) and then the literal as a typed constant.
   `FuseDef` gained the fuse word's address (`fuse F0 = "K" addr=N`).
+- **Inline ToBoolean and equality.** `js.to_bool` dispatches on the tag
+  inline, and objects are truthy while the runtime's emulates-undefined
+  fuse is intact. Equality compares take `ok_clean` inline where the
+  operands' bits decide:
+  - strictly, when neither operand is a double, string or BigInt;
+  - loosely, for int32/int32 and boolean/boolean pairs, and for
+    null/undefined/object pairs while that fuse is intact.
+- **Property ICs for unpredicted sites (§4.3).**
+  - A `js.getprop` calls the module's shared probe `night_ic_get` with
+    the site's IC row. It covers the own and holder ways, then the
+    megamorphic table. A hit takes `ok_clean`; a miss calls
+    `get_prop_ic_miss`, which fills the ways.
+  - A `js.setprop` has bbv's way-0 arm inline: an overwrite of the own
+    slot the way names, when the object's word has no RANGES and, for a
+    value that is not a number, no TYPES. Barriers are as for
+    `store_field`. A miss calls `set_prop_ic_miss`.
+  - The transition (add) and megamorphic set arms stay bbv-only.
 - Measured at this point (Octane, in-process, best of two, versus
   `--pipeline baseline`): richards 424 → 634, crypto 3187 → 3780,
   deltablue 597 → 650, box2d 1970 → 2109; the rest are within noise

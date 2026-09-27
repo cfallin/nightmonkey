@@ -51,13 +51,14 @@ use crate::wasm::baseline::layout::{
 use crate::wasm::bbv::abi::{
     BINOP_BITAND, BINOP_BITNOT, BINOP_BITOR, BINOP_BITXOR, BINOP_DEC, BINOP_DIV, BINOP_INC,
     BINOP_LSH, BINOP_MOD, BINOP_MUL, BINOP_RSH, BINOP_SUB, BINOP_URSH, CLASS_WORD_SHALLOW,
-    CLASS_WORD_RANGES, CLASS_WORD_SLOTS, CHUNK_STORE_BUFFER_OFFSET, CMP_EQ, CMP_GE, CMP_GT, CMP_LE, CMP_LT, CMP_NE, CMP_STRICTEQ, CMP_STRICTNE,
+    CLASS_WORD_RANGES, CLASS_WORD_SLOTS, IC_SET_ABSSLOT, IC_SET_RECVSHAPE, IC_SET_SLOTENC,
+    IC_WAY_ADDR_PLACEHOLDER, NATIVE_SLOTS_OFFSET, CHUNK_STORE_BUFFER_OFFSET, CMP_EQ, CMP_GE, CMP_GT, CMP_LE, CMP_LT, CMP_NE, CMP_STRICTEQ, CMP_STRICTNE,
     ELEMENTS_INITLEN_BACK, FIXED_SLOTS_BASE, FLAGS_ALL, OBJ_CLASS_IDX_OFFSET, OBJ_ELEMENTS_OFFSET,
     JSCONTEXT_ZONE_OFFSET, NOT_CHUNK_MASK, SHAPE_IMMUTABLE_FLAGS_OFFSET, SHAPE_IS_NATIVE_BIT,
     SHAPE_OFFSET, VAL_GCTHING_TAG_MIN, ZONE_NEEDS_BARRIER_OFFSET,
 };
 use crate::wasm::translate::{
-    AtomTable, Helpers, MAGIC_UNINITIALIZED_LEXICAL, TAG_BIGINT_HI, TAG_BOOLEAN, TAG_CLEAR,
+    AtomTable, Helpers, INLINE_IC_STRIDE, MAGIC_UNINITIALIZED_LEXICAL, TAG_BIGINT_HI, TAG_BOOLEAN, TAG_CLEAR,
     TAG_INT32, TAG_MAGIC, TAG_NULL, TAG_OBJECT, TAG_STRING, TAG_SYMBOL, TAG_UNDEFINED,
 };
 
@@ -78,6 +79,8 @@ pub struct Lowered {
     pub body_off_patches: Vec<Value>,
     /// `Call` placeholders for the script's baseline body, one per exit.
     pub baseline_calls: Vec<Value>,
+    /// Property-IC way-address placeholders, with their row offsets.
+    pub prop_ic_patches: Vec<(Value, u32)>,
 }
 
 /// The resume words `f`'s exits and throws carry: the set the baseline
@@ -172,6 +175,8 @@ struct Lower<'a> {
     atoms: &'a mut AtomTable,
     /// Adapter-offset placeholders (`Outcome::Compiled::body_off_patches`).
     body_off_patches: Vec<Value>,
+    /// Property-IC way-address placeholders (`Outcome::Compiled::prop_ic_patches`).
+    prop_ic_patches: Vec<(Value, u32)>,
     /// The census helper, when exits are counted (`--mir-exit-census`).
     exit_census: Option<Func>,
     ctor_stamp: Option<[u32; 3]>,
@@ -240,6 +245,7 @@ pub fn lower<'a>(
         mm,
         atoms,
         body_off_patches: vec![],
+        prop_ic_patches: vec![],
         exit_census: if o.exit_census { h.census } else { None },
         ctor_stamp: o.ctor_stamp,
         strict: o.strict,
@@ -249,6 +255,7 @@ pub fn lower<'a>(
         body: l.body,
         body_off_patches: l.body_off_patches,
         baseline_calls: l.baseline_calls,
+        prop_ic_patches: l.prop_ic_patches,
     })
 }
 
@@ -1210,13 +1217,37 @@ impl<'a> Lower<'a> {
                 self.cond_br(ok, t, e);
             }
             Opcode::JsGetProp(name) => {
+                // The site's inline cache (as bbv's fact-free reads): the
+                // shared probe `night_ic_get` (own and holder ways, then
+                // the megamorphic table) takes `ok_clean` on a hit; a miss
+                // runs the generic get and fills the site's ways.
                 let at = self.atom(name);
-                self.js_call(inst, self.h.get_property, &[a[0], at], false)?;
+                let cache = self.atoms.next_prop_cache();
+                let way_base = self.i32c(IC_WAY_ADDR_PLACEHOLDER);
+                self.prop_ic_patches.push((way_base, cache * INLINE_IC_STRIDE));
+                let r = self.call(self.h.ic_get_poly, &[a[0], at, way_base], &[Type::I64]);
+                let tag = self.tag_of(r);
+                let miss = self.tag_is(tag, TAG_MAGIC as u32);
+                let slow = self.body.add_block();
+                let t = self.edge(inst, 0, &[r])?;
+                self.cond_br(miss, Self::to(slow), t);
+                self.cur = slow;
+                let c = self.i32c(cache);
+                self.js_call(inst, self.h.get_prop_ic_miss, &[a[0], at, c], false)?;
             }
             Opcode::JsSetProp(name, strict) => {
+                // The site's inline cache, way 0 only: an overwrite of the
+                // own slot the way describes, taking `ok_clean`. A miss
+                // runs the generic set and fills the way.
                 let at = self.atom(name);
-                let sv = self.i32c(u32::from(strict));
-                self.js_call(inst, self.h.set_property, &[a[0], at, a[1], sv], false)?;
+                let cache = self.atoms.next_prop_cache();
+                let way = self.i32c(IC_WAY_ADDR_PLACEHOLDER);
+                self.prop_ic_patches.push((way, cache * INLINE_IC_STRIDE));
+                let slow = self.body.add_block();
+                self.set_ic_way0(inst, a[0], a[1], way, slow)?;
+                self.cur = slow;
+                let (c, sv) = (self.i32c(cache), self.i32c(u32::from(strict)));
+                self.js_call(inst, self.h.set_prop_ic_miss, &[a[0], at, a[1], c, sv], false)?;
             }
             Opcode::JsGetElem => {
                 // An in-bounds, non-hole dense element of a native object
@@ -1583,7 +1614,8 @@ impl<'a> Lower<'a> {
                 }
                 self.store_i64(obj, off, v);
                 if !num {
-                    self.post_barrier(obj, slot, v);
+                    let s = self.i32c(slot);
+                    self.post_barrier(obj, s, v);
                 }
                 vec![]
             }
@@ -1611,13 +1643,13 @@ impl<'a> Lower<'a> {
 
     /// The incremental pre-write barrier on the slot at `obj + off`: while
     /// the zone is marking, mark the value about to be overwritten.
-    fn pre_barrier(&mut self, obj: Value, off: u32) {
+    fn pre_barrier(&mut self, addr: Value, off: u32) {
         let zone = self.load_i32(self.cx, JSCONTEXT_ZONE_OFFSET);
         let flag = self.load_i32(zone, ZONE_NEEDS_BARRIER_OFFSET);
         let (marking, cont) = (self.body.add_block(), self.body.add_block());
         self.cond_br(flag, Self::to(marking), Self::to(cont));
         self.cur = marking;
-        let old = self.load_i64(obj, off);
+        let old = self.load_i64(addr, off);
         self.call(self.h.pre_write_barrier, &[old], &[]);
         self.terminate(Terminator::Br { target: Self::to(cont) });
         self.cur = cont;
@@ -1626,7 +1658,7 @@ impl<'a> Lower<'a> {
     /// The generational post-write barrier for storing boxed `v` into fixed
     /// slot `slot` of `obj`: a nursery GC thing into a tenured object is
     /// recorded in the store buffer.
-    fn post_barrier(&mut self, obj: Value, slot: u32, v: Value) {
+    fn post_barrier(&mut self, obj: Value, slot: Value, v: Value) {
         let cont = self.body.add_block();
         let mask = self.i32c(NOT_CHUNK_MASK);
         let chunk = self.bin(Operator::I32And, obj, mask, Type::I32);
@@ -1647,10 +1679,53 @@ impl<'a> Lower<'a> {
         self.cond_br(sb, Self::to(record), Self::to(cont));
         self.cur = record;
         let owner = self.box_tagged(TAG_OBJECT, obj);
-        let s = self.i32c(slot);
-        self.call(self.h.post_write_barrier, &[owner, s, v], &[]);
+        self.call(self.h.post_write_barrier, &[owner, slot, v], &[]);
         self.terminate(Terminator::Br { target: Self::to(cont) });
         self.cur = cont;
+    }
+
+    /// A set IC's way 0 (`bbv`'s `emit_set_prop_ic_inline` without its
+    /// transition and megamorphic arms): with `recv` an object of the
+    /// way's shape, store `val` to the slot the way names and take
+    /// `ok_clean`; else branch to `slow`. The store bypasses the engine's
+    /// choke, so it also requires the object's word to carry no bit it
+    /// could falsify: RANGES never, TYPES unless `val` is a number.
+    fn set_ic_way0(&mut self, inst: mir::Inst, recv: Value, val: Value, way: Value, slow: Block) -> R<()> {
+        let num = matches!(self.ty(self.f.insts[inst].args[1]), MType::Val(s) if s.tags.subset_of(TagSet::NUMBER));
+        let tag = self.tag_of(recv);
+        let is_obj = self.tag_is(tag, TAG_OBJECT as u32);
+        self.check(is_obj, slow);
+        let obj = self.un(Operator::I32WrapI64, recv, Type::I32);
+        let shape = self.load_i32(obj, SHAPE_OFFSET);
+        let cached = self.load_i32(way, IC_SET_RECVSHAPE);
+        let hit = self.bin(Operator::I32Eq, shape, cached, Type::I32);
+        self.check(hit, slow);
+        let w = self.load_i32(obj, OBJ_CLASS_IDX_OFFSET);
+        let m = self.i32c(CLASS_WORD_RANGES | if num { 0 } else { CLASS_WORD_SHALLOW });
+        let bits = self.bin(Operator::I32And, w, m, Type::I32);
+        let clean = self.un(Operator::I32Eqz, bits, Type::I32);
+        self.check(clean, slow);
+        // The slot: `enc & 1` selects the dynamic slots over the object,
+        // `enc & !1` is the byte offset from that base.
+        let enc = self.load_i32(way, IC_SET_SLOTENC);
+        let one = self.i32c(1);
+        let dynamic = self.bin(Operator::I32And, enc, one, Type::I32);
+        let not1 = self.i32c(!1);
+        let off = self.bin(Operator::I32And, enc, not1, Type::I32);
+        let slots = self.load_i32(obj, NATIVE_SLOTS_OFFSET);
+        let base = self.op(Operator::Select, &[slots, obj, dynamic], Some(Type::I32));
+        let addr = self.bin(Operator::I32Add, base, off, Type::I32);
+        if !num {
+            self.pre_barrier(addr, 0);
+        }
+        self.store_i64(addr, 0, val);
+        if !num {
+            let abs = self.load_i32(way, IC_SET_ABSSLOT);
+            self.post_barrier(obj, abs, val);
+        }
+        let t = self.edge(inst, 0, &[])?;
+        self.terminate(Terminator::Br { target: t });
+        Ok(())
     }
 
     /// Branch to `fail` unless `cond`.

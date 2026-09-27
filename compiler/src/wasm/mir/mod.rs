@@ -100,7 +100,7 @@ pub fn translate_script(
         construct_cell_patches: vec![],
         strlit_patches: vec![],
         intrinsic_cell_patches: vec![],
-        prop_ic_patches: vec![],
+        prop_ic_patches: lowered.prop_ic_patches,
         body_off_patches: lowered.body_off_patches,
         ctor_nslots_patches: vec![],
         extra_bodies: vec![ExtraBody {

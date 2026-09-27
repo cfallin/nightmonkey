@@ -41,7 +41,7 @@ pub(crate) const OBJ_ELEMENTS_OFFSET: u32 = 12;
 pub(crate) const FIXED_SLOTS_BASE: u32 = 16;
 /// `slots_` again, reached from a `NativeObject*` in the slot-address
 /// decoder rather than from the object header walk.
-pub(super) const NATIVE_SLOTS_OFFSET: u32 = 8;
+pub(crate) const NATIVE_SLOTS_OFFSET: u32 = 8;
 
 // --- the likely-class (stamp) word ----------------------------------------
 //
@@ -308,14 +308,14 @@ pub(super) const IC_TRANS_ROW_OFF: u32 = INLINE_IC_WAYS * INLINE_IC_WAY_BYTES;
 pub(super) use crate::region_shape::INLINE_IC_TRANS_BYTES as IC_TRANS_ROW_BYTES;
 pub(super) const INLINE_IC_STRIDE: u32 = IC_TRANS_ROW_OFF + IC_TRANS_ROW_BYTES;
 const _: () = assert!(INLINE_IC_STRIDE == crate::region_shape::INLINE_IC_STRIDE);
-pub(super) const IC_WAY_ADDR_PLACEHOLDER: u32 = 0xDEAD_C200;
+pub(crate) const IC_WAY_ADDR_PLACEHOLDER: u32 = 0xDEAD_C200;
 
 pub(super) const IC_WAY_RECVSHAPE: u32 = 0;
 pub(super) const IC_WAY_MONO_OFF: u32 = 4;
 pub(super) const IC_WAY_HOLDERPTR: u32 = 8;
-pub(super) const IC_SET_RECVSHAPE: u32 = 0;
-pub(super) const IC_SET_SLOTENC: u32 = 8;
-pub(super) const IC_SET_ABSSLOT: u32 = 12;
+pub(crate) const IC_SET_RECVSHAPE: u32 = 0;
+pub(crate) const IC_SET_SLOTENC: u32 = 8;
+pub(crate) const IC_SET_ABSSLOT: u32 = 12;
 pub(super) const IC_POLY_SENTINEL: u32 = 1;
 
 pub(super) const IC_TRANS_OLDSHAPE: u32 = 0;
