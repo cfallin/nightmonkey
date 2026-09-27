@@ -1228,6 +1228,20 @@ impl<'a> Gen<'a> {
     fn finalize_resume_dispatch(&mut self, disp: Block) {
         self.cur = disp;
         self.live = true;
+        // MIR's write-through stores keep a double a double: box the
+        // formals, locals and rval as this body would (an integral double
+        // an int32), since it passes them on to callees whose MIR entries
+        // guard int32 formals.
+        for i in 0..self.layout.nargs {
+            let off = self.layout.arg(i);
+            self.canon_slot(self.sp, off);
+        }
+        for j in 0..self.layout.nlocals {
+            let off = self.layout.local(j);
+            self.canon_slot(self.vp, off);
+        }
+        let off = self.layout.rval();
+        self.canon_slot(self.vp, off);
         let bad = self.body.add_block();
         let words = self.ext_resumes.clone();
         let hops: Vec<(ResumeWord, Block)> =
@@ -2799,6 +2813,18 @@ impl<'a> Gen<'a> {
     /// Box an f64 as the engine's `NumberValue` does: an int32 when it is
     /// one exactly (not -0), else a double, with NaN canonicalized (a
     /// non-canonical NaN could alias a boxed tag).
+    /// Rewrite the Value at `base + off` as `box_number` boxes it.
+    fn canon_slot(&mut self, base: Value, off: u32) {
+        let v = self.load_i64(base, off);
+        let tag = self.tag_of(v);
+        let k = self.i32c(TAG_CLEAR);
+        let is_dbl = self.binop(Operator::I32LtU, tag, k, Type::I32);
+        let f = self.unop(Operator::F64ReinterpretI64, v, Type::F64);
+        let b = self.box_number(f);
+        let nv = self.select(Type::I64, b, v, is_dbl);
+        self.store_i64(base, off, nv);
+    }
+
     fn box_number(&mut self, x: Value) -> Value {
         let i = self.unop(Operator::I32TruncSatF64S, x, Type::I32);
         let back = self.unop(Operator::F64ConvertI32S, i, Type::F64);
