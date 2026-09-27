@@ -1205,7 +1205,10 @@ impl<'a> Lower<'a> {
             | Opcode::JsBinop(_)
             | Opcode::JsUnop(_)
             | Opcode::JsCompare(_)
-            | Opcode::JsToNumeric => self.js_op(inst, &d.op, &a)?,
+            | Opcode::JsToNumeric => {
+                self.numeric_fast_arms(inst, &d.op, &a)?;
+                self.js_op(inst, &d.op, &a)?
+            }
             Opcode::JsTypeofEq(k) => {
                 // A leaf: no GC, no JS.
                 let kv = self.i32c(u32::from(k));
@@ -1492,6 +1495,199 @@ impl<'a> Lower<'a> {
             _ => unreachable!(),
         };
         self.js_call(inst, f, &args, false)
+    }
+
+    /// The inline arms of a generic numeric op, as baseline's (and the
+    /// portable baseline interpreter's) are: all-int32 operands, then all
+    /// numbers as doubles, each taking `ok_clean` with the boxed result (a
+    /// bool for a compare); otherwise falls through to the helper. Without
+    /// them MIR would run code whose types it does not know slower than
+    /// baseline does. Emits nothing for an op with no arm.
+    fn numeric_fast_arms(&mut self, inst: mir::Inst, op: &Opcode, a: &[Value]) -> R<()> {
+        use Operator as O;
+        #[derive(Clone, Copy)]
+        enum Int {
+            Checked(O, O),
+            Mul,
+            Plain(O),
+            Mod,
+            Ursh,
+            Step(O, u32),
+            Neg,
+            BitNot,
+            Same,
+            Cmp(O),
+        }
+        #[derive(Clone, Copy)]
+        enum Num {
+            Bin(O),
+            Step(O),
+            Neg,
+            Same,
+            Cmp(O),
+        }
+        let (n, int, num): (usize, Option<Int>, Option<Num>) = match *op {
+            Opcode::JsAdd => (2, Some(Int::Checked(O::I32Add, O::I64Add)), Some(Num::Bin(O::F64Add))),
+            Opcode::JsBinop(b) => match b {
+                JsBinop::Sub => (2, Some(Int::Checked(O::I32Sub, O::I64Sub)), Some(Num::Bin(O::F64Sub))),
+                JsBinop::Mul => (2, Some(Int::Mul), Some(Num::Bin(O::F64Mul))),
+                JsBinop::Div => (2, None, Some(Num::Bin(O::F64Div))),
+                // Double `%` is fmod, which Wasm lacks.
+                JsBinop::Mod => (2, Some(Int::Mod), None),
+                JsBinop::BitAnd => (2, Some(Int::Plain(O::I32And)), None),
+                JsBinop::BitOr => (2, Some(Int::Plain(O::I32Or)), None),
+                JsBinop::BitXor => (2, Some(Int::Plain(O::I32Xor)), None),
+                // Wasm masks shift counts to 5 bits, as JS does.
+                JsBinop::Lsh => (2, Some(Int::Plain(O::I32Shl)), None),
+                JsBinop::Rsh => (2, Some(Int::Plain(O::I32ShrS)), None),
+                JsBinop::Ursh => (2, Some(Int::Ursh), None),
+                JsBinop::Pow => return Ok(()),
+            },
+            Opcode::JsUnop(u) => match u {
+                JsUnop::Inc => (1, Some(Int::Step(O::I32Add, i32::MAX as u32)), Some(Num::Step(O::F64Add))),
+                JsUnop::Dec => (1, Some(Int::Step(O::I32Sub, i32::MIN as u32)), Some(Num::Step(O::F64Sub))),
+                JsUnop::Neg => (1, Some(Int::Neg), Some(Num::Neg)),
+                JsUnop::BitNot => (1, Some(Int::BitNot), None),
+                JsUnop::Pos => (1, Some(Int::Same), Some(Num::Same)),
+            },
+            Opcode::JsToNumeric => (1, Some(Int::Same), Some(Num::Same)),
+            Opcode::JsCompare(cc) => {
+                let (i, f) = match cc {
+                    JsCc::Lt => (O::I32LtS, O::F64Lt),
+                    JsCc::Le => (O::I32LeS, O::F64Le),
+                    JsCc::Gt => (O::I32GtS, O::F64Gt),
+                    JsCc::Ge => (O::I32GeS, O::F64Ge),
+                    _ => return Ok(()),
+                };
+                (2, Some(Int::Cmp(i)), Some(Num::Cmp(f)))
+            }
+            _ => return Ok(()),
+        };
+        let ops = &a[..n];
+        let slow = self.body.add_block();
+        let num_b = if num.is_some() { self.body.add_block() } else { slow };
+        if let Some(int) = int {
+            let mut all = self.i32c(1);
+            for &v in ops {
+                let t = self.tag_of(v);
+                let is = self.tag_is(t, TAG_INT32 as u32);
+                all = self.bin(O::I32And, all, is, Type::I32);
+            }
+            let int_b = self.body.add_block();
+            self.cond_br(all, Self::to(int_b), Self::to(num_b));
+            self.cur = int_b;
+            let x = self.un(O::I32WrapI64, ops[0], Type::I32);
+            let y = if n == 2 { self.un(O::I32WrapI64, ops[1], Type::I32) } else { x };
+            let one = self.i32c(1);
+            let (r, ok) = match int {
+                Int::Checked(o, wide) => {
+                    let r = self.bin(o, x, y, Type::I32);
+                    let x64 = self.un(O::I64ExtendI32S, x, Type::I64);
+                    let y64 = self.un(O::I64ExtendI32S, y, Type::I64);
+                    let w = self.bin(wide, x64, y64, Type::I64);
+                    let r64 = self.un(O::I64ExtendI32S, r, Type::I64);
+                    (r, self.bin(O::I64Eq, w, r64, Type::I32))
+                }
+                Int::Mul => {
+                    let x64 = self.un(O::I64ExtendI32S, x, Type::I64);
+                    let y64 = self.un(O::I64ExtendI32S, y, Type::I64);
+                    let w = self.bin(O::I64Mul, x64, y64, Type::I64);
+                    let r = self.un(O::I32WrapI64, w, Type::I32);
+                    let r64 = self.un(O::I64ExtendI32S, r, Type::I64);
+                    let fits = self.bin(O::I64Eq, w, r64, Type::I32);
+                    // A zero product with a negative operand is -0.
+                    let zero = self.un(O::I32Eqz, r, Type::I32);
+                    let xy = self.bin(O::I32Or, x, y, Type::I32);
+                    let z = self.i32c(0);
+                    let neg = self.bin(O::I32LtS, xy, z, Type::I32);
+                    let negz = self.bin(O::I32And, zero, neg, Type::I32);
+                    let not_negz = self.un(O::I32Eqz, negz, Type::I32);
+                    (r, self.bin(O::I32And, fits, not_negz, Type::I32))
+                }
+                Int::Plain(o) => (self.bin(o, x, y, Type::I32), one),
+                // A non-negative dividend and a positive divisor: the
+                // result is the unsigned remainder, never -0.
+                Int::Mod => {
+                    let z = self.i32c(0);
+                    let xn = self.bin(O::I32GeS, x, z, Type::I32);
+                    let yp = self.bin(O::I32GtS, y, z, Type::I32);
+                    let ok = self.bin(O::I32And, xn, yp, Type::I32);
+                    // The divisor is forced to 1 off the arm, so the
+                    // remainder never traps.
+                    let d = self.select(Type::I32, y, one, yp);
+                    (self.bin(O::I32RemU, x, d, Type::I32), ok)
+                }
+                // Only a result below 2^31 is an int32.
+                Int::Ursh => {
+                    let r = self.bin(O::I32ShrU, x, y, Type::I32);
+                    let z = self.i32c(0);
+                    (r, self.bin(O::I32GeS, r, z, Type::I32))
+                }
+                Int::Step(o, limit) => {
+                    let l = self.i32c(limit);
+                    let ok = self.bin(O::I32Ne, x, l, Type::I32);
+                    (self.bin(o, x, one, Type::I32), ok)
+                }
+                // Neg of 0 is -0 and of INT32_MIN overflows.
+                Int::Neg => {
+                    let z = self.i32c(0);
+                    let min = self.i32c(i32::MIN as u32);
+                    let nz = self.bin(O::I32Ne, x, z, Type::I32);
+                    let nm = self.bin(O::I32Ne, x, min, Type::I32);
+                    let ok = self.bin(O::I32And, nz, nm, Type::I32);
+                    (self.bin(O::I32Sub, z, x, Type::I32), ok)
+                }
+                Int::BitNot => {
+                    let m1 = self.i32c(u32::MAX);
+                    (self.bin(O::I32Xor, x, m1, Type::I32), one)
+                }
+                Int::Same => (x, one),
+                Int::Cmp(o) => (self.bin(o, x, y, Type::I32), one),
+            };
+            let out = if matches!(int, Int::Cmp(_)) { r } else { self.box_tagged(TAG_INT32, r) };
+            let t = self.edge(inst, 0, &[out])?;
+            self.cond_br(ok, t, Self::to(num_b));
+        } else {
+            self.terminate(Terminator::Br { target: Self::to(num_b) });
+        }
+        if let Some(num) = num {
+            self.cur = num_b;
+            let mut all = self.i32c(1);
+            for &v in ops {
+                let t = self.tag_of(v);
+                let int = self.tag_is(t, TAG_INT32 as u32);
+                let clear = self.i32c(TAG_CLEAR);
+                let dbl = self.bin(O::I32LtU, t, clear, Type::I32);
+                let is = self.bin(O::I32Or, int, dbl, Type::I32);
+                all = self.bin(O::I32And, all, is, Type::I32);
+            }
+            let go = self.body.add_block();
+            self.cond_br(all, Self::to(go), Self::to(slow));
+            self.cur = go;
+            let x = self.to_f64(ops[0]);
+            let y = if n == 2 { self.to_f64(ops[1]) } else { x };
+            let out = match num {
+                Num::Bin(o) => {
+                    let r = self.bin(o, x, y, Type::F64);
+                    self.box_number(r)
+                }
+                Num::Step(o) => {
+                    let one = self.f64c(1f64.to_bits());
+                    let r = self.bin(o, x, one, Type::F64);
+                    self.box_number(r)
+                }
+                Num::Neg => {
+                    let r = self.un(O::F64Neg, x, Type::F64);
+                    self.box_number(r)
+                }
+                Num::Same => ops[0],
+                Num::Cmp(o) => self.bin(o, x, y, Type::I32),
+            };
+            let t = self.edge(inst, 0, &[out])?;
+            self.terminate(Terminator::Br { target: t });
+        }
+        self.cur = slow;
+        Ok(())
     }
 
     /// Whether an object that emulates `undefined` (`document.all`) may
