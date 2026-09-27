@@ -113,16 +113,16 @@ pub(super) const JSCLASS_EMULATES_UNDEFINED: u32 = 1 << 6;
 //   [-16] flags   [-12] initializedLength   [-8] capacity   [-4] length
 //   [  0] element 0 ...
 
-pub(super) const ELEMENTS_HEADER_BYTES: u32 = 16;
+pub(crate) const ELEMENTS_HEADER_BYTES: u32 = 16;
 pub(crate) const ELEMENTS_FLAGS_BACK: u32 = 16;
 pub(crate) const ELEMENTS_INITLEN_BACK: u32 = 12;
-pub(super) const ELEMENTS_CAPACITY_BACK: u32 = 8;
+pub(crate) const ELEMENTS_CAPACITY_BACK: u32 = 8;
 pub(crate) const ELEMENTS_LENGTH_BACK: u32 = 4;
 pub(super) const ELEMENTS_FLAG_FIXED: u32 = 0x1;
 pub(crate) const ELEMENTS_FROZEN_FLAG: u32 = 0x40;
 pub(super) const ELEMENTS_NON_PACKED_FLAG: u32 = 0x80;
 /// Any of these set means the dense append arm must bail to the helper.
-pub(super) const ELEMENTS_PUSH_BAIL_MASK: u32 = 0x72;
+pub(crate) const ELEMENTS_PUSH_BAIL_MASK: u32 = 0x72;
 
 // --- TypedArrayObject -----------------------------------------------------
 //
@@ -263,7 +263,7 @@ pub(crate) const IOF_CELL_GEN: u32 = 4;
 pub(crate) const IOF_CELL_SLOTENC: u32 = 8;
 pub(crate) const IOF_CELL_ADDR_PLACEHOLDER: u32 = 0xDEAD_BF80;
 
-pub(super) const ALLOC_CELL_ADDR_PLACEHOLDER: u32 = 0xDEAD_BF00;
+pub(crate) const ALLOC_CELL_ADDR_PLACEHOLDER: u32 = 0xDEAD_BF00;
 pub(super) const INTRINSIC_CELL_ADDR_PLACEHOLDER: u32 = 0xDEAD_C100;
 
 // --- the property inline caches -------------------------------------------

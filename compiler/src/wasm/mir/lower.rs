@@ -53,6 +53,7 @@ use crate::wasm::bbv::abi::{
     BINOP_LSH, BINOP_MOD, BINOP_MUL, BINOP_RSH, BINOP_SUB, BINOP_URSH, CLASS_WORD_SHALLOW,
     CLASS_WORD_RANGES, CLASS_WORD_SENTINEL, CLASS_WORD_SLOTS, SHAPE_SMALL_SLOTSPAN_MASK_BITS,
     SHAPE_SMALL_SLOTSPAN_SHIFT, TA_DATA_PAYLOAD_OFFSET, TA_LENGTH_PAYLOAD_OFFSET, ELEMENTS_LENGTH_BACK,
+    ELEMENTS_CAPACITY_BACK, ELEMENTS_PUSH_BAIL_MASK, ELEMENTS_HEADER_BYTES, ALLOC_CELL_ADDR_PLACEHOLDER,
     STRING_LENGTH_OFFSET, STRING_FLAGS_OFFSET, STRING_CHARS_OFFSET, STRING_LINEAR_BIT,
     STRING_INLINE_CHARS_BIT, STRING_LATIN1_CHARS_BIT, CALL_CELL_ADDR_PLACEHOLDER, CALL_CELL_FUNCIDX,
     CALL_CELL_SCRIPT, EARLY_KEY_MAX, EARLY_KEY_SHIFT, IC_SET_ABSSLOT,
@@ -71,7 +72,8 @@ use crate::wasm::bbv::abi::{
     SHAPE_OFFSET, VAL_GCTHING_TAG_MIN, ZONE_NEEDS_BARRIER_OFFSET,
 };
 use crate::wasm::translate::{
-    AtomTable, Helpers, INLINE_IC_STRIDE, MAGIC_IS_CONSTRUCTING, MAGIC_UNINITIALIZED_LEXICAL, TAG_BIGINT_HI, TAG_BOOLEAN, TAG_CLEAR,
+    AtomTable, Helpers, APPEND_CACHE_ENTRY_BYTES, APPEND_CACHE_SIZE, BC_ARR_POP, BC_ARR_PUSH,
+    ELEMENTS_POP_BAIL_MASK, INLINE_IC_STRIDE, MAGIC_IS_CONSTRUCTING, MAGIC_UNINITIALIZED_LEXICAL, TAG_BIGINT_HI, TAG_BOOLEAN, TAG_CLEAR,
     TAG_INT32, TAG_MAGIC, TAG_NULL, TAG_OBJECT, TAG_STRING, TAG_SYMBOL, TAG_UNDEFINED,
 };
 
@@ -104,6 +106,7 @@ pub struct Lowered {
     pub iof_cell_patches: Vec<(Value, u32)>,
     pub construct_cell_patches: Vec<(Value, u32)>,
     pub call_cell_patches: Vec<(Value, u32)>,
+    pub alloc_cell_patches: Vec<(Value, u32)>,
     /// Per mnemonic: how many instructions, and the wasm values they
     /// lowered to (`--dump-opsize`).
     pub opsize: BTreeMap<String, (u32, u32)>,
@@ -253,6 +256,7 @@ struct Lower<'a> {
     construct_cell_patches: Vec<(Value, u32)>,
     /// Call value cell placeholders (bbv's per-site cell; 0: the trash row).
     call_cell_patches: Vec<(Value, u32)>,
+    alloc_cell_patches: Vec<(Value, u32)>,
     opsize: BTreeMap<String, (u32, u32)>,
     /// The census helper, when exits are counted (`--mir-exit-census`).
     exit_census: Option<Func>,
@@ -356,6 +360,7 @@ pub fn lower<'a>(
         iof_cell_patches: vec![],
         construct_cell_patches: vec![],
         call_cell_patches: vec![],
+        alloc_cell_patches: vec![],
         opsize: BTreeMap::new(),
         exit_census: if o.exit_census { h.census } else { None },
         ctor_restamp: o.ctor_restamp,
@@ -377,6 +382,7 @@ pub fn lower<'a>(
         iof_cell_patches: l.iof_cell_patches,
         construct_cell_patches: l.construct_cell_patches,
         call_cell_patches: l.call_cell_patches,
+        alloc_cell_patches: l.alloc_cell_patches,
         opsize: l.opsize,
     })
 }
@@ -1929,10 +1935,14 @@ impl<'a> Lower<'a> {
                         let sv = self.i32c(u32::from(strict));
                         (h.del_elem, vec![a[0], a[1], sv])
                     }
-                    RtOp::NewObject => (h.new_object, vec![z]),
+                    RtOp::NewObject => {
+                        let cell = self.alloc_inline(inst, None)?;
+                        (h.new_object, vec![cell])
+                    }
                     RtOp::NewArray(len) => {
+                        let cell = self.alloc_inline(inst, Some(len))?;
                         let lv = self.i32c(len);
-                        (h.new_array, vec![lv, z])
+                        (h.new_array, vec![lv, cell])
                     }
                     RtOp::InitProp(name, attrs) => {
                         let (at, av, none) = (self.atom(name), self.i32c(attrs), self.i32c(u32::MAX));
@@ -3751,6 +3761,16 @@ impl<'a> Lower<'a> {
             let call = self.body.add_block();
             self.char_arms(inst, ops, call)?;
             self.cur = call;
+            if self.names_atom("push") {
+                let call = self.body.add_block();
+                self.push_arm(inst, ops, call)?;
+                self.cur = call;
+            }
+        }
+        if ops.len() == 2 && self.names_atom("pop") {
+            let call = self.body.add_block();
+            self.pop_arm(inst, ops, call)?;
+            self.cur = call;
         }
         let live = self.live_across(inst);
         self.spill(&live)?;
@@ -3826,6 +3846,227 @@ impl<'a> Lower<'a> {
         let t = self.edge(inst, 1, &[result])?;
         let e = self.edge(inst, 2, &[])?;
         self.cond_br(ok, t, e);
+        Ok(())
+    }
+
+    /// An object or array literal (`array_len`) from the site's
+    /// inline-alloc cell (bbv's `emit_alloc_inline`): with the cell filled
+    /// and room in the nursery, bump and write the header the cell holds
+    /// (an array's elements inline, empty), taking `ok_clean`. Returns the
+    /// cell, for the helper that fills it, with `cur` on the miss.
+    fn alloc_inline(&mut self, inst: mir::Inst, array_len: Option<u32>) -> R<Value> {
+        let cell = self.i32c(ALLOC_CELL_ADDR_PLACEHOLDER);
+        let idx = self.atoms.next_alloc_cell();
+        self.alloc_cell_patches.push((cell, idx));
+        let slow = self.body.add_block();
+        let shape = self.load_i32(cell, 0);
+        self.check(shape, slow);
+        let posp_slot = self.i32c(self.h.nursery_pos_slot);
+        let posp = self.load_i32(posp_slot, 0);
+        let pos = self.load_i32(posp, 0);
+        let total = self.load_i32(cell, 4);
+        let newpos = self.bin(Operator::I32Add, pos, total, Type::I32);
+        let endp_slot = self.i32c(self.h.nursery_end_slot);
+        let endp = self.load_i32(endp_slot, 0);
+        let end = self.load_i32(endp, 0);
+        let fits = self.bin(Operator::I32LeU, newpos, end, Type::I32);
+        self.check(fits, slow);
+        self.store_i32(posp, 0, newpos);
+        let hdr = self.load_i32(cell, 16);
+        self.store_i32(pos, 0, hdr);
+        let hb = self.i32c(NURSERY_HEADER_BYTES);
+        let obj = self.bin(Operator::I32Add, pos, hb, Type::I32);
+        self.store_i32(obj, SHAPE_OFFSET, shape);
+        let z = self.i32c(0);
+        self.store_i32(obj, OBJ_CLASS_IDX_OFFSET, z);
+        let slots = self.load_i32(cell, 8);
+        self.store_i32(obj, NATIVE_SLOTS_OFFSET, slots);
+        match array_len {
+            None => {
+                let elems = self.load_i32(cell, 12);
+                self.store_i32(obj, OBJ_ELEMENTS_OFFSET, elems);
+            }
+            Some(_) => {
+                let eoff = self.load_i32(cell, 12);
+                let elems = self.bin(Operator::I32Add, obj, eoff, Type::I32);
+                self.store_i32(obj, OBJ_ELEMENTS_OFFSET, elems);
+                let ehdr = self.elem_header_addr(elems, ELEMENTS_HEADER_BYTES);
+                let flags = self.load_i32(cell, 20);
+                self.store_i32(ehdr, 0, flags);
+                self.store_i32(ehdr, 4, z);
+                let cap = self.load_i32(cell, 24);
+                self.store_i32(ehdr, 8, cap);
+                let len = self.load_i32(cell, 28);
+                self.store_i32(ehdr, 12, len);
+            }
+        }
+        let r = self.box_tagged(TAG_OBJECT, obj);
+        let t = self.edge(inst, 0, &[r])?;
+        self.terminate(Terminator::Br { target: t });
+        self.cur = slow;
+        Ok(cell)
+    }
+
+    /// Whether the function names atom `s` (a builtin arm's gate, as bbv's
+    /// `script_names_push`: an arm costs code where it never fires).
+    fn names_atom(&self, s: &str) -> bool {
+        self.mm.atoms.iter().any(|(_, a)| a.chars().iter().copied().eq(s.encode_utf16()))
+    }
+
+    /// Whether boxed `callee` is the pristine builtin of cell `idx`.
+    fn builtin_is(&mut self, callee: Value, idx: u32) -> Value {
+        let c = self.i32c(self.h.builtin_cells_base + 8 * idx);
+        let bits = self.load_i64(c, 0);
+        self.bin(Operator::I64Eq, callee, bits, Type::I32)
+    }
+
+    /// `Array.prototype.push(v)` on a dense array, call-free (bbv's push
+    /// arm): with the elements packed, room left, and the receiver's shape
+    /// in the append cache with its protos' shapes unchanged (no indexed
+    /// property can appear on them), store at the end and bump the
+    /// initialized length and `length`, taking `ok_clean` with the new
+    /// length; else `other`.
+    fn push_arm(&mut self, inst: mir::Inst, ops: &[Value], other: Block) -> R<()> {
+        let (callee, this, arg) = (ops[0], ops[1], ops[2]);
+        let is_push = self.builtin_is(callee, BC_ARR_PUSH);
+        let ttag = self.tag_of(this);
+        let this_obj = self.tag_is(ttag, TAG_OBJECT as u32);
+        let m = self.bin(Operator::I32And, is_push, this_obj, Type::I32);
+        self.check(m, other);
+        let obj = self.un(Operator::I32WrapI64, this, Type::I32);
+        let elements = self.load_i32(obj, OBJ_ELEMENTS_OFFSET);
+        let flags = self.elem_header(elements, ELEMENTS_FLAGS_BACK);
+        let initlen = self.elem_header(elements, ELEMENTS_INITLEN_BACK);
+        let cap = self.elem_header(elements, ELEMENTS_CAPACITY_BACK);
+        let len = self.elem_header(elements, ELEMENTS_LENGTH_BACK);
+        let bm = self.i32c(ELEMENTS_PUSH_BAIL_MASK);
+        let bail = self.bin(Operator::I32And, flags, bm, Type::I32);
+        let flags_ok = self.un(Operator::I32Eqz, bail, Type::I32);
+        let len_eq = self.bin(Operator::I32Eq, len, initlen, Type::I32);
+        let has_cap = self.bin(Operator::I32LtU, initlen, cap, Type::I32);
+        let imax = self.i32c(0x7FFF_FFFF);
+        let fits = self.bin(Operator::I32LtU, len, imax, Type::I32);
+        let a = self.bin(Operator::I32And, flags_ok, len_eq, Type::I32);
+        let b = self.bin(Operator::I32And, has_cap, fits, Type::I32);
+        let ok = self.bin(Operator::I32And, a, b, Type::I32);
+        self.check(ok, other);
+        let (row, hit) = self.append_row(obj);
+        self.check(hit, other);
+        let arr = self.load_i32(row, 20);
+        self.check(arr, other);
+        for k in 0..2 {
+            let p = self.load_i32(row, 4 + 8 * k);
+            let s = self.load_i32(row, 8 + 8 * k);
+            // A null proto's row word is 0; its shape load reads the
+            // (mapped) zero page's word, which the `or` discards.
+            let live = self.load_i32(p, SHAPE_OFFSET);
+            let empty = self.un(Operator::I32Eqz, p, Type::I32);
+            let same = self.bin(Operator::I32Eq, live, s, Type::I32);
+            let okp = self.bin(Operator::I32Or, empty, same, Type::I32);
+            self.check(okp, other);
+        }
+        let three = self.i32c(3);
+        let off = self.bin(Operator::I32Shl, initlen, three, Type::I32);
+        let addr = self.bin(Operator::I32Add, elements, off, Type::I32);
+        self.store_i64(addr, 0, arg);
+        let one = self.i32c(1);
+        let newlen = self.bin(Operator::I32Add, initlen, one, Type::I32);
+        self.set_elem_header(elements, ELEMENTS_INITLEN_BACK, newlen);
+        self.set_elem_header(elements, ELEMENTS_LENGTH_BACK, newlen);
+        let f = self.h.post_write_barrier_elem;
+        self.post_barrier(f, obj, initlen, arg);
+        let r = self.box_tagged(TAG_INT32, newlen);
+        let t = self.edge(inst, 0, &[r])?;
+        self.terminate(Terminator::Br { target: t });
+        Ok(())
+    }
+
+    /// The append-cache row for `obj`'s shape, and whether it is that
+    /// shape's (the row's first word).
+    fn append_row(&mut self, obj: Value) -> (Value, Value) {
+        let shape = self.load_i32(obj, SHAPE_OFFSET);
+        let three = self.i32c(3);
+        let sh = self.bin(Operator::I32ShrU, shape, three, Type::I32);
+        let k1 = self.i32c(2654435761);
+        let h = self.bin(Operator::I32Mul, sh, k1, Type::I32);
+        let mask = self.i32c(APPEND_CACHE_SIZE - 1);
+        let ridx = self.bin(Operator::I32And, h, mask, Type::I32);
+        let stride = self.i32c(APPEND_CACHE_ENTRY_BYTES);
+        let roff = self.bin(Operator::I32Mul, ridx, stride, Type::I32);
+        let base = self.i32c(self.h.append_cache_base);
+        let row = self.bin(Operator::I32Add, base, roff, Type::I32);
+        let rshape = self.load_i32(row, 0);
+        let hit = self.bin(Operator::I32Eq, shape, rshape, Type::I32);
+        (row, hit)
+    }
+
+    /// The address of the elements header word `back` bytes below
+    /// `elements`.
+    fn elem_header_addr(&mut self, elements: Value, back: u32) -> Value {
+        let k = self.i32c(back);
+        self.bin(Operator::I32Sub, elements, k, Type::I32)
+    }
+
+    fn elem_header(&mut self, elements: Value, back: u32) -> Value {
+        let a = self.elem_header_addr(elements, back);
+        self.load_i32(a, 0)
+    }
+
+    fn set_elem_header(&mut self, elements: Value, back: u32, v: Value) {
+        let a = self.elem_header_addr(elements, back);
+        self.store_i32(a, 0, v);
+    }
+
+    /// `Array.prototype.pop()` on a dense array (bbv's pop arm): with the
+    /// elements packed and non-empty, no incremental marking (the dropped
+    /// element would lose its barrier), and no hole at the end, shrink by
+    /// one, taking `ok_clean` with the last element; else `other`.
+    fn pop_arm(&mut self, inst: mir::Inst, ops: &[Value], other: Block) -> R<()> {
+        let (callee, this) = (ops[0], ops[1]);
+        let is_pop = self.builtin_is(callee, BC_ARR_POP);
+        let ttag = self.tag_of(this);
+        let this_obj = self.tag_is(ttag, TAG_OBJECT as u32);
+        let m = self.bin(Operator::I32And, is_pop, this_obj, Type::I32);
+        self.check(m, other);
+        let obj = self.un(Operator::I32WrapI64, this, Type::I32);
+        let shape = self.load_i32(obj, SHAPE_OFFSET);
+        let base = self.load_i32(shape, SHAPE_BASESHAPE_OFFSET);
+        let clasp = self.load_i32(base, BASESHAPE_CLASP_OFFSET);
+        let aslot = self.i32c(self.h.array_class_slot);
+        let arr_class = self.load_i32(aslot, 0);
+        let is_arr = self.bin(Operator::I32Eq, clasp, arr_class, Type::I32);
+        self.check(is_arr, other);
+        let elements = self.load_i32(obj, OBJ_ELEMENTS_OFFSET);
+        let flags = self.elem_header(elements, ELEMENTS_FLAGS_BACK);
+        let initlen = self.elem_header(elements, ELEMENTS_INITLEN_BACK);
+        let len = self.elem_header(elements, ELEMENTS_LENGTH_BACK);
+        let bm = self.i32c(ELEMENTS_POP_BAIL_MASK);
+        let bail = self.bin(Operator::I32And, flags, bm, Type::I32);
+        let flags_ok = self.un(Operator::I32Eqz, bail, Type::I32);
+        let len_eq = self.bin(Operator::I32Eq, len, initlen, Type::I32);
+        let z = self.i32c(0);
+        let nonempty = self.bin(Operator::I32Ne, len, z, Type::I32);
+        let zone = self.load_i32(self.cx, JSCONTEXT_ZONE_OFFSET);
+        let needs = self.load_i32(zone, ZONE_NEEDS_BARRIER_OFFSET);
+        let no_barrier = self.un(Operator::I32Eqz, needs, Type::I32);
+        let a = self.bin(Operator::I32And, flags_ok, len_eq, Type::I32);
+        let b = self.bin(Operator::I32And, nonempty, no_barrier, Type::I32);
+        let ok = self.bin(Operator::I32And, a, b, Type::I32);
+        self.check(ok, other);
+        let one = self.i32c(1);
+        let newlen = self.bin(Operator::I32Sub, len, one, Type::I32);
+        let three = self.i32c(3);
+        let off = self.bin(Operator::I32Shl, newlen, three, Type::I32);
+        let addr = self.bin(Operator::I32Add, elements, off, Type::I32);
+        let elem = self.load_i64(addr, 0);
+        let etag = self.tag_of(elem);
+        let hole = self.tag_is(etag, TAG_MAGIC as u32);
+        let not_hole = self.un(Operator::I32Eqz, hole, Type::I32);
+        self.check(not_hole, other);
+        self.set_elem_header(elements, ELEMENTS_INITLEN_BACK, newlen);
+        self.set_elem_header(elements, ELEMENTS_LENGTH_BACK, newlen);
+        let t = self.edge(inst, 0, &[elem])?;
+        self.terminate(Terminator::Br { target: t });
         Ok(())
     }
 
