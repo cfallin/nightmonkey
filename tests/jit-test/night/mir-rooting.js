@@ -66,3 +66,27 @@ stress = false;
 gczeal(7, 3);
 run();
 gczeal(0);
+
+// Retention matches baseline's frame: a local's value stays alive until
+// the local is overwritten, even where it is dead, and no longer after;
+// including across a GC inside an inlined callee.
+function collect() { gc(); }
+function released() {
+  gc();
+  var o = makeFinalizeObserver();
+  var c0 = finalizeCount();
+  o = undefined;
+  collect();
+  return finalizeCount() - c0;
+}
+function retained() {
+  gc();
+  var o = makeFinalizeObserver();
+  var c0 = finalizeCount();
+  collect();
+  return finalizeCount() - c0;
+}
+for (var n = 0; n < 40; n++) {
+  assertEq(released(), 1);
+  assertEq(retained(), 0);
+}

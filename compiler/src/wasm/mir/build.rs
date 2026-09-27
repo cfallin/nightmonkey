@@ -751,9 +751,6 @@ impl<'a> Shape<'a> {
 /// One run of the builder over the script.
 struct Run<'s, 'a> {
     s: &'s Shape<'a>,
-    /// Per frame slot, the value a `frame.store` this block has emitted
-    /// put there (`retain_locals`).
-    framed: BTreeMap<usize, mir::Value>,
     table: &'s BTreeMap<Pc, Vec<Ty>>,
     /// Loop-header slots this run guards on the way into their loop, to
     /// their narrow type (`Native`, `Ta`).
@@ -836,7 +833,6 @@ impl<'s, 'a> Run<'s, 'a> {
             st: vec![],
             args_placeholder: None,
             args_local: None,
-            framed: BTreeMap::new(),
             pc: Pc::new(0),
             pre: vec![],
             exit_blk: None,
@@ -1026,30 +1022,34 @@ impl<'s, 'a> Run<'s, 'a> {
     fn at(&mut self, b: mir::Block) {
         self.cur = b;
         self.live = true;
-        self.framed.clear();
     }
 
     /// Before an op that may GC: write each managed local (formal, local,
     /// rval) to the frame, where the GC sees it. A local's value then stays
     /// alive until the local is overwritten, as in baseline, whose frame
     /// holds it (a `WeakMap` key held only by a dead local must survive);
-    /// MIR otherwise roots only what is live. The lowering drops a store
-    /// of what the frame already holds on the path.
+    /// MIR otherwise roots only what is live. Emitted before every such op:
+    /// the lowering writes them only where the op can GC (a slow path, or
+    /// the call), and drops a store of what the frame holds on the path.
     fn retain_locals(&mut self, op: &Opcode) {
         use mir::ops::SuccRole;
         let may_gc = matches!(op, Opcode::ConstStr(_))
             || op.roles().iter().any(|r| matches!(r, SuccRole::Err | SuccRole::OkDirty));
-        if !may_gc {
-            return;
+        if may_gc {
+            self.retain_all();
         }
+    }
+
+    /// `retain_locals` unconditionally: before an inlined callee, whose
+    /// GC points are its own ops.
+    fn retain_all(&mut self) {
         for ix in 1..self.frame_len().min(self.st.len()) {
             let x = self.st[ix];
             let managed = matches!(x.ty, Ty::Val(_) | Ty::Obj(..) | Ty::ObjHint(_) | Ty::Native | Ty::Ta(_));
-            if !managed || self.framed.get(&ix) == Some(&x.v) {
+            if !managed {
                 continue;
             }
             self.f.add_inst(self.cur, Opcode::FrameStore(u32::try_from(ix).unwrap()), vec![x.v], &[], vec![]);
-            self.framed.insert(ix, x.v);
         }
     }
 
@@ -1858,6 +1858,7 @@ impl<'s, 'a> Run<'s, 'a> {
             }
             let saved_mm = self.mm.clone();
             let saved_frames = self.f.inline_frames.len();
+            self.retain_all();
             match super::inline::splice(&mut self.mm, &mut self.f, callee, 0, hit, &operands, None, join, err) {
                 Ok(()) => {
                     self.mm.script_addrs.insert(*k, callee.mm.script_addrs[k]);
@@ -1952,6 +1953,7 @@ impl<'s, 'a> Run<'s, 'a> {
         let saved_mm = self.mm.clone();
         let saved_frames = self.f.inline_frames.len();
         let here = self.cur;
+        self.retain_all();
         match super::inline::splice(&mut self.mm, &mut self.f, callee, 0, here, &operands, Some(nt), ret, err) {
             Ok(()) => {
                 self.mm.script_addrs.insert(k, callee.mm.script_addrs[&k]);
@@ -2311,7 +2313,6 @@ impl<'s, 'a> Run<'s, 'a> {
         }
         if x.ty != Ty::Dead && self.write_through(ix) {
             self.inst(Opcode::FrameStore(u32::try_from(ix).unwrap()), vec![x.v], None);
-            self.framed.insert(ix, x.v);
         }
         self.st[ix] = x;
     }

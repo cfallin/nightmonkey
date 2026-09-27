@@ -243,6 +243,9 @@ struct Lower<'a> {
     /// Per (frame, slot): the value a `frame.store` put there, along the
     /// emission path; a store of the same value again is dropped.
     framed: BTreeMap<(u32, u32), mir::Value>,
+    /// The builder's retaining frame stores before the next instruction:
+    /// emitted where that instruction can GC (`root`), not before it.
+    pending_retain: Vec<((u32, u32), mir::Value)>,
     /// The MIR block being lowered.
     cur_mblock: mir::Block,
     /// Whether the emission point is on a helper's slow path: its edges'
@@ -294,6 +297,10 @@ struct Lower<'a> {
     ctor_restamp: Option<[u32; 7]>,
     /// One exit hub per frame shape (`exit_hub`).
     exit_hubs: BTreeMap<Vec<Option<BoxKind>>, Block>,
+    /// One `exit.inline` hub per inline frame: its entry and last blocks,
+    /// its site-index param and call status, and each site's tail
+    /// (`exit_inline`).
+    inline_hubs: BTreeMap<u32, (Block, Block, Value, Value, Vec<Block>)>,
     strict: bool,
     plain_env: bool,
     own_env: bool,
@@ -406,6 +413,7 @@ pub fn lower<'a>(
         slotted: BTreeSet::new(),
         dirty: BTreeSet::new(),
         framed: BTreeMap::new(),
+        pending_retain: vec![],
         cur_mblock: mir::Block::from_u32(0),
         cold: false,
         pending: BTreeMap::new(),
@@ -435,6 +443,7 @@ pub fn lower<'a>(
         exit_census: if o.exit_census { h.census } else { None },
         ctor_restamp: o.ctor_restamp,
         exit_hubs: BTreeMap::new(),
+        inline_hubs: BTreeMap::new(),
         strict: o.strict,
         plain_env: o.plain_env,
         own_env: o.own_env,
@@ -870,8 +879,21 @@ impl<'a> Lower<'a> {
             self.enter_block(b)?;
             for &inst in &f.blocks[b].insts {
                 self.cold = false;
+                // Retaining stores still pending at a terminator that
+                // cannot GC (an inlined call's entry): the GC points are
+                // past the block, so they are written here.
+                if !self.pending_retain.is_empty()
+                    && !self.f.insts[inst].succs.is_empty()
+                    && !self.may_gc(inst)
+                {
+                    self.flush_retain(None)?;
+                    self.pending_retain.clear();
+                }
                 let before = self.body.values.len();
                 self.inst(inst)?;
+                if self.may_gc(inst) {
+                    self.pending_retain.clear();
+                }
                 let e = self
                     .opsize
                     .entry(mir::print::mnemonic(&f.insts[inst].op))
@@ -882,6 +904,25 @@ impl<'a> Lower<'a> {
         }
         if let Some((b, _)) = self.pending.iter().find(|(_, v)| !v.is_empty()) {
             return Err(format!("lowering: an edge into {b} was never placed"));
+        }
+        // Each `exit.inline` hub continues at its site's tail.
+        for (_, last, site, err, tails) in std::mem::take(&mut self.inline_hubs).into_values() {
+            let targets: Vec<BlockTarget> = tails
+                .iter()
+                .map(|&t| BlockTarget {
+                    block: t,
+                    args: vec![err],
+                })
+                .collect();
+            let default = targets[0].clone();
+            self.body.set_terminator(
+                last,
+                Terminator::Select {
+                    value: site,
+                    targets,
+                    default,
+                },
+            );
         }
         waffle::passes::empty_blocks::run(&mut self.body);
         Ok(())
@@ -926,24 +967,6 @@ impl<'a> Lower<'a> {
             }
         }
         (stores, entered)
-    }
-
-    /// Whether `v` is live across the next may-GC instruction after `inst`
-    /// in its block (so rooted there).
-    fn rooted_across_next_gc(&self, inst: mir::Inst, v: mir::Value) -> bool {
-        let insts = &self.f.blocks[self.cur_mblock].insts;
-        let Some(pos) = insts.iter().position(|&i| i == inst) else {
-            return false;
-        };
-        let Some(&next) = insts[pos + 1..].iter().find(|&&i| self.may_gc(i)) else {
-            return false;
-        };
-        let live = if self.f.insts[next].succs.is_empty() {
-            self.live_after(next)
-        } else {
-            self.live_across(next)
-        };
-        live.contains(&v)
     }
 
     /// Whether `inst` may call something that GCs (a superset of where the
@@ -1140,6 +1163,7 @@ impl<'a> Lower<'a> {
         self.slotted.clear();
         self.dirty = dirty;
         self.framed = framed;
+        self.pending_retain.clear();
         for (v, loc, es) in plan {
             match loc {
                 Loc::Param => {
@@ -1593,12 +1617,50 @@ impl<'a> Lower<'a> {
         }
     }
 
+    /// Write the pending retaining stores (the locals' values, into the
+    /// frame the GC sees: a value stays alive while its local holds it, as
+    /// in baseline), but not where both it and what the frame slot holds
+    /// are rooted anyway, in `live` (so in their home slots). Returns the
+    /// stores made.
+    fn flush_retain(&mut self, live: Option<&[mir::Value]>) -> R<u32> {
+        let mut stores = 0;
+        for (key, v) in self.pending_retain.clone() {
+            if self.framed.get(&key) == Some(&v) {
+                continue;
+            }
+            if let Some(live) = live {
+                if live.contains(&v) && self.framed.get(&key).is_some_and(|o| live.contains(o)) {
+                    continue;
+                }
+            }
+            let (fid, k) = key;
+            let f = fid as usize;
+            let l = self.frame_layouts[f];
+            let (nargs, nlocals) = (l.nargs, l.nlocals);
+            let off = self.frame_off[f]
+                + match k {
+                    0 => FrameLayout::THIS,
+                    k if k <= nargs => l.arg(k - 1),
+                    k if k <= nargs + nlocals => l.local(k - 1 - nargs),
+                    _ => l.rval(),
+                };
+            let w = self.value_here(v)?;
+            let t = self.ty(v);
+            let b = self.boxed(&t, w)?;
+            let base = if fid == 0 && k <= nargs { self.sp } else { self.vp };
+            self.store_i64(base, off, b);
+            self.framed.insert(key, v);
+            stores += 1;
+        }
+        Ok(stores)
+    }
+
     /// Before a may-GC call: store each of `live` (managed values live
     /// across it) that its home slot does not hold yet. A stored value
     /// stays stored (SSA values do not change, and the GC updates the slot
     /// in place), so repeated calls store it once.
     fn root(&mut self, live: &[mir::Value]) -> R<()> {
-        let mut stores = 0;
+        let mut stores = self.flush_retain(Some(live))?;
         for &v in live {
             if self.slotted.contains(&v) {
                 continue;
@@ -1652,23 +1714,12 @@ impl<'a> Lower<'a> {
             let key = (self.cur_frame, k);
             let aliased = self.mapped_formals && self.cur_frame == 0 && k >= 1 && k <= self.layout.nargs;
             if !aliased {
-                if self.framed.get(&key) == Some(&d.args[0]) {
-                    return Ok(());
+                // A retaining store (the builder's `retain_locals`): held
+                // for the next instruction's GC points.
+                if self.framed.get(&key) != Some(&d.args[0]) {
+                    self.pending_retain.push((key, d.args[0]));
                 }
-                // A retaining store (the builder's `retain_locals`) is not
-                // needed where its value is rooted across the may-GC op it
-                // precedes (live, so in its home slot) and so is what the
-                // frame slot holds: dropping it keeps nothing alive that
-                // would not be anyway. The value stays live until the store
-                // before the op where it is not (its local overwritten, or
-                // the function ending), which writes it.
-                let v = d.args[0];
-                if let Some(&old) = self.framed.get(&key) {
-                    if self.rooted_across_next_gc(inst, v) && self.rooted_across_next_gc(inst, old) {
-                        return Ok(());
-                    }
-                }
-                self.framed.insert(key, d.args[0]);
+                return Ok(());
             }
         }
         let a = self.args(inst)?;
@@ -2570,7 +2621,7 @@ impl<'a> Lower<'a> {
                     self.cur = arr;
                     // The helper's reload rebinds the live values on its
                     // path only.
-                    let saved = (self.vmap.clone(), self.slotted.clone(), self.dirty.clone());
+                    let saved = (self.vmap.clone(), self.slotted.clone(), self.dirty.clone(), self.framed.clone());
                     let cell = self.alloc_inline(inst, Some(0))?;
                     let lv = self.i32c(0);
                     let live = self.live_across(inst);
@@ -2578,7 +2629,7 @@ impl<'a> Lower<'a> {
                     let t = self.edge(inst, 1, &[r])?;
                     let e = self.edge(inst, 2, &[])?;
                     self.cond_br(ok, t, e);
-                    (self.vmap, self.slotted, self.dirty) = saved;
+                    (self.vmap, self.slotted, self.dirty, self.framed) = saved;
                     self.cur = other;
                 }
                 // The frame `[callee, this, args…, new.target]` above the
@@ -4948,11 +4999,19 @@ impl<'a> Lower<'a> {
         nlocals: u32,
         throw: bool,
     ) -> R<()> {
-        let fid = self.cur_frame as usize;
-        let callee = self.f.inline_frames[fid - 1].script;
+        let fid = self.cur_frame;
+        let callee = self.f.inline_frames[fid as usize - 1].script;
+        let max_depth = self.f.inline_frames[fid as usize - 1].max_depth;
         let what = format!("inline{} in sid#{}", if throw { " throw" } else { "" }, self.f.script);
         self.census_exit(callee, pc, &what);
-        let (base, end, l) = (self.frame_off[fid], self.frame_end[fid], self.frame_layouts[fid]);
+        // Rooted here, on the site's own state: the caller's managed values
+        // live across the call (the same set at every exit of this frame,
+        // which all continue at the call's join).
+        let live = self.live_across(inst);
+        self.root(&live)?;
+        // The whole frame, boxed: a dead slot and the stack above this
+        // pc's depth as undefined (baseline writes those before reading).
+        let undef = self.i64c(UNDEF);
         let mut ops = vec![];
         for (&v, &mv) in a.iter().zip(&d.args) {
             let dead = matches!(
@@ -4961,13 +5020,74 @@ impl<'a> Lower<'a> {
                     if self.f.insts[i].op == Opcode::ConstVal(ConstVal::Dead)
             );
             ops.push(if dead {
-                None
+                undef
             } else {
                 let t = self.ty(mv);
-                Some(self.boxed(&t, v)?)
+                self.boxed(&t, v)?
             });
         }
+        let full = (3 + nargs + nlocals + max_depth) as usize;
+        if ops.len() > full {
+            return Err("lowering: an exit.inline deeper than its frame".into());
+        }
+        ops.resize(full, undef);
+        if !self.inline_hubs.contains_key(&fid) {
+            let hub = self.inline_hub(fid, nargs, nlocals, max_depth)?;
+            self.inline_hubs.insert(fid, hub);
+        }
+        let (hub, _, _, _, tails) = self.inline_hubs.get_mut(&fid).unwrap();
+        let hub = *hub;
+        let idx = u32::try_from(tails.len()).unwrap();
+        let tail = self.body.add_block();
+        let err = self.body.add_blockparam(tail, Type::I32);
+        self.inline_hubs.get_mut(&fid).unwrap().4.push(tail);
+        let mode = if throw {
+            ResumeMode::Throw
+        } else {
+            ResumeMode::Continue
+        };
+        let w = ResumeWord { pc, mode };
+        let mut args = vec![self.i32c(w.encode() as u32), self.i32c(idx)];
+        args.extend(ops);
+        self.terminate(Terminator::Br {
+            target: BlockTarget { block: hub, args },
+        });
+        // The site's tail: back from the callee's baseline body, with the
+        // site's own state after the call.
+        self.cur = tail;
+        self.after_gc(&live);
+        let end = self.frame_end[fid as usize];
+        let result = self.load_i64(self.vp, end);
+        let ok = self.un(Operator::I32Eqz, err, Type::I32);
+        let t = self.edge(inst, 0, &[result])?;
+        let e = self.edge(inst, 1, &[])?;
+        self.cond_br(ok, t, e);
+        Ok(())
+    }
+
+    /// The `exit.inline` hub for inline frame `fid`: params the resume
+    /// word, the site index, and the whole frame boxed (`this`, formals,
+    /// locals, rval, the stack to its deepest); it writes the callee's
+    /// frame, the resume word and the backoff, then runs the callee's
+    /// baseline body on it. Its terminator, a dispatch to the sites'
+    /// tails, is set once every site is lowered.
+    fn inline_hub(
+        &mut self,
+        fid: u32,
+        nargs: u32,
+        nlocals: u32,
+        max_depth: u32,
+    ) -> R<(Block, Block, Value, Value, Vec<Block>)> {
+        let saved = self.cur;
+        let hub = self.body.add_block();
+        let word = self.body.add_blockparam(hub, Type::I32);
+        let site = self.body.add_blockparam(hub, Type::I32);
+        let n = 3 + nargs + nlocals + max_depth;
+        let ops: Vec<Option<Value>> = (0..n).map(|_| Some(self.body.add_blockparam(hub, Type::I64))).collect();
+        self.cur = hub;
         let fp = frame_parts(&ops, nargs, nlocals).ok_or("lowering: malformed exit.inline")?;
+        let f = fid as usize;
+        let (base, end, l) = (self.frame_off[f], self.frame_end[f], self.frame_layouts[f]);
         // Inline frames are placed from `vp`.
         let sp = self.vp;
         if let Some(v) = *fp.this {
@@ -4991,19 +5111,12 @@ impl<'a> Lower<'a> {
                 self.store_i64(sp, base + l.operand(u32::try_from(k).unwrap()), v);
             }
         }
-        let mode = if throw {
-            ResumeMode::Throw
-        } else {
-            ResumeMode::Continue
-        };
-        let w = ResumeWord { pc, mode };
-        let word = self.i64c((TAG_INT32 << 32) | u64::from(w.encode() as u32));
-        self.store_i64(sp, base + l.resume(), word);
+        let w64 = self.un(Operator::I64ExtendI32U, word, Type::I64);
+        let tag = self.i64c(TAG_INT32 << 32);
+        let wv = self.bin(Operator::I64Or, w64, tag, Type::I64);
+        self.store_i64(sp, base + l.resume(), wv);
         let backoff = self.i64c((TAG_INT32 << 32) | u64::from(ONRAMP_BACKOFF));
         self.store_i64(sp, base + l.backoff(), backoff);
-        // The call, rooted: the caller's managed values live across it.
-        let live = self.live_across(inst);
-        self.root(&live)?;
         let callee = self.load_i64(sp, base + FrameLayout::CALLEE);
         let (funcidx, script) = self.classify(callee);
         let off = self.i32c(u32::MAX);
@@ -5027,13 +5140,10 @@ impl<'a> Lower<'a> {
             tys,
         ));
         let err = self.push_val(ValueDef::PickOutput(call, 0, Type::I32));
-        self.after_gc(&live);
-        let result = self.load_i64(sp, end);
-        let ok = self.un(Operator::I32Eqz, err, Type::I32);
-        let t = self.edge(inst, 0, &[result])?;
-        let e = self.edge(inst, 1, &[])?;
-        self.cond_br(ok, t, e);
-        Ok(())
+        // The dispatch goes where the body ends (classify branches).
+        let last = self.cur;
+        self.cur = saved;
+        Ok((hub, last, site, err, vec![]))
     }
 
     /// Leave MIR at `w` with the frame state `ops` (this, formals,
