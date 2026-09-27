@@ -1501,6 +1501,48 @@ and exit censuses against bbv, not by op coverage.
   crypto 7422/15502, raytrace 6332/11754, earley-boyer 5162/13224,
   navier-stokes 11619/22660, splay 5906/7653, pdfjs 7700/20484.
 
+**M5e. Proofs in the builder's types (2026-09-27).** Micro-benchmarks
+isolating one pattern each (field updates through `this`, polymorphic
+calls over a list, allocation, `am3`-style array arithmetic), AOT against
+bbv, found the costs; the fixes are general.
+- **Proven receivers.** The builder's slot types carry what a dominating
+  guard proved: `Obj(keys, types)` (a raw object of those layouts),
+  `ObjHint(keys)` (proved before a fence: the next typed access guards
+  again, exiting on a miss) and `Native` (elements addressable). A
+  method's `this` is guarded to `this_layouts` once, at `FunctionThis`;
+  typed sites whose receiver the slot covers take no guard and no IC
+  fallback. A fence weakens `Obj` slots in place (a `weaken` before the
+  terminator), the fence rule's weaker param.
+- **Dirty IC arms exit.** A typed load or store whose IC arm ran (a SLOTS
+  miss) exits at the next pc instead of rejoining, so the clean path keeps
+  its facts.
+- **Guard folding** keys guards by their operand up to `unbox` and folds
+  into an available guard of the same kind whose output implies it; block
+  params whose incoming values agree are forwarded (not across a fence
+  edge that kills the value's type), and the lowering runs in reverse
+  postorder.
+- **Elements.** Element accesses the analysis predicts on arrays (or whose
+  reads it saw yield numbers or objects) with int32 keys are `load_elem`
+  / `store_elem` on a `Native` receiver, with the generic op for holes and
+  out-of-bounds indices. A receiver guard whose loop brings the proof back
+  around is hoisted to the loop's entry (§10.2): the header's slot is
+  `Native` and the entry edges guard, exiting at the header.
+- **Stores and stamps.** Inline stores drop RANGES (no MIR claim rests on
+  it) rather than take the engine path, and clear TYPES for a non-number
+  only on an object still under construction, so constructors' field adds
+  replay their transitions inline. A layout constructor's first stamp is
+  inline. Snapshot objects are stamped by their constructor, not by their
+  field list alone (two classes with one field list got one key, and
+  their methods' `this` guards all missed).
+- **Smaller things.** `StrictConstantEq` inline (MIR and baseline); MIR's
+  rooting slots overlap baseline's operand slots, so the entry initializes
+  only the fixed frame and locals; an overflow-checked multiply tests for
+  -0 only on a zero product.
+- Micro-benchmarks (ms, MIR / bbv): fields 190/187, calls 145/138,
+  alloc 176/102, arith 150/128. Octane moves less: MIR's remaining gap
+  there is spread across calls not inlined (constructors, callees over
+  200 bytes), frame write-through and code size.
+
 **M6. The rest of §10**: box/unbox cleanup, memory optimizations, and
 numeric optimizations, each with its guard-count and instruction-count
 tests.

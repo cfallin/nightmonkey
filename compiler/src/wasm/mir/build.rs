@@ -61,6 +61,9 @@ enum Ty {
     /// field access through it guards the layout again, exiting on a miss
     /// (identity rarely changes), and refines the slot back to `Obj`.
     ObjHint(KeyRange),
+    /// A native object (`obj{Native}`, raw): its elements are addressable
+    /// (`load_elem`, `store_elem`). Immutable, so no fence kills it.
+    Native,
     /// A local, formal or rval that is dead here (never read before it is
     /// next written): no value, no block param. An exit passes it as
     /// `const.val dead`.
@@ -90,6 +93,7 @@ impl Ty {
                 ..ObjInfo::TOP
             }),
             Ty::ObjHint(_) => MType::OBJ_TOP,
+            Ty::Native => MType::Obj(ObjInfo::kind(ObjKind::Native)),
             Ty::Dead => unreachable!("a dead slot has no type"),
         }
     }
@@ -100,7 +104,7 @@ impl Ty {
             Ty::F64 => TagSet::NUMBER,
             Ty::Bool => TagSet::BOOLEAN,
             Ty::Val(t) => t,
-            Ty::Obj(..) | Ty::ObjHint(_) => TagSet::OBJECT,
+            Ty::Obj(..) | Ty::ObjHint(_) | Ty::Native => TagSet::OBJECT,
             Ty::Dead => TagSet::NONE,
         }
     }
@@ -288,6 +292,13 @@ pub fn build<'a>(
     build_at(ctx, names, sid, script, is_global, 0)
 }
 
+/// Element accesses the analysis predicts on arrays, with int32 keys, are
+/// `load_elem`/`store_elem` on a native receiver.
+const NATIVE_ELEMS: bool = true;
+
+/// A loop-invariant array's receiver guard is hoisted to the loop's entry.
+const HOIST_NATIVE: bool = true;
+
 /// Typed field accesses exit on a dirty IC arm rather than rejoin.
 const DIRTY_EXITS: bool = true;
 
@@ -367,18 +378,30 @@ fn build_at<'a>(
         }
     }
     let mut table: BTreeMap<Pc, Vec<Ty>> = BTreeMap::new();
+    // Loop-header slots guarded on the way into their loop (§10.2).
+    let mut hoist: std::collections::BTreeSet<(Pc, usize)> = std::collections::BTreeSet::new();
     // Within a run, a block's entry types join every forward edge into it
     // (`Run::pending`), so a run misses only what a loop's back edges
     // bring. Each rerun widens some loop header's entry types, and there
     // are finitely many widenings; the bound is a backstop.
     for _ in 0..256 {
-        let mut run = Run::new(&shape, &table);
+        let mut run = Run::new(&shape, &table, &hoist);
         run.build()?;
-        if !run.widen {
+        let new_hoists: Vec<(Pc, usize)> = run.hoist_req.difference(&hoist).copied().collect();
+        if !run.widen && new_hoists.is_empty() {
             let mm = std::mem::take(&mut run.mm);
             return Ok((mm, run.finish()));
         }
-        for (pc, tys) in run.out {
+        let out = std::mem::take(&mut run.out);
+        drop(run);
+        if !new_hoists.is_empty() {
+            // Entry types only widen across runs: a narrower header starts
+            // them over (the hoist set only grows, so this terminates).
+            hoist.extend(new_hoists);
+            table.clear();
+            continue;
+        }
+        for (pc, tys) in out {
             let e = table.entry(pc).or_insert_with(|| tys.clone());
             for (a, b) in e.iter_mut().zip(&tys) {
                 *a = a.join(*b);
@@ -665,6 +688,11 @@ impl<'a> Shape<'a> {
 struct Run<'s, 'a> {
     s: &'s Shape<'a>,
     table: &'s BTreeMap<Pc, Vec<Ty>>,
+    /// Loop-header slots this run guards on the way into their loop.
+    hoist: &'s std::collections::BTreeSet<(Pc, usize)>,
+    /// Loop-header slots whose back edges bring a native object where the
+    /// header has a `Val`: guarded on entry in the next run.
+    hoist_req: std::collections::BTreeSet<(Pc, usize)>,
     /// The types flowing into each block this run (joined).
     out: BTreeMap<Pc, Vec<Ty>>,
     f: mir::Func,
@@ -706,7 +734,11 @@ struct Run<'s, 'a> {
 }
 
 impl<'s, 'a> Run<'s, 'a> {
-    fn new(s: &'s Shape<'a>, table: &'s BTreeMap<Pc, Vec<Ty>>) -> Run<'s, 'a> {
+    fn new(
+        s: &'s Shape<'a>,
+        table: &'s BTreeMap<Pc, Vec<Ty>>,
+        hoist: &'s std::collections::BTreeSet<(Pc, usize)>,
+    ) -> Run<'s, 'a> {
         let frame = FrameShape {
             formals: s.nargs,
             locals: s.nlocals,
@@ -717,6 +749,8 @@ impl<'s, 'a> Run<'s, 'a> {
         Run {
             s,
             table,
+            hoist,
+            hoist_req: std::collections::BTreeSet::new(),
             out: BTreeMap::new(),
             f,
             mm: mir::Module::default(),
@@ -1183,6 +1217,50 @@ impl<'s, 'a> Run<'s, 'a> {
         let g = self.guard(Opcode::GuardLayout { keys, types: false }, vec![o], ty.mir());
         self.st.pop();
         self.push(g, ty);
+    }
+
+    /// An element access at `pc` the analysis predicts on an array with an
+    /// int32 key: the receiver as a native object (proven by its slot, or
+    /// guarded here, exiting on a miss, and every slot holding it then
+    /// refined) and the raw index. `None` for anything else.
+    fn native_elem(&mut self, pc: Pc, recv: Slot, key: Slot) -> Option<(mir::Value, mir::Value)> {
+        // The analysis saw the site read numbers or objects (not a
+        // string's characters), or write, or knows the array's class.
+        let site = self.site(pc);
+        let facts = &self.s.ctx.facts;
+        let predicted = self.s.ctx.array_elem_in.contains_key(&site)
+            || facts.elem_write_sites.contains_key(&site)
+            || facts.elem_sites.get(&site).is_some_and(|c| {
+                c.is_object() || (!c.prims().is_empty() && c.prims().subset_of(crate::opsem::NUM))
+            });
+        if !NATIVE_ELEMS
+            || (recv.ty != Ty::Native && !predicted)
+            || key.ty.num() != Some(Num::I32)
+            || !TagSet::OBJECT.subset_of(recv.ty.tags())
+        {
+            return None;
+        }
+        let i = self.as_i32(key);
+        let o = match recv.ty {
+            Ty::Native => recv.v,
+            Ty::Obj(..) | Ty::ObjHint(_) => self.guard(
+                Opcode::GuardKind(ObjKind::Native),
+                vec![recv.v],
+                Ty::Native.mir(),
+            ),
+            Ty::Val(_) => {
+                let u = self.guard(Opcode::GuardUnbox(UnboxKind::Obj), vec![recv.v], MType::OBJ_TOP);
+                let o = self.guard(Opcode::GuardKind(ObjKind::Native), vec![u], Ty::Native.mir());
+                for x in self.st.iter_mut() {
+                    if x.v == recv.v {
+                        *x = Slot { v: o, ty: Ty::Native };
+                    }
+                }
+                o
+            }
+            _ => return None,
+        };
+        Some((o, i))
     }
 
     /// Receiver `recv` of a typed site, when its slot type proves the
@@ -1747,6 +1825,13 @@ impl<'s, 'a> Run<'s, 'a> {
             self.widen = true;
             return None;
         }
+        if HOIST_NATIVE && self.s.loops.contains_key(&to) {
+            for (i, (&a, &b)) in tys.iter().zip(&want).enumerate() {
+                if a == Ty::Native && matches!(b, Ty::Val(t) if TagSet::OBJECT.subset_of(t)) {
+                    self.hoist_req.insert((to, i));
+                }
+            }
+        }
         let block = self.block_for(to, from)?;
         let st = self.st.clone();
         let args = st
@@ -1780,7 +1865,9 @@ impl<'s, 'a> Run<'s, 'a> {
         match x.ty {
             Ty::Dead => unreachable!("a dead slot is never read"),
             Ty::Bool => x.v,
-            Ty::Obj(..) | Ty::ObjHint(_) => self.inst(Opcode::ConstBool(true), vec![], Some(MType::Bool)),
+            Ty::Obj(..) | Ty::ObjHint(_) | Ty::Native => {
+                self.inst(Opcode::ConstBool(true), vec![], Some(MType::Bool))
+            }
             Ty::I32 => {
                 let z = self.const_i32(0);
                 self.inst(
@@ -2023,6 +2110,38 @@ impl<'s, 'a> Run<'s, 'a> {
                 Ty::Val(tags) if tags == TagSet::ALL => None,
                 Ty::Val(tags) => Some(Opcode::GuardTags(tags)),
                 Ty::ObjHint(_) => Some(Opcode::GuardUnbox(UnboxKind::Obj)),
+                Ty::Native => {
+                    let ok = self.new_block();
+                    let o = self.f.add_param(ok, MType::OBJ_TOP);
+                    self.term(
+                        Opcode::GuardUnbox(UnboxKind::Obj),
+                        vec![v],
+                        vec![
+                            Edge {
+                                block: ok,
+                                args: vec![EdgeArg::Out(0)],
+                            },
+                            Self::goto(fail),
+                        ],
+                    );
+                    self.at(ok);
+                    let ok = self.new_block();
+                    let out = self.f.add_param(ok, t.mir());
+                    self.term(
+                        Opcode::GuardKind(ObjKind::Native),
+                        vec![o],
+                        vec![
+                            Edge {
+                                block: ok,
+                                args: vec![EdgeArg::Out(0)],
+                            },
+                            Self::goto(fail),
+                        ],
+                    );
+                    self.at(ok);
+                    args.push(EdgeArg::Value(out));
+                    continue;
+                }
                 Ty::Obj(keys, types) => {
                     // Unbox, then the layout.
                     let ok = self.new_block();
@@ -2099,6 +2218,13 @@ impl<'s, 'a> Run<'s, 'a> {
         }
         let mut tys = tys?;
         self.s.depths.at(pc)?;
+        // Slots guarded on the way into the loop (§10.2): native objects in
+        // the loop, however they came in.
+        for (i, t) in tys.iter_mut().enumerate() {
+            if self.hoist.contains(&(pc, i)) && matches!(*t, Ty::Val(u) if TagSet::OBJECT.subset_of(u)) {
+                *t = Ty::Native;
+            }
+        }
         // Slots dead here take no param.
         let live = &self.s.live[&pc];
         for (t, &l) in tys.iter_mut().zip(live) {
@@ -2113,6 +2239,21 @@ impl<'s, 'a> Run<'s, 'a> {
             self.at(t);
             let params = self.f.blocks[t].params.clone();
             let mut params = params.into_iter();
+            // The edge's frame, for a hoisted guard's exit (at `pc`,
+            // before the loop runs).
+            let frame: Vec<Slot> = {
+                let mut ps = self.f.blocks[t].params.clone().into_iter();
+                ttys.iter()
+                    .map(|&ty| match ty {
+                        Ty::Dead => Slot::dead(),
+                        ty => Slot {
+                            v: ps.next().unwrap(),
+                            ty,
+                        },
+                    })
+                    .collect()
+            };
+            let mut exit_b = None;
             let mut args = vec![];
             for (&from_ty, &to_ty) in ttys.iter().zip(&tys) {
                 let v = if from_ty == Ty::Dead {
@@ -2124,6 +2265,48 @@ impl<'s, 'a> Run<'s, 'a> {
                     continue;
                 }
                 let v = v.expect("a slot live at a block is live on each edge into it");
+                if matches!((from_ty, to_ty), (Ty::Val(_), Ty::Native)) {
+                    let fail = *exit_b.get_or_insert_with(|| {
+                        let here = self.cur;
+                        let b = self.new_block();
+                        self.at(b);
+                        let ops = self.exit_operands(pc, &frame);
+                        let eop = self.exit_op(pc, false);
+                        self.term(eop, ops, vec![]);
+                        self.at(here);
+                        b
+                    });
+                    let ok = self.new_block();
+                    let u = self.f.add_param(ok, MType::OBJ_TOP);
+                    self.term(
+                        Opcode::GuardUnbox(UnboxKind::Obj),
+                        vec![v],
+                        vec![
+                            Edge {
+                                block: ok,
+                                args: vec![EdgeArg::Out(0)],
+                            },
+                            Self::goto(fail),
+                        ],
+                    );
+                    self.at(ok);
+                    let ok = self.new_block();
+                    let o = self.f.add_param(ok, Ty::Native.mir());
+                    self.term(
+                        Opcode::GuardKind(ObjKind::Native),
+                        vec![u],
+                        vec![
+                            Edge {
+                                block: ok,
+                                args: vec![EdgeArg::Out(0)],
+                            },
+                            Self::goto(fail),
+                        ],
+                    );
+                    self.at(ok);
+                    args.push(EdgeArg::Value(o));
+                    continue;
+                }
                 args.push(EdgeArg::Value(self.convert(Slot { v, ty: from_ty }, to_ty)));
             }
             self.term(
@@ -2769,7 +2952,7 @@ impl<'s, 'a> Run<'s, 'a> {
                         self.at(d);
                         o
                     }
-                    Ty::Bool | Ty::Obj(..) | Ty::ObjHint(_) => {
+                    Ty::Bool | Ty::Obj(..) | Ty::ObjHint(_) | Ty::Native => {
                         self.jump_to(default, Some(pc));
                         return Ok(());
                     }
@@ -2986,8 +3169,53 @@ impl<'s, 'a> Run<'s, 'a> {
             GetElem => {
                 let key = self.pop();
                 let recv = self.pop();
-                let (x, k) = (self.boxed(recv), self.boxed(key));
-                let r = self.js(Opcode::JsGetElem, vec![x, k], MType::VAL_TOP);
+                let r = match self.native_elem(pc, recv, key) {
+                    Some((o, i)) => {
+                        // A dense element inline; out of bounds or a
+                        // hole, the generic op.
+                        self.demote_objs();
+                        let (ok, generic, join) = (self.new_block(), self.new_block(), self.new_block());
+                        let p = self.f.add_param(ok, MType::VAL_TOP);
+                        let jr = self.f.add_param(join, MType::VAL_TOP);
+                        self.term(
+                            Opcode::LoadElem,
+                            vec![o, i],
+                            vec![
+                                Edge {
+                                    block: ok,
+                                    args: vec![EdgeArg::Out(0)],
+                                },
+                                Self::goto(generic),
+                            ],
+                        );
+                        self.at(ok);
+                        self.term(
+                            Opcode::Jump,
+                            vec![],
+                            vec![Edge {
+                                block: join,
+                                args: vec![EdgeArg::Value(p)],
+                            }],
+                        );
+                        self.at(generic);
+                        let (x, k) = (self.boxed(recv), self.boxed(key));
+                        let r = self.js(Opcode::JsGetElem, vec![x, k], MType::VAL_TOP);
+                        self.term(
+                            Opcode::Jump,
+                            vec![],
+                            vec![Edge {
+                                block: join,
+                                args: vec![EdgeArg::Value(r)],
+                            }],
+                        );
+                        self.at(join);
+                        jr
+                    }
+                    None => {
+                        let (x, k) = (self.boxed(recv), self.boxed(key));
+                        self.js(Opcode::JsGetElem, vec![x, k], MType::VAL_TOP)
+                    }
+                };
                 self.push(r, Ty::Val(TagSet::ALL));
                 let claim = self.s.ctx.facts.elem_sites.get(&self.site(pc)).copied();
                 self.guard_result(claim.unwrap_or_default(), pc + op.len(), true);
@@ -2996,9 +3224,33 @@ impl<'s, 'a> Run<'s, 'a> {
                 let v = self.pop();
                 let key = self.pop();
                 let recv = self.pop();
-                let (x, k, y) = (self.boxed(recv), self.boxed(key), self.boxed(v));
-                self.js_void(Opcode::JsSetElem(op == StrictSetElem), vec![x, k, y]);
-                self.repush(v);
+                match self.native_elem(pc, recv, key) {
+                    Some((o, i)) => {
+                        // A dense overwrite inline; else the generic op.
+                        self.demote_objs();
+                        let v = self.demote(v);
+                        let y = self.boxed(v);
+                        let (ok, generic, join) = (self.new_block(), self.new_block(), self.new_block());
+                        self.term(
+                            Opcode::StoreElem,
+                            vec![o, i, y],
+                            vec![Self::goto(ok), Self::goto(generic)],
+                        );
+                        self.at(ok);
+                        self.term(Opcode::Jump, vec![], vec![Self::goto(join)]);
+                        self.at(generic);
+                        let (x, k) = (self.boxed(recv), self.boxed(key));
+                        self.js_void(Opcode::JsSetElem(op == StrictSetElem), vec![x, k, y]);
+                        self.term(Opcode::Jump, vec![], vec![Self::goto(join)]);
+                        self.at(join);
+                        self.st.push(v);
+                    }
+                    None => {
+                        let (x, k, y) = (self.boxed(recv), self.boxed(key), self.boxed(v));
+                        self.js_void(Opcode::JsSetElem(op == StrictSetElem), vec![x, k, y]);
+                        self.repush(v);
+                    }
+                }
             }
             // Generic operations through their runtime helpers.
             Instanceof | In | HasOwn if RT_OPS => {

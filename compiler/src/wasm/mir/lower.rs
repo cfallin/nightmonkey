@@ -40,7 +40,7 @@ use crate::mir::ops::{
     frame_parts, ArithOp, BitOp, Cc, ConstVal, F64Op, JsBinop, JsCc, JsUnop, MathFn, NumRepr,
     Opcode, UnboxKind,
 };
-use crate::mir::types::{Machine, TagSet, Type as MType};
+use crate::mir::types::{Machine, ObjKind, TagSet, Type as MType};
 use crate::opsem::{
     PRIM_BIGINT, PRIM_BOOLEAN, PRIM_DOUBLE, PRIM_INT32, PRIM_NULL, PRIM_STRING, PRIM_SYMBOL,
     PRIM_UNDEFINED,
@@ -1422,20 +1422,34 @@ impl<'a> Lower<'a> {
                         (r, self.bin(Operator::I64Eq, w, r64, Type::I32))
                     }
                     ArithOp::Mul => {
+                        // Branches, not one flag: the product fits, and
+                        // only a zero one (rare) tests for -0 (a negative
+                        // operand).
                         let x64 = self.un(Operator::I64ExtendI32S, x, Type::I64);
                         let y64 = self.un(Operator::I64ExtendI32S, y, Type::I64);
                         let w = self.bin(Operator::I64Mul, x64, y64, Type::I64);
                         let r = self.un(Operator::I32WrapI64, w, Type::I32);
                         let r64 = self.un(Operator::I64ExtendI32S, r, Type::I64);
                         let fits = self.bin(Operator::I64Eq, w, r64, Type::I32);
-                        // A zero product with a negative operand is -0.
-                        let zero = self.un(Operator::I32Eqz, r, Type::I32);
+                        let (nz, zero, ok_b, fail_b) = (
+                            self.body.add_block(),
+                            self.body.add_block(),
+                            self.body.add_block(),
+                            self.body.add_block(),
+                        );
+                        self.cond_br(fits, Self::to(nz), Self::to(fail_b));
+                        self.cur = nz;
+                        self.cond_br(r, Self::to(ok_b), Self::to(zero));
+                        self.cur = zero;
                         let xy = self.bin(Operator::I32Or, x, y, Type::I32);
                         let z = self.i32c(0);
                         let neg = self.bin(Operator::I32LtS, xy, z, Type::I32);
-                        let negz = self.bin(Operator::I32And, zero, neg, Type::I32);
-                        let not_negz = self.un(Operator::I32Eqz, negz, Type::I32);
-                        (r, self.bin(Operator::I32And, fits, not_negz, Type::I32))
+                        self.cond_br(neg, Self::to(fail_b), Self::to(ok_b));
+                        self.cur = fail_b;
+                        let f = self.edge(inst, 1, &[])?;
+                        self.terminate(Terminator::Br { target: f });
+                        self.cur = ok_b;
+                        (r, self.i32c(1))
                     }
                 };
                 self.guard(inst, ok, &[r])?;
@@ -1619,6 +1633,54 @@ impl<'a> Lower<'a> {
                 self.cur = slow;
                 let sv = self.i32c(u32::from(strict));
                 self.js_call(inst, self.h.set_element, &[a[0], a[1], a[2], sv], false)?;
+            }
+            Opcode::GuardKind(ObjKind::Native) => {
+                let shape = self.load_i32(a[0], SHAPE_OFFSET);
+                let flags = self.load_i32(shape, SHAPE_IMMUTABLE_FLAGS_OFFSET);
+                let bit = self.i32c(SHAPE_IS_NATIVE_BIT);
+                let native = self.bin(Operator::I32And, flags, bit, Type::I32);
+                self.guard(inst, native, &[a[0]])?;
+            }
+            Opcode::LoadElem => {
+                // An in-bounds, non-hole dense element; else `fail`.
+                let fail = self.body.add_block();
+                let (_, v) = self.elem_addr(a[0], a[1], fail, true);
+                let t = self.edge(inst, 0, &[v.unwrap()])?;
+                self.terminate(Terminator::Br { target: t });
+                self.cur = fail;
+                let f = self.edge(inst, 1, &[])?;
+                self.terminate(Terminator::Br { target: f });
+            }
+            Opcode::StoreElem => {
+                // An in-bounds overwrite of a non-hole dense element of
+                // unfrozen elements (an own writable data property); else
+                // `fail`. RANGES, consumed by no MIR claim, is dropped.
+                let num = matches!(self.ty(d.args[2]), MType::Val(s) if s.tags.subset_of(TagSet::NUMBER));
+                let fail = self.body.add_block();
+                let (addr, _) = self.elem_addr(a[0], a[1], fail, true);
+                let elements = self.load_i32(a[0], OBJ_ELEMENTS_OFFSET);
+                let back = self.i32c(ELEMENTS_FLAGS_BACK);
+                let header = self.bin(Operator::I32Sub, elements, back, Type::I32);
+                let flags = self.load_i32(header, 0);
+                let fz = self.i32c(ELEMENTS_FROZEN_FLAG);
+                let frozen = self.bin(Operator::I32And, flags, fz, Type::I32);
+                let thawed = self.un(Operator::I32Eqz, frozen, Type::I32);
+                self.check(thawed, fail);
+                let w = self.load_i32(a[0], OBJ_CLASS_IDX_OFFSET);
+                self.clear_bits(a[0], w, CLASS_WORD_RANGES);
+                if !num {
+                    self.pre_barrier(addr, 0);
+                }
+                self.store_i64(addr, 0, a[2]);
+                if !num {
+                    let f = self.h.post_write_barrier_elem;
+                    self.post_barrier(f, a[0], a[1], a[2]);
+                }
+                let t = self.edge(inst, 0, &[])?;
+                self.terminate(Terminator::Br { target: t });
+                self.cur = fail;
+                let f = self.edge(inst, 1, &[])?;
+                self.terminate(Terminator::Br { target: f });
             }
             Opcode::Call => self.js_call_op(inst, &a)?,
             Opcode::GuardScript(sid) => {
@@ -3219,6 +3281,29 @@ impl<'a> Lower<'a> {
 
     /// `dense_element`'s checks, returning the object, its elements, the
     /// index, the element's address and its value.
+    /// Element `idx` of native object `obj`: its address, branching to
+    /// `fail` unless in bounds (and, with `load`, the value, unless a hole).
+    fn elem_addr(&mut self, obj: Value, idx: Value, fail: Block, load: bool) -> (Value, Option<Value>) {
+        let elements = self.load_i32(obj, OBJ_ELEMENTS_OFFSET);
+        let back = self.i32c(ELEMENTS_INITLEN_BACK);
+        let header = self.bin(Operator::I32Sub, elements, back, Type::I32);
+        let initlen = self.load_i32(header, 0);
+        let in_bounds = self.bin(Operator::I32LtU, idx, initlen, Type::I32);
+        self.check(in_bounds, fail);
+        let eight = self.i32c(8);
+        let off = self.bin(Operator::I32Mul, idx, eight, Type::I32);
+        let addr = self.bin(Operator::I32Add, elements, off, Type::I32);
+        if !load {
+            return (addr, None);
+        }
+        let v = self.load_i64(addr, 0);
+        let vtag = self.tag_of(v);
+        let hole = self.tag_is(vtag, TAG_MAGIC as u32);
+        let not_hole = self.un(Operator::I32Eqz, hole, Type::I32);
+        self.check(not_hole, fail);
+        (addr, Some(v))
+    }
+
     fn dense_slot(&mut self, recv: Value, key: Value, fail: Block) -> (Value, Value, Value, Value, Value) {
         let tag = self.tag_of(recv);
         let is_obj = self.tag_is(tag, TAG_OBJECT as u32);
