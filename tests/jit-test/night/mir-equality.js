@@ -48,3 +48,15 @@ if (typeof createIsHTMLDDA === "function") {
     assertEq(eq(o, null), false);
   }
 }
+
+// Strict equality against a small constant (`StrictConstantEq`), inline:
+// an int8 matches an int32 or an equal double; true/false, null and
+// undefined match exactly.
+function k(x) {
+  return (x === 1 ? 1 : 0) + (x === -3 ? 2 : 0) + (x === true ? 4 : 0) +
+         (x === null ? 8 : 0) + (x === undefined ? 16 : 0) + (x !== 0 ? 32 : 0);
+}
+var ks = [1, 1.0, -3, -3.0, true, false, null, undefined, 0, -0, 0.5, "1", NaN, {}];
+var want = [33, 33, 34, 34, 36, 32, 40, 48, 0, 0, 32, 32, 32, 32];
+for (var n = 0; n < 50; n++)
+  for (var i = 0; i < ks.length; i++) assertEq(k(ks[i]), want[i]);

@@ -135,7 +135,6 @@ pub fn translate_script(
         atoms,
         &f,
         baseline::layout::FrameLayout::of(script),
-        baseline::layout::StackDepths::compute(script)?.max,
         lower::LowerOpts {
             stress: ctx.opts.mir_stress,
             exit_census: ctx.opts.instrument.mir_exits,

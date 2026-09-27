@@ -33,7 +33,7 @@ use waffle::{
     ValueDef,
 };
 
-use crate::ids::Pc;
+use crate::ids::{Pc, ScriptId};
 use crate::mir;
 use crate::mir::func::{Edge, EdgeArg, RootKind};
 use crate::mir::ops::{
@@ -210,11 +210,9 @@ struct Lower<'a> {
     carried: BTreeMap<mir::Block, Vec<mir::Value>>,
     /// The waffle value standing for each MIR value at the emission point.
     vmap: BTreeMap<mir::Value, Value>,
-    /// Where the rooting slots start, in bytes above `sp`: past the whole
-    /// baseline frame, at its deepest operand stack.
+    /// Where the rooting slots start, in bytes above `sp`: past baseline's
+    /// fixed frame and locals, over its operand slots.
     root_base: u32,
-    /// The baseline frame's deepest operand stack.
-    max_depth: u32,
     /// With inlined callees (§5.5): the rooting area's size in slots (the
     /// most managed values live anywhere), and per frame id its base and
     /// end offsets from `sp` and its layout. Frame 0 is the function's;
@@ -297,7 +295,6 @@ pub fn lower<'a>(
     atoms: &'a mut AtomTable,
     f: &'a mir::Func,
     layout: FrameLayout,
-    max_depth: u32,
     o: LowerOpts,
     gname_bids: BTreeMap<mir::entity::AtomId, u32>,
     gname_fused: BTreeMap<mir::entity::AtomId, crate::wasm::translate::FusedGname>,
@@ -307,10 +304,14 @@ pub fn lower<'a>(
     let entry = body.entry;
     let p = |i: usize| body.blocks[entry].params[i].1;
     let (cx, sp, argc, retval_out, script_param, new_target) = (p(0), p(1), p(2), p(3), p(4), p(5));
-    // Rooting slots and callee frames go above the whole baseline frame,
-    // which therefore always holds valid Values (a fresh entry initializes
-    // it): an exit can leave a dead slot as it is.
-    let root_base = layout.operand(max_depth);
+    // Rooting slots and callee frames go above baseline's fixed frame and
+    // locals, which therefore always hold valid Values (a fresh entry
+    // initializes them): an exit can leave a dead one as it is. They
+    // overlap baseline's operand slots, which MIR never reads while it
+    // runs (an onramp reads them before anything is spilled, an exit
+    // writes every one below its depth), so those are not initialized:
+    // a helper's GC scan stops at the spilled roots.
+    let root_base = layout.operand(0);
     let mut l = Lower {
         h,
         f,
@@ -329,7 +330,6 @@ pub fn lower<'a>(
         carried: BTreeMap::new(),
         vmap: BTreeMap::new(),
         root_base,
-        max_depth,
         inline: !f.inline_frames.is_empty(),
         root_slots: 0,
         frame_off: vec![0],
@@ -876,9 +876,6 @@ impl<'a> Lower<'a> {
         let zero = self.i64c(TAG_INT32 << 32);
         self.store_i64(vp, l.resume(), zero);
         self.store_i64(vp, l.backoff(), zero);
-        for k in 0..self.max_depth {
-            self.store_i64(vp, l.operand(k), undef);
-        }
         self.init_root_area();
         if self.own_env {
             // Every slot is valid: the GC may run. Failing, the throw has
@@ -935,12 +932,6 @@ impl<'a> Lower<'a> {
         vals.push(self.load_i64(vp, l.rval()));
         for k in 0..depth {
             vals.push(self.load_i64(vp, l.operand(k)));
-        }
-        // Baseline's operand slots above its current depth are stale; MIR's
-        // rooting `top` covers them, so make them valid.
-        let undef = self.i64c(UNDEF);
-        for k in depth..self.max_depth {
-            self.store_i64(vp, l.operand(k), undef);
         }
         self.init_root_area();
         if vals.len() != self.f.blocks[root].params.len() {
@@ -1465,10 +1456,9 @@ impl<'a> Lower<'a> {
                 self.def(inst, v);
             }
             Opcode::JsConstantStrictEq(k) => {
-                // A leaf: no GC, no JS.
-                let kv = self.i32c(u32::from(k));
-                let f = self.h.constant_strict_eq;
-                let v = self.call1(f, &[self.cx, a[0], kv], Type::I32);
+                // `ConstantStrictEqual` inline (bbv's): the operand's type
+                // byte, then its payload.
+                let v = self.constant_strict_eq(a[0], k);
                 self.def(inst, v);
             }
             // The activation's environment is fixed (§5.1): the frame's env
@@ -2912,6 +2902,37 @@ impl<'a> Lower<'a> {
         Ok(())
     }
 
+    /// `x === k` for a `StrictConstantEq` operand `k` (the high byte its
+    /// type: 2 boolean, 3 undefined, 4 null, else an int8), as a raw bool.
+    fn constant_strict_eq(&mut self, x: Value, k: u16) -> Value {
+        let (ty, lo) = ((k >> 8) & 0xFF, (k & 0xFF) as u8);
+        let tag = self.tag_of(x);
+        match ty {
+            3 => self.tag_is(tag, TAG_UNDEFINED as u32),
+            4 => self.tag_is(tag, TAG_NULL as u32),
+            2 => {
+                let want = self.i64c((TAG_BOOLEAN << 32) | u64::from(lo & 1));
+                self.bin(Operator::I64Eq, x, want, Type::I32)
+            }
+            _ => {
+                // An int32 of that value, or a double equal to it.
+                let n = i32::from(lo as i8);
+                let is_int = self.tag_is(tag, TAG_INT32 as u32);
+                let low = self.un(Operator::I32WrapI64, x, Type::I32);
+                let nv = self.i32c(n as u32);
+                let low_eq = self.bin(Operator::I32Eq, low, nv, Type::I32);
+                let int_eq = self.bin(Operator::I32And, is_int, low_eq, Type::I32);
+                let it = self.i32c(TAG_INT32 as u32);
+                let is_dbl = self.bin(Operator::I32LtU, tag, it, Type::I32);
+                let d = self.un(Operator::F64ReinterpretI64, x, Type::F64);
+                let dv = self.f64c(f64::from(n).to_bits());
+                let dbl_eq = self.bin(Operator::F64Eq, d, dv, Type::I32);
+                let dbl_eq = self.bin(Operator::I32And, is_dbl, dbl_eq, Type::I32);
+                self.bin(Operator::I32Or, int_eq, dbl_eq, Type::I32)
+            }
+        }
+    }
+
     /// An inline store's duty to the receiver's class word `w`: RANGES is
     /// consumed checklessly, but by no MIR claim, so it is dropped here
     /// rather than sent to the engine; TYPES survives a number store, and
@@ -3354,6 +3375,19 @@ impl<'a> Lower<'a> {
     /// frame. The caller continues on `ok` with the callee's result, or on
     /// `err`.
     #[allow(clippy::too_many_arguments)]
+    /// Count this exit (`--mir-exit-census`), with its static record.
+    fn census_exit(&mut self, script: ScriptId, pc: Pc, what: &str) {
+        let Some(census) = self.exit_census else { return };
+        static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        crate::diag_line!("night: mir exit {id} sid#{script} pc {pc} {what}");
+        let (k, i) = (
+            self.i32c(crate::options::MIR_EXIT_CENSUS_KIND),
+            self.i32c(id),
+        );
+        self.call1(census, &[k, i], Type::I32);
+    }
+
     fn exit_inline(
         &mut self,
         inst: mir::Inst,
@@ -3365,6 +3399,9 @@ impl<'a> Lower<'a> {
         throw: bool,
     ) -> R<()> {
         let fid = self.cur_frame as usize;
+        let callee = self.f.inline_frames[fid - 1].script;
+        let what = format!("inline{} in sid#{}", if throw { " throw" } else { "" }, self.f.script);
+        self.census_exit(callee, pc, &what);
         let (base, end, l) = (self.frame_off[fid], self.frame_end[fid], self.frame_layouts[fid]);
         let mut ops = vec![];
         for (&v, &mv) in a.iter().zip(&d.args) {
@@ -3462,21 +3499,7 @@ impl<'a> Lower<'a> {
         nargs: u32,
         nlocals: u32,
     ) -> R<()> {
-        if let Some(census) = self.exit_census {
-            static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-            let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            crate::diag_line!(
-                "night: mir exit {id} sid#{} pc {} {:?}",
-                self.f.script,
-                w.pc,
-                w.mode
-            );
-            let (k, i) = (
-                self.i32c(crate::options::MIR_EXIT_CENSUS_KIND),
-                self.i32c(id),
-            );
-            self.call1(census, &[k, i], Type::I32);
-        }
+        self.census_exit(self.f.script, w.pc, &format!("{:?}", w.mode));
         let mut shape = Vec::with_capacity(ops.len());
         for (t, &d) in tys.iter().zip(dead) {
             shape.push(if d { None } else { Some(BoxKind::of(t)?) });
@@ -3544,10 +3567,13 @@ impl<'a> Lower<'a> {
         if let Some(v) = *fp.rval {
             self.store_i64(vp, l.rval(), v);
         }
+        // Every stack slot: MIR's roots overlap them.
         for (k, v) in fp.stack.iter().enumerate() {
-            if let Some(v) = *v {
-                self.store_i64(vp, l.operand(u32::try_from(k).unwrap()), v);
-            }
+            let v = match *v {
+                Some(v) => v,
+                None => self.i64c(UNDEF),
+            };
+            self.store_i64(vp, l.operand(u32::try_from(k).unwrap()), v);
         }
         // The fixed slots MIR does not keep current. The env slot is fixed
         // for the activation, and the arguments-object slot holds the one

@@ -2004,10 +2004,7 @@ impl<'a> Gen<'a> {
             StrictConstantEq | StrictConstantNe => {
                 let operand = p.next_uint16().unwrap();
                 let v = self.slot(d - 1);
-                let o = self.i32c(u32::from(operand));
-                let mut b = self
-                    .call(h.constant_strict_eq, &[self.cx, v, o], Some(Type::I32))
-                    .unwrap();
+                let mut b = self.constant_strict_eq(v, operand);
                 if op == StrictConstantNe {
                     let z = self.i32c(0);
                     b = self.binop(Operator::I32Eq, b, z, Type::I32);
@@ -2747,6 +2744,38 @@ impl<'a> Gen<'a> {
             self.br(Self::goto(join));
         }
         (self.cur, self.live) = (join, true);
+    }
+
+    /// `x === k` for a `StrictConstantEq` operand `k` (the high byte its
+    /// type: 2 boolean, 3 undefined, 4 null, else an int8), as a raw bool:
+    /// `ConstantStrictEqual` inline.
+    fn constant_strict_eq(&mut self, x: Value, k: u16) -> Value {
+        let (ty, lo) = ((k >> 8) & 0xFF, (k & 0xFF) as u8);
+        match ty {
+            3 => self.tag_eq(x, TAG_UNDEFINED),
+            4 => self.tag_eq(x, TAG_NULL),
+            2 => {
+                let want = self.i64c((TAG_BOOLEAN << 32) | u64::from(lo & 1));
+                self.binop(Operator::I64Eq, x, want, Type::I32)
+            }
+            _ => {
+                // An int32 of that value, or a double equal to it.
+                let n = i32::from(lo as i8);
+                let tag = self.tag_of(x);
+                let it = self.i32c(TAG_INT32 as u32);
+                let is_int = self.binop(Operator::I32Eq, tag, it, Type::I32);
+                let low = self.unop(Operator::I32WrapI64, x, Type::I32);
+                let nv = self.i32c(n as u32);
+                let low_eq = self.binop(Operator::I32Eq, low, nv, Type::I32);
+                let int_eq = self.binop(Operator::I32And, is_int, low_eq, Type::I32);
+                let is_dbl = self.binop(Operator::I32LtU, tag, it, Type::I32);
+                let d = self.unop(Operator::F64ReinterpretI64, x, Type::F64);
+                let dv = self.f64c(f64::from(n));
+                let dbl_eq = self.binop(Operator::F64Eq, d, dv, Type::I32);
+                let dbl_eq = self.binop(Operator::I32And, is_dbl, dbl_eq, Type::I32);
+                self.binop(Operator::I32Or, int_eq, dbl_eq, Type::I32)
+            }
+        }
     }
 
     fn f64c(&mut self, x: f64) -> Value {

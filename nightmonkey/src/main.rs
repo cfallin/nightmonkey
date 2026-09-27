@@ -434,9 +434,38 @@ fn main() -> Result<()> {
                 .iter()
                 .map(|&n| names.get(n).chars().to_vec())
                 .collect();
-            // First row wins on duplicate field lists (layout_ctors is
-            // sorted, so the pick is stable).
-            row_of.entry(chars).or_insert(u32::try_from(lid).unwrap());
+            // A field list two rows share names no row by itself: the
+            // object's constructor decides (below), or nothing does.
+            row_of
+                .entry(chars)
+                .and_modify(|r| *r = u32::MAX)
+                .or_insert(u32::try_from(lid).unwrap());
+        }
+        // A prototype object -> the layout row of the constructor whose
+        // `prototype` it is (`ctor_stamps`): a layout key names a class,
+        // and objects of two classes can carry the same field list.
+        let lid_of_key: std::collections::HashMap<_, u32> = env
+            .layout_ctors
+            .iter()
+            .enumerate()
+            .map(|(lid, &k)| (k, u32::try_from(lid).unwrap()))
+            .collect();
+        let mut row_of_proto: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
+        for o in &source.objects {
+            let SourceObject::Object(od) = o else {
+                continue;
+            };
+            let Some(sc) = od.script else { continue };
+            let Some(&key) = env.facts.ctor_stamps.get(&night_compiler::ids::ScriptId::new(sc.id())) else {
+                continue;
+            };
+            let Some(&lid) = lid_of_key.get(&key) else { continue };
+            for &(nid, vid) in &od.properties {
+                if matches!(source.object(nid), SourceObject::String(st) if st.chars() == "prototype".encode_utf16().collect::<Vec<u16>>().as_slice())
+                {
+                    row_of_proto.insert(vid.id(), lid);
+                }
+            }
         }
         let global = source.global_object.map(|g| g.id());
         let mut out = Vec::new();
@@ -468,8 +497,24 @@ fn main() -> Result<()> {
             if !ok {
                 continue;
             }
-            let Some(&lid) = row_of.get(&chars) else {
-                continue;
+            let by_proto = od.proto.and_then(|p| row_of_proto.get(&p.id())).copied();
+            let lid = match by_proto {
+                Some(lid) => {
+                    // The constructor's row, if the object has exactly it.
+                    let key = env.layout_ctors[lid as usize];
+                    let row: Vec<Vec<u16>> = env.likely_class_layouts[&key]
+                        .iter()
+                        .map(|&n| names.get(n).chars().to_vec())
+                        .collect();
+                    if row != chars {
+                        continue;
+                    }
+                    lid
+                }
+                None => match row_of.get(&chars) {
+                    Some(&lid) if lid != u32::MAX => lid,
+                    _ => continue,
+                },
             };
             let Some(&addr) = walk_out.object_addr.get(&(i as u32)) else {
                 continue;
