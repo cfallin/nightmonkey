@@ -1198,6 +1198,7 @@ impl Parser {
             NewObject(_) => NewObject(self.layout_key()?),
             EnvLoad(_) => EnvLoad(EnvSlot::new(self.int()?)),
             EnvStore(_) => EnvStore(EnvSlot::new(self.int()?)),
+            JsLambda(_) => JsLambda(self.int()?),
             other => other,
         })
     }
@@ -1421,6 +1422,7 @@ fn template(mn: &str) -> Option<Opcode> {
         JsGetName(placeholder_atom),
         JsBoxThis,
         JsBindGName(placeholder_atom),
+        JsLambda(0),
         JsSetName(placeholder_atom, false),
         JsSetName(placeholder_atom, true),
         LoadField(placeholder_atom),

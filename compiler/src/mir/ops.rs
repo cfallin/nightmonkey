@@ -319,6 +319,9 @@ pub enum Opcode {
     /// `env.name = v` for a global or name assignment (`SetGName`), strict
     /// or sloppy.
     JsSetName(AtomId, bool),
+    /// A closure of the script's inner function `index` (a gcthing index)
+    /// over environment `args[0]` (`Lambda`).
+    JsLambda(u32),
 
     // Objects.
     LoadField(AtomId),
@@ -427,7 +430,7 @@ impl Opcode {
             | JsSetName(..) | LoadField(_) | StoreField(_) | Call | CallDirect | Construct
             | CallNative(_) => CLEAN_DIRTY_ERR.to_vec(),
             // No dynamic effect report: the kill is static, on `ok`.
-            JsGetName(_) => OK_ERR.to_vec(),
+            JsGetName(_) | JsLambda(_) => OK_ERR.to_vec(),
             _ => vec![],
         }
     }
@@ -1031,6 +1034,11 @@ pub fn signature(op: &Opcode, args: &[Type], m: &Module) -> SigResult {
             arity(args, 0)?;
             Sig::output(Type::val(TagSet::OBJECT))
         }
+        JsLambda(_) => {
+            arity(args, 1)?;
+            want_kind(&obj(&args[0], "js.lambda")?, ObjKind::Env, "js.lambda")?;
+            Sig::output(Type::val(TagSet::OBJECT))
+        }
         JsSetName(..) => {
             arity(args, 2)?;
             val(&args[0], "js.setname env")?;
@@ -1451,6 +1459,9 @@ pub fn effects(op: &Opcode, args: &[Type], m: &Module) -> Effects {
             return Effects::generic(FlagsEffect::Dynamic)
         }
         JsGetName(_) => return Effects::generic(FlagsEffect::Bits(FlagBits::ALL)),
+        // An allocation, but reported as generic: it runs no JS, yet a GC
+        // may move anything.
+        JsLambda(_) => return Effects::generic(FlagsEffect::Bits(FlagBits::ALL)),
         Call | CallDirect | Construct | CallNative(_) => {
             return Effects::generic(FlagsEffect::Callee)
         }

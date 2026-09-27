@@ -77,6 +77,7 @@ pub fn translate_script(
             stress: ctx.opts.mir_stress,
             exit_census: ctx.opts.instrument.mir_exits,
             strict: script.strict,
+            plain_env: baseline::needs_env(script) && baseline::env_is_plain(ctx.source, script),
             ctor_stamp: ctx.stamp_ctors_in.get(&sid).map(|si| {
                 [
                     si.layout_id,

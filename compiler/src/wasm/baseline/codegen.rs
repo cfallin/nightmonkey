@@ -808,29 +808,7 @@ impl<'a> Gen<'a> {
     // --- prologue -------------------------------------------------------------
 
     fn env_is_plain(&self) -> bool {
-        let Some(bs) = self.script.body_scope else {
-            return false;
-        };
-        let SourceObject::Scope(ScopeData {
-            kind: 0,
-            has_environment: false,
-            enclosing,
-            ..
-        }) = self.ctx.source.object(bs)
-        else {
-            return false;
-        };
-        // A named lambda's own-name environment is built by the setup.
-        !enclosing.is_some_and(|e| {
-            matches!(
-                self.ctx.source.object(e),
-                SourceObject::Scope(ScopeData {
-                    is_named_lambda: true,
-                    has_environment: true,
-                    ..
-                })
-            )
-        })
+        env_is_plain(self.ctx.source, self.script)
     }
 
     /// `argc` without its flag bits, and `vp`. Emitted in the entry block,
@@ -3194,6 +3172,36 @@ impl<'a> Gen<'a> {
 /// Whether the body keeps an env chain in its frame: it has env ops, or an
 /// op whose helper reads the chain (direct eval, `EnvCallee`, module and
 /// resource-management ops).
+/// Whether `script`'s activation environment is its callee's own
+/// environment: a function body scope with no environment of its own
+/// (no call object, no named-lambda scope). The prologue then just loads
+/// it from the callee.
+pub(crate) fn env_is_plain(source: &crate::source::Source, script: &Script) -> bool {
+    let Some(bs) = script.body_scope else {
+        return false;
+    };
+    let SourceObject::Scope(ScopeData {
+        kind: 0,
+        has_environment: false,
+        enclosing,
+        ..
+    }) = source.object(bs)
+    else {
+        return false;
+    };
+    // A named lambda's own-name environment is built by the setup.
+    !enclosing.is_some_and(|e| {
+        matches!(
+            source.object(e),
+            SourceObject::Scope(ScopeData {
+                is_named_lambda: true,
+                has_environment: true,
+                ..
+            })
+        )
+    })
+}
+
 pub(crate) fn needs_env(script: &Script) -> bool {
     crate::wasm::translate::uses_env_ops(script)
         || script.parser().opcodes().any(|op| {

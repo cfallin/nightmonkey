@@ -1335,6 +1335,25 @@ the numbers call for it.
     value that is not a number, no TYPES. Barriers are as for
     `store_field`. A miss calls `set_prop_ic_miss`.
   - The transition (add) and megamorphic set arms stay bbv-only.
+- **Inline dense element overwrite.** `js.setelem` stores an in-bounds,
+  non-hole dense element inline when the elements are not frozen and the
+  word has no RANGES, with the element barriers.
+- **Environment chains, the fixed case (M5, first part).** A script
+  whose activation environment is its callee's own (no call object, no
+  named-lambda scope: baseline's `env_is_plain`) now compiles:
+  - the fresh entry writes the callee's environment to the frame's env
+    slot, where it stays for the activation (exits leave it alone), and
+    `env.current` reads it back;
+  - `GetAliasedVar` is `env.parent`^hops then `env.load`, and its result
+    is guarded at the def against the analysis's `aliased_sites` claim;
+  - `SetAliasedVar`/`InitAliasedLexical` are `env.store`, lowered to the
+    runtime's leaf store (with its barriers); `CheckAliasedLexical` is
+    `CheckLexical`'s guard; `Lambda` is `js.lambda` over the env;
+  - scopes that push environments (`PushLexicalEnv` and the rest) still
+    decline.
+  Non-fused `GetGName` results are likewise guarded at the def against
+  `gname_types`. navier-stokes, whose hot code reads closure variables,
+  goes from 3987 to 11200.
 - Measured at this point (Octane, in-process, best of two, versus
   `--pipeline baseline`): richards 424 → 634, crypto 3187 → 3780,
   deltablue 597 → 650, box2d 1970 → 2109; the rest are within noise

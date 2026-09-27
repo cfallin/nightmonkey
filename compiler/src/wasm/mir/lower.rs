@@ -52,7 +52,8 @@ use crate::wasm::bbv::abi::{
     BINOP_BITAND, BINOP_BITNOT, BINOP_BITOR, BINOP_BITXOR, BINOP_DEC, BINOP_DIV, BINOP_INC,
     BINOP_LSH, BINOP_MOD, BINOP_MUL, BINOP_RSH, BINOP_SUB, BINOP_URSH, CLASS_WORD_SHALLOW,
     CLASS_WORD_RANGES, CLASS_WORD_SLOTS, IC_SET_ABSSLOT, IC_SET_RECVSHAPE, IC_SET_SLOTENC,
-    IC_WAY_ADDR_PLACEHOLDER, NATIVE_SLOTS_OFFSET, CHUNK_STORE_BUFFER_OFFSET, CMP_EQ, CMP_GE, CMP_GT, CMP_LE, CMP_LT, CMP_NE, CMP_STRICTEQ, CMP_STRICTNE,
+    IC_WAY_ADDR_PLACEHOLDER, NATIVE_SLOTS_OFFSET, FUNC_ENV_SLOT_OFFSET, FUNC_SCRIPT_SLOT_OFFSET,
+    SHAPE_FIXED_SLOTS_MASK_BITS, SHAPE_FIXED_SLOTS_SHIFT, CHUNK_STORE_BUFFER_OFFSET, CMP_EQ, CMP_GE, CMP_GT, CMP_LE, CMP_LT, CMP_NE, CMP_STRICTEQ, CMP_STRICTNE,
     ELEMENTS_FLAGS_BACK, ELEMENTS_FROZEN_FLAG, ELEMENTS_INITLEN_BACK, FIXED_SLOTS_BASE, FLAGS_ALL, OBJ_CLASS_IDX_OFFSET, OBJ_ELEMENTS_OFFSET,
     JSCONTEXT_ZONE_OFFSET, NOT_CHUNK_MASK, SHAPE_IMMUTABLE_FLAGS_OFFSET, SHAPE_IS_NATIVE_BIT,
     SHAPE_OFFSET, VAL_GCTHING_TAG_MIN, ZONE_NEEDS_BARRIER_OFFSET,
@@ -181,6 +182,7 @@ struct Lower<'a> {
     exit_census: Option<Func>,
     ctor_stamp: Option<[u32; 3]>,
     strict: bool,
+    plain_env: bool,
 }
 
 /// Per-script lowering choices besides the function itself.
@@ -195,6 +197,8 @@ pub struct LowerOpts {
     pub ctor_stamp: Option<[u32; 3]>,
     /// Strict-mode code: a field store's generic fallback throws on failure.
     pub strict: bool,
+    /// The activation's environment is its callee's (`baseline::env_is_plain`).
+    pub plain_env: bool,
 }
 
 /// Lower `f` (a function of `mm`, whose baseline frame is `layout`) into a
@@ -249,6 +253,7 @@ pub fn lower<'a>(
         exit_census: if o.exit_census { h.census } else { None },
         ctor_stamp: o.ctor_stamp,
         strict: o.strict,
+        plain_env: o.plain_env,
     };
     l.run()?;
     Ok(Lowered {
@@ -692,9 +697,18 @@ impl<'a> Lower<'a> {
         for j in 0..l.nlocals {
             self.store_i64(vp, l.local(j), undef);
         }
-        for off in [l.env(), l.args_obj(), l.rval()] {
+        for off in [l.args_obj(), l.rval()] {
             self.store_i64(vp, off, undef);
         }
+        // The environment: the callee's own, or none (§5.1).
+        let env = if self.plain_env {
+            let callee = self.load_i64(self.sp, 0);
+            let f = self.un(Operator::I32WrapI64, callee, Type::I32);
+            self.load_i64(f, FUNC_ENV_SLOT_OFFSET)
+        } else {
+            undef
+        };
+        self.store_i64(vp, l.env(), env);
         self.store_i64(vp, l.new_target(), self.new_target);
         let zero = self.i64c(TAG_INT32 << 32);
         self.store_i64(vp, l.resume(), zero);
@@ -1205,6 +1219,41 @@ impl<'a> Lower<'a> {
                 let f = self.h.constant_strict_eq;
                 let v = self.call1(f, &[self.cx, a[0], kv], Type::I32);
                 self.def(inst, v);
+            }
+            // The activation's environment is fixed (§5.1): the frame's env
+            // slot, which the fresh entry (or baseline, before an onramp)
+            // set, and which is rooted with the frame.
+            Opcode::EnvCurrent => {
+                let env = self.load_i64(self.sp, self.layout.env());
+                let p = self.un(Operator::I32WrapI64, env, Type::I32);
+                self.def(inst, p);
+            }
+            // `EnvironmentObject::ENCLOSING_ENV_SLOT`, always fixed.
+            Opcode::EnvParent => {
+                let env = self.load_i64(a[0], FIXED_SLOTS_BASE);
+                let p = self.un(Operator::I32WrapI64, env, Type::I32);
+                self.def(inst, p);
+            }
+            Opcode::EnvLoad(slot) => {
+                let addr = self.slot_addr(a[0], slot.get());
+                let v = self.load_i64(addr, 0);
+                self.def(inst, v);
+            }
+            Opcode::EnvStore(slot) => {
+                // A leaf with its barriers: `setAliasedBinding` zero hops up.
+                let env = self.box_tagged(TAG_OBJECT, a[0]);
+                let (z, s) = (self.i32c(0), self.i32c(slot.get()));
+                self.call(self.h.set_aliased, &[self.cx, env, z, s, a[1]], &[]);
+            }
+            Opcode::JsLambda(index) => {
+                let env = self.box_tagged(TAG_OBJECT, a[0]);
+                let script = self.script_ptr();
+                let i = self.i32c(index);
+                let live = self.live_across(inst);
+                let (ok, r) = self.gc_call(self.h.lambda, &[env, script, i], &live)?;
+                let t = self.edge(inst, 0, &[r])?;
+                let e = self.edge(inst, 1, &[])?;
+                self.cond_br(ok, t, e);
             }
             Opcode::JsGetName(name) => {
                 // `ok` and `err` (a static kill): not a clean/dirty op.
@@ -1758,6 +1807,37 @@ impl<'a> Lower<'a> {
         Ok(())
     }
 
+    /// The address of native object `obj`'s slot `slot`: a fixed slot if
+    /// the shape has that many, else a dynamic one.
+    fn slot_addr(&mut self, obj: Value, slot: u32) -> Value {
+        let shape = self.load_i32(obj, SHAPE_OFFSET);
+        let flags = self.load_i32(shape, SHAPE_IMMUTABLE_FLAGS_OFFSET);
+        let sh = self.i32c(SHAPE_FIXED_SLOTS_SHIFT);
+        let n = self.bin(Operator::I32ShrU, flags, sh, Type::I32);
+        let m = self.i32c(SHAPE_FIXED_SLOTS_MASK_BITS);
+        let nfixed = self.bin(Operator::I32And, n, m, Type::I32);
+        let s = self.i32c(slot);
+        let fixed = self.bin(Operator::I32LtU, s, nfixed, Type::I32);
+        let base = self.i32c(FIXED_SLOTS_BASE);
+        let fixed_base = self.bin(Operator::I32Add, obj, base, Type::I32);
+        let fixed_addr = self.i32c(8 * slot);
+        let fixed_addr = self.bin(Operator::I32Add, fixed_base, fixed_addr, Type::I32);
+        let slots = self.load_i32(obj, NATIVE_SLOTS_OFFSET);
+        let rel = self.bin(Operator::I32Sub, s, nfixed, Type::I32);
+        let eight = self.i32c(8);
+        let off = self.bin(Operator::I32Mul, rel, eight, Type::I32);
+        let dyn_addr = self.bin(Operator::I32Add, slots, off, Type::I32);
+        self.op(Operator::Select, &[fixed_addr, dyn_addr, fixed], Some(Type::I32))
+    }
+
+    /// The script's `JSScript*`, re-derived from the callee (a rooted frame
+    /// slot), as baseline's `script_ptr`.
+    fn script_ptr(&mut self) -> Value {
+        let callee = self.load_i64(self.sp, 0);
+        let f = self.un(Operator::I32WrapI64, callee, Type::I32);
+        self.load_i32(f, FUNC_SCRIPT_SLOT_OFFSET)
+    }
+
     /// Branch to `fail` unless `cond`.
     fn check(&mut self, cond: Value, fail: Block) {
         let cont = self.body.add_block();
@@ -1962,10 +2042,10 @@ impl<'a> Lower<'a> {
         for (k, &v) in fp.stack.iter().enumerate() {
             self.store_i64(vp, l.operand(u32::try_from(k).unwrap()), v);
         }
-        // The fixed slots, as the prologue would have set them. MIR declines
-        // scripts with an env chain or an arguments object.
+        // The fixed slots, as the prologue would have set them. The env
+        // slot is fixed for the activation and already set; MIR declines
+        // scripts with an arguments object.
         let undef = self.i64c(UNDEF);
-        self.store_i64(vp, l.env(), undef);
         self.store_i64(vp, l.args_obj(), undef);
         self.store_i64(vp, l.new_target(), self.new_target);
         let word = self.i64c((TAG_INT32 << 32) | u64::from(w.encode() as u32));

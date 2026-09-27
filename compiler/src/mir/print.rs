@@ -354,6 +354,7 @@ pub fn mnemonic(op: &Opcode) -> String {
         JsGetName(_) => "js.getname".into(),
         JsBoxThis => "js.box_this".into(),
         JsBindGName(_) => "js.bindgname".into(),
+        JsLambda(_) => "js.lambda".into(),
         JsSetName(_, false) => "js.setname".into(),
         JsSetName(_, true) => "js.setname.strict".into(),
         LoadField(_) => "load_field".into(),
@@ -428,6 +429,7 @@ fn immediates(m: &Module, op: &Opcode) -> Option<String> {
         CheckNative(n) | CallNative(n) => n.to_string(),
         NewObject(k) => format!("L{k}"),
         EnvLoad(s) | EnvStore(s) => s.to_string(),
+        JsLambda(k) => k.to_string(),
         _ => return None,
     })
 }

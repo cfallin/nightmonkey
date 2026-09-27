@@ -204,7 +204,12 @@ pub fn build(
     if fl.rebase_vp || script.has_mapped_args {
         return Err("reads actuals".into());
     }
-    if crate::wasm::baseline::needs_env(script) {
+    // An env chain is supported while it is fixed for the whole
+    // activation (§5.1): the callee's own environment, with no scope of
+    // this script's pushing one (those ops decline one by one).
+    if crate::wasm::baseline::needs_env(script)
+        && !crate::wasm::baseline::env_is_plain(ctx.source, script)
+    {
         return Err("env chain".into());
     }
     let depths = StackDepths::compute(script).map_err(|e| format!("stack depths ({e})"))?;
@@ -214,8 +219,15 @@ pub fn build(
             continue;
         }
         if let crate::source::SourceObject::String(s) = ctx.source.object(gc) {
-            if let Some(fg) = names.lookup(s.chars()).and_then(|n| ctx.fused_gnames.get(&n)) {
-                shape.fused.insert(u32::try_from(i).unwrap(), *fg);
+            let Some(n) = names.lookup(s.chars()) else {
+                continue;
+            };
+            let i = u32::try_from(i).unwrap();
+            if let Some(fg) = ctx.fused_gnames.get(&n) {
+                shape.fused.insert(i, *fg);
+            }
+            if let Some(c) = ctx.facts.gname_types.get(&n) {
+                shape.gname_types.insert(i, *c);
             }
         }
     }
@@ -416,6 +428,9 @@ struct Shape<'a> {
     wrap_ok: std::collections::BTreeSet<Pc>,
     /// Per gcthing index naming a fused global: its fuse and literal.
     fused: BTreeMap<u32, crate::wasm::translate::FusedGname>,
+    /// Per gcthing index naming a global: the analysis's likely type
+    /// (`gname_types`), guarded at the def.
+    gname_types: BTreeMap<u32, crate::facts::Claim>,
 }
 
 impl<'a> Shape<'a> {
@@ -457,6 +472,7 @@ impl<'a> Shape<'a> {
             live,
             wrap_ok,
             fused: BTreeMap::new(),
+            gname_types: BTreeMap::new(),
         })
     }
 
@@ -872,6 +888,17 @@ impl<'s, 'a> Run<'s, 'a> {
         };
         self.push(v, ty);
         true
+    }
+
+    /// The environment `hops` links up the chain from the activation's
+    /// (which is fixed: see `build`).
+    fn env_at(&mut self, hops: u16) -> mir::Value {
+        let env = MType::Obj(ObjInfo::kind(ObjKind::Env));
+        let mut e = self.inst(Opcode::EnvCurrent, vec![], Some(env.clone()));
+        for _ in 0..hops {
+            e = self.inst(Opcode::EnvParent, vec![e], Some(env.clone()));
+        }
+        e
     }
 
     /// The atom for gcthing `index` (a name), in the module's table.
@@ -1487,8 +1514,8 @@ impl<'s, 'a> Run<'s, 'a> {
         let mut p = self.s.imms(pc);
         let int_ty = Ty::I32;
         match op {
-            // (`DebugLeaveLexicalEnv` only matters with an env chain, which
-            // MIR declines.)
+            // (`DebugLeaveLexicalEnv` only matters with lexical
+            // environments, which MIR declines.)
             Nop | Lineno | JumpTarget | LoopHead | NopDestructuring | NopIsAssignOp
             | DebugLeaveLexicalEnv => {}
 
@@ -1561,7 +1588,34 @@ impl<'s, 'a> Run<'s, 'a> {
                 let ix = self.rval_ix();
                 self.st[ix] = x;
             }
-            CheckLexical => {
+            GetAliasedVar | GetAliasedDebugVar => {
+                let hops = p.next_uint16().unwrap();
+                let slot = p.next_uint24().unwrap();
+                let e = self.env_at(hops);
+                let v = self.inst(
+                    Opcode::EnvLoad(crate::ids::EnvSlot::new(slot)),
+                    vec![e],
+                    Some(MType::VAL_TOP),
+                );
+                self.push(v, Ty::Val(TagSet::ALL));
+                let claim = self.s.ctx.facts.aliased_sites.get(&self.site(pc)).copied();
+                self.guard_result(claim.unwrap_or_default(), pc + op.len());
+            }
+            SetAliasedVar | InitAliasedLexical => {
+                let hops = p.next_uint16().unwrap();
+                let slot = p.next_uint24().unwrap();
+                let x = self.top();
+                let v = self.boxed(x);
+                let e = self.env_at(hops);
+                self.inst(Opcode::EnvStore(crate::ids::EnvSlot::new(slot)), vec![e, v], None);
+            }
+            Lambda => {
+                let index = p.next_uint32().unwrap();
+                let e = self.env_at(0);
+                let r = self.js_static(Opcode::JsLambda(index), vec![e], MType::val(TagSet::OBJECT));
+                self.push(r, Ty::Val(TagSet::OBJECT));
+            }
+            CheckLexical | CheckAliasedLexical => {
                 // The top may be the TDZ sentinel only if its type admits
                 // magic; then guard it away (baseline throws on failure).
                 let x = self.top();
@@ -2135,6 +2189,9 @@ impl<'s, 'a> Run<'s, 'a> {
                 }
                 let r = self.js_static(Opcode::JsGetName(a), vec![], MType::VAL_TOP);
                 self.push(r, Ty::Val(TagSet::ALL));
+                if let Some(&claim) = self.s.gname_types.get(&index) {
+                    self.guard_result(claim, pc + op.len());
+                }
             }
             GetProp => {
                 let a = self.atom(p.next_uint32().unwrap())?;
