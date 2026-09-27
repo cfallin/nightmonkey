@@ -1457,6 +1457,17 @@ the numbers call for it.
 richards put the gap to bbv here: bbv's hot loop inlines the small task
 methods, and MIR calls them, paying `night_call_classify` and a
 `call_indirect` per call.
+- **Implemented as designed in §5.5**, in `wasm/mir/inline.rs` and the
+  builder's `inline_call`. Callees must be at most
+  `INLINE_MAX_BYTECODE` (200) bytes and at most 800 MIR instructions.
+  Nesting goes at most 2 deep, and a site takes at most 4 targets.
+- The `guard.script` check is inline: a function class, the script
+  slot, and a compiled script. Unpredicted property reads have way 0 of
+  their IC inline: the own fixed slot, then the prototype holder.
+- Structured control flow in waffle's backend (lowering, and drop of the
+  `WasmBlock` tree) is now iterative. MIR's guard chains nest deep
+  enough to overflow a rayon worker's stack (pdfjs).
+- AOT richards: 3318 → 7442 (legacy bbv: 11886).
 
 **M6. The rest of §10**: box/unbox cleanup, memory optimizations, and
 numeric optimizations, each with its guard-count and instruction-count

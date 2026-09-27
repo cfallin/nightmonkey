@@ -52,7 +52,9 @@ use crate::wasm::bbv::abi::{
     BINOP_BITAND, BINOP_BITNOT, BINOP_BITOR, BINOP_BITXOR, BINOP_DEC, BINOP_DIV, BINOP_INC,
     BINOP_LSH, BINOP_MOD, BINOP_MUL, BINOP_RSH, BINOP_SUB, BINOP_URSH, CLASS_WORD_SHALLOW,
     CLASS_WORD_RANGES, CLASS_WORD_SLOTS, IC_SET_ABSSLOT, IC_SET_RECVSHAPE, IC_SET_SLOTENC,
-    IC_WAY_ADDR_PLACEHOLDER, NATIVE_SLOTS_OFFSET, FUNC_ENV_SLOT_OFFSET, FUNC_SCRIPT_SLOT_OFFSET,
+    IC_WAY_HOLDERPTR, IC_WAY_MONO_OFF, IC_WAY_RECVSHAPE,
+    IC_WAY_ADDR_PLACEHOLDER, NATIVE_SLOTS_OFFSET, SHAPE_BASESHAPE_OFFSET, BASESHAPE_CLASP_OFFSET,
+    BASESCRIPT_NIGHTFUNCINDEX_OFFSET, FUNC_ENV_SLOT_OFFSET, FUNC_SCRIPT_SLOT_OFFSET,
     SHAPE_FIXED_SLOTS_MASK_BITS, SHAPE_FIXED_SLOTS_SHIFT, JSCONTEXT_REALM_OFFSET,
     REALM_GLOBAL_OFFSET, CHUNK_STORE_BUFFER_OFFSET, CMP_EQ, CMP_GE, CMP_GT, CMP_LE, CMP_LT, CMP_NE, CMP_STRICTEQ, CMP_STRICTNE,
     ELEMENTS_FLAGS_BACK, ELEMENTS_FROZEN_FLAG, ELEMENTS_INITLEN_BACK, FIXED_SLOTS_BASE, FLAGS_ALL, OBJ_CLASS_IDX_OFFSET, OBJ_ELEMENTS_OFFSET,
@@ -65,6 +67,9 @@ use crate::wasm::translate::{
 };
 
 type R<T> = Result<T, String>;
+
+/// Whether global binding writes get their inline arm.
+const INLINE_GNAME_SETS: bool = false;
 
 const UNDEF: u64 = TAG_UNDEFINED << 32;
 
@@ -194,6 +199,17 @@ struct Lower<'a> {
     root_base: u32,
     /// The baseline frame's deepest operand stack.
     max_depth: u32,
+    /// With inlined callees (§5.5): the rooting area's size in slots (the
+    /// most managed values live anywhere), and per frame id its base and
+    /// end offsets from `sp` and its layout. Frame 0 is the function's;
+    /// its end is the rooting area's.
+    inline: bool,
+    root_slots: u32,
+    frame_off: Vec<u32>,
+    frame_end: Vec<u32>,
+    frame_layouts: Vec<FrameLayout>,
+    /// The frame of the instruction being lowered.
+    cur_frame: u32,
     baseline_calls: Vec<Value>,
     /// The stress mode's period (`Options::mir_stress`); 0 = off.
     stress: u32,
@@ -218,6 +234,9 @@ struct Lower<'a> {
     /// The syntactic global binding (`TranslateCtx::syn_gnames`) each
     /// global name read names, for its inline arms.
     gname_bids: BTreeMap<mir::entity::AtomId, u32>,
+    /// Each global name with a fused literal (`fused_gnames`), which an
+    /// inline write must keep.
+    gname_fused: BTreeMap<mir::entity::AtomId, crate::wasm::translate::FusedGname>,
 }
 
 /// Per-script lowering choices besides the function itself.
@@ -251,6 +270,7 @@ pub fn lower<'a>(
     max_depth: u32,
     o: LowerOpts,
     gname_bids: BTreeMap<mir::entity::AtomId, u32>,
+    gname_fused: BTreeMap<mir::entity::AtomId, crate::wasm::translate::FusedGname>,
 ) -> R<Lowered> {
     if layout.rebase_vp {
         return Err("lowering: a script that reads its actuals".into());
@@ -281,6 +301,12 @@ pub fn lower<'a>(
         vmap: BTreeMap::new(),
         root_base,
         max_depth,
+        inline: !f.inline_frames.is_empty(),
+        root_slots: 0,
+        frame_off: vec![0],
+        frame_end: vec![root_base],
+        frame_layouts: vec![layout],
+        cur_frame: 0,
         baseline_calls: vec![],
         stress: o.stress,
         has_onramps: f.roots.iter().any(|r| r.kind != RootKind::Entry),
@@ -296,6 +322,7 @@ pub fn lower<'a>(
         plain_env: o.plain_env,
         forward_resume: o.forward_resume,
         gname_bids,
+        gname_fused,
     };
     l.run()?;
     Ok(Lowered {
@@ -364,6 +391,11 @@ impl<'a> Lower<'a> {
     fn store_i64(&mut self, addr: Value, offset: u32, v: Value) {
         let m = self.mem(3, offset);
         self.op(Operator::I64Store { memory: m }, &[addr, v], None);
+    }
+
+    fn store_i32(&mut self, addr: Value, offset: u32, v: Value) {
+        let m = self.mem(2, offset);
+        self.op(Operator::I32Store { memory: m }, &[addr, v], None);
     }
 
     fn add_off(&mut self, addr: Value, off: u32) -> Value {
@@ -617,6 +649,9 @@ impl<'a> Lower<'a> {
         let f = self.f;
         let reach = self.reachable();
         self.liveness(&reach);
+        if self.inline {
+            self.inline_layout(&reach);
+        }
         // Waffle blocks: the block's own params, then its carried values.
         for &b in &f.layout {
             if !reach.contains(&b) {
@@ -771,6 +806,7 @@ impl<'a> Lower<'a> {
         for k in 0..self.max_depth {
             self.store_i64(vp, l.operand(k), undef);
         }
+        self.init_root_area();
         let params = self.f.blocks[root].params.clone();
         if params.len() != vals.len() {
             return Err("lowering: the entry root's params are not the frame".into());
@@ -818,6 +854,7 @@ impl<'a> Lower<'a> {
         for k in depth..self.max_depth {
             self.store_i64(vp, l.operand(k), undef);
         }
+        self.init_root_area();
         if vals.len() != self.f.blocks[root].params.len() {
             return Err("lowering: an onramp root's params are not the frame".into());
         }
@@ -939,7 +976,7 @@ impl<'a> Lower<'a> {
     /// and the boxed result it wrote at `top`.
     fn gc_call(&mut self, f: Func, args: &[Value], live: &[mir::Value]) -> R<(Value, Value)> {
         self.spill(live)?;
-        let top_off = self.root_base + 8 * u32::try_from(live.len()).unwrap();
+        let top_off = self.top_off(live.len());
         let top = self.add_off(self.sp, top_off);
         let mut full = vec![self.cx, top];
         full.extend_from_slice(args);
@@ -947,6 +984,64 @@ impl<'a> Lower<'a> {
         self.reload(live)?;
         let result = self.load_i64(self.sp, top_off);
         Ok((ok, result))
+    }
+
+    /// The first free byte above everything this instruction's frame
+    /// chain holds, as an offset from `sp`: where a helper's out-slot and
+    /// GC scan limit, and a real call's frame, go. Without inlined
+    /// callees, just past the `live` rooting slots; with them, past the
+    /// instruction's own inline frame (the rooting area, of fixed size,
+    /// sits below every inline frame).
+    fn top_off(&self, live: usize) -> u32 {
+        if self.inline {
+            self.frame_end[self.cur_frame as usize]
+        } else {
+            self.root_base + 8 * u32::try_from(live).unwrap()
+        }
+    }
+
+    /// Lay out the rooting area and the inline frames (§5.5). The area
+    /// holds at most the managed values live into a block plus those
+    /// defined in it; each inline frame sits at its parent's end.
+    fn inline_layout(&mut self, reach: &BTreeSet<mir::Block>) {
+        let f = self.f;
+        let mut r = 0usize;
+        for &b in &f.layout {
+            if !reach.contains(&b) {
+                continue;
+            }
+            let mut n = self.live_in[&b].iter().filter(|&&v| is_managed(&self.ty(v))).count();
+            n += f.blocks[b].params.iter().filter(|&&v| is_managed(&self.ty(v))).count();
+            for &inst in &f.blocks[b].insts {
+                n += f.insts[inst].results.iter().filter(|&&v| is_managed(&self.ty(v))).count();
+            }
+            r = r.max(n);
+        }
+        self.root_slots = u32::try_from(r).unwrap();
+        self.frame_end[0] = self.root_base + 8 * self.root_slots;
+        for fr in &f.inline_frames {
+            let lay = FrameLayout {
+                nargs: fr.shape.formals,
+                nlocals: fr.shape.locals,
+                rebase_vp: false,
+            };
+            let off = self.frame_end[fr.parent as usize];
+            self.frame_off.push(off);
+            self.frame_end.push(off + lay.top(fr.max_depth + 3));
+            self.frame_layouts.push(lay);
+        }
+    }
+
+    /// Make the rooting area valid Values: with inline frames, helpers'
+    /// GC scan limit lies above it whatever is live.
+    fn init_root_area(&mut self) {
+        if !self.inline {
+            return;
+        }
+        let undef = self.i64c(UNDEF);
+        for i in 0..self.root_slots {
+            self.store_i64(self.sp, self.root_base + 8 * i, undef);
+        }
     }
 
     /// Store `live` (managed values), boxed, to the rooting slots.
@@ -981,6 +1076,7 @@ impl<'a> Lower<'a> {
     }
 
     fn inst(&mut self, inst: mir::Inst) -> R<()> {
+        self.cur_frame = self.f.inst_frame[inst];
         let d = self.f.insts[inst].clone();
         let a = self.args(inst)?;
         let at = |i: usize| self.f.values[d.args[i]].ty;
@@ -1284,7 +1380,8 @@ impl<'a> Lower<'a> {
             // slot, which the fresh entry (or baseline, before an onramp)
             // set, and which is rooted with the frame.
             Opcode::EnvCurrent => {
-                let env = self.load_i64(self.sp, self.layout.env());
+                let fid = self.cur_frame as usize;
+                let env = self.load_i64(self.sp, self.frame_off[fid] + self.frame_layouts[fid].env());
                 let p = self.un(Operator::I32WrapI64, env, Type::I32);
                 self.def(inst, p);
             }
@@ -1306,14 +1403,16 @@ impl<'a> Lower<'a> {
                 self.call(self.h.set_aliased, &[self.cx, env, z, s, a[1]], &[]);
             }
             Opcode::FrameStore(k) => {
-                let (nargs, nlocals) = (self.f.frame.formals, self.f.frame.locals);
-                let l = self.layout;
-                let off = match k {
-                    0 => FrameLayout::THIS,
-                    k if k <= nargs => l.arg(k - 1),
-                    k if k <= nargs + nlocals => l.local(k - 1 - nargs),
-                    _ => l.rval(),
-                };
+                let fid = self.cur_frame as usize;
+                let l = self.frame_layouts[fid];
+                let (nargs, nlocals) = (l.nargs, l.nlocals);
+                let off = self.frame_off[fid]
+                    + match k {
+                        0 => FrameLayout::THIS,
+                        k if k <= nargs => l.arg(k - 1),
+                        k if k <= nargs + nlocals => l.local(k - 1 - nargs),
+                        _ => l.rval(),
+                    };
                 // The Value it is. A double goes in as a double (NaN made
                 // canonical, as any boxed double must be), not re-tagged
                 // as an int32: `box_number` is not needed for validity.
@@ -1360,6 +1459,9 @@ impl<'a> Lower<'a> {
                 let cache = self.atoms.next_prop_cache();
                 let way_base = self.i32c(IC_WAY_ADDR_PLACEHOLDER);
                 self.prop_ic_patches.push((way_base, cache * INLINE_IC_STRIDE));
+                let probe = self.body.add_block();
+                self.get_ic_way0(inst, a[0], way_base, probe)?;
+                self.cur = probe;
                 let r = self.call(self.h.ic_get_poly, &[a[0], at, way_base], &[Type::I64]);
                 let tag = self.tag_of(r);
                 let miss = self.tag_is(tag, TAG_MAGIC as u32);
@@ -1429,6 +1531,47 @@ impl<'a> Lower<'a> {
                 self.js_call(inst, self.h.set_element, &[a[0], a[1], a[2], sv], false)?;
             }
             Opcode::Call => self.js_call_op(inst, &a)?,
+            Opcode::GuardScript(sid) => {
+                // The callee is a function of `sid`'s script, which is
+                // compiled (§5.5): its class is a function class, its
+                // script slot is that script (a native's slot never is),
+                // and the script has a table index.
+                let addr = *self
+                    .mm
+                    .script_addrs
+                    .get(&sid)
+                    .ok_or("lowering: guard.script without the script's address")?;
+                let shape = self.load_i32(a[0], SHAPE_OFFSET);
+                let base = self.load_i32(shape, SHAPE_BASESHAPE_OFFSET);
+                let clasp = self.load_i32(base, BASESHAPE_CLASP_OFFSET);
+                let slot = self.i32c(self.h.fn_class_slot);
+                let fn_class = self.load_i32(slot, 0);
+                let ext_class = self.load_i32(slot, 4);
+                let is_fn = self.bin(Operator::I32Eq, clasp, fn_class, Type::I32);
+                let is_ext = self.bin(Operator::I32Eq, clasp, ext_class, Type::I32);
+                let is_function = self.bin(Operator::I32Or, is_fn, is_ext, Type::I32);
+                let (fun_b, fail_b) = (self.body.add_block(), self.body.add_block());
+                self.cond_br(is_function, Self::to(fun_b), Self::to(fail_b));
+                self.cur = fun_b;
+                let script = self.load_i32(a[0], FUNC_SCRIPT_SLOT_OFFSET);
+                let want = self.i32c(addr);
+                let same = self.bin(Operator::I32Eq, script, want, Type::I32);
+                let idx_addr = self.i32c(addr);
+                let idx = self.load_i32(idx_addr, BASESCRIPT_NIGHTFUNCINDEX_OFFSET);
+                let z = self.i32c(0);
+                let compiled = self.bin(Operator::I32Ne, idx, z, Type::I32);
+                let ok = self.bin(Operator::I32And, same, compiled, Type::I32);
+                let t = self.edge(inst, 0, &[a[0]])?;
+                let e = self.edge(inst, 1, &[])?;
+                self.cond_br(ok, t, e);
+                self.cur = fail_b;
+                let e = self.edge(inst, 1, &[])?;
+                self.terminate(Terminator::Br { target: e });
+            }
+            Opcode::InlineEnter => self.inline_enter(&d, &a)?,
+            Opcode::ExitInline { pc, nargs, nlocals, throw } => {
+                self.exit_inline(inst, &d, &a, pc, nargs, nlocals, throw)?
+            }
             Opcode::Construct(nslots, word) => {
                 // The frame `[callee, this, args…, new.target]` above the
                 // rooting slots, then the runtime's construct (it creates
@@ -1436,7 +1579,7 @@ impl<'a> Lower<'a> {
                 // constructor). The result lands at the frame's top.
                 let live = self.live_across(inst);
                 self.spill(&live)?;
-                let frame = self.root_base + 8 * u32::try_from(live.len()).unwrap();
+                let frame = self.top_off(live.len());
                 for (k, &v) in a.iter().enumerate() {
                     self.store_i64(self.sp, frame + 8 * u32::try_from(k).unwrap(), v);
                 }
@@ -1496,6 +1639,10 @@ impl<'a> Lower<'a> {
                 self.js_call(inst, self.h.bind_unqualified_gname, &[at], false)?;
             }
             Opcode::JsSetName(name, strict) => {
+                if let Some(&bid) = self.gname_bids.get(&name).filter(|_| INLINE_GNAME_SETS) {
+                    let fused = self.gname_fused.get(&name).copied();
+                    self.gname_set_arms(inst, bid, a[1], fused)?;
+                }
                 let at = self.atom(name);
                 let sv = self.i32c(u32::from(strict));
                 self.js_call(inst, self.h.set_name, &[a[0], at, a[1], sv], false)?;
@@ -1660,6 +1807,127 @@ impl<'a> Lower<'a> {
         let addr = self.bin(Operator::I32Add, slot_base, off, Type::I32);
         let v = self.load_i64(addr, 0);
         let t = self.edge(inst, 0, &[v])?;
+        self.terminate(Terminator::Br { target: t });
+        self.cur = slow;
+        Ok(())
+    }
+
+    /// The inline arm of a write to syntactic global binding `bid` (bbv's
+    /// `emit_set_name_inline_guarded`), taking `ok_clean`: with the
+    /// binding's slot row resolved against the global's live shape (or
+    /// re-resolved by the leaf) and writable, store `val` with barriers,
+    /// then keep the binding's value fuse, the bind epoch and a fused
+    /// literal's fuse as the generic store would. Falls through to the
+    /// helper otherwise (accessors, lexicals, read-only, undeclared).
+    fn gname_set_arms(
+        &mut self,
+        inst: mir::Inst,
+        bid: u32,
+        val: Value,
+        fused: Option<crate::wasm::translate::FusedGname>,
+    ) -> R<()> {
+        let base = self.i32c(self.h.global_slots_base);
+        let entry0 = self.load_i32(base, 8 * bid);
+        let shape0 = self.load_i32(base, 8 * bid + 4);
+        let one = self.i32c(1);
+        let two = self.i32c(2);
+        let writable = |l: &mut Self, e: Value| {
+            let r = l.bin(Operator::I32And, e, one, Type::I32);
+            let sh = l.bin(Operator::I32ShrU, e, two, Type::I32);
+            let w = l.bin(Operator::I32And, sh, one, Type::I32);
+            l.bin(Operator::I32And, r, w, Type::I32)
+        };
+        let rw0 = writable(self, entry0);
+        let realm = self.load_i32(self.cx, JSCONTEXT_REALM_OFFSET);
+        let global = self.load_i32(realm, REALM_GLOBAL_OFFSET);
+        let live = self.load_i32(global, SHAPE_OFFSET);
+        let same = self.bin(Operator::I32Eq, shape0, live, Type::I32);
+        let hit = self.bin(Operator::I32And, rw0, same, Type::I32);
+        let use_b = self.body.add_block();
+        let entry = self.body.add_blockparam(use_b, Type::I32);
+        let resolve_b = self.body.add_block();
+        self.cond_br(hit, BlockTarget { block: use_b, args: vec![entry0] }, Self::to(resolve_b));
+        self.cur = resolve_b;
+        let b = self.i32c(bid);
+        let entry1 = self.call1(self.h.resolve_global_slot_guarded, &[self.cx, b], Type::I32);
+        let rw1 = writable(self, entry1);
+        let slow = self.body.add_block();
+        self.cond_br(rw1, BlockTarget { block: use_b, args: vec![entry1] }, Self::to(slow));
+
+        self.cur = use_b;
+        // Entry: bit 1 selects the dynamic slots, `entry & !7` is the byte
+        // offset from that base, `entry >> 3` the slot index within it.
+        let sh = self.bin(Operator::I32ShrU, entry, one, Type::I32);
+        let dynamic = self.bin(Operator::I32And, sh, one, Type::I32);
+        let m = self.i32c(!7);
+        let idx8 = self.bin(Operator::I32And, entry, m, Type::I32);
+        let z = self.i32c(0);
+        let fb = self.i32c(FIXED_SLOTS_BASE);
+        let add = self.select(Type::I32, z, fb, dynamic);
+        let off = self.bin(Operator::I32Add, idx8, add, Type::I32);
+        let slots = self.load_i32(global, NATIVE_SLOTS_OFFSET);
+        let slot_base = self.select(Type::I32, slots, global, dynamic);
+        let addr = self.bin(Operator::I32Add, slot_base, off, Type::I32);
+        self.pre_barrier(addr, 0);
+        self.store_i64(addr, 0, val);
+        let three = self.i32c(3);
+        let idx = self.bin(Operator::I32ShrU, entry, three, Type::I32);
+        let flags = self.load_i32(live, SHAPE_IMMUTABLE_FLAGS_OFFSET);
+        let fs = self.i32c(SHAPE_FIXED_SLOTS_SHIFT);
+        let nf = self.bin(Operator::I32ShrU, flags, fs, Type::I32);
+        let fm = self.i32c(SHAPE_FIXED_SLOTS_MASK_BITS);
+        let nfixed = self.bin(Operator::I32And, nf, fm, Type::I32);
+        let idx_plus = self.bin(Operator::I32Add, idx, nfixed, Type::I32);
+        let abs = self.select(Type::I32, idx_plus, idx, dynamic);
+        self.post_barrier(self.h.post_write_barrier, global, abs, val);
+        // The binding's value fuse (`gGlobalVals[bid]`): an armed cell whose
+        // value changes mirrors a non-GC value in place, and otherwise is
+        // unarmed with the re-arm left to the runtime (bbv's
+        // `emit_blow_binding_value_fuse`).
+        let vals = self.i32c(self.h.global_vals_base + 16 * bid);
+        let fw = self.load_i32(vals, 8);
+        let armed = self.bin(Operator::I32Eq, fw, one, Type::I32);
+        let old = self.load_i64(vals, 0);
+        let changed = self.bin(Operator::I64Ne, old, val, Type::I32);
+        let blow = self.bin(Operator::I32And, armed, changed, Type::I32);
+        let (blow_b, cont) = (self.body.add_block(), self.body.add_block());
+        self.cond_br(blow, Self::to(blow_b), Self::to(cont));
+        self.cur = blow_b;
+        let tag = self.tag_of(val);
+        let st = self.i32c(TAG_STRING as u32);
+        let is_gc = self.bin(Operator::I32GeU, tag, st, Type::I32);
+        let (gc_b, plain_b) = (self.body.add_block(), self.body.add_block());
+        self.cond_br(is_gc, Self::to(gc_b), Self::to(plain_b));
+        self.cur = plain_b;
+        self.store_i64(vals, 0, val);
+        self.terminate(Terminator::Br { target: Self::to(cont) });
+        self.cur = gc_b;
+        let z = self.i32c(0);
+        self.store_i32(vals, 8, z);
+        let b = self.i32c(bid);
+        self.call(self.h.binding_written, &[b], &[]);
+        self.terminate(Terminator::Br { target: Self::to(cont) });
+        self.cur = cont;
+        // The bind epoch.
+        let slot = self.i32c(self.h.strlit_slot + crate::region_shape::STRLIT_BIND_EPOCH_ADDR_OFF);
+        let ep = self.load_i32(slot, 0);
+        let e = self.load_i32(ep, 0);
+        let e1 = self.bin(Operator::I32Add, e, one, Type::I32);
+        self.store_i32(ep, 0, e1);
+        // A fused literal's fuse: the literal arms it, anything else blows
+        // it.
+        if let Some(fg) = fused {
+            let fa = self.i32c(fg.fuse_addr);
+            let f = self.load_i32(fa, 0);
+            let lit = self.i64c(fg.boxed);
+            let neq = self.bin(Operator::I64Ne, val, lit, Type::I32);
+            let z = self.i32c(0);
+            let is_zero = self.bin(Operator::I32Eq, f, z, Type::I32);
+            let armed = self.select(Type::I32, one, f, is_zero);
+            let nf = self.select(Type::I32, two, armed, neq);
+            self.store_i32(fa, 0, nf);
+        }
+        let t = self.edge(inst, 0, &[])?;
         self.terminate(Terminator::Br { target: t });
         self.cur = slow;
         Ok(())
@@ -2127,6 +2395,48 @@ impl<'a> Lower<'a> {
         self.cur = cont;
     }
 
+    /// A get IC's way 0 inline (bbv's `emit_get_ic_inline_arms`, one way):
+    /// with `recv` an object of the way's shape, the value from its own
+    /// fixed slot, or through the way's holder (a prototype method) while
+    /// the holder keeps its shape, taking `ok_clean`; else `probe`.
+    fn get_ic_way0(&mut self, inst: mir::Inst, recv: Value, way: Value, probe: Block) -> R<()> {
+        let tag = self.tag_of(recv);
+        let is_obj = self.tag_is(tag, TAG_OBJECT as u32);
+        self.check(is_obj, probe);
+        let obj = self.un(Operator::I32WrapI64, recv, Type::I32);
+        let shape = self.load_i32(obj, SHAPE_OFFSET);
+        let wshape = self.load_i32(way, IC_WAY_RECVSHAPE);
+        let hit = self.bin(Operator::I32Eq, shape, wshape, Type::I32);
+        self.check(hit, probe);
+        let moff = self.load_i32(way, IC_WAY_MONO_OFF);
+        let (own, tail) = (self.body.add_block(), self.body.add_block());
+        self.cond_br(moff, Self::to(own), Self::to(tail));
+        self.cur = own;
+        let addr = self.bin(Operator::I32Add, obj, moff, Type::I32);
+        let v = self.load_i64(addr, 0);
+        let t = self.edge(inst, 0, &[v])?;
+        self.terminate(Terminator::Br { target: t });
+        self.cur = tail;
+        let hp = self.load_i32(way, IC_WAY_HOLDERPTR);
+        let chs = self.load_i32(way, IC_WAY_HOLDERPTR + 4);
+        let enc = self.load_i32(way, IC_WAY_HOLDERPTR + 8);
+        let base = self.select(Type::I32, hp, obj, hp);
+        let live = self.load_i32(base, SHAPE_OFFSET);
+        let same = self.bin(Operator::I32Eq, live, chs, Type::I32);
+        self.check(same, probe);
+        let one = self.i32c(1);
+        let dynamic = self.bin(Operator::I32And, enc, one, Type::I32);
+        let not1 = self.i32c(!1);
+        let off = self.bin(Operator::I32And, enc, not1, Type::I32);
+        let slots = self.load_i32(base, NATIVE_SLOTS_OFFSET);
+        let sb = self.select(Type::I32, slots, base, dynamic);
+        let addr = self.bin(Operator::I32Add, sb, off, Type::I32);
+        let v = self.load_i64(addr, 0);
+        let t = self.edge(inst, 0, &[v])?;
+        self.terminate(Terminator::Br { target: t });
+        Ok(())
+    }
+
     /// A set IC's way 0 (`bbv`'s `emit_set_prop_ic_inline` without its
     /// transition and megamorphic arms): with `recv` an object of the
     /// way's shape, store `val` to the slot the way names and take
@@ -2197,7 +2507,7 @@ impl<'a> Lower<'a> {
     /// The script's `JSScript*`, re-derived from the callee (a rooted frame
     /// slot), as baseline's `script_ptr`.
     fn script_ptr(&mut self) -> Value {
-        let callee = self.load_i64(self.sp, 0);
+        let callee = self.load_i64(self.sp, self.frame_off[self.cur_frame as usize]);
         let f = self.un(Operator::I32WrapI64, callee, Type::I32);
         self.load_i32(f, FUNC_SCRIPT_SLOT_OFFSET)
     }
@@ -2268,7 +2578,7 @@ impl<'a> Lower<'a> {
         const HEADROOM: u32 = 64 * 1024;
         let live = self.live_across(inst);
         self.spill(&live)?;
-        let frame = self.root_base + 8 * u32::try_from(live.len()).unwrap();
+        let frame = self.top_off(live.len());
         for (k, &v) in ops.iter().enumerate() {
             self.store_i64(self.sp, frame + 8 * u32::try_from(k).unwrap(), v);
         }
@@ -2277,22 +2587,7 @@ impl<'a> Lower<'a> {
         let base = self.add_off(self.sp, frame);
         let top = self.add_off(self.sp, top_off);
         let z = self.i32c(0);
-        let cls = {
-            let args = self.body.arg_pool.from_iter([ops[0], z, z].into_iter());
-            let tys = self
-                .body
-                .type_pool
-                .from_iter([Type::I32, Type::I32, Type::I32].into_iter());
-            self.push_val(ValueDef::Operator(
-                Operator::Call {
-                    function_index: self.h.call_classify,
-                },
-                args,
-                tys,
-            ))
-        };
-        let funcidx = self.push_val(ValueDef::PickOutput(cls, 0, Type::I32));
-        let script = self.push_val(ValueDef::PickOutput(cls, 1, Type::I32));
+        let (funcidx, script) = self.classify(ops[0]);
         let limit_addr = self.i32c(self.h.night_stack_limit_base);
         let limit = self.load_i32(limit_addr, 0);
         let hi = self.add_off(top, HEADROOM);
@@ -2354,6 +2649,172 @@ impl<'a> Lower<'a> {
         let result = self.load_i64(self.sp, top_off);
         let t = self.edge(inst, 1, &[result])?;
         let e = self.edge(inst, 2, &[])?;
+        self.cond_br(ok, t, e);
+        Ok(())
+    }
+
+    /// `night_call_classify` of boxed `callee`: its funcref-table index (0
+    /// when not compiled or not a scripted function) and its `JSScript*`.
+    fn classify(&mut self, callee: Value) -> (Value, Value) {
+        let z = self.i32c(0);
+        let args = self.body.arg_pool.from_iter([callee, z, z].into_iter());
+        let tys = self
+            .body
+            .type_pool
+            .from_iter([Type::I32, Type::I32, Type::I32].into_iter());
+        let cls = self.push_val(ValueDef::Operator(
+            Operator::Call {
+                function_index: self.h.call_classify,
+            },
+            args,
+            tys,
+        ));
+        let funcidx = self.push_val(ValueDef::PickOutput(cls, 0, Type::I32));
+        let script = self.push_val(ValueDef::PickOutput(cls, 1, Type::I32));
+        (funcidx, script)
+    }
+
+    /// `inline.enter` (§5.5): the inlined callee's frame, as its
+    /// prologue would write it, from `callee, this, formals`. Every slot
+    /// up to the frame's end is made a valid Value: helpers' GC scan limit
+    /// inside the callee is that end.
+    fn inline_enter(&mut self, d: &mir::func::InstData, a: &[Value]) -> R<()> {
+        let fid = self.cur_frame as usize;
+        let (base, l) = (self.frame_off[fid], self.frame_layouts[fid]);
+        let max_depth = self.f.inline_frames[fid - 1].max_depth;
+        if a.len() != 2 + l.nargs as usize {
+            return Err("lowering: inline.enter needs callee, this and every formal".into());
+        }
+        let mut boxed = vec![];
+        for (&v, &mv) in a.iter().zip(&d.args) {
+            let t = self.ty(mv);
+            boxed.push(self.boxed(&t, v)?);
+        }
+        let sp = self.sp;
+        self.store_i64(sp, base + FrameLayout::CALLEE, boxed[0]);
+        self.store_i64(sp, base + FrameLayout::THIS, boxed[1]);
+        for i in 0..l.nargs {
+            self.store_i64(sp, base + l.arg(i), boxed[2 + i as usize]);
+        }
+        let undef = self.i64c(UNDEF);
+        for j in 0..l.nlocals {
+            self.store_i64(sp, base + l.local(j), undef);
+        }
+        // The callee's own environment: what its prologue loads, for a
+        // script whose activation has none of its own (the only kind
+        // inlined).
+        let fun = self.un(Operator::I32WrapI64, boxed[0], Type::I32);
+        let env = self.load_i64(fun, FUNC_ENV_SLOT_OFFSET);
+        self.store_i64(sp, base + l.env(), env);
+        self.store_i64(sp, base + l.args_obj(), undef);
+        self.store_i64(sp, base + l.new_target(), undef);
+        self.store_i64(sp, base + l.rval(), undef);
+        let zero = self.i64c(TAG_INT32 << 32);
+        self.store_i64(sp, base + l.resume(), zero);
+        self.store_i64(sp, base + l.backoff(), zero);
+        for k in 0..max_depth + 3 {
+            self.store_i64(sp, base + l.operand(k), undef);
+        }
+        Ok(())
+    }
+
+    /// `exit.inline` (§5.5): finish the inlined callee in its baseline
+    /// body from `pc`. Write the operands the frame does not already hold
+    /// (write-through keeps the formals, locals and rval), the resume
+    /// word, then call the callee's entry with `ARGC_RESUME_BIT` on its
+    /// frame. The caller continues on `ok` with the callee's result, or on
+    /// `err`.
+    #[allow(clippy::too_many_arguments)]
+    fn exit_inline(
+        &mut self,
+        inst: mir::Inst,
+        d: &mir::func::InstData,
+        a: &[Value],
+        pc: Pc,
+        nargs: u32,
+        nlocals: u32,
+        throw: bool,
+    ) -> R<()> {
+        let fid = self.cur_frame as usize;
+        let (base, end, l) = (self.frame_off[fid], self.frame_end[fid], self.frame_layouts[fid]);
+        let mut ops = vec![];
+        for (&v, &mv) in a.iter().zip(&d.args) {
+            let dead = matches!(
+                self.f.values[mv].def,
+                mir::func::ValueDef::Result(i, _)
+                    if self.f.insts[i].op == Opcode::ConstVal(ConstVal::Dead)
+            );
+            ops.push(if dead {
+                None
+            } else {
+                let t = self.ty(mv);
+                Some(self.boxed(&t, v)?)
+            });
+        }
+        let fp = frame_parts(&ops, nargs, nlocals).ok_or("lowering: malformed exit.inline")?;
+        let sp = self.sp;
+        if let Some(v) = *fp.this {
+            self.store_i64(sp, base + FrameLayout::THIS, v);
+        }
+        for (i, v) in fp.args.iter().enumerate() {
+            if let Some(v) = *v {
+                self.store_i64(sp, base + l.arg(u32::try_from(i).unwrap()), v);
+            }
+        }
+        for (j, v) in fp.locals.iter().enumerate() {
+            if let Some(v) = *v {
+                self.store_i64(sp, base + l.local(u32::try_from(j).unwrap()), v);
+            }
+        }
+        if let Some(v) = *fp.rval {
+            self.store_i64(sp, base + l.rval(), v);
+        }
+        for (k, v) in fp.stack.iter().enumerate() {
+            if let Some(v) = *v {
+                self.store_i64(sp, base + l.operand(u32::try_from(k).unwrap()), v);
+            }
+        }
+        let mode = if throw {
+            ResumeMode::Throw
+        } else {
+            ResumeMode::Continue
+        };
+        let w = ResumeWord { pc, mode };
+        let word = self.i64c((TAG_INT32 << 32) | u64::from(w.encode() as u32));
+        self.store_i64(sp, base + l.resume(), word);
+        let backoff = self.i64c((TAG_INT32 << 32) | u64::from(ONRAMP_BACKOFF));
+        self.store_i64(sp, base + l.backoff(), backoff);
+        // The call, rooted: the caller's managed values live across it.
+        let live = self.live_across(inst);
+        self.spill(&live)?;
+        let callee = self.load_i64(sp, base + FrameLayout::CALLEE);
+        let (funcidx, script) = self.classify(callee);
+        let off = self.i32c(u32::MAX);
+        self.body_off_patches.push(off);
+        let body_idx = self.bin(Operator::I32Sub, funcidx, off, Type::I32);
+        let frame = self.add_off(sp, base);
+        let top = self.add_off(sp, end);
+        let argc = self.i32c(nargs | ARGC_RESUME_BIT);
+        let undef = self.i64c(UNDEF);
+        let args = self
+            .body
+            .arg_pool
+            .from_iter([self.cx, frame, argc, top, script, undef, body_idx].into_iter());
+        let tys = self.body.type_pool.from_iter([Type::I32, Type::I32].into_iter());
+        let call = self.push_val(ValueDef::Operator(
+            Operator::CallIndirect {
+                sig_index: self.h.night_abi_sig2,
+                table_index: self.h.indirect_table,
+            },
+            args,
+            tys,
+        ));
+        let err = self.push_val(ValueDef::PickOutput(call, 0, Type::I32));
+        self.reload(&live)?;
+        let result = self.load_i64(sp, end);
+        let ok = self.un(Operator::I32Eqz, err, Type::I32);
+        let t = self.edge(inst, 0, &[result])?;
+        let e = self.edge(inst, 1, &[])?;
         self.cond_br(ok, t, e);
         Ok(())
     }

@@ -1,0 +1,320 @@
+//! Inlining by splicing (docs/MIR.md §5.5): a callee's MIR, built on its
+//! own, copied into the caller at a call site.
+//!
+//! The callee keeps a real baseline-format frame (an inline frame), kept
+//! current by write-through, so each of its exits becomes an
+//! `exit.inline`: finish the callee in its baseline body, then continue
+//! the caller. Its `return`s become edges to the call's continuation, and
+//! its onramp roots are dropped (the copy is entered only at the call).
+
+use std::collections::{BTreeMap, BTreeSet};
+
+use crate::mir;
+use crate::mir::entity::{AtomId, Block, FuseId, Inst, Value};
+use crate::mir::func::{Edge, EdgeArg, Func, InlineFrame, LoopDecl, RootKind};
+use crate::mir::module::{FieldDef, Module};
+use crate::mir::ops::Opcode;
+use crate::mir::types::{FactKind, StrInfo, Type};
+
+/// A callee built for inlining: its module and function, and its frame's
+/// deepest operand stack.
+pub(crate) struct Callee {
+    pub mm: Module,
+    pub f: Func,
+    pub max_depth: u32,
+}
+
+/// How the callee's module entities are named in the caller's.
+struct Maps {
+    atoms: BTreeMap<AtomId, AtomId>,
+    fuses: BTreeMap<FuseId, FuseId>,
+}
+
+impl Maps {
+    fn atom(&self, a: AtomId) -> AtomId {
+        self.atoms[&a]
+    }
+
+    fn ty(&self, t: Type) -> Result<Type, String> {
+        Ok(match t {
+            Type::Str(s) => Type::Str(self.str(s)),
+            Type::Val(mut v) => {
+                v.str = self.str(v.str);
+                Type::Val(v)
+            }
+            Type::Fact(FactKind::Fuse(f)) => Type::Fact(FactKind::Fuse(self.fuses[&f])),
+            Type::Fact(_) => return Err("inline: a binding or native fact".into()),
+            t => t,
+        })
+    }
+
+    fn str(&self, s: StrInfo) -> StrInfo {
+        StrInfo {
+            atom: s.atom.map(|a| self.atom(a)),
+        }
+    }
+
+    fn op(&self, op: Opcode) -> Result<Opcode, String> {
+        use Opcode::*;
+        Ok(match op {
+            ConstStr(a) => ConstStr(self.atom(a)),
+            JsGetProp(a) => JsGetProp(self.atom(a)),
+            JsSetProp(a, s) => JsSetProp(self.atom(a), s),
+            JsGetName(a) => JsGetName(self.atom(a)),
+            JsBindGName(a) => JsBindGName(self.atom(a)),
+            JsSetName(a, s) => JsSetName(self.atom(a), s),
+            LoadField(a) => LoadField(self.atom(a)),
+            StoreField(a) => StoreField(self.atom(a)),
+            InitField(a) => InitField(self.atom(a)),
+            CheckFuse(f) => CheckFuse(self.fuses[&f]),
+            ConstObj(_) | GuardSingleton(_) | CheckBinding(_) | CheckNative(_) | LoadGName(_)
+            | StoreGName(_) | CallNative(_) => {
+                return Err(format!("inline: {} is not remapped", mir::print::mnemonic(&op)))
+            }
+            op => op,
+        })
+    }
+}
+
+/// Merge the callee's module tables into the caller's, returning how its
+/// entities are renamed. Fails where the two describe a layout slot
+/// differently.
+fn merge_module(mm: &mut Module, k: &Module) -> Result<Maps, String> {
+    let mut maps = Maps {
+        atoms: BTreeMap::new(),
+        fuses: BTreeMap::new(),
+    };
+    for (a, s) in k.atoms.iter() {
+        maps.atoms.insert(a, mm.intern_atom(s.chars()));
+    }
+    for (fid, d) in k.fuses.iter() {
+        let found = mm.fuses.iter().find(|(_, x)| x.addr == d.addr).map(|(f, _)| f);
+        let id = match found {
+            Some(f) => f,
+            None => mm.fuses.push(d.clone()),
+        };
+        maps.fuses.insert(fid, id);
+    }
+    if !k.snap_objs.is_empty() || !k.bindings.is_empty() || !k.natives.is_empty() {
+        return Err("inline: snapshot objects, bindings or natives".into());
+    }
+    for (&key, lay) in &k.layouts {
+        let mine = mm.layouts.entry(key).or_default();
+        if lay.elements.is_some() && mine.elements.is_some() && lay.elements != mine.elements {
+            return Err("inline: array layouts disagree".into());
+        }
+        if mine.elements.is_none() {
+            mine.elements = lay.elements;
+        }
+        if mine.fields.len() < lay.fields.len() {
+            mine.fields.resize(lay.fields.len(), None);
+        }
+        for (i, fd) in lay.fields.iter().enumerate() {
+            let Some(fd) = fd else { continue };
+            let def = FieldDef {
+                name: maps.atom(fd.name),
+                claim: maps.ty(fd.claim)?,
+            };
+            match &mine.fields[i] {
+                None => mine.fields[i] = Some(def),
+                Some(x) if *x == def => {}
+                Some(_) => return Err("inline: layouts disagree on a field".into()),
+            }
+        }
+    }
+    mm.script_addrs.extend(k.script_addrs.iter().map(|(&s, &a)| (s, a)));
+    Ok(maps)
+}
+
+/// Splice callee `k` into `f` (of module `mm`) at the end of block
+/// `enter`, which is not yet terminated, called from frame `parent` with
+/// `operands`: callee (an object of `k`'s script), `this`, and one value
+/// per formal. Its returns go to `join` (one `Val` param), its exceptions
+/// to `err` (no params).
+pub(crate) fn splice(
+    mm: &mut Module,
+    f: &mut Func,
+    k: &Callee,
+    parent: u32,
+    enter: Block,
+    operands: &[Value],
+    join: Block,
+    err: Block,
+) -> Result<(), String> {
+    let kf = &k.f;
+    if operands.len() != 2 + kf.frame.formals as usize {
+        return Err("inline: operands are not callee, this and the formals".into());
+    }
+    let maps = merge_module(mm, &k.mm)?;
+    // Everything that can fail, before `f` changes: every op and type of
+    // the copy must remap.
+    for (i, d) in kf.insts.iter() {
+        let _ = i;
+        match d.op {
+            Opcode::Return | Opcode::Exit { .. } | Opcode::ExitThrow { .. } => {}
+            op => {
+                maps.op(op)?;
+            }
+        }
+    }
+    for (_, v) in kf.values.iter() {
+        maps.ty(v.ty)?;
+    }
+    // Frames: the callee's own, then its own inlined callees'.
+    let base = u32::try_from(f.inline_frames.len()).unwrap() + 1;
+    let frame = |j: u32| if j == 0 { base } else { base + j };
+    f.inline_frames.push(InlineFrame {
+        script: kf.script,
+        shape: kf.frame.clone(),
+        parent,
+        max_depth: k.max_depth,
+    });
+    for fr in &kf.inline_frames {
+        f.inline_frames.push(InlineFrame {
+            parent: frame(fr.parent),
+            ..fr.clone()
+        });
+    }
+    // The callee's blocks reachable from its entry.
+    let entry = kf
+        .roots
+        .iter()
+        .find(|r| r.kind == RootKind::Entry)
+        .ok_or("inline: the callee has no entry")?
+        .block;
+    let mut reach = BTreeSet::new();
+    let mut work = vec![entry];
+    while let Some(b) = work.pop() {
+        if reach.insert(b) {
+            work.extend(kf.succs(b));
+        }
+    }
+    let mut bmap: BTreeMap<Block, Block> = BTreeMap::new();
+    let mut vmap: BTreeMap<Value, Value> = BTreeMap::new();
+    for &b in &kf.layout {
+        if !reach.contains(&b) {
+            continue;
+        }
+        let nb = f.add_block();
+        for &p in &kf.blocks[b].params {
+            let t = maps.ty(kf.values[p].ty)?;
+            vmap.insert(p, f.add_param(nb, t));
+        }
+        bmap.insert(b, nb);
+    }
+    // Instructions, first without operands or successors (a value may be
+    // used in a block laid out before its definition's).
+    let mut imap: Vec<(Inst, Inst)> = vec![];
+    for &b in &kf.layout {
+        if !reach.contains(&b) {
+            continue;
+        }
+        for &i in &kf.blocks[b].insts {
+            let d = &kf.insts[i];
+            let op = match d.op {
+                Opcode::Return => Opcode::Jump,
+                Opcode::Exit { pc, nargs, nlocals } => Opcode::ExitInline {
+                    pc,
+                    nargs,
+                    nlocals,
+                    throw: false,
+                },
+                Opcode::ExitThrow { pc, nargs, nlocals } => Opcode::ExitInline {
+                    pc,
+                    nargs,
+                    nlocals,
+                    throw: true,
+                },
+                op => maps.op(op)?,
+            };
+            let tys: Vec<Type> = d
+                .results
+                .iter()
+                .map(|&r| maps.ty(kf.values[r].ty))
+                .collect::<Result<_, _>>()?;
+            let (ni, rs) = f.add_inst(bmap[&b], op, vec![], &tys, vec![]);
+            for (&r, &nr) in d.results.iter().zip(&rs) {
+                vmap.insert(r, nr);
+            }
+            f.inst_frame[ni] = frame(kf.inst_frame[i]);
+            f.witnesses[ni] = match op {
+                // Finishing the callee may do anything.
+                Opcode::ExitInline { .. } => Some(mir::func::Witness {
+                    may_kill: mir::types::KillPattern::ALL,
+                }),
+                _ => kf.witnesses[i].clone(),
+            };
+            imap.push((i, ni));
+        }
+    }
+    let val = |v: Value| -> Result<Value, String> {
+        vmap.get(&v)
+            .copied()
+            .ok_or_else(|| format!("inline: {v} is not defined in the copy"))
+    };
+    for &(i, ni) in &imap {
+        let d = &kf.insts[i];
+        let args: Vec<Value> = d.args.iter().map(|&v| val(v)).collect::<Result<_, _>>()?;
+        let succs: Vec<Edge> = match d.op {
+            Opcode::Return => vec![Edge {
+                block: join,
+                args: vec![EdgeArg::Value(args[0])],
+            }],
+            Opcode::Exit { .. } | Opcode::ExitThrow { .. } => vec![
+                Edge {
+                    block: join,
+                    args: vec![EdgeArg::Out(0)],
+                },
+                Edge {
+                    block: err,
+                    args: vec![],
+                },
+            ],
+            _ => d
+                .succs
+                .iter()
+                .map(|e| {
+                    Ok(Edge {
+                        block: *bmap
+                            .get(&e.block)
+                            .ok_or("inline: an edge leaves the callee's reachable blocks")?,
+                        args: e
+                            .args
+                            .iter()
+                            .map(|a| match *a {
+                                EdgeArg::Value(v) => val(v).map(EdgeArg::Value),
+                                EdgeArg::Out(k) => Ok(EdgeArg::Out(k)),
+                            })
+                            .collect::<Result<_, String>>()?,
+                    })
+                })
+                .collect::<Result<_, String>>()?,
+        };
+        let nd = &mut f.insts[ni];
+        nd.args = if d.op == Opcode::Return { vec![] } else { args };
+        nd.succs = succs;
+    }
+    for l in &kf.loops {
+        if let (Some(&h), Some(&p)) = (bmap.get(&l.header), bmap.get(&l.preheader)) {
+            f.loops.push(LoopDecl {
+                header: h,
+                preheader: p,
+            });
+        }
+    }
+    // Enter: write the callee's frame, then its entry with the operands.
+    let (enter_inst, _) = f.add_inst(enter, Opcode::InlineEnter, operands.to_vec(), &[], vec![]);
+    f.inst_frame[enter_inst] = base;
+    let (jump, _) = f.add_inst(
+        enter,
+        Opcode::Jump,
+        vec![],
+        &[],
+        vec![Edge {
+            block: bmap[&entry],
+            args: operands.iter().map(|&v| EdgeArg::Value(v)).collect(),
+        }],
+    );
+    f.inst_frame[jump] = parent;
+    Ok(())
+}

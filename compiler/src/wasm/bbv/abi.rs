@@ -93,14 +93,14 @@ pub const EARLY_KEY_MAX: u32 = 0x0FFF;
 //              +8  TaggedProto (the object's [[Prototype]])
 //   JSClass    +4  flags
 
-pub(super) const SHAPE_BASESHAPE_OFFSET: u32 = 0;
+pub(crate) const SHAPE_BASESHAPE_OFFSET: u32 = 0;
 pub(crate) const SHAPE_IMMUTABLE_FLAGS_OFFSET: u32 = 4;
 pub(crate) const SHAPE_IS_NATIVE_BIT: u32 = 1 << 4;
 pub(crate) const SHAPE_FIXED_SLOTS_SHIFT: u32 = 6;
 pub(crate) const SHAPE_FIXED_SLOTS_MASK_BITS: u32 = 0x1f;
 pub(super) const SHAPE_SMALL_SLOTSPAN_SHIFT: u32 = 11;
 pub(super) const SHAPE_SMALL_SLOTSPAN_MASK_BITS: u32 = 0x3ff;
-pub(super) const BASESHAPE_CLASP_OFFSET: u32 = 0;
+pub(crate) const BASESHAPE_CLASP_OFFSET: u32 = 0;
 pub(super) const BASESHAPE_PROTO_OFFSET: u32 = 8;
 pub(super) const CLASP_FLAGS_OFFSET: u32 = 4;
 pub(super) const JSCLASS_EMULATES_UNDEFINED: u32 = 1 << 6;
@@ -164,7 +164,7 @@ pub(super) const FUNCTION_FLAGS_BASESCRIPT: u32 = 1 << 5;
 pub(super) const FUNCTION_FLAGS_CONSTRUCTOR: u32 = 1 << 8;
 pub(super) const FUNCTION_KIND_MASK: u32 = 0x0007;
 pub(super) const FUNCTION_KIND_CLASS_CTOR: u32 = 3;
-pub(super) const BASESCRIPT_NIGHTFUNCINDEX_OFFSET: u32 = 56;
+pub(crate) const BASESCRIPT_NIGHTFUNCINDEX_OFFSET: u32 = 56;
 
 // --- JSContext and the GC ------------------------------------------------
 //
@@ -310,9 +310,9 @@ pub(super) const INLINE_IC_STRIDE: u32 = IC_TRANS_ROW_OFF + IC_TRANS_ROW_BYTES;
 const _: () = assert!(INLINE_IC_STRIDE == crate::region_shape::INLINE_IC_STRIDE);
 pub(crate) const IC_WAY_ADDR_PLACEHOLDER: u32 = 0xDEAD_C200;
 
-pub(super) const IC_WAY_RECVSHAPE: u32 = 0;
-pub(super) const IC_WAY_MONO_OFF: u32 = 4;
-pub(super) const IC_WAY_HOLDERPTR: u32 = 8;
+pub(crate) const IC_WAY_RECVSHAPE: u32 = 0;
+pub(crate) const IC_WAY_MONO_OFF: u32 = 4;
+pub(crate) const IC_WAY_HOLDERPTR: u32 = 8;
 pub(crate) const IC_SET_RECVSHAPE: u32 = 0;
 pub(crate) const IC_SET_SLOTENC: u32 = 8;
 pub(crate) const IC_SET_ABSSLOT: u32 = 12;

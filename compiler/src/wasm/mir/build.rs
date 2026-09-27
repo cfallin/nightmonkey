@@ -112,6 +112,31 @@ impl Ty {
     }
 }
 
+/// The representation a numeric claim is speculated in (§8's
+/// guard-at-defs): int32 for an int32-only claim, and also for a number
+/// claim the analysis says is mostly int32 (int32 in it, not flagged
+/// double-first: the order bbv's typed-load ladder tries), exiting on a
+/// double; f64 for other number claims. `None` for anything else.
+const SPECULATE_INT_FIRST: bool = false;
+
+fn num_claim_ty(claim: crate::facts::Claim) -> Option<Ty> {
+    let prims = claim.prims();
+    if claim.is_none() || claim.is_object() || prims.is_empty() {
+        None
+    } else if prims.subset_of(PRIM_INT32)
+        || (SPECULATE_INT_FIRST
+            && prims.subset_of(crate::opsem::NUM)
+            && prims.intersects(PRIM_INT32)
+            && !claim.double_first())
+    {
+        Some(Ty::I32)
+    } else if prims.subset_of(crate::opsem::NUM) {
+        Some(Ty::F64)
+    } else {
+        None
+    }
+}
+
 /// Whether every field of layout `k` has a number claim (so its objects
 /// keep the TYPES bit through engine-path stores); false for a layout no
 /// constructor describes.
@@ -129,6 +154,42 @@ fn numeric_layout(ctx: &crate::wasm::translate::TranslateCtx<'_>, k: u32) -> boo
                 !p.is_empty() && p.subset_of(crate::opsem::NUM)
             })
         })
+}
+
+impl<'a> Shape<'a> {
+    /// Callee `k` built for inlining here (§5.5), if it may be: an
+    /// inline-eligible script that is not this one, not a constructor
+    /// that stamps its `this`, and small enough once built.
+    fn callee(&self, k: ScriptId) -> Option<std::rc::Rc<super::inline::Callee>> {
+        if let Some(c) = self.callees.borrow().get(&k) {
+            return c.clone();
+        }
+        let c = self.build_callee(k).map(std::rc::Rc::new);
+        self.callees.borrow_mut().insert(k, c.clone());
+        c
+    }
+
+    fn build_callee(&self, k: ScriptId) -> Option<super::inline::Callee> {
+        if self.inline_depth >= MAX_INLINE_DEPTH || k == self.sid {
+            return None;
+        }
+        let names = self.names?;
+        let crate::source::SourceObject::Script(ks) =
+            self.ctx.source.object(crate::source::SourceObjectId::new(k.get()))
+        else {
+            return None;
+        };
+        if !super::inline_eligible(self.ctx, ks) || self.ctx.stamp_ctors_in.contains_key(&k) {
+            return None;
+        }
+        let (mut mm, f) = build_at(self.ctx, names, k, ks, false, self.inline_depth + 1).ok()?;
+        if f.insts.len() > MAX_INLINE_INSTS {
+            return None;
+        }
+        mm.script_addrs.insert(k, ks.addr);
+        let max_depth = StackDepths::compute(ks).ok()?.max;
+        Some(super::inline::Callee { mm, f, max_depth })
+    }
 }
 
 /// A property access the analysis predicts: the receiver's layouts
@@ -173,12 +234,31 @@ impl Slot {
 }
 
 /// Build the MIR body for `script`, or decline with a reason.
-pub fn build(
-    ctx: &TranslateCtx,
-    names: &crate::ids::Names,
+pub fn build<'a>(
+    ctx: &'a TranslateCtx<'a>,
+    names: &'a crate::ids::Names,
     sid: ScriptId,
-    script: &Script,
+    script: &'a Script,
     is_global: bool,
+) -> Result<(mir::Module, mir::Func), String> {
+    build_at(ctx, names, sid, script, is_global, 0)
+}
+
+/// How deep inlining nests: a caller's callees, and theirs.
+const MAX_INLINE_DEPTH: u32 = 2;
+/// The most MIR instructions a callee may have to be inlined.
+const MAX_INLINE_INSTS: usize = 800;
+/// The most targets a call site inlines (a guard chain on the script).
+const MAX_INLINE_TARGETS: usize = 4;
+
+/// `build`, as the callee of an inlining `depth` levels down.
+fn build_at<'a>(
+    ctx: &'a TranslateCtx<'a>,
+    names: &'a crate::ids::Names,
+    sid: ScriptId,
+    script: &'a Script,
+    is_global: bool,
+    depth: u32,
 ) -> Result<(mir::Module, mir::Func), String> {
     if is_global {
         return Err("global script".into());
@@ -213,6 +293,8 @@ pub fn build(
     }
     let depths = StackDepths::compute(script).map_err(|e| format!("stack depths ({e})"))?;
     let mut shape = Shape::of(ctx, sid, script, fl, depths)?;
+    shape.names = Some(names);
+    shape.inline_depth = depth;
     for (i, &gc) in script.gcthings.iter().enumerate() {
         if gc.is_other() {
             continue;
@@ -430,6 +512,11 @@ struct Shape<'a> {
     /// Per gcthing index naming a global: the analysis's likely type
     /// (`gname_types`), guarded at the def.
     gname_types: BTreeMap<u32, crate::facts::Claim>,
+    names: Option<&'a crate::ids::Names>,
+    /// How deep in inlining this build is (0: a script's own).
+    inline_depth: u32,
+    /// Callees built for inlining, by script; `None` if one cannot be.
+    callees: std::cell::RefCell<BTreeMap<ScriptId, Option<std::rc::Rc<super::inline::Callee>>>>,
 }
 
 impl<'a> Shape<'a> {
@@ -472,6 +559,9 @@ impl<'a> Shape<'a> {
             wrap_ok,
             fused: BTreeMap::new(),
             gname_types: BTreeMap::new(),
+            names: None,
+            inline_depth: 0,
+            callees: Default::default(),
         })
     }
 
@@ -503,16 +593,7 @@ impl<'a> Shape<'a> {
             .get(&(self.sid, ArgIndex::new(i + 1)))
             .copied()
             .unwrap_or(Claim::NONE);
-        let prims = claim.prims();
-        if claim.is_none() || claim.is_object() || prims.is_empty() {
-            Ty::Val(TagSet::ALL)
-        } else if prims.subset_of(PRIM_INT32) {
-            Ty::I32
-        } else if prims.subset_of(crate::opsem::NUM) {
-            Ty::F64
-        } else {
-            Ty::Val(TagSet::ALL)
-        }
+        num_claim_ty(claim).unwrap_or(Ty::Val(TagSet::ALL))
     }
 }
 
@@ -784,12 +865,10 @@ impl<'s, 'a> Run<'s, 'a> {
         if claim.is_none() || claim.is_object() || prims.is_empty() {
             return;
         }
-        let (op, ty) = if prims.subset_of(PRIM_INT32) {
-            (Opcode::GuardUnbox(UnboxKind::I32), Ty::I32)
-        } else if prims.subset_of(crate::opsem::NUM) {
-            (Opcode::GuardUnbox(UnboxKind::F64Num), Ty::F64)
-        } else {
-            return;
+        let (op, ty) = match num_claim_ty(claim) {
+            Some(Ty::I32) => (Opcode::GuardUnbox(UnboxKind::I32), Ty::I32),
+            Some(Ty::F64) => (Opcode::GuardUnbox(UnboxKind::F64Num), Ty::F64),
+            _ => return,
         };
         let x = self.top();
         if !matches!(x.ty, Ty::Val(_)) {
@@ -1034,6 +1113,82 @@ impl<'s, 'a> Run<'s, 'a> {
 
     /// A generic op: both success edges continue with its output (of type
     /// `out`); an exception goes to the op's throw block.
+    /// A call whose predicted targets are inlined (§5.5): the callee
+    /// guarded to each target's script in turn, each target's MIR spliced
+    /// in on its hit; the ordinary call when none matches. Returns the
+    /// result, at the continuation.
+    fn inline_call(
+        &mut self,
+        targets: &[(ScriptId, std::rc::Rc<super::inline::Callee>)],
+        vals: &[mir::Value],
+    ) -> mir::Value {
+        let join = self.new_block();
+        let result = self.f.add_param(join, MType::VAL_TOP);
+        let err = self.exit_block(true);
+        let generic = self.new_block();
+        let obj_b = self.new_block();
+        let obj = self.f.add_param(obj_b, MType::OBJ_TOP);
+        self.term(
+            Opcode::GuardUnbox(UnboxKind::Obj),
+            vec![vals[0]],
+            vec![
+                Edge {
+                    block: obj_b,
+                    args: vec![EdgeArg::Out(0)],
+                },
+                Self::goto(generic),
+            ],
+        );
+        self.at(obj_b);
+        for (k, callee) in targets {
+            let hit = self.new_block();
+            let kt = MType::Obj(ObjInfo::kind(ObjKind::Function(Some(*k))));
+            let kobj = self.f.add_param(hit, kt);
+            let miss = self.new_block();
+            self.term(
+                Opcode::GuardScript(*k),
+                vec![obj],
+                vec![
+                    Edge {
+                        block: hit,
+                        args: vec![EdgeArg::Out(0)],
+                    },
+                    Self::goto(miss),
+                ],
+            );
+            self.at(hit);
+            let nformals = callee.f.frame.formals as usize;
+            let mut operands = vec![kobj, vals[1]];
+            let undef = self.const_val(ConstVal::Undefined);
+            for i in 0..nformals {
+                operands.push(vals.get(2 + i).copied().unwrap_or(undef));
+            }
+            let saved_mm = self.mm.clone();
+            let saved_frames = self.f.inline_frames.len();
+            match super::inline::splice(&mut self.mm, &mut self.f, callee, 0, hit, &operands, join, err) {
+                Ok(()) => {
+                    self.mm.script_addrs.insert(*k, callee.mm.script_addrs[k]);
+                }
+                Err(_) => {
+                    // Not this one after all: the hit takes the ordinary call.
+                    self.mm = saved_mm;
+                    self.f.inline_frames.truncate(saved_frames);
+                    self.term(Opcode::Jump, vec![], vec![Self::goto(generic)]);
+                }
+            }
+            self.at(miss);
+        }
+        self.term(Opcode::Jump, vec![], vec![Self::goto(generic)]);
+        self.at(generic);
+        let e = Edge {
+            block: join,
+            args: vec![EdgeArg::Out(0)],
+        };
+        self.term(Opcode::Call, vals.to_vec(), vec![e.clone(), e, Self::goto(err)]);
+        self.at(join);
+        result
+    }
+
     fn js(&mut self, op: Opcode, args: Vec<mir::Value>, out: MType) -> mir::Value {
         let ok = self.new_block();
         let p = self.f.add_param(ok, out);
@@ -2305,7 +2460,20 @@ impl<'s, 'a> Run<'s, 'a> {
                 let n = self.st.len();
                 let operands: Vec<Slot> = self.st.drain(n - argc - 2..).collect();
                 let vals: Vec<mir::Value> = operands.into_iter().map(|x| self.boxed(x)).collect();
-                let r = self.js(Opcode::Call, vals, MType::VAL_TOP);
+                let targets: Vec<(ScriptId, std::rc::Rc<super::inline::Callee>)> = self
+                    .s
+                    .ctx
+                    .facts
+                    .scripted_targets(self.site(pc))
+                    .iter()
+                    .take(MAX_INLINE_TARGETS + 1)
+                    .filter_map(|&k| Some((k, self.s.callee(k)?)))
+                    .collect();
+                let r = if targets.is_empty() || targets.len() > MAX_INLINE_TARGETS {
+                    self.js(Opcode::Call, vals, MType::VAL_TOP)
+                } else {
+                    self.inline_call(&targets, &vals)
+                };
                 self.push(r, Ty::Val(TagSet::ALL));
                 let claim = self.s.ctx.facts.call_types.get(&self.site(pc)).copied();
                 self.guard_result(claim.unwrap_or_default(), pc + op.len());

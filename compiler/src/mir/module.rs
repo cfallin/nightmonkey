@@ -115,6 +115,9 @@ pub struct Module {
     pub natives: EntityVec<NativeId, NativeDef>,
     pub regions: EntityVec<RegionId, Region>,
     pub funcs: Vec<Func>,
+    /// The runtime `JSScript*` of each script a `guard.script` names
+    /// (§5.5). Not printed: a module parsed from text has none.
+    pub script_addrs: BTreeMap<crate::ids::ScriptId, u32>,
 }
 
 impl Module {

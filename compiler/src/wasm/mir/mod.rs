@@ -4,6 +4,7 @@
 //! script's table entry, with the baseline body beside it.
 
 pub mod build;
+pub(crate) mod inline;
 pub mod lower;
 
 use crate::bytecode::Script;
@@ -14,7 +15,7 @@ use crate::wasm::translate::{AtomTable, ExtraBody, Outcome, TranslateCtx};
 use waffle::Module;
 
 /// Whether MIR inlines calls (§5.5; in progress).
-const INLINING: bool = false;
+const INLINING: bool = true;
 
 /// The most bytecode a script may have to be inlined (§5.5).
 pub(crate) const INLINE_MAX_BYTECODE: usize = 200;
@@ -97,6 +98,14 @@ pub fn translate_script(
             Some((a, *ctx.syn_gnames.get(&n)?))
         })
         .collect();
+    let gname_fused = mm
+        .atoms
+        .iter()
+        .filter_map(|(a, s)| {
+            let n = atoms.names.lookup(s.chars())?;
+            Some((a, *ctx.fused_gnames.get(&n)?))
+        })
+        .collect();
     let lowered = match lower::lower(
         m,
         ctx.helpers,
@@ -120,6 +129,7 @@ pub fn translate_script(
             }),
         },
         gname_bids,
+        gname_fused,
     ) {
         Ok(l) => l,
         Err(reason) => return Ok(Err(reason)),
