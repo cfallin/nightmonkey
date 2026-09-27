@@ -52,7 +52,10 @@ use crate::wasm::bbv::abi::{
     BINOP_BITAND, BINOP_BITNOT, BINOP_BITOR, BINOP_BITXOR, BINOP_DEC, BINOP_DIV, BINOP_INC,
     BINOP_LSH, BINOP_MOD, BINOP_MUL, BINOP_RSH, BINOP_SUB, BINOP_URSH, CLASS_WORD_SHALLOW,
     CLASS_WORD_RANGES, CLASS_WORD_SENTINEL, CLASS_WORD_SLOTS, SHAPE_SMALL_SLOTSPAN_MASK_BITS,
-    SHAPE_SMALL_SLOTSPAN_SHIFT, TA_DATA_PAYLOAD_OFFSET, TA_LENGTH_PAYLOAD_OFFSET, EARLY_KEY_MAX, EARLY_KEY_SHIFT, IC_SET_ABSSLOT,
+    SHAPE_SMALL_SLOTSPAN_SHIFT, TA_DATA_PAYLOAD_OFFSET, TA_LENGTH_PAYLOAD_OFFSET, ELEMENTS_LENGTH_BACK,
+    STRING_LENGTH_OFFSET, STRING_FLAGS_OFFSET, STRING_CHARS_OFFSET, STRING_LINEAR_BIT,
+    STRING_INLINE_CHARS_BIT, STRING_LATIN1_CHARS_BIT, CALL_CELL_ADDR_PLACEHOLDER, CALL_CELL_FUNCIDX,
+    CALL_CELL_SCRIPT, EARLY_KEY_MAX, EARLY_KEY_SHIFT, IC_SET_ABSSLOT,
     IC_SET_RECVSHAPE, IC_SET_SLOTENC, IC_TRANS_ABSSLOT, IC_TRANS_INLINE_HOPS, IC_TRANS_NEWSHAPE,
     IC_TRANS_OLDSHAPE, IC_TRANS_PROTO0, IC_TRANS_PROTO_HOPS, IC_TRANS_PROTO_ROW_BYTES,
     IC_TRANS_ROW_OFF, IC_TRANS_SLOTOFF, BASESHAPE_PROTO_OFFSET, IOF_CELL_ADDR_PLACEHOLDER,
@@ -100,6 +103,7 @@ pub struct Lowered {
     /// `instanceof` cell placeholders, with their rows (+1).
     pub iof_cell_patches: Vec<(Value, u32)>,
     pub construct_cell_patches: Vec<(Value, u32)>,
+    pub call_cell_patches: Vec<(Value, u32)>,
 }
 
 /// The resume words `f`'s exits and throws carry: the set the baseline
@@ -242,6 +246,8 @@ struct Lower<'a> {
     iof_cell_patches: Vec<(Value, u32)>,
     /// Construct cell placeholders (bbv's per-site cell).
     construct_cell_patches: Vec<(Value, u32)>,
+    /// Call value cell placeholders (bbv's per-site cell; 0: the trash row).
+    call_cell_patches: Vec<(Value, u32)>,
     /// The census helper, when exits are counted (`--mir-exit-census`).
     exit_census: Option<Func>,
     ctor_stamp: Option<[u32; 3]>,
@@ -347,6 +353,7 @@ pub fn lower<'a>(
         prop_ic_patches: vec![],
         iof_cell_patches: vec![],
         construct_cell_patches: vec![],
+        call_cell_patches: vec![],
         exit_census: if o.exit_census { h.census } else { None },
         ctor_stamp: o.ctor_stamp,
         ctor_restamp: o.ctor_restamp,
@@ -367,6 +374,7 @@ pub fn lower<'a>(
         prop_ic_patches: l.prop_ic_patches,
         iof_cell_patches: l.iof_cell_patches,
         construct_cell_patches: l.construct_cell_patches,
+        call_cell_patches: l.call_cell_patches,
     })
 }
 
@@ -1581,6 +1589,37 @@ impl<'a> Lower<'a> {
                 let cache = self.atoms.next_prop_cache();
                 let way_base = self.i32c(IC_WAY_ADDR_PLACEHOLDER);
                 self.prop_ic_patches.push((way_base, cache * INLINE_IC_STRIDE));
+                let nm = String::from_utf16_lossy(self.mm.atoms[name].chars());
+                if nm == "charCodeAt" || nm == "charAt" {
+                    // A string's pristine char method, while String.prototype
+                    // is untouched (bbv's char-op read): the cached native.
+                    let cell = if nm == "charCodeAt" { self.h.str_ccat_cell } else { self.h.str_cat_cell };
+                    let ic = self.body.add_block();
+                    let tag = self.tag_of(a[0]);
+                    let is_str = self.tag_is(tag, TAG_STRING as u32);
+                    let fslot = self.i32c(self.h.str_fuse_addr_slot);
+                    let faddr = self.load_i32(fslot, 0);
+                    let fword = self.load_i32(faddr, 0);
+                    let intact = self.un(Operator::I32Eqz, fword, Type::I32);
+                    let c = self.i32c(cell);
+                    let bits = self.load_i64(c, 0);
+                    let z = self.i64c(0);
+                    let armed = self.bin(Operator::I64Ne, bits, z, Type::I32);
+                    let ok = self.bin(Operator::I32And, is_str, intact, Type::I32);
+                    let ok = self.bin(Operator::I32And, ok, armed, Type::I32);
+                    let hit = self.body.add_block();
+                    self.cond_br(ok, Self::to(hit), Self::to(ic));
+                    self.cur = hit;
+                    let t = self.edge(inst, 0, &[bits])?;
+                    self.terminate(Terminator::Br { target: t });
+                    self.cur = ic;
+                }
+                if self.mm.atoms[name].chars() == "length".encode_utf16().collect::<Vec<u16>>().as_slice() {
+                    // Not a slot: a string's or an array's own word.
+                    let ic = self.body.add_block();
+                    self.length_arms(inst, a[0], ic)?;
+                    self.cur = ic;
+                }
                 let probe = self.body.add_block();
                 self.get_ic_way0(inst, a[0], way_base, probe)?;
                 self.cur = probe;
@@ -1591,6 +1630,20 @@ impl<'a> Lower<'a> {
                 let t = self.edge(inst, 0, &[r])?;
                 self.cond_br(miss, Self::to(slow), t);
                 self.cur = slow;
+                if let Some(census) = self.exit_census {
+                    static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                    let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    crate::diag_line!(
+                        "night: mir getmiss {id} sid#{} {}",
+                        self.f.script,
+                        String::from_utf16_lossy(self.mm.atoms[name].chars())
+                    );
+                    let (k, i) = (
+                        self.i32c(crate::options::MIR_GET_MISS_CENSUS_KIND),
+                        self.i32c(id),
+                    );
+                    self.call1(census, &[k, i], Type::I32);
+                }
                 let c = self.i32c(cache);
                 self.js_call(inst, self.h.get_prop_ic_miss, &[a[0], at, c], false)?;
             }
@@ -3083,6 +3136,172 @@ impl<'a> Lower<'a> {
         Ok(())
     }
 
+    /// The pristine `charCodeAt`/`charAt` on a linear string with an
+    /// in-bounds int32 index, and `String.fromCharCode` of a code below 256
+    /// (bbv's char arms): the char inline (`charAt` and `fromCharCode`
+    /// only below 256, a static unit string), taking `ok_clean`; else
+    /// branch to `other` (the call). The callee is compared against the
+    /// startup-cached natives' bits: a monkeypatched one misses.
+    fn char_arms(&mut self, inst: mir::Inst, ops: &[Value], other: Block) -> R<()> {
+        let (callee, this, arg) = (ops[0], ops[1], ops[2]);
+        let atag = self.tag_of(arg);
+        let arg_int = self.tag_is(atag, TAG_INT32 as u32);
+        let code = self.un(Operator::I32WrapI64, arg, Type::I32);
+        let ccat_c = self.i32c(self.h.str_ccat_cell);
+        let ccat = self.load_i64(ccat_c, 0);
+        let cat_c = self.i32c(self.h.str_cat_cell);
+        let cat = self.load_i64(cat_c, 0);
+        let is_ccat = self.bin(Operator::I64Eq, callee, ccat, Type::I32);
+        let is_cat = self.bin(Operator::I64Eq, callee, cat, Type::I32);
+        let either = self.bin(Operator::I32Or, is_ccat, is_cat, Type::I32);
+        let ttag = self.tag_of(this);
+        let this_str = self.tag_is(ttag, TAG_STRING as u32);
+        let m = self.bin(Operator::I32And, either, this_str, Type::I32);
+        let m = self.bin(Operator::I32And, m, arg_int, Type::I32);
+        let (chr, fcc) = (self.body.add_block(), self.body.add_block());
+        self.cond_br(m, Self::to(chr), Self::to(fcc));
+        // String.fromCharCode(code < 256): the static unit string.
+        self.cur = fcc;
+        let fcc_c = self.i32c(self.h.str_fcc_cell);
+        let fcc_bits = self.load_i64(fcc_c, 0);
+        let is_fcc = self.bin(Operator::I64Eq, callee, fcc_bits, Type::I32);
+        let lim = self.i32c(256);
+        let small = self.bin(Operator::I32LtU, code, lim, Type::I32);
+        let f = self.bin(Operator::I32And, is_fcc, arg_int, Type::I32);
+        let f = self.bin(Operator::I32And, f, small, Type::I32);
+        self.check(f, other);
+        let r = self.unit_string(code);
+        let t = self.edge(inst, 0, &[r])?;
+        self.terminate(Terminator::Br { target: t });
+        // The char of a linear string.
+        self.cur = chr;
+        let sp = self.un(Operator::I32WrapI64, this, Type::I32);
+        let flags = self.load_i32(sp, STRING_FLAGS_OFFSET);
+        let lb = self.i32c(STRING_LINEAR_BIT);
+        let lin = self.bin(Operator::I32And, flags, lb, Type::I32);
+        self.check(lin, other);
+        let len = self.load_i32(sp, STRING_LENGTH_OFFSET);
+        let inb = self.bin(Operator::I32LtU, code, len, Type::I32);
+        self.check(inb, other);
+        let ib = self.i32c(STRING_INLINE_CHARS_BIT);
+        let inl = self.bin(Operator::I32And, flags, ib, Type::I32);
+        let outofline = self.load_i32(sp, STRING_CHARS_OFFSET);
+        let inaddr = self.add_off(sp, STRING_CHARS_OFFSET);
+        let chars = self.select(Type::I32, inaddr, outofline, inl);
+        let latb = self.i32c(STRING_LATIN1_CHARS_BIT);
+        let lat = self.bin(Operator::I32And, flags, latb, Type::I32);
+        let (l8, l16, got) = (self.body.add_block(), self.body.add_block(), self.body.add_block());
+        let c = self.body.add_blockparam(got, Type::I32);
+        self.cond_br(lat, Self::to(l8), Self::to(l16));
+        self.cur = l8;
+        let a8 = self.bin(Operator::I32Add, chars, code, Type::I32);
+        let m8 = self.mem(0, 0);
+        let c8 = self.un(Operator::I32Load8U { memory: m8 }, a8, Type::I32);
+        self.terminate(Terminator::Br {
+            target: BlockTarget {
+                block: got,
+                args: vec![c8],
+            },
+        });
+        self.cur = l16;
+        let one = self.i32c(1);
+        let off = self.bin(Operator::I32Shl, code, one, Type::I32);
+        let a16 = self.bin(Operator::I32Add, chars, off, Type::I32);
+        let m16 = self.mem(1, 0);
+        let c16 = self.un(Operator::I32Load16U { memory: m16 }, a16, Type::I32);
+        self.terminate(Terminator::Br {
+            target: BlockTarget {
+                block: got,
+                args: vec![c16],
+            },
+        });
+        self.cur = got;
+        let (ccb, catb) = (self.body.add_block(), self.body.add_block());
+        self.cond_br(is_ccat, Self::to(ccb), Self::to(catb));
+        self.cur = ccb;
+        let r = self.box_tagged(TAG_INT32, c);
+        let t = self.edge(inst, 0, &[r])?;
+        self.terminate(Terminator::Br { target: t });
+        self.cur = catb;
+        let lim = self.i32c(256);
+        let small = self.bin(Operator::I32LtU, c, lim, Type::I32);
+        self.check(small, other);
+        let r = self.unit_string(c);
+        let t = self.edge(inst, 0, &[r])?;
+        self.terminate(Terminator::Br { target: t });
+        Ok(())
+    }
+
+    /// The static unit string of code `c` (< 256), boxed.
+    fn unit_string(&mut self, c: Value) -> Value {
+        let slot = self.i32c(self.h.static_strings_slot);
+        let tbl = self.load_i32(slot, 0);
+        let two = self.i32c(2);
+        let off = self.bin(Operator::I32Shl, c, two, Type::I32);
+        let e = self.bin(Operator::I32Add, tbl, off, Type::I32);
+        let atom = self.load_i32(e, 0);
+        self.box_tagged(TAG_STRING, atom)
+    }
+
+    /// `x.length` for a string (its length word) or an array (its elements
+    /// header's, when an int32), taking `ok_clean`; else branch to `other`.
+    fn length_arms(&mut self, inst: mir::Inst, x: Value, other: Block) -> R<()> {
+        let tag = self.tag_of(x);
+        let (s_b, o_chk) = (self.body.add_block(), self.body.add_block());
+        let is_str = self.tag_is(tag, TAG_STRING as u32);
+        self.cond_br(is_str, Self::to(s_b), Self::to(o_chk));
+        self.cur = s_b;
+        let sp = self.un(Operator::I32WrapI64, x, Type::I32);
+        let slen = self.load_i32(sp, STRING_LENGTH_OFFSET);
+        let r = self.box_tagged(TAG_INT32, slen);
+        let t = self.edge(inst, 0, &[r])?;
+        self.terminate(Terminator::Br { target: t });
+        self.cur = o_chk;
+        let is_obj = self.tag_is(tag, TAG_OBJECT as u32);
+        self.check(is_obj, other);
+        let obj = self.un(Operator::I32WrapI64, x, Type::I32);
+        let shape = self.load_i32(obj, SHAPE_OFFSET);
+        let base = self.load_i32(shape, SHAPE_BASESHAPE_OFFSET);
+        let clasp = self.load_i32(base, BASESHAPE_CLASP_OFFSET);
+        let aslot = self.i32c(self.h.array_class_slot);
+        let arr_class = self.load_i32(aslot, 0);
+        let is_arr = self.bin(Operator::I32Eq, clasp, arr_class, Type::I32);
+        let (arr_b, args_chk) = (self.body.add_block(), self.body.add_block());
+        self.cond_br(is_arr, Self::to(arr_b), Self::to(args_chk));
+        // An arguments object: its packed length (fixed slot 0, the count
+        // above bit 5), unless the length was overwritten (bit 0).
+        self.cur = args_chk;
+        let acbase = self.i32c(self.h.args_class_base);
+        let mapped = self.load_i32(acbase, 0);
+        let unmapped = self.load_i32(acbase, 4);
+        let m = self.bin(Operator::I32Eq, clasp, mapped, Type::I32);
+        let u = self.bin(Operator::I32Eq, clasp, unmapped, Type::I32);
+        let is_args = self.bin(Operator::I32Or, m, u, Type::I32);
+        self.check(is_args, other);
+        let packed = self.load_i32(obj, FIXED_SLOTS_BASE);
+        let one = self.i32c(1);
+        let over = self.bin(Operator::I32And, packed, one, Type::I32);
+        let kept = self.un(Operator::I32Eqz, over, Type::I32);
+        self.check(kept, other);
+        let five = self.i32c(5);
+        let argc = self.bin(Operator::I32ShrU, packed, five, Type::I32);
+        let r = self.box_tagged(TAG_INT32, argc);
+        let t = self.edge(inst, 0, &[r])?;
+        self.terminate(Terminator::Br { target: t });
+        self.cur = arr_b;
+        let elements = self.load_i32(obj, OBJ_ELEMENTS_OFFSET);
+        let back = self.i32c(ELEMENTS_LENGTH_BACK);
+        let la = self.bin(Operator::I32Sub, elements, back, Type::I32);
+        let alen = self.load_i32(la, 0);
+        let z = self.i32c(0);
+        let fits = self.bin(Operator::I32GeS, alen, z, Type::I32);
+        self.check(fits, other);
+        let r = self.box_tagged(TAG_INT32, alen);
+        let t = self.edge(inst, 0, &[r])?;
+        self.terminate(Terminator::Br { target: t });
+        Ok(())
+    }
+
     /// A layout constructor's first stamp of its completed `this`, inline
     /// (bbv's `emit_class_idx_stamp_impl`; `night_runtime_ctor_stamp`'s
     /// gates): an object still under construction whose early key is ours
@@ -3470,6 +3689,11 @@ impl<'a> Lower<'a> {
         /// Headroom a compiled body may use past its actuals (the runtime
         /// entries' `kNightStackHeadroomSlots`).
         const HEADROOM: u32 = 64 * 1024;
+        if ops.len() == 3 {
+            let call = self.body.add_block();
+            self.char_arms(inst, ops, call)?;
+            self.cur = call;
+        }
         let live = self.live_across(inst);
         self.spill(&live)?;
         let frame = self.top_off(live.len());
@@ -3550,8 +3774,33 @@ impl<'a> Lower<'a> {
     /// `night_call_classify` of boxed `callee`: its funcref-table index (0
     /// when not compiled or not a scripted function) and its `JSScript*`.
     fn classify(&mut self, callee: Value) -> (Value, Value) {
-        let z = self.i32c(0);
-        let args = self.body.arg_pool.from_iter([callee, z, z].into_iter());
+        // The site's value cell (bbv's `emit_inline_classify`): the steady
+        // state is one callee repeating, and a hit is the whole classify.
+        // The fill caches tenured functions only, and a major GC zeroes
+        // the region; a zero row never false-hits (it is the double +0).
+        let cell = self.i32c(CALL_CELL_ADDR_PLACEHOLDER);
+        let idx = self.atoms.next_call_cell();
+        self.call_cell_patches.push((cell, idx + 1));
+        let trash = self.i32c(CALL_CELL_ADDR_PLACEHOLDER);
+        self.call_cell_patches.push((trash, 0));
+        let done = self.body.add_block();
+        let fp = self.body.add_blockparam(done, Type::I32);
+        let sp = self.body.add_blockparam(done, Type::I32);
+        let cached = self.load_i64(cell, 0);
+        let f = self.load_i32(cell, CALL_CELL_FUNCIDX);
+        let sc = self.load_i32(cell, CALL_CELL_SCRIPT);
+        let hit = self.bin(Operator::I64Eq, callee, cached, Type::I32);
+        let miss = self.body.add_block();
+        self.cond_br(
+            hit,
+            BlockTarget {
+                block: done,
+                args: vec![f, sc],
+            },
+            Self::to(miss),
+        );
+        self.cur = miss;
+        let args = self.body.arg_pool.from_iter([callee, cell, trash].into_iter());
         let tys = self
             .body
             .type_pool
@@ -3565,7 +3814,14 @@ impl<'a> Lower<'a> {
         ));
         let funcidx = self.push_val(ValueDef::PickOutput(cls, 0, Type::I32));
         let script = self.push_val(ValueDef::PickOutput(cls, 1, Type::I32));
-        (funcidx, script)
+        self.terminate(Terminator::Br {
+            target: BlockTarget {
+                block: done,
+                args: vec![funcidx, script],
+            },
+        });
+        self.cur = done;
+        (fp, sp)
     }
 
     /// `inline.enter` (§5.5): the inlined callee's frame, as its

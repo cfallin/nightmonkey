@@ -171,7 +171,7 @@ pub fn translate_script(
         body: lowered.body,
         likely_patches: vec![],
         fuse_call_patches: vec![],
-        call_cell_patches: vec![],
+        call_cell_patches: lowered.call_cell_patches,
         alloc_cell_patches: vec![],
         iof_cell_patches: lowered.iof_cell_patches,
         construct_cell_patches: lowered.construct_cell_patches,

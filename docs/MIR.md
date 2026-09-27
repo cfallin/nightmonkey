@@ -1567,6 +1567,17 @@ bbv, found the costs; the fixes are general.
 - Octane under MIR vs bbv: crypto 11886/15378, navier-stokes
   20182/23058, earley-boyer 8479/13272.
 
+**M5g. IC misses (2026-09-27).** `--mir-exit-census` also counts each
+`js.getprop` site's IC misses (census kind 91, `night: mir getmiss`),
+which found the helper calls the ICs cannot avoid:
+- `length` is no slot: a string's length word, an array's elements
+  header and an arguments object's packed length are read inline
+  (deltablue took 11M misses on one array `length`; +14%).
+- `s.charCodeAt`/`s.charAt` on a string read the cached pristine natives
+  while the String fuse is intact, and the call arms (bbv's) load the
+  char of a linear string inline; `String.fromCharCode(c < 256)` is a
+  static unit string (crypto's 5M misses).
+
 **M6. The rest of §10**: box/unbox cleanup, memory optimizations, and
 numeric optimizations, each with its guard-count and instruction-count
 tests.

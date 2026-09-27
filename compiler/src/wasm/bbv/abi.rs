@@ -117,7 +117,7 @@ pub(super) const ELEMENTS_HEADER_BYTES: u32 = 16;
 pub(crate) const ELEMENTS_FLAGS_BACK: u32 = 16;
 pub(crate) const ELEMENTS_INITLEN_BACK: u32 = 12;
 pub(super) const ELEMENTS_CAPACITY_BACK: u32 = 8;
-pub(super) const ELEMENTS_LENGTH_BACK: u32 = 4;
+pub(crate) const ELEMENTS_LENGTH_BACK: u32 = 4;
 pub(super) const ELEMENTS_FLAG_FIXED: u32 = 0x1;
 pub(crate) const ELEMENTS_FROZEN_FLAG: u32 = 0x40;
 pub(super) const ELEMENTS_NON_PACKED_FLAG: u32 = 0x80;
@@ -138,15 +138,15 @@ pub(crate) const TA_DATA_PAYLOAD_OFFSET: u32 = FIXED_SLOTS_BASE + 8 * 3;
 //   +4  length
 //   +8  chars pointer, or the first inline char when INLINE_CHARS is set
 
-pub(super) const STRING_FLAGS_OFFSET: u32 = 0;
-pub(super) const STRING_LENGTH_OFFSET: u32 = 4;
-pub(super) const STRING_CHARS_OFFSET: u32 = 8;
+pub(crate) const STRING_FLAGS_OFFSET: u32 = 0;
+pub(crate) const STRING_LENGTH_OFFSET: u32 = 4;
+pub(crate) const STRING_CHARS_OFFSET: u32 = 8;
 /// `JSString::ATOM_BIT` -- atoms are deduped, so two atoms compare by
 /// pointer.
 pub(super) const STRING_ATOM_BIT: u32 = 1 << 3;
-pub(super) const STRING_LINEAR_BIT: u32 = 1 << 4;
-pub(super) const STRING_INLINE_CHARS_BIT: u32 = 1 << 6;
-pub(super) const STRING_LATIN1_CHARS_BIT: u32 = 1 << 10;
+pub(crate) const STRING_LINEAR_BIT: u32 = 1 << 4;
+pub(crate) const STRING_INLINE_CHARS_BIT: u32 = 1 << 6;
+pub(crate) const STRING_LATIN1_CHARS_BIT: u32 = 1 << 10;
 
 // --- JSFunction / BaseScript ----------------------------------------------
 //
@@ -235,9 +235,9 @@ pub(crate) const FLAGS_ALL: u32 = FLAG_MUT_THIS | FLAG_MUT_OTHER | FLAG_STAMPS |
 // what makes an unpatched one findable in the output.
 
 /// Per-site callee value cell: `[callee_bits i64][funcidx i32][script i32]`.
-pub(super) const CALL_CELL_FUNCIDX: u32 = 8;
-pub(super) const CALL_CELL_SCRIPT: u32 = 12;
-pub(super) const CALL_CELL_ADDR_PLACEHOLDER: u32 = 0xDEAD_BEE0;
+pub(crate) const CALL_CELL_FUNCIDX: u32 = 8;
+pub(crate) const CALL_CELL_SCRIPT: u32 = 12;
+pub(crate) const CALL_CELL_ADDR_PLACEHOLDER: u32 = 0xDEAD_BEE0;
 
 /// Per-site construct cell: the first 20 bytes mirror the call cell, then
 /// `[ctorShape u32][gen u32][protoPtr u32][protoSlotEnc u32]`.
