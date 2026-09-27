@@ -36,6 +36,9 @@ pub enum ConstVal {
     /// the exit's pc (§5.1's liveness pruning). The lowering leaves such a
     /// slot as the frame already has it.
     Dead,
+    /// The `this` placeholder of a `new` (`JS_IS_CONSTRUCTING`), a magic
+    /// value.
+    IsConstructing,
 }
 
 /// The target of an unbox.
@@ -351,7 +354,10 @@ pub enum Opcode {
     // Calls. Operands: callee (or new.target pair), `this`, args.
     Call,
     CallDirect,
-    Construct,
+    /// `new`: operands callee, `this` (the IS_CONSTRUCTING magic), args,
+    /// new.target. The site's sized-allocation slot count and early stamp
+    /// word (`bbv::construct_nslots`/`construct_alloc_word`).
+    Construct(u32, u32),
     CallNative(NativeId),
 }
 
@@ -427,7 +433,7 @@ impl Opcode {
             | InitField(_) => OK_FAIL.to_vec(),
             JsAdd | JsBinop(_) | JsUnop(_) | JsCompare(_) | JsToNumeric | JsGetProp(_)
             | JsSetProp(..) | JsGetElem | JsSetElem(_) | JsBoxThis | JsBindGName(_)
-            | JsSetName(..) | LoadField(_) | StoreField(_) | Call | CallDirect | Construct
+            | JsSetName(..) | LoadField(_) | StoreField(_) | Call | CallDirect | Construct(..)
             | CallNative(_) => CLEAN_DIRTY_ERR.to_vec(),
             // No dynamic effect report: the kill is static, on `ok`.
             JsGetName(_) | JsLambda(_) => OK_ERR.to_vec(),
@@ -597,7 +603,7 @@ pub fn const_val_type(c: ConstVal) -> Type {
             ObjInfo::TOP,
             StrInfo::TOP,
         )),
-        ConstVal::Uninitialized => Type::val(TagSet::MAGIC),
+        ConstVal::Uninitialized | ConstVal::IsConstructing => Type::val(TagSet::MAGIC),
         ConstVal::Dead => Type::VAL_TOP,
     }
 }
@@ -1283,13 +1289,13 @@ pub fn signature(op: &Opcode, args: &[Type], m: &Module) -> SigResult {
             Sig::none()
         }
 
-        Call | Construct => {
+        Call | Construct(..) => {
             want(args.len() >= 2, || "call: expected callee and this".into())?;
             for t in args {
                 val(t, "call operand")?;
             }
-            Sig::output(if *op == Construct {
-                Type::OBJ_TOP
+            Sig::output(if matches!(op, Construct(..)) {
+                Type::val(TagSet::OBJECT)
             } else {
                 Type::VAL_TOP
             })
@@ -1462,7 +1468,7 @@ pub fn effects(op: &Opcode, args: &[Type], m: &Module) -> Effects {
         // An allocation, but reported as generic: it runs no JS, yet a GC
         // may move anything.
         JsLambda(_) => return Effects::generic(FlagsEffect::Bits(FlagBits::ALL)),
-        Call | CallDirect | Construct | CallNative(_) => {
+        Call | CallDirect | Construct(..) | CallNative(_) => {
             return Effects::generic(FlagsEffect::Callee)
         }
         // The atom's string: its lowering calls a may-GC helper.

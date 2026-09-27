@@ -380,7 +380,7 @@ pub fn mnemonic(op: &Opcode) -> String {
         EnvStore(_) => "env.store".into(),
         Call => "call".into(),
         CallDirect => "call_direct".into(),
-        Construct => "construct".into(),
+        Construct(..) => "construct".into(),
         CallNative(_) => "call_native".into(),
     }
 }
@@ -398,6 +398,7 @@ fn immediates(m: &Module, op: &Opcode) -> Option<String> {
             crate::mir::ops::ConstVal::Double(bits) => format!("double {}", f64_str(*bits)),
             crate::mir::ops::ConstVal::Uninitialized => "uninitialized".into(),
             crate::mir::ops::ConstVal::Dead => "dead".into(),
+            crate::mir::ops::ConstVal::IsConstructing => "is_constructing".into(),
         },
         JsTypeofEq(k) => k.to_string(),
         JsConstantStrictEq(k) => k.to_string(),
@@ -430,6 +431,7 @@ fn immediates(m: &Module, op: &Opcode) -> Option<String> {
         NewObject(k) => format!("L{k}"),
         EnvLoad(s) | EnvStore(s) => s.to_string(),
         JsLambda(k) => k.to_string(),
+        Construct(n, w) => format!("{n}, {w}"),
         _ => return None,
     })
 }

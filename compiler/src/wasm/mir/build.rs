@@ -2263,6 +2263,26 @@ impl<'s, 'a> Run<'s, 'a> {
                 self.js_void(Opcode::JsSetElem(op == StrictSetElem), vec![x, k, y]);
                 self.st.push(v);
             }
+            IsConstructing => {
+                let v = self.const_val(ConstVal::IsConstructing);
+                self.push(v, Ty::Val(TagSet::MAGIC));
+            }
+            New | NewContent => {
+                // [callee, this, args…, new.target] -> [object]
+                let argc = usize::from(p.next_uint16().unwrap());
+                let n = self.st.len();
+                let operands: Vec<Slot> = self.st.drain(n - argc - 3..).collect();
+                let vals: Vec<mir::Value> = operands.into_iter().map(|x| self.boxed(x)).collect();
+                let site = self.site(pc);
+                let mono = match self.s.ctx.facts.scripted_targets(site) {
+                    [s] => Some(*s),
+                    _ => None,
+                };
+                let nslots = crate::wasm::bbv::construct_nslots(self.s.ctx, mono, site);
+                let word = crate::wasm::bbv::construct_alloc_word(self.s.ctx, mono, site);
+                let r = self.js(Opcode::Construct(nslots, word), vals, MType::val(TagSet::OBJECT));
+                self.push(r, Ty::Val(TagSet::OBJECT));
+            }
             Call | CallIgnoresRv | CallContent => {
                 let argc = usize::from(p.next_uint16().unwrap());
                 let n = self.st.len();

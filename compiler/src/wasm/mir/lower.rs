@@ -59,7 +59,7 @@ use crate::wasm::bbv::abi::{
     SHAPE_OFFSET, VAL_GCTHING_TAG_MIN, ZONE_NEEDS_BARRIER_OFFSET,
 };
 use crate::wasm::translate::{
-    AtomTable, Helpers, INLINE_IC_STRIDE, MAGIC_UNINITIALIZED_LEXICAL, TAG_BIGINT_HI, TAG_BOOLEAN, TAG_CLEAR,
+    AtomTable, Helpers, INLINE_IC_STRIDE, MAGIC_IS_CONSTRUCTING, MAGIC_UNINITIALIZED_LEXICAL, TAG_BIGINT_HI, TAG_BOOLEAN, TAG_CLEAR,
     TAG_INT32, TAG_MAGIC, TAG_NULL, TAG_OBJECT, TAG_STRING, TAG_SYMBOL, TAG_UNDEFINED,
 };
 
@@ -938,6 +938,7 @@ impl<'a> Lower<'a> {
                     ConstVal::Int32(n) => (TAG_INT32 << 32) | u64::from(n as u32),
                     ConstVal::Double(bits) => bits,
                     ConstVal::Uninitialized => (TAG_MAGIC << 32) | MAGIC_UNINITIALIZED_LEXICAL,
+                    ConstVal::IsConstructing => (TAG_MAGIC << 32) | MAGIC_IS_CONSTRUCTING,
                     ConstVal::Dead => UNDEF,
                 };
                 let v = self.i64c(bits);
@@ -1346,6 +1347,29 @@ impl<'a> Lower<'a> {
                 self.js_call(inst, self.h.set_element, &[a[0], a[1], a[2], sv], false)?;
             }
             Opcode::Call => self.js_call_op(inst, &a)?,
+            Opcode::Construct(nslots, word) => {
+                // The frame `[callee, this, args…, new.target]` above the
+                // rooting slots, then the runtime's construct (it creates
+                // `this` sized and seeded for the site, and runs the
+                // constructor). The result lands at the frame's top.
+                let live = self.live_across(inst);
+                self.spill(&live)?;
+                let frame = self.root_base + 8 * u32::try_from(live.len()).unwrap();
+                for (k, &v) in a.iter().enumerate() {
+                    self.store_i64(self.sp, frame + 8 * u32::try_from(k).unwrap(), v);
+                }
+                let argc = u32::try_from(a.len() - 3).unwrap();
+                let top_off = frame + 8 * u32::try_from(a.len()).unwrap();
+                let base = self.add_off(self.sp, frame);
+                let top = self.add_off(self.sp, top_off);
+                let (av, nv, wv) = (self.i32c(argc), self.i32c(nslots), self.i32c(word));
+                let ok = self.call1(self.h.construct, &[self.cx, top, base, av, nv, wv], Type::I32);
+                self.reload(&live)?;
+                let r = self.load_i64(self.sp, top_off);
+                let t = self.edge(inst, 1, &[r])?;
+                let e = self.edge(inst, 2, &[])?;
+                self.cond_br(ok, t, e);
+            }
             Opcode::GuardLayout { keys, types } => {
                 // The stamp word (`JSObject*+4`): identity is layout key + 1
                 // in the low 16 bits; TYPES is the SHALLOW bit (§4.3).

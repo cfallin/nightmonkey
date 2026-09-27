@@ -1153,6 +1153,7 @@ impl Parser {
                     "double" => crate::mir::ops::ConstVal::Double(self.f64_bits()?),
                     "uninitialized" => crate::mir::ops::ConstVal::Uninitialized,
                     "dead" => crate::mir::ops::ConstVal::Dead,
+                    "is_constructing" => crate::mir::ops::ConstVal::IsConstructing,
                     _ => return self.err(format!("bad const.val literal `{w}`")),
                 })
             }
@@ -1199,6 +1200,11 @@ impl Parser {
             EnvLoad(_) => EnvLoad(EnvSlot::new(self.int()?)),
             EnvStore(_) => EnvStore(EnvSlot::new(self.int()?)),
             JsLambda(_) => JsLambda(self.int()?),
+            Construct(..) => {
+                let n = self.int()?;
+                self.expect_punct(",")?;
+                Construct(n, self.int()?)
+            }
             other => other,
         })
     }
@@ -1448,7 +1454,7 @@ fn template(mn: &str) -> Option<Opcode> {
         EnvStore(EnvSlot::new(0)),
         Call,
         CallDirect,
-        Construct,
+        Construct(0, 0),
         CallNative(NativeId::from_u32(0)),
     ];
     for k in UnboxKind::ALL {
