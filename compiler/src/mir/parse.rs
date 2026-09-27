@@ -1208,6 +1208,7 @@ impl Parser {
             EnvLoad(_) => EnvLoad(EnvSlot::new(self.int()?)),
             EnvStore(_) => EnvStore(EnvSlot::new(self.int()?)),
             JsLambda(_) => JsLambda(self.int()?),
+            RestArray(_) => RestArray(self.int()?),
             FrameStore(_) => FrameStore(self.int()?),
             Construct(..) => {
                 let n = self.int()?;
@@ -1440,6 +1441,10 @@ fn template(mn: &str) -> Option<Opcode> {
         JsBindGName(placeholder_atom),
         JsLambda(0),
         JsThrow,
+        ArgsObject,
+        RestArray(0),
+        ArgsLength,
+        ActualArg,
         JsRt(RtOp::Instanceof),
         JsRt(RtOp::In),
         JsRt(RtOp::HasOwn),

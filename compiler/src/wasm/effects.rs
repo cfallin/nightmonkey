@@ -264,6 +264,7 @@ fn helper_rows() -> Vec<Row> {
         ),
         (|h| h.set_aliased, "set_aliased", leaf_user(Slot.bit())),
         (|h| h.ctor_stamp, "ctor_stamp", leaf(ClassWord.bit())),
+        (|h| h.ctor_restamp, "ctor_restamp", leaf(ClassWord.bit())),
         (|h| h.gen_suspend, "gen_suspend", leaf_user(slot_elems)),
         (|h| h.gen_restore, "gen_restore", leaf_user(slot_elems)),
         (|h| h.gen_closing, "gen_closing", leaf_user(0)),

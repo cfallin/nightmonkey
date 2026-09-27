@@ -4209,6 +4209,45 @@ void night_runtime_ctor_stamp(uint64_t thisBits, uint32_t layoutId,
   obj->setExternalWord((layoutId + 1) | (w0 & keepBits));
 }
 
+// bbv's `emit_class_idx_stamp_impl` restamp form, as a helper. No epoch
+// bump: the only stamped words the gates admit are prefix-stamped ones,
+// and advancing those falsifies nothing a caller carries.
+void night_runtime_ctor_restamp(uint64_t thisBits, uint32_t layoutId,
+                                uint32_t nFields, uint32_t keepBits,
+                                uint32_t prefix0, uint32_t prefix1,
+                                uint32_t prefix2, uint32_t prefix3) {
+  JS::Value v = JS::Value::fromRawBits(thisBits);
+  if (!v.isObject() || !v.toObject().is<js::NativeObject>()) {
+    return;
+  }
+  js::NativeObject* obj = &v.toObject().as<js::NativeObject>();
+  uint32_t w0 = obj->externalWord();
+  uint32_t idx = w0 & 0xFFFF;
+  if (idx == layoutId + 1) {
+    return;
+  }
+  const uint32_t prefixes[4] = {prefix0, prefix1, prefix2, prefix3};
+  auto isPrefix = [&](uint32_t k) {
+    for (uint32_t p : prefixes) {
+      if (p != 0 && k == p) {
+        return true;
+      }
+    }
+    return false;
+  };
+  bool ok = false;
+  if (w0 & js::night::kWordConstructing) {
+    uint32_t key = (w0 >> 18) & 0x0FFF;
+    ok = key == 0 || key == layoutId + 1 || isPrefix(key);
+  } else {
+    ok = isPrefix(idx) && !(w0 & js::night::kWordAdvIneligible);
+  }
+  if (!ok || obj->slotSpan() < nFields) {
+    return;
+  }
+  obj->setExternalWord((layoutId + 1) | (w0 & keepBits));
+}
+
 // `FinalYieldRval`: close the completed generator.
 bool night_runtime_gen_final(JSContext* cx, uint32_t top, uint64_t gen) {
   SetNightTop(cx, top);

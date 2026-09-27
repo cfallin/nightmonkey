@@ -401,6 +401,17 @@ int32_t night_runtime_mir_stress(uint32_t period);
 NIGHT_RUNTIME_EXPORT(night_runtime_ctor_stamp)
 void night_runtime_ctor_stamp(uint64_t thisBits, uint32_t layoutId,
                               uint32_t nFields, uint32_t keepBits);
+// The two-phase restamp at an init delegate's returns (bbv's restamp form
+// of the ctor-exit stamp): advance `this` to layout `layoutId` when it is
+// already that layout (no-op), still under the CONSTRUCTING sentinel with
+// an early key of ours, a prefix layout's, or none, or stamped with a
+// prefix layout and eligible to advance; and its slot span covers the
+// layout. `prefixN` are prefix layout ids + 1 (0: none). Leaf.
+NIGHT_RUNTIME_EXPORT(night_runtime_ctor_restamp)
+void night_runtime_ctor_restamp(uint64_t thisBits, uint32_t layoutId,
+                                uint32_t nFields, uint32_t keepBits,
+                                uint32_t prefix0, uint32_t prefix1,
+                                uint32_t prefix2, uint32_t prefix3);
 
 // `key in obj` (JSOp::In): boxed boolean to the out-slot; throws when `obj`
 // is not an object. May GC (proxy hooks).

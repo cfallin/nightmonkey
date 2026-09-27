@@ -362,6 +362,15 @@ pub enum Opcode {
     JsSetName(AtomId, bool),
     /// A generic operation through its runtime helper (see [`RtOp`]).
     JsRt(RtOp),
+    /// The function's (unmapped) arguments object: the frame's cached
+    /// one, else a new one, cached. Only in the function's own frame.
+    ArgsObject,
+    /// A rest-parameter array of the actuals past the first `n`.
+    RestArray(u32),
+    /// The actual argument count, an i32.
+    ArgsLength,
+    /// Actual argument `args[0]` (an i32 index below the count).
+    ActualArg,
     /// `throw args[0]`: the only successor is `err`.
     JsThrow,
     /// Write `args[0]` (a `Val`, or an i32, f64 or bool, stored as the
@@ -486,6 +495,7 @@ impl Opcode {
             // No dynamic effect report: the kill is static, on `ok`.
             JsGetName(_) | JsLambda(_) | ExitInline { .. } => OK_ERR.to_vec(),
             JsRt(_) => CLEAN_DIRTY_ERR.to_vec(),
+            ArgsObject | RestArray(_) => OK_ERR.to_vec(),
             JsThrow => vec![SuccRole::Err],
             _ => vec![],
         }
@@ -1099,6 +1109,19 @@ pub fn signature(op: &Opcode, args: &[Type], m: &Module) -> SigResult {
             val(&args[0], "js.throw")?;
             Sig::none()
         }
+        ArgsObject | RestArray(_) => {
+            arity(args, 0)?;
+            Sig::output(Type::val(TagSet::OBJECT))
+        }
+        ArgsLength => {
+            arity(args, 0)?;
+            Sig::result(Type::I32(IRange::new(0, i64::from(i32::MAX))))
+        }
+        ActualArg => {
+            arity(args, 1)?;
+            i32r(&args[0], "args.actual")?;
+            Sig::result(Type::VAL_TOP)
+        }
         JsToBool => {
             arity(args, 1)?;
             val(&args[0], "js.tobool")?;
@@ -1577,6 +1600,8 @@ pub fn effects(op: &Opcode, args: &[Type], m: &Module) -> Effects {
         }
         JsGetName(_) => return Effects::generic(FlagsEffect::Bits(FlagBits::ALL)),
         JsRt(_) => return Effects::generic(FlagsEffect::Dynamic),
+        // Allocations; conservatively generic.
+        ArgsObject | RestArray(_) => return Effects::generic(FlagsEffect::Bits(FlagBits::ALL)),
         JsThrow => return Effects::generic(FlagsEffect::Bits(FlagBits::ALL)),
         // An allocation, but reported as generic: it runs no JS, yet a GC
         // may move anything.

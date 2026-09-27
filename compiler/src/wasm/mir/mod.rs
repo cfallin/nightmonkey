@@ -120,6 +120,7 @@ pub fn translate_script(
             strict: script.strict,
             plain_env: baseline::needs_env(script) && baseline::env_is_plain(ctx.source, script),
             forward_resume: inline_eligible(ctx, script),
+            ctor_restamp: ctx.deleg_restamps_in.get(&sid).and_then(crate::wasm::bbv::restamp_args),
             ctor_stamp: ctx.stamp_ctors_in.get(&sid).map(|si| {
                 [
                     si.layout_id,

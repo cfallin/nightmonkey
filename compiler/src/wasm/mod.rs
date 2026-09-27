@@ -1015,6 +1015,7 @@ pub fn resolve_helpers(
         gen_is_closing: resolve(m, "night_runtime_gen_is_closing")?,
         mir_stress: resolve(m, "night_runtime_mir_stress")?,
         ctor_stamp: resolve(m, "night_runtime_ctor_stamp")?,
+        ctor_restamp: resolve(m, "night_runtime_ctor_restamp")?,
     })
 }
 

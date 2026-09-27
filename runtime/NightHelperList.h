@@ -172,6 +172,7 @@
   NIGHT_RUNTIME_HELPER(night_runtime_gen_is_closing)              \
   NIGHT_RUNTIME_HELPER(night_runtime_mir_stress)                  \
   NIGHT_RUNTIME_HELPER(night_runtime_ctor_stamp)                  \
+  NIGHT_RUNTIME_HELPER(night_runtime_ctor_restamp)                \
   NIGHT_RUNTIME_HELPER(night_runtime_regex_ci_compare)
 
 namespace js {

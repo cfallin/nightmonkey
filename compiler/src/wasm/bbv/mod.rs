@@ -216,6 +216,32 @@ pub(crate) fn ctor_stamp_keep_bits(si: &StampCtorIn) -> u32 {
         | if si.ranges.iter().any(Option::is_some) { CLASS_WORD_RANGES } else { 0 }
 }
 
+/// Whether the baseline and MIR tiers restamp at init delegates' returns.
+const RESTAMPS: bool = false;
+
+/// The arguments after `this` of `night_runtime_ctor_restamp` for init
+/// delegate `si`: layout, field count, kept bits, then up to four prefix
+/// layout ids + 1 (0: none). `None` for a delegate with more prefixes
+/// (it is then not restamped outside bbv, which costs typed accesses only).
+pub(crate) fn restamp_args(si: &StampCtorIn) -> Option<[u32; 7]> {
+    if !RESTAMPS || si.prefix_keys.len() > 4 {
+        return None;
+    }
+    let mut a = [
+        si.layout_id,
+        u32::try_from(si.fields.len()).unwrap(),
+        ctor_stamp_keep_bits(si),
+        0,
+        0,
+        0,
+        0,
+    ];
+    for (i, &p) in si.prefix_keys.iter().enumerate() {
+        a[3 + i] = p + 1;
+    }
+    Some(a)
+}
+
 // --- block keys ----------------------------------------------------------
 
 /// Pc-space cap. Scripts are capped at 128 KiB of bytecode (the translate

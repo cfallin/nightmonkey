@@ -126,7 +126,10 @@ const SPECULATE_INT_FIRST: bool = true;
 
 /// Whether the generic runtime ops (`js.rt`, `js.throw`, `js.typeof`)
 /// are built.
-const RT_OPS: bool = false;
+const RT_OPS: bool = true;
+
+/// Whether scripts that read their actuals are built.
+const ACTUALS: bool = false;
 
 fn num_claim_ty(claim: crate::facts::Claim, int_first: bool) -> Option<Ty> {
     let prims = claim.prims();
@@ -189,7 +192,12 @@ impl<'a> Shape<'a> {
         else {
             return None;
         };
-        if !super::inline_eligible(self.ctx, ks) || self.ctx.stamp_ctors_in.contains_key(&k) {
+        // A stamping constructor or an init delegate stamps `this` at its
+        // returns, which an inlined copy's returns would skip.
+        if !super::inline_eligible(self.ctx, ks)
+            || self.ctx.stamp_ctors_in.contains_key(&k)
+            || self.ctx.deleg_restamps_in.contains_key(&k)
+        {
             return None;
         }
         let (mut mm, f) = build_at(self.ctx, names, k, ks, false, self.inline_depth + 1).ok()?;
@@ -289,7 +297,10 @@ fn build_at<'a>(
         return Err("class constructor".into());
     }
     let fl = FrameLayout::of(script);
-    if fl.rebase_vp || script.has_mapped_args {
+    if script.has_mapped_args {
+        return Err("mapped arguments".into());
+    }
+    if !ACTUALS && fl.rebase_vp {
         return Err("reads actuals".into());
     }
     // An env chain is supported while it is fixed for the whole
@@ -2581,7 +2592,34 @@ impl<'s, 'a> Run<'s, 'a> {
                 let a = self.pop();
                 let x = self.boxed(a);
                 let err = self.exit_block(true);
-                self.term(Opcode::JsThrow, vec![x], vec![Self::goto(err)]);
+                let (t, _) = self.f.add_inst(self.cur, Opcode::JsThrow, vec![x], &[], vec![Self::goto(err)]);
+                self.live = false;
+                self.f.witnesses[t] = Some(mir::func::Witness {
+                    may_kill: mir::types::KillPattern::ALL,
+                });
+            }
+            // The actuals (the frame's variable region is past them: the
+            // lowering's `vp`).
+            Arguments => {
+                let v = self.js_static(Opcode::ArgsObject, vec![], MType::val(TagSet::OBJECT));
+                self.push(v, Ty::Val(TagSet::OBJECT));
+            }
+            Rest => {
+                let nformal = self.s.nargs.saturating_sub(1);
+                let v = self.js_static(Opcode::RestArray(nformal), vec![], MType::val(TagSet::OBJECT));
+                self.push(v, Ty::Val(TagSet::OBJECT));
+            }
+            ArgumentsLength => {
+                let v = self.inst(Opcode::ArgsLength, vec![], Some(MType::I32_TOP));
+                self.push(v, Ty::I32);
+            }
+            GetActualArg => {
+                let i = self.pop();
+                if i.ty != Ty::I32 {
+                    return Err("GetActualArg of a non-int32 index".into());
+                }
+                let v = self.inst(Opcode::ActualArg, vec![i.v], Some(MType::VAL_TOP));
+                self.push(v, Ty::Val(TagSet::ALL));
             }
             IsConstructing => {
                 let v = self.const_val(ConstVal::IsConstructing);

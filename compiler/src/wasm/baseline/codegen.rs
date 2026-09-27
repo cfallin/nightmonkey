@@ -28,7 +28,7 @@ use super::layout::{
 };
 use crate::bytecode::{BytecodeParser, JSOp, Script, TryNoteKind};
 use crate::ids::{Pc, ScriptId, Site};
-use crate::wasm::bbv::{construct_alloc_word, construct_nslots, ctor_stamp_keep_bits};
+use crate::wasm::bbv::{construct_alloc_word, construct_nslots, ctor_stamp_keep_bits, restamp_args};
 use crate::source::{ScopeData, SourceObject};
 use crate::wasm::bbv::abi::{
     BINOP_BITAND, BINOP_BITNOT, BINOP_BITOR, BINOP_BITXOR, BINOP_DEC, BINOP_DIV, BINOP_INC,
@@ -72,6 +72,9 @@ pub(super) struct Gen<'a> {
     /// arguments after `this`): without it no object a baseline or MIR
     /// constructor builds is ever stamped, and every layout guard misses.
     ctor_stamp: Option<[u32; 3]>,
+    /// An init delegate's restamp (`night_runtime_ctor_restamp`'s
+    /// arguments after `this`).
+    ctor_restamp: Option<[u32; 7]>,
     atoms: &'a mut AtomTable,
     script: &'a Script,
     is_global: bool,
@@ -206,6 +209,7 @@ impl<'a> Gen<'a> {
                     ctor_stamp_keep_bits(si),
                 ]
             }),
+            ctor_restamp: ctx.deleg_restamps_in.get(&sid).and_then(restamp_args),
             atoms,
             script,
             is_global,
@@ -1324,6 +1328,13 @@ impl<'a> Gen<'a> {
             let thisv = self.load_i64(self.sp, FrameLayout::THIS);
             let (l, n, k) = (self.i32c(layout), self.i32c(nfields), self.i32c(keep));
             self.call(self.h.ctor_stamp, &[thisv, l, n, k], None);
+        }
+        if let Some(r) = self.ctor_restamp {
+            let mut args = vec![self.load_i64(self.sp, FrameLayout::THIS)];
+            for x in r {
+                args.push(self.i32c(x));
+            }
+            self.call(self.h.ctor_restamp, &args, None);
         }
         self.store_i64(self.retval_out, 0, v);
         let zero = self.i32c(0);
