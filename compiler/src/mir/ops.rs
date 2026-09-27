@@ -223,6 +223,14 @@ pub enum RtOp {
     InitProp(AtomId, u32),
     /// Define own element `key` of `obj` to `v`, with the attributes.
     InitElem(u32),
+    /// ToPropertyKey (a string, a symbol or an int32) -> val.
+    ToPropertyKey,
+    /// The regexp literal the script's gcthing `index` names, cloned ->
+    /// object.
+    RegExp(u32),
+    /// Define getter/setter `name` of `obj` to `f` (`kind`: 1 setter,
+    /// 2 hidden).
+    InitPropGetSet(AtomId, u32),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -343,6 +351,11 @@ pub enum Opcode {
     /// `v === c` for the constant the operand of `JSOp::StrictConstantEq`
     /// encodes (`js::ConstantCompareOperand`): a leaf.
     JsConstantStrictEq(u16),
+    /// Formal `n` of the frame's mapped `arguments` object (which the
+    /// entry made): `ArgumentsObject::arg`, a leaf.
+    ArgsMapped(u32),
+    /// Set formal `n` of the frame's mapped `arguments` object: a leaf.
+    ArgsMappedSet(u32),
     JsToBool,
     JsToNumeric,
     JsGetProp(AtomId),
@@ -1102,6 +1115,9 @@ pub fn signature(op: &Opcode, args: &[Type], m: &Module) -> SigResult {
                 RtOp::NewObject | RtOp::NewArray(_) => (0, Some(Type::val(TagSet::OBJECT))),
                 RtOp::InitProp(..) => (2, None),
                 RtOp::InitElem(_) => (3, None),
+                RtOp::ToPropertyKey => (1, Some(Type::VAL_TOP)),
+                RtOp::RegExp(_) => (0, Some(Type::val(TagSet::OBJECT))),
+                RtOp::InitPropGetSet(..) => (2, None),
             };
             arity(args, n)?;
             for t in args {
@@ -1155,6 +1171,15 @@ pub fn signature(op: &Opcode, args: &[Type], m: &Module) -> SigResult {
             arity(args, 1)?;
             val(&args[0], "js leaf compare")?;
             Sig::result(Type::Bool)
+        }
+        ArgsMapped(_) => {
+            arity(args, 0)?;
+            Sig::result(Type::VAL_TOP)
+        }
+        ArgsMappedSet(_) => {
+            arity(args, 1)?;
+            val(&args[0], "args.mapped_set")?;
+            Sig::none()
         }
         JsToNumeric => {
             arity(args, 1)?;
@@ -1668,6 +1693,11 @@ pub fn effects(op: &Opcode, args: &[Type], m: &Module) -> Effects {
         }
         NewObject(_) | NewArray => fx.may_gc = true,
         LoadElem => fx.reads = vec![Region::Elements(elements_root(recv, m))],
+        ArgsMapped(_) => fx.reads = vec![Region::Unknown],
+        ArgsMappedSet(_) => {
+            fx.writes = vec![Region::Unknown];
+            fx.flags = FlagsEffect::Bits(FlagBits::MUT_OTHER);
+        }
         StoreElem => {
             fx.writes = vec![Region::Elements(elements_root(recv, m))];
             fx.flags = FlagsEffect::Bits(FlagBits::MUT_OTHER);
@@ -1851,8 +1881,9 @@ mod tests {
         let s = signature(&Opcode::LoadField(o), &[k3(true)], &m).unwrap();
         assert_eq!(s.outputs[0].obj_info().unwrap().layout, None);
         assert_eq!(s.outputs[0].obj_info().unwrap().kind, ObjKind::Plain);
-        // Without `types`, no load.
-        assert!(signature(&Opcode::LoadField(x), &[k3(false)], &m).is_err());
+        // Without `types`, the identity alone: any val.
+        let s = signature(&Opcode::LoadField(x), &[k3(false)], &m).unwrap();
+        assert_eq!(s.outputs, vec![Type::VAL_TOP]);
         // Stores require conformance.
         assert!(signature(
             &Opcode::StoreField(x),

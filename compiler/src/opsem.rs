@@ -256,6 +256,11 @@ impl TaKind {
 
     /// log2 of the element size in bytes: the shift from an element index
     /// to a byte offset.
+    /// Whether the elements are floating-point (their loads are doubles).
+    pub const fn is_float(self) -> bool {
+        matches!(self, TaKind::Float32 | TaKind::Float64)
+    }
+
     pub const fn log2_bytes(self) -> u32 {
         match self {
             TaKind::Int8 | TaKind::Uint8 | TaKind::Uint8Clamped => 0,

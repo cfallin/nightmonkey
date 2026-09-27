@@ -1543,6 +1543,30 @@ bbv, found the costs; the fixes are general.
   there is spread across calls not inlined (constructors, callees over
   200 bytes), frame write-through and code size.
 
+**M5f. Coverage and typed arrays (2026-09-27).**
+- **Declines closed.** `ToPropertyKey` (compound element assignment; a
+  no-op for an int32, string or symbol key), regexp literals, getter and
+  setter literals, `GetFrameArg` (a formal's frame slot, as `GetArg`),
+  and mapped `arguments` with formals: the entry makes the object before
+  anything can exit, and `GetArg`/`SetArg` are the leaf ops
+  `args.mapped`/`args.mapped_set` on it, as baseline's are.
+- **Typed arrays.** Element accesses the analysis predicts on a typed
+  array of one kind (`ta_elem_sites`) with int32 keys are
+  `load_ta`/`store_ta` on a receiver of the builder's `Ta(kind)` slot
+  type (`guard.kind TypedArray(k)`: a class compare), its guard hoisted
+  to the loop's entry like a native receiver's; out of bounds, the
+  generic op. Integer kinds load and store int32s, float kinds doubles
+  (a NaN load is the canonical NaN); clamped and Uint32 arrays stay
+  generic.
+- **Fixes.** An inlined callee's getter/setter definitions kept their
+  callee atom ids (the splice's op remap missed them). A script making
+  its own environment read `this` and the formals from the frame before
+  `env_setup`, which may GC: a moved nursery formal was then stored into
+  the call object at its old address (earley-boyer crashed under AOT);
+  they are read again after it.
+- Octane under MIR vs bbv: crypto 11886/15378, navier-stokes
+  20182/23058, earley-boyer 8479/13272.
+
 **M6. The rest of §10**: box/unbox cleanup, memory optimizations, and
 numeric optimizations, each with its guard-count and instruction-count
 tests.

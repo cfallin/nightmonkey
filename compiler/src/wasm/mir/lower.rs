@@ -52,7 +52,7 @@ use crate::wasm::bbv::abi::{
     BINOP_BITAND, BINOP_BITNOT, BINOP_BITOR, BINOP_BITXOR, BINOP_DEC, BINOP_DIV, BINOP_INC,
     BINOP_LSH, BINOP_MOD, BINOP_MUL, BINOP_RSH, BINOP_SUB, BINOP_URSH, CLASS_WORD_SHALLOW,
     CLASS_WORD_RANGES, CLASS_WORD_SENTINEL, CLASS_WORD_SLOTS, SHAPE_SMALL_SLOTSPAN_MASK_BITS,
-    SHAPE_SMALL_SLOTSPAN_SHIFT, EARLY_KEY_MAX, EARLY_KEY_SHIFT, IC_SET_ABSSLOT,
+    SHAPE_SMALL_SLOTSPAN_SHIFT, TA_DATA_PAYLOAD_OFFSET, TA_LENGTH_PAYLOAD_OFFSET, EARLY_KEY_MAX, EARLY_KEY_SHIFT, IC_SET_ABSSLOT,
     IC_SET_RECVSHAPE, IC_SET_SLOTENC, IC_TRANS_ABSSLOT, IC_TRANS_INLINE_HOPS, IC_TRANS_NEWSHAPE,
     IC_TRANS_OLDSHAPE, IC_TRANS_PROTO0, IC_TRANS_PROTO_HOPS, IC_TRANS_PROTO_ROW_BYTES,
     IC_TRANS_ROW_OFF, IC_TRANS_SLOTOFF, BASESHAPE_PROTO_OFFSET, IOF_CELL_ADDR_PLACEHOLDER,
@@ -892,6 +892,14 @@ impl<'a> Lower<'a> {
             self.cur = made;
             let env = self.load_i64(top, 0);
             self.store_i64(vp, l.env(), env);
+            // The GC updated the frame, not the values read from it before.
+            vals = vec![
+                self.load_i64(self.sp, FrameLayout::CALLEE),
+                self.load_i64(self.sp, FrameLayout::THIS),
+            ];
+            for i in 0..self.layout.nargs {
+                vals.push(self.load_i64(self.sp, self.layout.arg(i)));
+            }
         }
         let params = self.f.blocks[root].params.clone();
         if params.len() != vals.len() {
@@ -1462,6 +1470,18 @@ impl<'a> Lower<'a> {
                 self.numeric_fast_arms(inst, &d.op, &a)?;
                 self.js_op(inst, &d.op, &a)?
             }
+            Opcode::ArgsMapped(n) | Opcode::ArgsMappedSet(n) => {
+                // The entry made the object (mapped scripts are not
+                // inlined: the frame is the function's own).
+                let obj = self.load_i64(self.vp, self.layout.args_obj());
+                let i = self.i32c(n);
+                if let Opcode::ArgsMapped(_) = d.op {
+                    let v = self.call1(self.h.get_mapped_arg, &[obj, i], Type::I64);
+                    self.def(inst, v);
+                } else {
+                    self.call(self.h.set_mapped_arg, &[obj, i, a[0]], &[]);
+                }
+            }
             Opcode::JsTypeofEq(k) => {
                 // A leaf: no GC, no JS.
                 let kv = self.i32c(u32::from(k));
@@ -1641,6 +1661,95 @@ impl<'a> Lower<'a> {
                 let native = self.bin(Operator::I32And, flags, bit, Type::I32);
                 self.guard(inst, native, &[a[0]])?;
             }
+            Opcode::GuardKind(ObjKind::TypedArray(k)) => {
+                // The class is the kind's typed-array class (bbv's
+                // `ta_clasp_eq`).
+                let shape = self.load_i32(a[0], SHAPE_OFFSET);
+                let base = self.load_i32(shape, SHAPE_BASESHAPE_OFFSET);
+                let clasp = self.load_i32(base, BASESHAPE_CLASP_OFFSET);
+                let cslot = self.i32c(self.h.ta_class_base + 4 * (u32::from(k.code()) - 1));
+                let want = self.load_i32(cslot, 0);
+                let ok = self.bin(Operator::I32Eq, clasp, want, Type::I32);
+                self.guard(inst, ok, &[a[0]])?;
+            }
+            Opcode::LoadTa | Opcode::StoreTa => {
+                // An in-bounds element (a detached array has length 0);
+                // else `fail`.
+                let k = match self.ty(d.args[0]) {
+                    MType::Obj(o) => match o.kind {
+                        ObjKind::TypedArray(k) => k,
+                        _ => return Err("lowering: typed array op without a kind".into()),
+                    },
+                    _ => return Err("lowering: typed array op without a kind".into()),
+                };
+                let fail = self.body.add_block();
+                let len = self.load_i32(a[0], TA_LENGTH_PAYLOAD_OFFSET);
+                let ok = self.bin(Operator::I32LtU, a[1], len, Type::I32);
+                self.check(ok, fail);
+                let data = self.load_i32(a[0], TA_DATA_PAYLOAD_OFFSET);
+                let sh = k.log2_bytes();
+                let addr = if sh == 0 {
+                    self.bin(Operator::I32Add, data, a[1], Type::I32)
+                } else {
+                    let s = self.i32c(sh);
+                    let off = self.bin(Operator::I32Shl, a[1], s, Type::I32);
+                    self.bin(Operator::I32Add, data, off, Type::I32)
+                };
+                use crate::opsem::TaKind as K;
+                let outs = if d.op == Opcode::LoadTa {
+                    let m = self.mem(sh, 0);
+                    let v = match k {
+                        K::Int8 => self.un(Operator::I32Load8S { memory: m }, addr, Type::I32),
+                        K::Uint8 | K::Uint8Clamped => self.un(Operator::I32Load8U { memory: m }, addr, Type::I32),
+                        K::Int16 => self.un(Operator::I32Load16S { memory: m }, addr, Type::I32),
+                        K::Uint16 => self.un(Operator::I32Load16U { memory: m }, addr, Type::I32),
+                        K::Int32 => self.un(Operator::I32Load { memory: m }, addr, Type::I32),
+                        K::Uint32 => return Err("lowering: load_ta of a Uint32Array".into()),
+                        K::Float32 | K::Float64 => {
+                            let d = if k == K::Float32 {
+                                let f = self.un(Operator::F32Load { memory: m }, addr, Type::F32);
+                                self.un(Operator::F64PromoteF32, f, Type::F64)
+                            } else {
+                                self.un(Operator::F64Load { memory: m }, addr, Type::F64)
+                            };
+                            // Any NaN as the canonical one: a boxed double
+                            // must not look like a tag.
+                            let nan = self.bin(Operator::F64Ne, d, d, Type::I32);
+                            let c = self.f64c(f64::NAN.to_bits());
+                            self.select(Type::F64, c, d, nan)
+                        }
+                    };
+                    vec![v]
+                } else {
+                    let m = self.mem(sh, 0);
+                    let v = a[2];
+                    match k {
+                        K::Int8 | K::Uint8 => {
+                            self.op(Operator::I32Store8 { memory: m }, &[addr, v], None);
+                        }
+                        K::Int16 | K::Uint16 => {
+                            self.op(Operator::I32Store16 { memory: m }, &[addr, v], None);
+                        }
+                        K::Int32 | K::Uint32 => {
+                            self.op(Operator::I32Store { memory: m }, &[addr, v], None);
+                        }
+                        K::Float32 => {
+                            let f = self.un(Operator::F32DemoteF64, v, Type::F32);
+                            self.op(Operator::F32Store { memory: m }, &[addr, f], None);
+                        }
+                        K::Float64 => {
+                            self.op(Operator::F64Store { memory: m }, &[addr, v], None);
+                        }
+                        K::Uint8Clamped => return Err("lowering: store_ta to a Uint8ClampedArray".into()),
+                    }
+                    vec![]
+                };
+                let t = self.edge(inst, 0, &outs)?;
+                self.terminate(Terminator::Br { target: t });
+                self.cur = fail;
+                let f = self.edge(inst, 1, &[])?;
+                self.terminate(Terminator::Br { target: f });
+            }
             Opcode::LoadElem => {
                 // An in-bounds, non-hole dense element; else `fail`.
                 let fail = self.body.add_block();
@@ -1755,6 +1864,16 @@ impl<'a> Lower<'a> {
                     RtOp::InitElem(attrs) => {
                         let av = self.i32c(attrs);
                         (h.init_elem, vec![a[0], a[1], a[2], av])
+                    }
+                    RtOp::ToPropertyKey => (h.to_property_key, vec![a[0]]),
+                    RtOp::RegExp(idx) => {
+                        let script = self.script_ptr();
+                        let iv = self.i32c(idx);
+                        (h.regexp, vec![script, iv])
+                    }
+                    RtOp::InitPropGetSet(name, kind) => {
+                        let (at, kv) = (self.atom(name), self.i32c(kind));
+                        (h.init_prop_getset, vec![a[0], at, a[1], kv])
                     }
                 };
                 self.js_call(inst, f, &args, false)?;

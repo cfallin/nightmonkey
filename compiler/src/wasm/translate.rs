@@ -6287,7 +6287,6 @@ mod tests {
                     &mut atoms,
                     f,
                     layout,
-                    f.frame.depths.values().copied().max().unwrap_or(0),
                     crate::wasm::mir::lower::LowerOpts {
                         stress: 3,
                         ..Default::default()

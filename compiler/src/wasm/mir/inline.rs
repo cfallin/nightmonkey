@@ -69,6 +69,9 @@ impl Maps {
             CheckFuse(f) => CheckFuse(self.fuses[&f]),
             JsRt(mir::ops::RtOp::DelProp(a, s)) => JsRt(mir::ops::RtOp::DelProp(self.atom(a), s)),
             JsRt(mir::ops::RtOp::InitProp(a, t)) => JsRt(mir::ops::RtOp::InitProp(self.atom(a), t)),
+            JsRt(mir::ops::RtOp::InitPropGetSet(a, k)) => {
+                JsRt(mir::ops::RtOp::InitPropGetSet(self.atom(a), k))
+            }
             ConstObj(_) | GuardSingleton(_) | CheckBinding(_) | CheckNative(_) | LoadGName(_)
             | StoreGName(_) | CallNative(_) => {
                 return Err(format!("inline: {} is not remapped", mir::print::mnemonic(&op)))

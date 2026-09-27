@@ -294,7 +294,8 @@ fn operand_types() {
         Check::OperandType,
         "is not a supertype of the rule's val",
     );
-    // Field ops need the layout claim with `types`.
+    // Without `types` on the layout claim, a field load is only a val: a
+    // successor expecting the field's claim is ill-typed.
     let m = "  layout L3 = { x: val{int32} }";
     verify_err(
         &with_module(
@@ -306,8 +307,8 @@ fn operand_types() {
                  b3(v4: val{{int32}}):\n  return v4\n{EXIT0}"
             ),
         ),
-        Check::OperandType,
-        "lacks `types`",
+        Check::EdgeType,
+        "is not a subtype of param",
     );
 }
 

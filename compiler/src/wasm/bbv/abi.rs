@@ -128,8 +128,8 @@ pub(super) const ELEMENTS_PUSH_BAIL_MASK: u32 = 0x72;
 //
 // The length and the data pointer are boxed values in fixed slots 1 and 3.
 
-pub(super) const TA_LENGTH_PAYLOAD_OFFSET: u32 = FIXED_SLOTS_BASE + 8;
-pub(super) const TA_DATA_PAYLOAD_OFFSET: u32 = FIXED_SLOTS_BASE + 8 * 3;
+pub(crate) const TA_LENGTH_PAYLOAD_OFFSET: u32 = FIXED_SLOTS_BASE + 8;
+pub(crate) const TA_DATA_PAYLOAD_OFFSET: u32 = FIXED_SLOTS_BASE + 8 * 3;
 
 // --- JSString -------------------------------------------------------------
 //

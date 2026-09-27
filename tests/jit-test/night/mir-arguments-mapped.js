@@ -41,3 +41,27 @@ for (var n = 0; n < 60; n++) {
   assertEq(withEnv(1, 2), 7);
 }
 assertEq(withEnv(1, 2, 3), 10);
+
+// With formals: a mapped `arguments` object aliases them both ways, the
+// formals are read and written through it, and baseline (after an exit or
+// before an onramp) sees the same.
+function alias(a, b) {
+  arguments[0] = a * 2;
+  b = b + 1;
+  return a * 100 + arguments[1] * 10 + arguments.length;
+}
+function loopAlias(n, s) {
+  for (var i = 0; i < n; i++) {
+    s += arguments[2] | 0;
+    n = n;                        // a formal write inside the loop
+  }
+  return s;
+}
+for (var k = 0; k < 60; k++) {
+  assertEq(alias(1, 2), 200 + 30 + 2);
+  assertEq(alias(3, 4, 5), 600 + 50 + 3);
+  assertEq(loopAlias(10, 0, 3), 30);
+}
+assertEq(loopAlias(30000, 0, 1), 30000);   // an onramp
+assertEq(alias(1.5, "x"), NaN);            // an exit: a double, a string
+assertEq(alias(1, "x"), NaN);

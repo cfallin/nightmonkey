@@ -64,6 +64,9 @@ enum Ty {
     /// A native object (`obj{Native}`, raw): its elements are addressable
     /// (`load_elem`, `store_elem`). Immutable, so no fence kills it.
     Native,
+    /// A typed array of this kind (`obj{TypedArray(k)}`, raw): its
+    /// elements are `load_ta`/`store_ta`. Immutable.
+    Ta(crate::opsem::TaKind),
     /// A local, formal or rval that is dead here (never read before it is
     /// next written): no value, no block param. An exit passes it as
     /// `const.val dead`.
@@ -94,6 +97,7 @@ impl Ty {
             }),
             Ty::ObjHint(_) => MType::OBJ_TOP,
             Ty::Native => MType::Obj(ObjInfo::kind(ObjKind::Native)),
+            Ty::Ta(k) => MType::Obj(ObjInfo::kind(ObjKind::TypedArray(k))),
             Ty::Dead => unreachable!("a dead slot has no type"),
         }
     }
@@ -104,7 +108,7 @@ impl Ty {
             Ty::F64 => TagSet::NUMBER,
             Ty::Bool => TagSet::BOOLEAN,
             Ty::Val(t) => t,
-            Ty::Obj(..) | Ty::ObjHint(_) | Ty::Native => TagSet::OBJECT,
+            Ty::Obj(..) | Ty::ObjHint(_) | Ty::Native | Ty::Ta(_) => TagSet::OBJECT,
             Ty::Dead => TagSet::NONE,
         }
     }
@@ -296,8 +300,16 @@ pub fn build<'a>(
 /// `load_elem`/`store_elem` on a native receiver.
 const NATIVE_ELEMS: bool = true;
 
+/// Element accesses the analysis predicts on typed arrays are
+/// `load_ta`/`store_ta`.
+const TA_ELEMS: bool = true;
+
 /// A loop-invariant array's receiver guard is hoisted to the loop's entry.
 const HOIST_NATIVE: bool = true;
+
+/// Scripts whose mapped `arguments` alias formals are built: the formals
+/// are read and written through the object.
+const MAPPED_ARGS: bool = true;
 
 /// Typed field accesses exit on a dirty IC arm rather than rejoin.
 const DIRTY_EXITS: bool = true;
@@ -345,7 +357,7 @@ fn build_at<'a>(
     // is nothing to alias, and the object (made by the runtime, which maps
     // by the callee) is an unmapped one plus `callee`: scheme runtimes'
     // variadic `sc_list`, prototype.js's `Class.create` wrapper.
-    if script.has_mapped_args && script.nargs > 0 {
+    if script.has_mapped_args && script.nargs > 0 && !MAPPED_ARGS {
         return Err("mapped arguments".into());
     }
     if !ACTUALS && fl.rebase_vp {
@@ -379,7 +391,7 @@ fn build_at<'a>(
     }
     let mut table: BTreeMap<Pc, Vec<Ty>> = BTreeMap::new();
     // Loop-header slots guarded on the way into their loop (§10.2).
-    let mut hoist: std::collections::BTreeSet<(Pc, usize)> = std::collections::BTreeSet::new();
+    let mut hoist: BTreeMap<(Pc, usize), Ty> = BTreeMap::new();
     // Within a run, a block's entry types join every forward edge into it
     // (`Run::pending`), so a run misses only what a loop's back edges
     // bring. Each rerun widens some loop header's entry types, and there
@@ -387,7 +399,12 @@ fn build_at<'a>(
     for _ in 0..256 {
         let mut run = Run::new(&shape, &table, &hoist);
         run.build()?;
-        let new_hoists: Vec<(Pc, usize)> = run.hoist_req.difference(&hoist).copied().collect();
+        let new_hoists: Vec<((Pc, usize), Ty)> = run
+            .hoist_req
+            .iter()
+            .filter(|(k, _)| !hoist.contains_key(k))
+            .map(|(&k, &t)| (k, t))
+            .collect();
         if !run.widen && new_hoists.is_empty() {
             let mm = std::mem::take(&mut run.mm);
             return Ok((mm, run.finish()));
@@ -438,7 +455,7 @@ fn liveness(script: &Script, nargs: u32, nlocals: u32) -> BTreeMap<Pc, Vec<bool>
                 None,
                 Some(1 + nargs as usize + p.next_uint24().unwrap() as usize),
             ),
-            JSOp::GetArg => (Some(1 + usize::from(p.next_uint16().unwrap())), None),
+            JSOp::GetArg | JSOp::GetFrameArg => (Some(1 + usize::from(p.next_uint16().unwrap())), None),
             JSOp::SetArg => (None, Some(1 + usize::from(p.next_uint16().unwrap()))),
             JSOp::GetRval | JSOp::RetRval => (Some(rval), None),
             JSOp::SetRval => (None, Some(rval)),
@@ -688,11 +705,12 @@ impl<'a> Shape<'a> {
 struct Run<'s, 'a> {
     s: &'s Shape<'a>,
     table: &'s BTreeMap<Pc, Vec<Ty>>,
-    /// Loop-header slots this run guards on the way into their loop.
-    hoist: &'s std::collections::BTreeSet<(Pc, usize)>,
-    /// Loop-header slots whose back edges bring a native object where the
-    /// header has a `Val`: guarded on entry in the next run.
-    hoist_req: std::collections::BTreeSet<(Pc, usize)>,
+    /// Loop-header slots this run guards on the way into their loop, to
+    /// their narrow type (`Native`, `Ta`).
+    hoist: &'s BTreeMap<(Pc, usize), Ty>,
+    /// Loop-header slots whose back edges bring a narrow object type where
+    /// the header has a `Val`: guarded on entry in the next run.
+    hoist_req: BTreeMap<(Pc, usize), Ty>,
     /// The types flowing into each block this run (joined).
     out: BTreeMap<Pc, Vec<Ty>>,
     f: mir::Func,
@@ -737,7 +755,7 @@ impl<'s, 'a> Run<'s, 'a> {
     fn new(
         s: &'s Shape<'a>,
         table: &'s BTreeMap<Pc, Vec<Ty>>,
-        hoist: &'s std::collections::BTreeSet<(Pc, usize)>,
+        hoist: &'s BTreeMap<(Pc, usize), Ty>,
     ) -> Run<'s, 'a> {
         let frame = FrameShape {
             formals: s.nargs,
@@ -750,7 +768,7 @@ impl<'s, 'a> Run<'s, 'a> {
             s,
             table,
             hoist,
-            hoist_req: std::collections::BTreeSet::new(),
+            hoist_req: BTreeMap::new(),
             out: BTreeMap::new(),
             f,
             mm: mir::Module::default(),
@@ -868,6 +886,11 @@ impl<'s, 'a> Run<'s, 'a> {
             },
             _ => x,
         }
+    }
+
+    /// Whether the script's formals are its mapped `arguments` object's.
+    fn mapped(&self) -> bool {
+        self.s.script.has_mapped_args && self.s.nargs > 0
     }
 
     /// Every `Obj` slot, as `ObjHint`: in the state and in this op's
@@ -1217,6 +1240,79 @@ impl<'s, 'a> Run<'s, 'a> {
         let g = self.guard(Opcode::GuardLayout { keys, types: false }, vec![o], ty.mir());
         self.st.pop();
         self.push(g, ty);
+    }
+
+    /// Boxed `v` as narrow object type `t` (`Native`, `Ta`): unboxed, then
+    /// its kind guarded, branching to `fail` on a miss.
+    fn guard_narrow(&mut self, v: mir::Value, t: Ty, fail: mir::Block) -> mir::Value {
+        let kind = match t {
+            Ty::Native => ObjKind::Native,
+            Ty::Ta(k) => ObjKind::TypedArray(k),
+            t => unreachable!("guard_narrow to {t:?}"),
+        };
+        let ok = self.new_block();
+        let u = self.f.add_param(ok, MType::OBJ_TOP);
+        self.term(
+            Opcode::GuardUnbox(UnboxKind::Obj),
+            vec![v],
+            vec![
+                Edge {
+                    block: ok,
+                    args: vec![EdgeArg::Out(0)],
+                },
+                Self::goto(fail),
+            ],
+        );
+        self.at(ok);
+        let ok = self.new_block();
+        let o = self.f.add_param(ok, t.mir());
+        self.term(
+            Opcode::GuardKind(kind),
+            vec![u],
+            vec![
+                Edge {
+                    block: ok,
+                    args: vec![EdgeArg::Out(0)],
+                },
+                Self::goto(fail),
+            ],
+        );
+        self.at(ok);
+        o
+    }
+
+    /// An element access at `pc` the analysis predicts on a typed array of
+    /// kind k (`ta_elem_sites`), with an int32 key: the receiver as that
+    /// typed array (proven by its slot, or guarded here, exiting on a
+    /// miss, every slot holding it refined), the raw index and the kind.
+    /// Not a Uint32Array (its elements are not int32s).
+    fn ta_elem(&mut self, pc: Pc, recv: Slot, key: Slot) -> Option<(mir::Value, mir::Value, crate::opsem::TaKind)> {
+        let k = match recv.ty {
+            Ty::Ta(k) => k,
+            _ => *self.s.ctx.facts.ta_elem_sites.get(&self.site(pc))?,
+        };
+        if !TA_ELEMS || k == crate::opsem::TaKind::Uint32 || key.ty.num() != Some(Num::I32) {
+            return None;
+        }
+        let o = match recv.ty {
+            Ty::Ta(_) => recv.v,
+            Ty::Obj(..) | Ty::ObjHint(_) | Ty::Native => {
+                self.guard(Opcode::GuardKind(ObjKind::TypedArray(k)), vec![recv.v], Ty::Ta(k).mir())
+            }
+            Ty::Val(t) if TagSet::OBJECT.subset_of(t) => {
+                let u = self.guard(Opcode::GuardUnbox(UnboxKind::Obj), vec![recv.v], MType::OBJ_TOP);
+                let o = self.guard(Opcode::GuardKind(ObjKind::TypedArray(k)), vec![u], Ty::Ta(k).mir());
+                for x in self.st.iter_mut() {
+                    if x.v == recv.v {
+                        *x = Slot { v: o, ty: Ty::Ta(k) };
+                    }
+                }
+                o
+            }
+            _ => return None,
+        };
+        let i = self.as_i32(key);
+        Some((o, i, k))
     }
 
     /// An element access at `pc` the analysis predicts on an array with an
@@ -1827,8 +1923,8 @@ impl<'s, 'a> Run<'s, 'a> {
         }
         if HOIST_NATIVE && self.s.loops.contains_key(&to) {
             for (i, (&a, &b)) in tys.iter().zip(&want).enumerate() {
-                if a == Ty::Native && matches!(b, Ty::Val(t) if TagSet::OBJECT.subset_of(t)) {
-                    self.hoist_req.insert((to, i));
+                if matches!(a, Ty::Native | Ty::Ta(_)) && matches!(b, Ty::Val(t) if TagSet::OBJECT.subset_of(t)) {
+                    self.hoist_req.insert((to, i), a);
                 }
             }
         }
@@ -1865,7 +1961,7 @@ impl<'s, 'a> Run<'s, 'a> {
         match x.ty {
             Ty::Dead => unreachable!("a dead slot is never read"),
             Ty::Bool => x.v,
-            Ty::Obj(..) | Ty::ObjHint(_) | Ty::Native => {
+            Ty::Obj(..) | Ty::ObjHint(_) | Ty::Native | Ty::Ta(_) => {
                 self.inst(Opcode::ConstBool(true), vec![], Some(MType::Bool))
             }
             Ty::I32 => {
@@ -2110,36 +2206,9 @@ impl<'s, 'a> Run<'s, 'a> {
                 Ty::Val(tags) if tags == TagSet::ALL => None,
                 Ty::Val(tags) => Some(Opcode::GuardTags(tags)),
                 Ty::ObjHint(_) => Some(Opcode::GuardUnbox(UnboxKind::Obj)),
-                Ty::Native => {
-                    let ok = self.new_block();
-                    let o = self.f.add_param(ok, MType::OBJ_TOP);
-                    self.term(
-                        Opcode::GuardUnbox(UnboxKind::Obj),
-                        vec![v],
-                        vec![
-                            Edge {
-                                block: ok,
-                                args: vec![EdgeArg::Out(0)],
-                            },
-                            Self::goto(fail),
-                        ],
-                    );
-                    self.at(ok);
-                    let ok = self.new_block();
-                    let out = self.f.add_param(ok, t.mir());
-                    self.term(
-                        Opcode::GuardKind(ObjKind::Native),
-                        vec![o],
-                        vec![
-                            Edge {
-                                block: ok,
-                                args: vec![EdgeArg::Out(0)],
-                            },
-                            Self::goto(fail),
-                        ],
-                    );
-                    self.at(ok);
-                    args.push(EdgeArg::Value(out));
+                Ty::Native | Ty::Ta(_) => {
+                    let o = self.guard_narrow(v, t, fail);
+                    args.push(EdgeArg::Value(o));
                     continue;
                 }
                 Ty::Obj(keys, types) => {
@@ -2221,8 +2290,10 @@ impl<'s, 'a> Run<'s, 'a> {
         // Slots guarded on the way into the loop (§10.2): native objects in
         // the loop, however they came in.
         for (i, t) in tys.iter_mut().enumerate() {
-            if self.hoist.contains(&(pc, i)) && matches!(*t, Ty::Val(u) if TagSet::OBJECT.subset_of(u)) {
-                *t = Ty::Native;
+            if let Some(&n) = self.hoist.get(&(pc, i)) {
+                if matches!(*t, Ty::Val(u) if TagSet::OBJECT.subset_of(u)) {
+                    *t = n;
+                }
             }
         }
         // Slots dead here take no param.
@@ -2265,7 +2336,7 @@ impl<'s, 'a> Run<'s, 'a> {
                     continue;
                 }
                 let v = v.expect("a slot live at a block is live on each edge into it");
-                if matches!((from_ty, to_ty), (Ty::Val(_), Ty::Native)) {
+                if matches!((from_ty, to_ty), (Ty::Val(_), Ty::Native | Ty::Ta(_))) {
                     let fail = *exit_b.get_or_insert_with(|| {
                         let here = self.cur;
                         let b = self.new_block();
@@ -2276,34 +2347,7 @@ impl<'s, 'a> Run<'s, 'a> {
                         self.at(here);
                         b
                     });
-                    let ok = self.new_block();
-                    let u = self.f.add_param(ok, MType::OBJ_TOP);
-                    self.term(
-                        Opcode::GuardUnbox(UnboxKind::Obj),
-                        vec![v],
-                        vec![
-                            Edge {
-                                block: ok,
-                                args: vec![EdgeArg::Out(0)],
-                            },
-                            Self::goto(fail),
-                        ],
-                    );
-                    self.at(ok);
-                    let ok = self.new_block();
-                    let o = self.f.add_param(ok, Ty::Native.mir());
-                    self.term(
-                        Opcode::GuardKind(ObjKind::Native),
-                        vec![u],
-                        vec![
-                            Edge {
-                                block: ok,
-                                args: vec![EdgeArg::Out(0)],
-                            },
-                            Self::goto(fail),
-                        ],
-                    );
-                    self.at(ok);
+                    let o = self.guard_narrow(v, to_ty, fail);
                     args.push(EdgeArg::Value(o));
                     continue;
                 }
@@ -2346,7 +2390,15 @@ impl<'s, 'a> Run<'s, 'a> {
         }
         self.pc = Pc::new(0);
         self.pre = self.st.clone();
+        if self.mapped() {
+            // First, before anything can exit: baseline, resumed, reads
+            // the formals through it.
+            self.js_static(Opcode::ArgsObject, vec![], MType::val(TagSet::OBJECT));
+        }
         for i in 0..self.s.nargs {
+            if self.mapped() {
+                break;
+            }
             let (op, ty) = match self.s.arg_claim(i) {
                 Ty::I32 => (Opcode::GuardUnbox(UnboxKind::I32), Ty::I32),
                 Ty::F64 => (Opcode::GuardUnbox(UnboxKind::F64Num), Ty::F64),
@@ -2425,10 +2477,39 @@ impl<'s, 'a> Run<'s, 'a> {
                 let x = self.top();
                 self.set_frame_slot(ix, x);
             }
-            GetArg => {
+            // With an unmapped `arguments` (or none to map), a formal's
+            // frame slot is the formal.
+            // A mapped `arguments` object aliases the formals: they are
+            // its (baseline's reads and writes too).
+            GetArg if self.mapped() => {
+                let n = u32::from(p.next_uint16().unwrap());
+                let v = self.inst(Opcode::ArgsMapped(n), vec![], Some(MType::VAL_TOP));
+                self.push(v, Ty::Val(TagSet::ALL));
+            }
+            GetArg | GetFrameArg => {
                 let n = u32::from(p.next_uint16().unwrap());
                 let x = self.st[self.arg_ix(n)];
                 self.st.push(x);
+            }
+            RegExp if RT_OPS => {
+                let idx = p.next_uint32().unwrap();
+                let r = self.js(Opcode::JsRt(RtOp::RegExp(idx)), vec![], MType::val(TagSet::OBJECT));
+                self.push(r, Ty::Val(TagSet::OBJECT));
+            }
+            InitPropGetter | InitHiddenPropGetter | InitPropSetter | InitHiddenPropSetter if RT_OPS => {
+                let a = self.atom(p.next_uint32().unwrap())?;
+                let kind = u32::from(matches!(op, InitPropSetter | InitHiddenPropSetter))
+                    | (u32::from(matches!(op, InitHiddenPropGetter | InitHiddenPropSetter)) << 1);
+                let f = self.pop();
+                let o = self.top();
+                let (x, y) = (self.boxed(o), self.boxed(f));
+                self.js_void(Opcode::JsRt(RtOp::InitPropGetSet(a, kind)), vec![x, y]);
+            }
+            SetArg if self.mapped() => {
+                let n = u32::from(p.next_uint16().unwrap());
+                let x = self.top();
+                let v = self.boxed(x);
+                self.inst(Opcode::ArgsMappedSet(n), vec![v], None);
             }
             SetArg => {
                 let n = u32::from(p.next_uint16().unwrap());
@@ -2952,7 +3033,7 @@ impl<'s, 'a> Run<'s, 'a> {
                         self.at(d);
                         o
                     }
-                    Ty::Bool | Ty::Obj(..) | Ty::ObjHint(_) | Ty::Native => {
+                    Ty::Bool | Ty::Obj(..) | Ty::ObjHint(_) | Ty::Native | Ty::Ta(_) => {
                         self.jump_to(default, Some(pc));
                         return Ok(());
                     }
@@ -3169,7 +3250,58 @@ impl<'s, 'a> Run<'s, 'a> {
             GetElem => {
                 let key = self.pop();
                 let recv = self.pop();
-                let r = match self.native_elem(pc, recv, key) {
+                let ta = self.ta_elem(pc, recv, key);
+                let r = if let Some((o, i, k)) = ta {
+                    // The element inline, as a boxed number; out of
+                    // bounds, the generic op.
+                    self.demote_objs();
+                    let (ok, generic, join) = (self.new_block(), self.new_block(), self.new_block());
+                    let raw = if k.is_float() { MType::F64_TOP } else { MType::I32_TOP };
+                    let p = self.f.add_param(ok, raw);
+                    let jr = self.f.add_param(join, MType::VAL_TOP);
+                    self.term(
+                        Opcode::LoadTa,
+                        vec![o, i],
+                        vec![
+                            Edge {
+                                block: ok,
+                                args: vec![EdgeArg::Out(0)],
+                            },
+                            Self::goto(generic),
+                        ],
+                    );
+                    self.at(ok);
+                    let ty = if k.is_float() { Ty::F64 } else { Ty::I32 };
+                    let b = self.boxed(Slot { v: p, ty });
+                    let b = self.weaken(b, MType::VAL_TOP);
+                    self.term(
+                        Opcode::Jump,
+                        vec![],
+                        vec![Edge {
+                            block: join,
+                            args: vec![EdgeArg::Value(b)],
+                        }],
+                    );
+                    self.at(generic);
+                    let (x, kb) = (self.boxed(recv), self.boxed(key));
+                    let r = self.js(Opcode::JsGetElem, vec![x, kb], MType::VAL_TOP);
+                    self.term(
+                        Opcode::Jump,
+                        vec![],
+                        vec![Edge {
+                            block: join,
+                            args: vec![EdgeArg::Value(r)],
+                        }],
+                    );
+                    self.at(join);
+                    Some(jr)
+                } else {
+                    None
+                };
+                let r = if let Some(r) = r {
+                    r
+                } else {
+                match self.native_elem(pc, recv, key) {
                     Some((o, i)) => {
                         // A dense element inline; out of bounds or a
                         // hole, the generic op.
@@ -3215,6 +3347,7 @@ impl<'s, 'a> Run<'s, 'a> {
                         let (x, k) = (self.boxed(recv), self.boxed(key));
                         self.js(Opcode::JsGetElem, vec![x, k], MType::VAL_TOP)
                     }
+                }
                 };
                 self.push(r, Ty::Val(TagSet::ALL));
                 let claim = self.s.ctx.facts.elem_sites.get(&self.site(pc)).copied();
@@ -3224,6 +3357,37 @@ impl<'s, 'a> Run<'s, 'a> {
                 let v = self.pop();
                 let key = self.pop();
                 let recv = self.pop();
+                let ta = self.ta_elem(pc, recv, key).and_then(|(o, i, k)| {
+                    // The value as the kind stores it, raw: an int32 for an
+                    // integer kind (not clamped), a number for a float one.
+                    use crate::opsem::TaKind as K;
+                    match (k, v.ty.num()) {
+                        (K::Uint8Clamped, _) | (K::Uint32, _) => None,
+                        (k, Some(_)) if k.is_float() => Some((o, i, self.as_f64(v))),
+                        (_, Some(Num::I32)) => Some((o, i, self.as_i32(v))),
+                        _ => None,
+                    }
+                });
+                if let Some((o, i, raw)) = ta {
+                    // The element store inline; out of bounds, the generic
+                    // op (which ignores it).
+                    self.demote_objs();
+                    let v = self.demote(v);
+                    let (ok, generic, join) = (self.new_block(), self.new_block(), self.new_block());
+                    self.term(
+                        Opcode::StoreTa,
+                        vec![o, i, raw],
+                        vec![Self::goto(ok), Self::goto(generic)],
+                    );
+                    self.at(ok);
+                    self.term(Opcode::Jump, vec![], vec![Self::goto(join)]);
+                    self.at(generic);
+                    let (x, kb, y) = (self.boxed(recv), self.boxed(key), self.boxed(v));
+                    self.js_void(Opcode::JsSetElem(op == StrictSetElem), vec![x, kb, y]);
+                    self.term(Opcode::Jump, vec![], vec![Self::goto(join)]);
+                    self.at(join);
+                    self.st.push(v);
+                } else {
                 match self.native_elem(pc, recv, key) {
                     Some((o, i)) => {
                         // A dense overwrite inline; else the generic op.
@@ -3250,6 +3414,7 @@ impl<'s, 'a> Run<'s, 'a> {
                         self.js_void(Opcode::JsSetElem(op == StrictSetElem), vec![x, k, y]);
                         self.repush(v);
                     }
+                }
                 }
             }
             // Generic operations through their runtime helpers.
@@ -3327,6 +3492,17 @@ impl<'s, 'a> Run<'s, 'a> {
                 let (x, z) = (self.boxed(o), self.boxed(v));
                 let e = crate::wasm::bbv::abi::INIT_ATTR_ENUMERATE;
                 self.js_void(Opcode::JsRt(RtOp::InitElem(e)), vec![x, k, z]);
+            }
+            ToPropertyKey if RT_OPS => {
+                // An int32, a string or a symbol is its own key.
+                let x = self.top();
+                let keyish = TagSet::INT32.union(TagSet::STRING).union(TagSet::prims(crate::opsem::PRIM_SYMBOL));
+                if !x.ty.tags().is_nonempty_subset_of(keyish) {
+                    let x = self.pop();
+                    let v = self.boxed(x);
+                    let r = self.js(Opcode::JsRt(RtOp::ToPropertyKey), vec![v], MType::VAL_TOP);
+                    self.push(r, Ty::Val(TagSet::ALL));
+                }
             }
             Typeof | TypeofExpr if RT_OPS => {
                 let a = self.pop();

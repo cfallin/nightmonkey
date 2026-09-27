@@ -177,8 +177,8 @@ impl Solver<'_> {
         // arithmetic its `== null` tests guard and marks the operands
         // fractional (crypto's multipliers).
         let passed = u32::try_from(args.len().saturating_sub(skip)).unwrap();
-        let nargs = match self.source.object(crate::source::SourceObjectId::new(f.get())) {
-            crate::source::SourceObject::Script(s) => u32::from(s.nargs),
+        let nargs = match self.source.objects.get(f.get() as usize) {
+            Some(crate::source::SourceObject::Script(s)) => u32::from(s.nargs),
             _ => 0,
         };
         for i in passed..nargs {
