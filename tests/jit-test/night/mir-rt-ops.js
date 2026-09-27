@@ -63,3 +63,21 @@ for (var n = 0; n < 10; n++) {
   try { throwsObj(tok); } catch (e) { got = e; }
 }
 assertEq(got, tok);
+
+// instanceof's cached prototype read goes stale: `.prototype` reassigned,
+// an object's proto changed, and a custom Symbol.hasInstance.
+function C() {}
+function isC(x) { return x instanceof C; }
+var c1 = new C();
+for (var n = 0; n < 30; n++) assertEq(isC(c1), true);
+C.prototype = { k: 1 };
+assertEq(isC(c1), false);
+var c2 = new C();
+assertEq(isC(c2), true);
+Object.setPrototypeOf(c2, Object.prototype);
+assertEq(isC(c2), false);
+var deep = Object.create(Object.create(Object.create(Object.create(Object.create(
+  Object.create(Object.create(Object.create(Object.create(C.prototype)))))))));
+assertEq(isC(deep), true);
+Object.defineProperty(C, Symbol.hasInstance, { value: function () { return true; } });
+assertEq(isC(3), true);

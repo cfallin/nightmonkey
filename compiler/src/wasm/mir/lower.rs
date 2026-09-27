@@ -51,7 +51,11 @@ use crate::wasm::baseline::layout::{
 use crate::wasm::bbv::abi::{
     BINOP_BITAND, BINOP_BITNOT, BINOP_BITOR, BINOP_BITXOR, BINOP_DEC, BINOP_DIV, BINOP_INC,
     BINOP_LSH, BINOP_MOD, BINOP_MUL, BINOP_RSH, BINOP_SUB, BINOP_URSH, CLASS_WORD_SHALLOW,
-    CLASS_WORD_RANGES, CLASS_WORD_SLOTS, IC_SET_ABSSLOT, IC_SET_RECVSHAPE, IC_SET_SLOTENC,
+    CLASS_WORD_RANGES, CLASS_WORD_SLOTS, EARLY_KEY_MAX, EARLY_KEY_SHIFT, IC_SET_ABSSLOT,
+    IC_SET_RECVSHAPE, IC_SET_SLOTENC, IC_TRANS_ABSSLOT, IC_TRANS_INLINE_HOPS, IC_TRANS_NEWSHAPE,
+    IC_TRANS_OLDSHAPE, IC_TRANS_PROTO0, IC_TRANS_PROTO_HOPS, IC_TRANS_PROTO_ROW_BYTES,
+    IC_TRANS_ROW_OFF, IC_TRANS_SLOTOFF, BASESHAPE_PROTO_OFFSET, IOF_CELL_ADDR_PLACEHOLDER,
+    IOF_CELL_GEN, IOF_CELL_SLOTENC,
     IC_WAY_HOLDERPTR, IC_WAY_MONO_OFF, IC_WAY_RECVSHAPE,
     IC_WAY_ADDR_PLACEHOLDER, NATIVE_SLOTS_OFFSET, SHAPE_BASESHAPE_OFFSET, BASESHAPE_CLASP_OFFSET,
     BASESCRIPT_NIGHTFUNCINDEX_OFFSET, FUNC_FLAGS_SLOT_OFFSET, FUNCTION_FLAGS_CONSTRUCTOR, FUNC_ENV_SLOT_OFFSET, FUNC_SCRIPT_SLOT_OFFSET,
@@ -69,7 +73,7 @@ use crate::wasm::translate::{
 type R<T> = Result<T, String>;
 
 /// Whether `new` of a compiled constructor calls it directly.
-const DIRECT_CONSTRUCT: bool = false;
+const DIRECT_CONSTRUCT: bool = true;
 
 /// Whether global binding writes get their inline arm.
 const INLINE_GNAME_SETS: bool = true;
@@ -91,6 +95,8 @@ pub struct Lowered {
     pub baseline_calls: Vec<Value>,
     /// Property-IC way-address placeholders, with their row offsets.
     pub prop_ic_patches: Vec<(Value, u32)>,
+    /// `instanceof` cell placeholders, with their rows (+1).
+    pub iof_cell_patches: Vec<(Value, u32)>,
 }
 
 /// The resume words `f`'s exits and throws carry: the set the baseline
@@ -231,6 +237,8 @@ struct Lower<'a> {
     body_off_patches: Vec<Value>,
     /// Property-IC way-address placeholders (`Outcome::Compiled::prop_ic_patches`).
     prop_ic_patches: Vec<(Value, u32)>,
+    /// `instanceof` cell placeholders (`Outcome::Compiled::iof_cell_patches`).
+    iof_cell_patches: Vec<(Value, u32)>,
     /// The census helper, when exits are counted (`--mir-exit-census`).
     exit_census: Option<Func>,
     ctor_stamp: Option<[u32; 3]>,
@@ -246,6 +254,9 @@ struct Lower<'a> {
     /// Each global name with a fused literal (`fused_gnames`), which an
     /// inline write must keep.
     gname_fused: BTreeMap<mir::entity::AtomId, crate::wasm::translate::FusedGname>,
+    /// Each property name's predicted (layout stamp key, byte offset)
+    /// pairs (`layout_addpred_in`), for the inline add arm.
+    add_preds: BTreeMap<mir::entity::AtomId, Vec<(u32, u32)>>,
 }
 
 /// Per-script lowering choices besides the function itself.
@@ -282,6 +293,7 @@ pub fn lower<'a>(
     o: LowerOpts,
     gname_bids: BTreeMap<mir::entity::AtomId, u32>,
     gname_fused: BTreeMap<mir::entity::AtomId, crate::wasm::translate::FusedGname>,
+    add_preds: BTreeMap<mir::entity::AtomId, Vec<(u32, u32)>>,
 ) -> R<Lowered> {
     let body = FunctionBody::new(m, h.night_abi_sig2);
     let entry = body.entry;
@@ -324,6 +336,7 @@ pub fn lower<'a>(
         atoms,
         body_off_patches: vec![],
         prop_ic_patches: vec![],
+        iof_cell_patches: vec![],
         exit_census: if o.exit_census { h.census } else { None },
         ctor_stamp: o.ctor_stamp,
         ctor_restamp: o.ctor_restamp,
@@ -333,6 +346,7 @@ pub fn lower<'a>(
         forward_resume: o.forward_resume,
         gname_bids,
         gname_fused,
+        add_preds,
     };
     l.run()?;
     Ok(Lowered {
@@ -340,6 +354,7 @@ pub fn lower<'a>(
         body_off_patches: l.body_off_patches,
         baseline_calls: l.baseline_calls,
         prop_ic_patches: l.prop_ic_patches,
+        iof_cell_patches: l.iof_cell_patches,
     })
 }
 
@@ -1511,8 +1526,10 @@ impl<'a> Lower<'a> {
                 let cache = self.atoms.next_prop_cache();
                 let way = self.i32c(IC_WAY_ADDR_PLACEHOLDER);
                 self.prop_ic_patches.push((way, cache * INLINE_IC_STRIDE));
-                let slow = self.body.add_block();
-                self.set_ic_way0(inst, a[0], a[1], way, slow)?;
+                let (trans, slow) = (self.body.add_block(), self.body.add_block());
+                self.set_ic_way0(inst, a[0], a[1], way, trans)?;
+                self.cur = trans;
+                self.set_ic_trans(inst, name, a[0], a[1], way, slow)?;
                 self.cur = slow;
                 let (c, sv) = (self.i32c(cache), self.i32c(u32::from(strict)));
                 self.js_call(inst, self.h.set_prop_ic_miss, &[a[0], at, a[1], c, sv], false)?;
@@ -1605,7 +1622,13 @@ impl<'a> Lower<'a> {
                 let h = self.h;
                 let z = self.i32c(0);
                 let (f, args) = match r {
-                    RtOp::Instanceof => (h.instanceof_, vec![a[0], a[1], z]),
+                    RtOp::Instanceof => {
+                        let cell = self.i32c(IOF_CELL_ADDR_PLACEHOLDER);
+                        let idx = self.atoms.next_iof_cell();
+                        self.iof_cell_patches.push((cell, idx + 1));
+                        self.instanceof_arms(inst, a[0], a[1], cell)?;
+                        (h.instanceof_, vec![a[0], a[1], cell])
+                    }
                     RtOp::In => (h.in_, vec![a[0], a[1]]),
                     RtOp::HasOwn => (h.has_own, vec![a[0], a[1]]),
                     RtOp::DelProp(name, strict) => {
@@ -1772,6 +1795,9 @@ impl<'a> Lower<'a> {
                 self.cur = call_b;
                 let thisv = self.load_i64(top, 0);
                 self.store_i64(base, FrameLayout::THIS, thisv);
+                // `create_this` may GC: the frame's copies are current, the
+                // operands from before it are not.
+                let new_target = self.load_i64(base, 8 * (argc + 2));
                 let off = self.i32c(u32::MAX);
                 self.body_off_patches.push(off);
                 let body_idx = self.bin(Operator::I32Sub, funcidx, off, Type::I32);
@@ -2740,6 +2766,192 @@ impl<'a> Lower<'a> {
         };
         let f = self.un(Operator::I32WrapI64, callee, Type::I32);
         self.load_i32(f, FUNC_SCRIPT_SLOT_OFFSET)
+    }
+
+    /// A set IC's add-transition row replayed inline (bbv's add arm, in its
+    /// sound subset): `recv` an object of the row's pre-add shape, the
+    /// row's prototype hops unchanged (the first two live, deeper ones
+    /// none), and the add unable to falsify the object's class-word bits.
+    /// That holds when it has no SLOTS, or lands where one of the name's
+    /// predicted (layout key, offset) pairs says; with no RANGES; and no
+    /// TYPES unless the value is a number. Then store the fresh slot, swap
+    /// the shape word and take `ok_clean`; else branch to `slow` (the
+    /// helper keeps the bits itself).
+    fn set_ic_trans(
+        &mut self,
+        inst: mir::Inst,
+        name: mir::entity::AtomId,
+        recv: Value,
+        val: Value,
+        way: Value,
+        slow: Block,
+    ) -> R<()> {
+        let num = matches!(self.ty(self.f.insts[inst].args[1]), MType::Val(s) if s.tags.subset_of(TagSet::NUMBER));
+        let tag = self.tag_of(recv);
+        let is_obj = self.tag_is(tag, TAG_OBJECT as u32);
+        self.check(is_obj, slow);
+        let obj = self.un(Operator::I32WrapI64, recv, Type::I32);
+        let row = self.add_off(way, IC_TRANS_ROW_OFF);
+        let shape = self.load_i32(obj, SHAPE_OFFSET);
+        let old = self.load_i32(row, IC_TRANS_OLDSHAPE);
+        let m_old = self.bin(Operator::I32Eq, old, shape, Type::I32);
+        self.check(m_old, slow);
+        let slot_off = self.load_i32(row, IC_TRANS_SLOTOFF);
+        self.check(slot_off, slow);
+        for n in 0..IC_TRANS_PROTO_HOPS {
+            let p = self.load_i32(row, IC_TRANS_PROTO0 + IC_TRANS_PROTO_ROW_BYTES * n);
+            let empty = self.un(Operator::I32Eqz, p, Type::I32);
+            let ok = if n < IC_TRANS_INLINE_HOPS {
+                let want = self.load_i32(row, IC_TRANS_PROTO0 + IC_TRANS_PROTO_ROW_BYTES * n + 4);
+                // An empty hop's load reads the null page's first word:
+                // only its `empty` matters.
+                let live = self.load_i32(p, SHAPE_OFFSET);
+                let same = self.bin(Operator::I32Eq, live, want, Type::I32);
+                self.bin(Operator::I32Or, empty, same, Type::I32)
+            } else {
+                empty
+            };
+            self.check(ok, slow);
+        }
+        // The class word.
+        let w = self.load_i32(obj, OBJ_CLASS_IDX_OFFSET);
+        let m = self.i32c(CLASS_WORD_RANGES | if num { 0 } else { CLASS_WORD_SHALLOW });
+        let bad = self.bin(Operator::I32And, w, m, Type::I32);
+        let clean = self.un(Operator::I32Eqz, bad, Type::I32);
+        self.check(clean, slow);
+        let sb = self.i32c(CLASS_WORD_SLOTS);
+        let slots = self.bin(Operator::I32And, w, sb, Type::I32);
+        let (keyed, go) = (self.body.add_block(), self.body.add_block());
+        self.cond_br(slots, Self::to(keyed), Self::to(go));
+        self.cur = keyed;
+        let preds = self.add_preds.get(&name).cloned().unwrap_or_default();
+        if preds.is_empty() {
+            self.terminate(Terminator::Br { target: Self::to(slow) });
+        } else {
+            // The live layout key: the early key under the CONSTRUCTING
+            // sentinel, else the stamped identity (they are disjoint).
+            let ksh = self.i32c(EARLY_KEY_SHIFT);
+            let kraw = self.bin(Operator::I32ShrU, w, ksh, Type::I32);
+            let km = self.i32c(EARLY_KEY_MAX);
+            let k_sent = self.bin(Operator::I32And, kraw, km, Type::I32);
+            let m16 = self.i32c(0xFFFF);
+            let k_idx = self.bin(Operator::I32And, w, m16, Type::I32);
+            let k = self.bin(Operator::I32Or, k_sent, k_idx, Type::I32);
+            let mut hit = self.i32c(0);
+            for (key, off) in preds {
+                let kv = self.i32c(key);
+                let ke = self.bin(Operator::I32Eq, k, kv, Type::I32);
+                let ov = self.i32c(off);
+                let oe = self.bin(Operator::I32Eq, slot_off, ov, Type::I32);
+                let both = self.bin(Operator::I32And, ke, oe, Type::I32);
+                hit = self.bin(Operator::I32Or, hit, both, Type::I32);
+            }
+            self.cond_br(hit, Self::to(go), Self::to(slow));
+        }
+        self.cur = go;
+        let addr = self.bin(Operator::I32Add, obj, slot_off, Type::I32);
+        self.store_i64(addr, 0, val);
+        let new_s = self.load_i32(row, IC_TRANS_NEWSHAPE);
+        self.store_i32(obj, SHAPE_OFFSET, new_s);
+        if !num {
+            let abs = self.load_i32(row, IC_TRANS_ABSSLOT);
+            self.post_barrier(self.h.post_write_barrier, obj, abs, val);
+        }
+        let t = self.edge(inst, 0, &[])?;
+        self.terminate(Terminator::Br { target: t });
+        Ok(())
+    }
+
+    /// `lhs instanceof rhs` inline (bbv's `emit_instanceof`), taking
+    /// `ok_clean`: with the site's cell describing `rhs` (its shape, under
+    /// the live IC generation), read its `.prototype` from the cached slot
+    /// and walk `lhs`'s prototype chain (bounded) for it. Anything else
+    /// falls through to the helper, which also fills the cell.
+    fn instanceof_arms(&mut self, inst: mir::Inst, lhs: Value, rhs: Value, cell: Value) -> R<()> {
+        let slow = self.body.add_block();
+        let rt = self.tag_of(rhs);
+        let r_obj = self.tag_is(rt, TAG_OBJECT as u32);
+        self.check(r_obj, slow);
+        let rptr = self.un(Operator::I32WrapI64, rhs, Type::I32);
+        let rshape = self.load_i32(rptr, SHAPE_OFFSET);
+        let cshape = self.load_i32(cell, 0);
+        let cgen = self.load_i32(cell, IOF_CELL_GEN);
+        let gen_addr = self.i32c(self.h.prop_ic_gen_base);
+        let live_gen = self.load_i32(gen_addr, 0);
+        let s_ok = self.bin(Operator::I32Eq, rshape, cshape, Type::I32);
+        let g_ok = self.bin(Operator::I32Eq, cgen, live_gen, Type::I32);
+        let hit = self.bin(Operator::I32And, s_ok, g_ok, Type::I32);
+        self.check(hit, slow);
+        // The live `.prototype`, from the cached slot.
+        let enc = self.load_i32(cell, IOF_CELL_SLOTENC);
+        let one = self.i32c(1);
+        let dynamic = self.bin(Operator::I32And, enc, one, Type::I32);
+        let not1 = self.i32c(!1);
+        let off = self.bin(Operator::I32And, enc, not1, Type::I32);
+        let slots = self.load_i32(rptr, NATIVE_SLOTS_OFFSET);
+        let sb = self.select(Type::I32, slots, rptr, dynamic);
+        let addr = self.bin(Operator::I32Add, sb, off, Type::I32);
+        let pval = self.load_i64(addr, 0);
+        let pt = self.tag_of(pval);
+        let p_obj = self.tag_is(pt, TAG_OBJECT as u32);
+        self.check(p_obj, slow);
+        let pptr = self.un(Operator::I32WrapI64, pval, Type::I32);
+        let (t_b, f_b) = (self.body.add_block(), self.body.add_block());
+        let lt = self.tag_of(lhs);
+        let l_obj = self.tag_is(lt, TAG_OBJECT as u32);
+        let lptr = self.un(Operator::I32WrapI64, lhs, Type::I32);
+        let walk = self.body.add_block();
+        let cur = self.body.add_blockparam(walk, Type::I32);
+        let depth = self.body.add_blockparam(walk, Type::I32);
+        let d0 = self.i32c(crate::constants::IOF_WALK_DEPTH);
+        // A primitive is never an instance.
+        self.cond_br(
+            l_obj,
+            BlockTarget {
+                block: walk,
+                args: vec![lptr, d0],
+            },
+            Self::to(f_b),
+        );
+        self.cur = walk;
+        let ws = self.load_i32(cur, SHAPE_OFFSET);
+        let wb = self.load_i32(ws, SHAPE_BASESHAPE_OFFSET);
+        let proto = self.load_i32(wb, BASESHAPE_PROTO_OFFSET);
+        let found = self.bin(Operator::I32Eq, proto, pptr, Type::I32);
+        let wa = self.body.add_block();
+        self.cond_br(found, Self::to(t_b), Self::to(wa));
+        // A TaggedProto below 2 is null (0: not an instance) or lazy (1).
+        self.cur = wa;
+        let two = self.i32c(2);
+        let low = self.bin(Operator::I32LtU, proto, two, Type::I32);
+        let (wb2, wc) = (self.body.add_block(), self.body.add_block());
+        self.cond_br(low, Self::to(wb2), Self::to(wc));
+        self.cur = wb2;
+        let z = self.i32c(0);
+        let is_null = self.bin(Operator::I32Eq, proto, z, Type::I32);
+        self.cond_br(is_null, Self::to(f_b), Self::to(slow));
+        self.cur = wc;
+        let z = self.i32c(0);
+        let spent = self.bin(Operator::I32Eq, depth, z, Type::I32);
+        let next = self.body.add_block();
+        self.cond_br(spent, Self::to(slow), Self::to(next));
+        self.cur = next;
+        let one = self.i32c(1);
+        let nd = self.bin(Operator::I32Sub, depth, one, Type::I32);
+        self.terminate(Terminator::Br {
+            target: BlockTarget {
+                block: walk,
+                args: vec![proto, nd],
+            },
+        });
+        for (b, v) in [(t_b, 1u64), (f_b, 0u64)] {
+            self.cur = b;
+            let r = self.i64c((TAG_BOOLEAN << 32) | v);
+            let t = self.edge(inst, 0, &[r])?;
+            self.terminate(Terminator::Br { target: t });
+        }
+        self.cur = slow;
+        Ok(())
     }
 
     /// Branch to `fail` unless `cond`.

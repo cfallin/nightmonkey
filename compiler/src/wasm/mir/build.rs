@@ -129,7 +129,7 @@ const SPECULATE_INT_FIRST: bool = true;
 const RT_OPS: bool = true;
 
 /// Whether `T.apply(this, arguments)` forwards the actuals.
-const APPLY_FWD: bool = false;
+const APPLY_FWD: bool = true;
 
 /// Whether scripts that read their actuals are built.
 const ACTUALS: bool = true;
@@ -300,7 +300,13 @@ fn build_at<'a>(
         return Err("class constructor".into());
     }
     let fl = FrameLayout::of(script);
-    if script.has_mapped_args {
+    // A mapped arguments object aliases the formals. With no formals, and
+    // every `arguments` only forwarded (so never made: `apply_forward`),
+    // there is nothing to model: prototype.js's `Class.create` wrapper.
+    let forwards = APPLY_FWD
+        && crate::wasm::translate::compute_apply_fwd_pcs(script, &ctx.facts.apply_sites, sid.get())
+            .is_some_and(|s| !s.is_empty());
+    if script.has_mapped_args && !(forwards && script.nargs == 0) {
         return Err("mapped arguments".into());
     }
     if !ACTUALS && fl.rebase_vp {
@@ -653,6 +659,13 @@ struct Run<'s, 'a> {
     live: bool,
     /// The frame: `this`, formals, locals, rval, then the operand stack.
     st: Vec<Slot>,
+    /// The value standing for the elided arguments object at an apply
+    /// forward site (`apply_forward`), if `Arguments` has run.
+    args_placeholder: Option<mir::Value>,
+    /// The local the placeholder was stored into (the `arguments` binding,
+    /// written once: `compute_apply_fwd_pcs`); tracked by slot, since
+    /// block params rename the value.
+    args_local: Option<usize>,
     /// The op being built, its state before it, and its shared exit and
     /// throw blocks.
     pc: Pc,
@@ -684,6 +697,8 @@ impl<'s, 'a> Run<'s, 'a> {
             cur,
             live: true,
             st: vec![],
+            args_placeholder: None,
+            args_local: None,
             pc: Pc::new(0),
             pre: vec![],
             exit_blk: None,
@@ -827,6 +842,53 @@ impl<'s, 'a> Run<'s, 'a> {
     /// The frame `st` as exit operands at `pc`, all `Val(⊤)`, recording the
     /// stack depth there.
     fn exit_operands(&mut self, pc: Pc, st: &[Slot]) -> Vec<mir::Value> {
+        // Baseline has no elided arguments object: an exit whose state
+        // holds the placeholder makes the real one first (into the frame
+        // slots that hold it, and in the operands), at the exit's own cost.
+        let mut st = st.to_vec();
+        let ph = self.args_placeholder;
+        let holds = |i: usize, x: &Slot| Some(x.v) == ph || Some(i) == self.args_local;
+        if ph.is_some() && st.iter().enumerate().any(|(i, x)| holds(i, x)) {
+            let ok = self.new_block();
+            let obj = self.f.add_param(ok, MType::val(TagSet::OBJECT));
+            let err = self.new_block();
+            let (t, _) = self.f.add_inst(
+                self.cur,
+                Opcode::ArgsObject,
+                vec![],
+                &[],
+                vec![
+                    Edge {
+                        block: ok,
+                        args: vec![EdgeArg::Out(0)],
+                    },
+                    Self::goto(err),
+                ],
+            );
+            self.f.witnesses[t] = Some(mir::func::Witness {
+                may_kill: mir::types::KillPattern::ALL,
+            });
+            // Out of memory making it: throw with the state as it is.
+            self.at(err);
+            let saved = self.args_placeholder.take();
+            let ops = self.exit_operands(pc, &st);
+            let eop = self.exit_op(pc, true);
+            self.term(eop, ops, vec![]);
+            self.args_placeholder = saved;
+            self.at(ok);
+            for (i, x) in st.iter_mut().enumerate() {
+                if Some(x.v) == ph || Some(i) == self.args_local {
+                    if self.write_through(i) {
+                        self.inst(Opcode::FrameStore(u32::try_from(i).unwrap()), vec![obj], None);
+                    }
+                    *x = Slot {
+                        v: obj,
+                        ty: Ty::Val(TagSet::OBJECT),
+                    };
+                }
+            }
+        }
+        let st = &st[..];
         let depth = st.len() - self.frame_len();
         self.f
             .frame
@@ -1539,6 +1601,9 @@ impl<'s, 'a> Run<'s, 'a> {
 
     /// Assign frame slot `ix`, writing it through to the frame.
     fn set_frame_slot(&mut self, ix: usize, x: Slot) {
+        if self.args_placeholder == Some(x.v) {
+            self.args_local = Some(ix);
+        }
         if x.ty != Ty::Dead && self.write_through(ix) {
             self.inst(Opcode::FrameStore(u32::try_from(ix).unwrap()), vec![x.v], None);
         }
@@ -2674,8 +2739,11 @@ impl<'s, 'a> Run<'s, 'a> {
             // lowering's `vp`).
             Arguments => {
                 if self.s.apply_fwd.is_some() {
-                    // Only forwarded (`apply_forward`): never made.
+                    // Only forwarded (`apply_forward`): never made, unless an
+                    // exit needs it (`exit_operands`). A value of its own,
+                    // so no other undefined is mistaken for it.
                     let v = self.const_val(ConstVal::Undefined);
+                    self.args_placeholder = Some(v);
                     self.push(v, Ty::Val(TagSet::prims(PRIM_UNDEFINED)));
                 } else {
                     let v = self.js_static(Opcode::ArgsObject, vec![], MType::val(TagSet::OBJECT));

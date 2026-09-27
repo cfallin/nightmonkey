@@ -81,7 +81,7 @@ pub(super) const CLASS_WORD_SENTINEL: u32 = 0x8000_0000;
 /// it. Set only on stamped (non-sentinel) words; while the sentinel is
 /// up this bit is part of the early key.
 pub(super) const CLASS_WORD_ADV_INELIGIBLE: u32 = 0x0004_0000;
-pub(super) const EARLY_KEY_SHIFT: u32 = 18;
+pub(crate) const EARLY_KEY_SHIFT: u32 = 18;
 pub const EARLY_KEY_MAX: u32 = 0x0FFF;
 
 // --- Shape / BaseShape / JSClass ------------------------------------------
@@ -101,7 +101,7 @@ pub(crate) const SHAPE_FIXED_SLOTS_MASK_BITS: u32 = 0x1f;
 pub(super) const SHAPE_SMALL_SLOTSPAN_SHIFT: u32 = 11;
 pub(super) const SHAPE_SMALL_SLOTSPAN_MASK_BITS: u32 = 0x3ff;
 pub(crate) const BASESHAPE_CLASP_OFFSET: u32 = 0;
-pub(super) const BASESHAPE_PROTO_OFFSET: u32 = 8;
+pub(crate) const BASESHAPE_PROTO_OFFSET: u32 = 8;
 pub(super) const CLASP_FLAGS_OFFSET: u32 = 4;
 pub(super) const JSCLASS_EMULATES_UNDEFINED: u32 = 1 << 6;
 
@@ -259,9 +259,9 @@ pub(super) const NSLOTS_REGION_PLACEHOLDER: u32 = 0xDEAD_D000;
 
 /// Instanceof cell: `[funShape u32][gen u32][slotenc u32]`. Must match
 /// `NightRuntime.cpp`'s `populate`.
-pub(super) const IOF_CELL_GEN: u32 = 4;
-pub(super) const IOF_CELL_SLOTENC: u32 = 8;
-pub(super) const IOF_CELL_ADDR_PLACEHOLDER: u32 = 0xDEAD_BF80;
+pub(crate) const IOF_CELL_GEN: u32 = 4;
+pub(crate) const IOF_CELL_SLOTENC: u32 = 8;
+pub(crate) const IOF_CELL_ADDR_PLACEHOLDER: u32 = 0xDEAD_BF80;
 
 pub(super) const ALLOC_CELL_ADDR_PLACEHOLDER: u32 = 0xDEAD_BF00;
 pub(super) const INTRINSIC_CELL_ADDR_PLACEHOLDER: u32 = 0xDEAD_C100;
@@ -304,7 +304,7 @@ pub(super) const INTRINSIC_CELL_ADDR_PLACEHOLDER: u32 = 0xDEAD_C100;
 // in `emit_set_prop_ic_inline`).
 
 pub(super) use crate::region_shape::{INLINE_IC_WAYS, INLINE_IC_WAY_BYTES};
-pub(super) const IC_TRANS_ROW_OFF: u32 = INLINE_IC_WAYS * INLINE_IC_WAY_BYTES;
+pub(crate) const IC_TRANS_ROW_OFF: u32 = INLINE_IC_WAYS * INLINE_IC_WAY_BYTES;
 pub(super) use crate::region_shape::INLINE_IC_TRANS_BYTES as IC_TRANS_ROW_BYTES;
 pub(super) const INLINE_IC_STRIDE: u32 = IC_TRANS_ROW_OFF + IC_TRANS_ROW_BYTES;
 const _: () = assert!(INLINE_IC_STRIDE == crate::region_shape::INLINE_IC_STRIDE);
@@ -318,19 +318,19 @@ pub(crate) const IC_SET_SLOTENC: u32 = 8;
 pub(crate) const IC_SET_ABSSLOT: u32 = 12;
 pub(super) const IC_POLY_SENTINEL: u32 = 1;
 
-pub(super) const IC_TRANS_OLDSHAPE: u32 = 0;
-pub(super) const IC_TRANS_NEWSHAPE: u32 = 4;
-pub(super) const IC_TRANS_SLOTOFF: u32 = 8;
-pub(super) const IC_TRANS_ABSSLOT: u32 = 12;
+pub(crate) const IC_TRANS_OLDSHAPE: u32 = 0;
+pub(crate) const IC_TRANS_NEWSHAPE: u32 = 4;
+pub(crate) const IC_TRANS_SLOTOFF: u32 = 8;
+pub(crate) const IC_TRANS_ABSSLOT: u32 = 12;
 /// First proto row; row `n` is at `IC_TRANS_PROTO0 + 8 * n`, holding the
 /// proto pointer then the shape it was validated against.
-pub(super) const IC_TRANS_PROTO0: u32 = 16;
-pub(super) const IC_TRANS_PROTO_ROW_BYTES: u32 = 8;
+pub(crate) const IC_TRANS_PROTO0: u32 = 16;
+pub(crate) const IC_TRANS_PROTO_ROW_BYTES: u32 = 8;
 /// Proto rows the runtime records.
-pub(super) const IC_TRANS_PROTO_HOPS: u32 = 4;
+pub(crate) const IC_TRANS_PROTO_HOPS: u32 = 4;
 /// Proto rows the inline replay arm validates; deeper rows must be empty or
 /// the arm falls to the helper, which replays against all of them.
-pub(super) const IC_TRANS_INLINE_HOPS: u32 = 2;
+pub(crate) const IC_TRANS_INLINE_HOPS: u32 = 2;
 
 /// A stamping ctor's proto-proof cell (one IC row, see `Bbv::proto_on`):
 /// the root `this` the proof was minted on, then the `IC_TRANS_INLINE_HOPS`

@@ -6294,6 +6294,7 @@ mod tests {
                     },
                     Default::default(),
                     Default::default(),
+                    Default::default(),
                 )
                 .unwrap_or_else(|e| panic!("{name}: {e}"));
                 let mut body = lowered.body;

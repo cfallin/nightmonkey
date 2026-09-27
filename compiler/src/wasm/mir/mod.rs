@@ -35,6 +35,18 @@ pub(crate) fn inline_eligible(ctx: &TranslateCtx, script: &Script) -> bool {
         && !script.has_mapped_args
         && !baseline::layout::FrameLayout::of(script).rebase_vp
         && script.try_notes.iter().all(|t| t.kind == TryNoteKind::Loop)
+        // The actuals ops read the frame they run in, which for an inlined
+        // copy is not the callee's (`ArgumentsLength` is not in
+        // `reads_actuals`).
+        && !script.parser().opcodes().any(|op| {
+            matches!(
+                op,
+                crate::bytecode::JSOp::ArgumentsLength
+                    | crate::bytecode::JSOp::GetActualArg
+                    | crate::bytecode::JSOp::Arguments
+                    | crate::bytecode::JSOp::Rest
+            )
+        })
         && (!baseline::needs_env(script) || baseline::env_is_plain(ctx.source, script))
 }
 
@@ -98,6 +110,16 @@ pub fn translate_script(
             Some((a, *ctx.syn_gnames.get(&n)?))
         })
         .collect();
+    let add_preds = mm
+        .atoms
+        .iter()
+        .filter_map(|(a, s)| {
+            let n = atoms.names.lookup(s.chars())?;
+            let pairs = ctx.layout_addpred_in.get(&n)?;
+            // Capped, as bbv's: an over-full list only costs the helper.
+            (pairs.len() <= 16).then(|| (a, pairs.iter().map(|p| (p.key.get(), p.offset)).collect()))
+        })
+        .collect();
     let gname_fused = mm
         .atoms
         .iter()
@@ -131,6 +153,7 @@ pub fn translate_script(
         },
         gname_bids,
         gname_fused,
+        add_preds,
     ) {
         Ok(l) => l,
         Err(reason) => return Ok(Err(reason)),
@@ -150,7 +173,7 @@ pub fn translate_script(
         fuse_call_patches: vec![],
         call_cell_patches: vec![],
         alloc_cell_patches: vec![],
-        iof_cell_patches: vec![],
+        iof_cell_patches: lowered.iof_cell_patches,
         construct_cell_patches: vec![],
         strlit_patches: vec![],
         intrinsic_cell_patches: vec![],
