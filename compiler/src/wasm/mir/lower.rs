@@ -1514,10 +1514,13 @@ impl<'a> Lower<'a> {
                 self.def(inst, v);
             }
             Opcode::EnvStore(slot) => {
-                // A leaf with its barriers: `setAliasedBinding` zero hops up.
-                let env = self.box_tagged(TAG_OBJECT, a[0]);
-                let (z, s) = (self.i32c(0), self.i32c(slot.get()));
-                self.call(self.h.set_aliased, &[self.cx, env, z, s, a[1]], &[]);
+                // `setAliasedBinding` zero hops up, inline: the slot store
+                // with its barriers.
+                let addr = self.slot_addr(a[0], slot.get());
+                self.pre_barrier(addr, 0);
+                self.store_i64(addr, 0, a[1]);
+                let s = self.i32c(slot.get());
+                self.post_barrier(self.h.post_write_barrier, a[0], s, a[1]);
             }
             Opcode::FrameStore(k) => {
                 let fid = self.cur_frame as usize;
@@ -2177,6 +2180,9 @@ impl<'a> Lower<'a> {
                 self.js_call(inst, self.h.box_nonstrict_this, &[a[0]], false)?;
             }
             Opcode::JsBindGName(name) => {
+                if let Some(&bid) = self.gname_bids.get(&name) {
+                    self.gname_bind_arms(inst, bid)?;
+                }
                 let at = self.atom(name);
                 self.js_call(inst, self.h.bind_unqualified_gname, &[at], false)?;
             }
@@ -2349,6 +2355,37 @@ impl<'a> Lower<'a> {
         let addr = self.bin(Operator::I32Add, slot_base, off, Type::I32);
         let v = self.load_i64(addr, 0);
         let t = self.edge(inst, 0, &[v])?;
+        self.terminate(Terminator::Br { target: t });
+        self.cur = slow;
+        Ok(())
+    }
+
+    /// The inline arm of binding syntactic global name `bid` (bbv's
+    /// `emit_bind_gname_inline`): with the binding's slot row resolved
+    /// against the global's live shape (or re-resolved by the leaf), the
+    /// binding object is the global object, taking `ok_clean`. Falls
+    /// through to the helper otherwise.
+    fn gname_bind_arms(&mut self, inst: mir::Inst, bid: u32) -> R<()> {
+        let base = self.i32c(self.h.global_slots_base);
+        let entry0 = self.load_i32(base, 8 * bid);
+        let shape0 = self.load_i32(base, 8 * bid + 4);
+        let one = self.i32c(1);
+        let resolved0 = self.bin(Operator::I32And, entry0, one, Type::I32);
+        let realm = self.load_i32(self.cx, JSCONTEXT_REALM_OFFSET);
+        let global = self.load_i32(realm, REALM_GLOBAL_OFFSET);
+        let live = self.load_i32(global, SHAPE_OFFSET);
+        let same = self.bin(Operator::I32Eq, shape0, live, Type::I32);
+        let hit = self.bin(Operator::I32And, resolved0, same, Type::I32);
+        let (hit_b, resolve_b, slow) = (self.body.add_block(), self.body.add_block(), self.body.add_block());
+        self.cond_br(hit, Self::to(hit_b), Self::to(resolve_b));
+        self.cur = resolve_b;
+        let b = self.i32c(bid);
+        let entry1 = self.call1(self.h.resolve_global_slot_guarded, &[self.cx, b], Type::I32);
+        let resolved1 = self.bin(Operator::I32And, entry1, one, Type::I32);
+        self.cond_br(resolved1, Self::to(hit_b), Self::to(slow));
+        self.cur = hit_b;
+        let g = self.box_tagged(TAG_OBJECT, global);
+        let t = self.edge(inst, 0, &[g])?;
         self.terminate(Terminator::Br { target: t });
         self.cur = slow;
         Ok(())
