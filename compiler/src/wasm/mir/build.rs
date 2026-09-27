@@ -496,6 +496,15 @@ fn liveness(script: &Script, nargs: u32, nlocals: u32) -> BTreeMap<Pc, Vec<bool>
             _ => (None, None),
         }
     };
+    // Exception edges: an op a catch or finally covers may throw to its
+    // handler, which baseline, resumed by an exit, can reach with the
+    // frame as the exit wrote it.
+    let handlers: Vec<(Pc, u32, Pc)> = script
+        .try_notes
+        .iter()
+        .filter(|t| matches!(t.kind, crate::bytecode::TryNoteKind::Catch | crate::bytecode::TryNoteKind::Finally))
+        .map(|t| (t.start, t.length, t.start + t.length))
+        .collect();
     let mut live: BTreeMap<Pc, Vec<bool>> = succs.keys().map(|&pc| (pc, vec![false; n])).collect();
     let pcs: Vec<Pc> = succs.keys().copied().rev().collect();
     let mut changed = true;
@@ -504,7 +513,11 @@ fn liveness(script: &Script, nargs: u32, nlocals: u32) -> BTreeMap<Pc, Vec<bool>
         for &pc in &pcs {
             let (op, ss) = &succs[&pc];
             let mut l = vec![false; n];
-            for s in ss {
+            let exc = handlers
+                .iter()
+                .filter(|&&(start, len, _)| pc >= start && pc < start + len)
+                .map(|&(_, _, h)| h);
+            for s in ss.iter().copied().chain(exc).collect::<Vec<_>>().iter() {
                 if let Some(ls) = live.get(s) {
                     for (a, b) in l.iter_mut().zip(ls) {
                         *a |= *b;
@@ -738,6 +751,9 @@ impl<'a> Shape<'a> {
 /// One run of the builder over the script.
 struct Run<'s, 'a> {
     s: &'s Shape<'a>,
+    /// Per frame slot, the value a `frame.store` this block has emitted
+    /// put there (`retain_locals`).
+    framed: BTreeMap<usize, mir::Value>,
     table: &'s BTreeMap<Pc, Vec<Ty>>,
     /// Loop-header slots this run guards on the way into their loop, to
     /// their narrow type (`Native`, `Ta`).
@@ -820,6 +836,7 @@ impl<'s, 'a> Run<'s, 'a> {
             st: vec![],
             args_placeholder: None,
             args_local: None,
+            framed: BTreeMap::new(),
             pc: Pc::new(0),
             pre: vec![],
             exit_blk: None,
@@ -849,6 +866,7 @@ impl<'s, 'a> Run<'s, 'a> {
     // --- emission ------------------------------------------------------------
 
     fn inst(&mut self, op: Opcode, args: Vec<mir::Value>, result: Option<MType>) -> mir::Value {
+        self.retain_locals(&op);
         let tys: Vec<MType> = result.into_iter().collect();
         let (_, rs) = self.f.add_inst(self.cur, op, args, &tys, vec![]);
         rs.first()
@@ -857,6 +875,7 @@ impl<'s, 'a> Run<'s, 'a> {
     }
 
     fn term(&mut self, op: Opcode, args: Vec<mir::Value>, mut succs: Vec<Edge>) {
+        self.retain_locals(&op);
         self.fence_params(&op, &args, &mut succs);
         self.f.add_inst(self.cur, op, args, &[], succs);
         self.live = false;
@@ -1007,6 +1026,31 @@ impl<'s, 'a> Run<'s, 'a> {
     fn at(&mut self, b: mir::Block) {
         self.cur = b;
         self.live = true;
+        self.framed.clear();
+    }
+
+    /// Before an op that may GC: write each managed local (formal, local,
+    /// rval) to the frame, where the GC sees it. A local's value then stays
+    /// alive until the local is overwritten, as in baseline, whose frame
+    /// holds it (a `WeakMap` key held only by a dead local must survive);
+    /// MIR otherwise roots only what is live. The lowering drops a store
+    /// of what the frame already holds on the path.
+    fn retain_locals(&mut self, op: &Opcode) {
+        use mir::ops::SuccRole;
+        let may_gc = matches!(op, Opcode::ConstStr(_))
+            || op.roles().iter().any(|r| matches!(r, SuccRole::Err | SuccRole::OkDirty));
+        if !may_gc {
+            return;
+        }
+        for ix in 1..self.frame_len().min(self.st.len()) {
+            let x = self.st[ix];
+            let managed = matches!(x.ty, Ty::Val(_) | Ty::Obj(..) | Ty::ObjHint(_) | Ty::Native | Ty::Ta(_));
+            if !managed || self.framed.get(&ix) == Some(&x.v) {
+                continue;
+            }
+            self.f.add_inst(self.cur, Opcode::FrameStore(u32::try_from(ix).unwrap()), vec![x.v], &[], vec![]);
+            self.framed.insert(ix, x.v);
+        }
     }
 
     fn const_val(&mut self, c: ConstVal) -> mir::Value {
@@ -1110,6 +1154,7 @@ impl<'s, 'a> Run<'s, 'a> {
             let ok = self.new_block();
             let obj = self.f.add_param(ok, MType::val(TagSet::OBJECT));
             let err = self.new_block();
+            self.retain_locals(&Opcode::ArgsObject);
             let (t, _) = self.f.add_inst(
                 self.cur,
                 Opcode::ArgsObject,
@@ -1652,6 +1697,7 @@ impl<'s, 'a> Run<'s, 'a> {
             },
             Self::goto(err),
         ];
+        self.retain_locals(&op);
         self.fence_params(&op, &args, &mut succs);
         let (inst, _) = self.f.add_inst(self.cur, op, args, &[], succs);
         self.f.witnesses[inst] = Some(mir::func::Witness {
@@ -1738,6 +1784,7 @@ impl<'s, 'a> Run<'s, 'a> {
         let err = self.exit_block(true);
         // Not `term`: the dirty edge's params are made above, and the
         // clean edge is no fence.
+        self.retain_locals(&op);
         self.f.add_inst(self.cur, op, args, &[], vec![clean, dirty, Self::goto(err)]);
         self.live = false;
         self.at(ok);
@@ -2249,12 +2296,12 @@ impl<'s, 'a> Run<'s, 'a> {
         (2 + self.s.nargs + self.s.nlocals) as usize
     }
 
-    /// Whether frame slot `ix` is written through (formals, locals, rval;
-    /// not `this`, which sloppy code boxes in place): its frame copy then
-    /// always holds its value, whatever its representation here (a merge
-    /// that converts it keeps the JS value), so exits leave it (§5.1).
+    /// Whether frame slot `ix` is written through: only the formals of a
+    /// mapped `arguments`, which aliases them. Its frame copy then always
+    /// holds its value, so exits leave it (§5.1). Everything else stays in
+    /// its own representation, and exits write it.
     fn write_through(&self, ix: usize) -> bool {
-        ix >= 1 && ix < self.frame_len()
+        self.mapped() && ix >= 1 && ix <= self.s.nargs as usize
     }
 
     /// Assign frame slot `ix`, writing it through to the frame.
@@ -2264,6 +2311,7 @@ impl<'s, 'a> Run<'s, 'a> {
         }
         if x.ty != Ty::Dead && self.write_through(ix) {
             self.inst(Opcode::FrameStore(u32::try_from(ix).unwrap()), vec![x.v], None);
+            self.framed.insert(ix, x.v);
         }
         self.st[ix] = x;
     }
@@ -3709,6 +3757,7 @@ impl<'s, 'a> Run<'s, 'a> {
                 let a = self.pop();
                 let x = self.boxed(a);
                 let err = self.exit_block(true);
+                self.retain_locals(&Opcode::JsThrow);
                 let (t, _) = self.f.add_inst(self.cur, Opcode::JsThrow, vec![x], &[], vec![Self::goto(err)]);
                 self.live = false;
                 self.f.witnesses[t] = Some(mir::func::Witness {

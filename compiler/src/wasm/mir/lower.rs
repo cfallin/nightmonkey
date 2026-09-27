@@ -10,14 +10,22 @@
 //!   ops that branch.
 //! - **Reducibility (§5.4).** A function with onramp roots may be
 //!   irreducible; waffle's backend makes it reducible by duplication.
-//! - **Rooting (§4.4).** Before a may-GC helper call, every managed value
-//!   (`Val`, `Obj`, `Str`) live across it is stored, boxed, to the
-//!   NightStack just above the padded formals, and the helper's `top` is
-//!   passed above them. Afterwards each is reloaded into a fresh waffle
-//!   value. So the waffle value standing for a managed MIR value differs
-//!   from path to path, and every managed value live into a block enters
-//!   it as a waffle block param (a *carried* value), passed along each
-//!   edge from the current mapping.
+//! - **Rooting (§4.4).** A managed value (`Val`, `Obj`, `Str`) that may be
+//!   live across a may-GC call has a home slot in the rooting area, above
+//!   baseline's fixed frame and locals; values never live at once share
+//!   one. Every may-GC call's GC scan covers the whole area, initialized
+//!   at entry. Before a call, each live managed value its slot does not
+//!   hold yet is stored, boxed; SSA values do not change and the GC
+//!   updates slots in place, so it stays stored across later calls. After
+//!   a call, register copies are dropped, and a value is reloaded where
+//!   next used. Where each managed value is (register, slot, or both) is
+//!   tracked along the emission; a block's entry state is decided from
+//!   its incoming edges, each of which gets its own waffle block to bring
+//!   the value there (`enter_block`, `conform`). Unmanaged values are
+//!   never rooted.
+//! - **Frame.** Formals, locals and rval stay in their own
+//!   representations (no write-through, except a mapped `arguments`'s
+//!   formals); exits write them.
 //! - **Exits (§5.1).** An exit writes the whole baseline frame (`this`,
 //!   formals, locals, rval, stack, and the fixed slots), stores its resume
 //!   word, calls the baseline body with `ARGC_RESUME_BIT`, and returns
@@ -216,19 +224,45 @@ struct Lower<'a> {
     new_target: Value,
     blocks: BTreeMap<mir::Block, Block>,
     live_in: BTreeMap<mir::Block, BTreeSet<mir::Value>>,
-    /// Per block: the managed live-ins that enter as waffle params (after
-    /// the block's own params), in order.
-    carried: BTreeMap<mir::Block, Vec<mir::Value>>,
-    /// The waffle value standing for each MIR value at the emission point.
+    /// The waffle value standing for each MIR value at the emission point:
+    /// for a managed value, its register copy, if it has a valid one (a
+    /// may-GC call invalidates them).
     vmap: BTreeMap<mir::Value, Value>,
+    /// Rooting (see the module doc): each managed value that may be live
+    /// across a may-GC call has a home slot in the rooting area, which
+    /// starts at `root_base` and holds `nslots` slots; `slotted` is the set
+    /// of values whose home slot holds them at the emission point.
+    root_base: u32,
+    home: BTreeMap<mir::Value, u32>,
+    nslots: u32,
+    slotted: BTreeSet<mir::Value>,
+    /// Home slots that may hold a value no longer live: cleared at the
+    /// next may-GC call, which must not keep it alive (a `WeakRef`'s
+    /// target, say).
+    dirty: BTreeSet<u32>,
+    /// Per (frame, slot): the value a `frame.store` put there, along the
+    /// emission path; a store of the same value again is dropped.
+    framed: BTreeMap<(u32, u32), mir::Value>,
+    /// The MIR block being lowered.
+    cur_mblock: mir::Block,
+    /// Whether the emission point is on a helper's slow path: its edges'
+    /// managed values are reloaded on the edge rather than at their uses.
+    cold: bool,
+    /// Edges into blocks not entered yet, and each entered block's entry
+    /// state (`enter_block`).
+    pending: BTreeMap<mir::Block, Vec<PendingEdge>>,
+    plans: BTreeMap<mir::Block, Vec<(mir::Value, Loc, bool)>>,
+    entry_dirty: BTreeMap<mir::Block, BTreeSet<u32>>,
+    rpo_index: BTreeMap<mir::Block, usize>,
+    preds: BTreeMap<mir::Block, Vec<mir::Block>>,
+    /// Per block: the managed values that may have been live across a
+    /// may-GC call since their definition, at its end.
+    crossed_out: BTreeMap<mir::Block, BTreeSet<mir::Value>>,
     /// With inlined callees (§5.5): per frame id its base and end offsets
-    /// from `sp` and its layout. Frame 0 is the function's, ending at
-    /// `root_base`. An instruction's rooting slots start at its frame's
-    /// end (a helper's GC scan stops past them), except an `exit.inline`'s:
-    /// those go in the gap below its frame (`exit_gap`, from its parent's
-    /// end), which the frame's baseline body does not overwrite.
+    /// from `sp` and its layout. Frame 0 is the function's, ending past
+    /// the rooting area; each inline frame sits at its parent's end. A
+    /// may-GC call's scan limit is its frame's end.
     inline: bool,
-    exit_gap: Vec<u32>,
     frame_off: Vec<u32>,
     frame_end: Vec<u32>,
     frame_layouts: Vec<FrameLayout>,
@@ -264,6 +298,7 @@ struct Lower<'a> {
     plain_env: bool,
     own_env: bool,
     forward_resume: bool,
+    mapped_formals: bool,
     /// The syntactic global binding (`TranslateCtx::syn_gnames`) each
     /// global name read names, for its inline arms.
     gname_bids: BTreeMap<mir::entity::AtomId, u32>,
@@ -273,6 +308,30 @@ struct Lower<'a> {
     /// Each property name's predicted (layout stamp key, byte offset)
     /// pairs (`layout_addpred_in`), for the inline add arm.
     add_preds: BTreeMap<mir::entity::AtomId, Vec<(u32, u32)>>,
+}
+
+/// An edge into a block not entered yet: its own waffle block, filled in
+/// when the block's entry state is decided, with the edge's explicit
+/// args and where each managed live-in of the target is along it (its
+/// register copy, if valid; whether its home slot holds it).
+struct PendingEdge {
+    tb: Block,
+    args: Vec<Value>,
+    snap: BTreeMap<mir::Value, (Option<Value>, bool)>,
+    dirty: BTreeSet<u32>,
+    framed: BTreeMap<(u32, u32), mir::Value>,
+    cold: bool,
+}
+
+/// Where a managed live-in of a block is on entry.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Loc {
+    /// In a register: a waffle param of the block.
+    Param,
+    /// In a register, the same waffle value along every edge.
+    Direct(Value),
+    /// Only in its home slot.
+    Slot,
 }
 
 /// Per-script lowering choices besides the function itself.
@@ -294,6 +353,9 @@ pub struct LowerOpts {
     /// The script may be inlined: its entry forwards a resume to its
     /// baseline body (§5.5).
     pub forward_resume: bool,
+    /// The script's formals are a mapped `arguments`'s, which may write
+    /// them behind MIR's back: their frame stores are never dropped.
+    pub mapped_formals: bool,
 }
 
 /// Lower `f` (a function of `mm`, whose baseline frame is `layout`) into a
@@ -337,10 +399,22 @@ pub fn lower<'a>(
         new_target,
         blocks: BTreeMap::new(),
         live_in: BTreeMap::new(),
-        carried: BTreeMap::new(),
         vmap: BTreeMap::new(),
+        root_base,
+        home: BTreeMap::new(),
+        nslots: 0,
+        slotted: BTreeSet::new(),
+        dirty: BTreeSet::new(),
+        framed: BTreeMap::new(),
+        cur_mblock: mir::Block::from_u32(0),
+        cold: false,
+        pending: BTreeMap::new(),
+        plans: BTreeMap::new(),
+        entry_dirty: BTreeMap::new(),
+        rpo_index: BTreeMap::new(),
+        preds: BTreeMap::new(),
+        crossed_out: BTreeMap::new(),
         inline: !f.inline_frames.is_empty(),
-        exit_gap: vec![0],
         frame_off: vec![0],
         frame_end: vec![root_base],
         frame_layouts: vec![layout],
@@ -365,6 +439,7 @@ pub fn lower<'a>(
         plain_env: o.plain_env,
         own_env: o.own_env,
         forward_resume: o.forward_resume,
+        mapped_formals: o.mapped_formals,
         gname_bids,
         gname_fused,
         add_preds,
@@ -633,12 +708,47 @@ impl<'a> Lower<'a> {
             .ok_or_else(|| format!("lowering: {v} has no value here"))
     }
 
-    fn args(&self, inst: mir::Inst) -> R<Vec<Value>> {
-        self.f.insts[inst]
-            .args
-            .iter()
-            .map(|&v| self.get(v))
-            .collect()
+    /// `v` in a register at the emission point: a managed value only in
+    /// its home slot is loaded (without recording the copy, which is valid
+    /// only on this path).
+    fn value_here(&mut self, v: mir::Value) -> R<Value> {
+        if let Some(&w) = self.vmap.get(&v) {
+            return Ok(w);
+        }
+        if self.slotted.contains(&v) {
+            return self.load_home(v);
+        }
+        Err(format!("lowering: {v} has no value here"))
+    }
+
+    /// Load managed `v` from its home slot, unboxed to its representation.
+    fn load_home(&mut self, v: mir::Value) -> R<Value> {
+        let off = self.home_off(v)?;
+        let raw = self.load_i64(self.vp, off);
+        let t = self.ty(v);
+        Ok(self.unboxed_managed(&t, raw))
+    }
+
+    fn home_off(&self, v: mir::Value) -> R<u32> {
+        let k = self
+            .home
+            .get(&v)
+            .ok_or_else(|| format!("lowering: {v} is live across a may-GC call but has no home slot"))?;
+        Ok(self.root_base + 8 * k)
+    }
+
+    /// The instruction's operands, at its start (which dominates all of its
+    /// code): a value only in its home slot is loaded, and the copy kept
+    /// until the next may-GC call.
+    fn args(&mut self, inst: mir::Inst) -> R<Vec<Value>> {
+        let vs = self.f.insts[inst].args.clone();
+        let mut out = vec![];
+        for v in vs {
+            let w = self.value_here(v)?;
+            self.vmap.insert(v, w);
+            out.push(w);
+        }
+        Ok(out)
     }
 
     /// Blocks reachable from a root.
@@ -726,10 +836,20 @@ impl<'a> Lower<'a> {
         let f = self.f;
         let reach = self.reachable();
         self.liveness(&reach);
-        if self.inline {
-            self.inline_layout(&reach);
+        let order = self.rpo();
+        for (i, &b) in order.iter().enumerate() {
+            self.rpo_index.insert(b, i);
+            for s in f.succs(b) {
+                self.preds.entry(s).or_default().push(b);
+            }
         }
-        // Waffle blocks: the block's own params, then its carried values.
+        self.homes(&reach, &order);
+        self.frame_end[0] = self.root_base + 8 * self.nslots;
+        if self.inline {
+            self.inline_layout();
+        }
+        // Waffle blocks with the block's own params; its managed live-ins
+        // are placed when it is entered.
         for &b in &f.layout {
             if !reach.contains(&b) {
                 continue;
@@ -740,39 +860,16 @@ impl<'a> Lower<'a> {
                     self.body.add_blockparam(wb, t);
                 }
             }
-            let carried: Vec<mir::Value> = self.live_in[&b]
-                .iter()
-                .copied()
-                .filter(|&v| is_managed(&self.ty(v)))
-                .collect();
-            for &v in &carried {
-                self.body.add_blockparam(wb, machine(&self.ty(v)).unwrap());
-            }
-            self.carried.insert(b, carried);
             self.blocks.insert(b, wb);
         }
         self.entry()?;
         // In reverse postorder, so a block's dominators, which define the
         // unmanaged values it uses directly, are lowered before it.
-        for b in self.rpo() {
-            self.cur = self.blocks[&b];
-            let wparams: Vec<Value> = self.body.blocks[self.cur]
-                .params
-                .iter()
-                .map(|&(_, v)| v)
-                .collect();
-            let mut k = 0;
-            for &p in &f.blocks[b].params {
-                if machine(&self.ty(p)).is_some() {
-                    self.vmap.insert(p, wparams[k]);
-                    k += 1;
-                }
-            }
-            for &v in &self.carried[&b].clone() {
-                self.vmap.insert(v, wparams[k]);
-                k += 1;
-            }
+        for b in order {
+            self.cur_mblock = b;
+            self.enter_block(b)?;
             for &inst in &f.blocks[b].insts {
+                self.cold = false;
                 let before = self.body.values.len();
                 self.inst(inst)?;
                 let e = self
@@ -783,7 +880,375 @@ impl<'a> Lower<'a> {
                 e.1 += u32::try_from(self.body.values.len() - before).unwrap();
             }
         }
+        if let Some((b, _)) = self.pending.iter().find(|(_, v)| !v.is_empty()) {
+            return Err(format!("lowering: an edge into {b} was never placed"));
+        }
+        waffle::passes::empty_blocks::run(&mut self.body);
         Ok(())
+    }
+
+    /// The frame stores in the loop through header `h` (the blocks between
+    /// it and its back-edge sources `later`), per (frame, slot), and the
+    /// inline frames the loop enters.
+    fn loop_frame_writes(
+        &self,
+        h: mir::Block,
+        later: &[mir::Block],
+    ) -> (BTreeMap<(u32, u32), BTreeSet<mir::Value>>, BTreeSet<u32>) {
+        let f = self.f;
+        let mut fwd: BTreeSet<mir::Block> = BTreeSet::new();
+        let mut work = vec![h];
+        while let Some(b) = work.pop() {
+            if fwd.insert(b) {
+                work.extend(f.succs(b));
+            }
+        }
+        let mut body: BTreeSet<mir::Block> = BTreeSet::new();
+        let mut work: Vec<mir::Block> = later.to_vec();
+        while let Some(b) = work.pop() {
+            if fwd.contains(&b) && body.insert(b) && b != h {
+                work.extend(self.preds.get(&b).cloned().unwrap_or_default());
+            }
+        }
+        let mut stores: BTreeMap<(u32, u32), BTreeSet<mir::Value>> = BTreeMap::new();
+        let mut entered = BTreeSet::new();
+        for b in body {
+            for &i in &f.blocks[b].insts {
+                match f.insts[i].op {
+                    Opcode::FrameStore(k) => {
+                        stores.entry((f.inst_frame[i], k)).or_default().insert(f.insts[i].args[0]);
+                    }
+                    Opcode::InlineEnter => {
+                        entered.insert(f.inst_frame[i]);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        (stores, entered)
+    }
+
+    /// Whether `v` is live across the next may-GC instruction after `inst`
+    /// in its block (so rooted there).
+    fn rooted_across_next_gc(&self, inst: mir::Inst, v: mir::Value) -> bool {
+        let insts = &self.f.blocks[self.cur_mblock].insts;
+        let Some(pos) = insts.iter().position(|&i| i == inst) else {
+            return false;
+        };
+        let Some(&next) = insts[pos + 1..].iter().find(|&&i| self.may_gc(i)) else {
+            return false;
+        };
+        let live = if self.f.insts[next].succs.is_empty() {
+            self.live_after(next)
+        } else {
+            self.live_across(next)
+        };
+        live.contains(&v)
+    }
+
+    /// Whether `inst` may call something that GCs (a superset of where the
+    /// lowering roots: any op with an `err` or `ok_dirty` edge, and a
+    /// string constant).
+    fn may_gc(&self, inst: mir::Inst) -> bool {
+        use mir::ops::SuccRole;
+        let op = &self.f.insts[inst].op;
+        matches!(op, Opcode::ConstStr(_))
+            || op.roles().iter().any(|r| matches!(r, SuccRole::Err | SuccRole::OkDirty))
+    }
+
+    /// Home slots: every managed value live across a may-GC instruction
+    /// gets one, shared among values never live at once. In SSA two
+    /// values interfere iff one is live at the other's definition, so
+    /// coloring in definition order (reverse postorder, which respects
+    /// dominance) against the colored values live there is enough. Also
+    /// computes `crossed_out`.
+    fn homes(&mut self, reach: &BTreeSet<mir::Block>, order: &[mir::Block]) {
+        let f = self.f;
+        let managed = |v: mir::Value| is_managed(&f.values[v].ty);
+        // Per block: the managed values live after each may-GC instruction,
+        // and the values live after each definition (block params first).
+        let mut cand: BTreeSet<mir::Value> = BTreeSet::new();
+        let mut crossed_gen: BTreeMap<mir::Block, BTreeSet<mir::Value>> = BTreeMap::new();
+        let mut def_live: Vec<(mir::Block, usize, mir::Value, Vec<mir::Value>)> = vec![];
+        for &b in reach {
+            let mut live: BTreeSet<mir::Value> = BTreeSet::new();
+            for s in f.succs(b) {
+                if let Some(l) = self.live_in.get(&s) {
+                    live.extend(l.iter().copied());
+                }
+            }
+            let insts = &f.blocks[b].insts;
+            for (k, &i) in insts.iter().enumerate().rev() {
+                let d = &f.insts[i];
+                for e in &d.succs {
+                    for a in &e.args {
+                        if let EdgeArg::Value(v) = a {
+                            live.insert(*v);
+                        }
+                    }
+                }
+                for &r in &d.results {
+                    live.remove(&r);
+                }
+                if self.may_gc(i) {
+                    let g = crossed_gen.entry(b).or_default();
+                    for &v in live.iter().filter(|&&v| managed(v)) {
+                        cand.insert(v);
+                        g.insert(v);
+                    }
+                }
+                for &r in &d.results {
+                    if managed(r) {
+                        let mut l: Vec<mir::Value> = live.iter().copied().filter(|&v| managed(v)).collect();
+                        l.push(r);
+                        def_live.push((b, k + 1, r, l));
+                    }
+                }
+                live.extend(d.args.iter().copied());
+            }
+            for &p in &f.blocks[b].params {
+                if managed(p) {
+                    let l: Vec<mir::Value> = live.iter().copied().filter(|&v| managed(v)).collect();
+                    def_live.push((b, 0, p, l));
+                }
+            }
+        }
+        // Color in definition order.
+        let pos: BTreeMap<mir::Block, usize> = order.iter().enumerate().map(|(i, &b)| (b, i)).collect();
+        def_live.sort_by_key(|&(b, k, v, _)| (pos.get(&b).copied().unwrap_or(usize::MAX), k, v));
+        let mut n = 0u32;
+        for (_, _, v, live) in def_live {
+            if !cand.contains(&v) {
+                continue;
+            }
+            let used: BTreeSet<u32> = live
+                .iter()
+                .filter(|&&u| u != v)
+                .filter_map(|u| self.home.get(u).copied())
+                .collect();
+            let c = (0..).find(|c| !used.contains(c)).unwrap();
+            n = n.max(c + 1);
+            self.home.insert(v, c);
+        }
+        self.nslots = n;
+        // What may have crossed a may-GC call, forward to a fixpoint.
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for &b in order {
+                let mut out: BTreeSet<mir::Value> = BTreeSet::new();
+                for p in self.preds.get(&b).cloned().unwrap_or_default() {
+                    if let Some(c) = self.crossed_out.get(&p) {
+                        out.extend(c.iter().copied());
+                    }
+                }
+                if let Some(g) = crossed_gen.get(&b) {
+                    out.extend(g.iter().copied());
+                }
+                if self.crossed_out.get(&b) != Some(&out) {
+                    self.crossed_out.insert(b, out);
+                    changed = true;
+                }
+            }
+        }
+    }
+
+    /// Enter block `b`: decide where each managed live-in is on entry from
+    /// the edges already made into it (every one but back edges), fill
+    /// those edges' blocks, and set the emission state.
+    ///
+    /// A value that may cross a may-GC call before a later (back) edge
+    /// reaches `b` enters only in its home slot, so a loop stores it once,
+    /// before it. Otherwise it enters in a register if every edge has one
+    /// (a param, unless every edge has the same value) or if every edge
+    /// but a helper's slow path does (which reloads it); else only in its
+    /// home slot, stored along the edges that have not stored it.
+    fn enter_block(&mut self, b: mir::Block) -> R<()> {
+        let f = self.f;
+        let wb = self.blocks[&b];
+        self.cur = wb;
+        let pend = self.pending.remove(&b).unwrap_or_default();
+        let me = self.rpo_index[&b];
+        let later: Vec<mir::Block> = self
+            .preds
+            .get(&b)
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|p| self.rpo_index.get(p).is_some_and(|&i| i >= me))
+            .collect();
+        let live: Vec<mir::Value> = self.live_in[&b].iter().copied().filter(|&v| is_managed(&self.ty(v))).collect();
+        let mut plan = vec![];
+        for &v in &live {
+            let at = |p: &PendingEdge| p.snap.get(&v).copied().unwrap_or((None, false));
+            let all_reg = pend.iter().all(|p| at(p).0.is_some());
+            let all_slot = pend.iter().all(|p| at(p).1);
+            let crossed_later = later
+                .iter()
+                .any(|p| self.crossed_out.get(p).is_some_and(|c| c.contains(&v)));
+            let hot: Vec<&PendingEdge> = pend.iter().filter(|p| !p.cold).collect();
+            let loc = if crossed_later && self.home.contains_key(&v) {
+                Loc::Slot
+            } else if all_reg && !pend.is_empty() {
+                let first = at(&pend[0]).0;
+                if later.is_empty() && pend.iter().all(|p| at(p).0 == first) {
+                    Loc::Direct(first.unwrap())
+                } else {
+                    Loc::Param
+                }
+            } else if !hot.is_empty() && hot.iter().all(|p| at(p).0.is_some()) {
+                Loc::Param
+            } else {
+                Loc::Slot
+            };
+            let entry_slotted = loc == Loc::Slot || (!pend.is_empty() && all_slot);
+            plan.push((v, loc, entry_slotted));
+        }
+        for &(v, loc, _) in &plan {
+            if loc == Loc::Param {
+                self.body.add_blockparam(wb, machine(&self.ty(v)).unwrap());
+            }
+        }
+        self.plans.insert(b, plan.clone());
+        let dirty: BTreeSet<u32> = pend.iter().flat_map(|p| p.dirty.iter().copied()).collect();
+        // What the frame holds on every edge. Where back edges are still
+        // to come, only slots the loop never stores a different value into
+        // (nor enters their inline frame), which the back edges then agree
+        // on.
+        let mut framed = pend.first().map(|p| p.framed.clone()).unwrap_or_default();
+        for p in pend.iter().skip(1) {
+            framed.retain(|k, v| p.framed.get(k) == Some(v));
+        }
+        if !later.is_empty() {
+            let (stores, entered) = self.loop_frame_writes(b, &later);
+            framed.retain(|k, v| !entered.contains(&k.0) && stores.get(k).is_none_or(|s| s.iter().all(|w| w == v)));
+        }
+        self.entry_dirty.insert(b, dirty.clone());
+        for p in pend {
+            self.conform(b, p)?;
+        }
+        // The emission state.
+        self.cur = wb;
+        let wparams: Vec<Value> = self.body.blocks[wb].params.iter().map(|&(_, v)| v).collect();
+        let mut k = 0;
+        for &p in &f.blocks[b].params {
+            if machine(&self.ty(p)).is_some() {
+                self.vmap.insert(p, wparams[k]);
+                k += 1;
+            }
+        }
+        self.slotted.clear();
+        self.dirty = dirty;
+        self.framed = framed;
+        for (v, loc, es) in plan {
+            match loc {
+                Loc::Param => {
+                    self.vmap.insert(v, wparams[k]);
+                    k += 1;
+                }
+                Loc::Direct(w) => {
+                    self.vmap.insert(v, w);
+                }
+                Loc::Slot => {
+                    self.vmap.remove(&v);
+                }
+            }
+            if es {
+                self.slotted.insert(v);
+            }
+        }
+        self.cold = false;
+        Ok(())
+    }
+
+    /// Fill edge `p` into entered block `b`: bring each managed live-in to
+    /// where `b` expects it, then branch.
+    fn conform(&mut self, b: mir::Block, p: PendingEdge) -> R<()> {
+        let saved = self.cur;
+        self.cur = p.tb;
+        let mut args = p.args;
+        for (v, loc, es) in self.plans[&b].clone() {
+            let (reg, sl) = p.snap.get(&v).copied().unwrap_or((None, false));
+            let lost = || format!("lowering: {v} is live into {b} but has no value on an edge");
+            if (loc == Loc::Slot || es) && !sl {
+                let r = reg.ok_or_else(lost)?;
+                let t = self.ty(v);
+                let boxed = self.boxed(&t, r)?;
+                let off = self.home_off(v)?;
+                self.store_i64(self.vp, off, boxed);
+            }
+            match loc {
+                Loc::Param => {
+                    let r = match reg {
+                        Some(r) => r,
+                        None if sl => self.load_home(v)?,
+                        None => return Err(lost()),
+                    };
+                    args.push(r);
+                }
+                Loc::Direct(w) => {
+                    if reg != Some(w) {
+                        return Err(format!("lowering: {v} enters {b} as two values"));
+                    }
+                }
+                Loc::Slot => {}
+            }
+        }
+        // A slot this edge may have left a dead value in, which the block
+        // does not know to clear (a back edge): clear it here, unless it
+        // holds a value the block keeps in it.
+        let kept: BTreeSet<u32> = self.plans[&b]
+            .iter()
+            .filter(|&&(_, loc, es)| loc == Loc::Slot || es)
+            .filter_map(|(v, _, _)| self.home.get(v).copied())
+            .collect();
+        let extra: Vec<u32> = p
+            .dirty
+            .iter()
+            .copied()
+            .filter(|s| !self.entry_dirty[&b].contains(s) && !kept.contains(s))
+            .collect();
+        if !extra.is_empty() {
+            let undef = self.i64c(UNDEF);
+            for s in extra {
+                self.store_i64(self.vp, self.root_base + 8 * s, undef);
+            }
+        }
+        let wb = self.blocks[&b];
+        self.terminate(Terminator::Br {
+            target: BlockTarget { block: wb, args },
+        });
+        self.cur = saved;
+        Ok(())
+    }
+
+    /// An edge into MIR block `b` with explicit waffle args `args`, from
+    /// the emission point: its own waffle block, filled now if `b` has been
+    /// entered (a back edge), else when it is.
+    fn edge_into(&mut self, b: mir::Block, args: Vec<Value>) -> R<BlockTarget> {
+        let tb = self.body.add_block();
+        let mut snap = BTreeMap::new();
+        if let Some(l) = self.live_in.get(&b) {
+            for &v in l {
+                if is_managed(&self.ty(v)) {
+                    snap.insert(v, (self.vmap.get(&v).copied(), self.slotted.contains(&v)));
+                }
+            }
+        }
+        let p = PendingEdge {
+            tb,
+            args,
+            snap,
+            dirty: self.dirty.clone(),
+            framed: self.framed.clone(),
+            cold: self.cold,
+        };
+        if self.plans.contains_key(&b) {
+            self.conform(b, p)?;
+        } else {
+            self.pending.entry(b).or_default().push(p);
+        }
+        Ok(Self::to(tb))
     }
 
     /// The entry. Under `ARGC_ONRAMP_BIT` (baseline at a loop header),
@@ -897,6 +1362,7 @@ impl<'a> Lower<'a> {
         let zero = self.i64c(TAG_INT32 << 32);
         self.store_i64(vp, l.resume(), zero);
         self.store_i64(vp, l.backoff(), zero);
+        self.init_root_area();
         if self.own_env {
             // Every slot is valid: the GC may run. Failing, the throw has
             // no handler (baseline's prologue: pc 0, depth 0).
@@ -931,10 +1397,8 @@ impl<'a> Lower<'a> {
                 args.push(self.unboxed_managed(&t, v));
             }
         }
-        let b = self.blocks[&root];
-        self.terminate(Terminator::Br {
-            target: BlockTarget { block: b, args },
-        });
+        let t = self.edge_into(root, args)?;
+        self.terminate(Terminator::Br { target: t });
         Ok(())
     }
 
@@ -964,10 +1428,10 @@ impl<'a> Lower<'a> {
         if vals.len() != self.f.blocks[root].params.len() {
             return Err("lowering: an onramp root's params are not the frame".into());
         }
-        let block = self.blocks[&root];
-        self.terminate(Terminator::Br {
-            target: BlockTarget { block, args: vals },
-        });
+        // After reading the operands: the rooting area overlaps them.
+        self.init_root_area();
+        let t = self.edge_into(root, vals)?;
+        self.terminate(Terminator::Br { target: t });
         Ok(())
     }
 
@@ -986,10 +1450,9 @@ impl<'a> Lower<'a> {
     /// The waffle target for MIR edge `e`, with `outs` standing for the
     /// terminator's outputs.
     fn target(&mut self, e: &Edge, outs: &[Value]) -> R<BlockTarget> {
-        let block = *self
-            .blocks
-            .get(&e.block)
-            .ok_or_else(|| format!("lowering: {} is unreachable", e.block))?;
+        if !self.blocks.contains_key(&e.block) {
+            return Err(format!("lowering: {} is unreachable", e.block));
+        }
         let mut args = vec![];
         let params = self.f.blocks[e.block].params.clone();
         for (a, &p) in e.args.iter().zip(&params) {
@@ -997,16 +1460,13 @@ impl<'a> Lower<'a> {
                 continue;
             }
             args.push(match *a {
-                EdgeArg::Value(v) => self.get(v)?,
+                EdgeArg::Value(v) => self.value_here(v)?,
                 EdgeArg::Out(k) => *outs
                     .get(k as usize)
                     .ok_or_else(|| format!("lowering: no output %{k}"))?,
             });
         }
-        for v in self.carried[&e.block].clone() {
-            args.push(self.get(v)?);
-        }
-        Ok(BlockTarget { block, args })
+        self.edge_into(e.block, args)
     }
 
     /// Branch to MIR edge `e` from a fresh block, returning that block's
@@ -1081,96 +1541,101 @@ impl<'a> Lower<'a> {
     /// rooted, reloading them afterwards. Returns the helper's i32 status
     /// and the boxed result it wrote at `top`.
     fn gc_call(&mut self, f: Func, args: &[Value], live: &[mir::Value]) -> R<(Value, Value)> {
-        self.spill(live)?;
+        self.root(live)?;
         let top_off = self.top_off(live.len());
         let top = self.add_off(self.vp, top_off);
         let mut full = vec![self.cx, top];
         full.extend_from_slice(args);
         let ok = self.call1(f, &full, Type::I32);
-        self.reload(live)?;
+        self.after_gc(live);
+        // A helper's slow path: its edges reload what their targets keep
+        // in registers.
+        self.cold = true;
         let result = self.load_i64(self.vp, top_off);
         Ok((ok, result))
     }
 
     /// The first free byte above everything this instruction's frame
     /// chain holds, as an offset from `sp`: where a helper's out-slot and
-    /// GC scan limit, and a real call's frame, go. Without inlined
-    /// callees, just past the `live` rooting slots; with them, past the
-    /// instruction's own inline frame (the rooting area, of fixed size,
-    /// sits below every inline frame).
-    fn top_off(&self, live: usize) -> u32 {
-        self.frame_end[self.cur_frame as usize] + 8 * u32::try_from(live).unwrap()
+    /// GC scan limit, and a real call's frame, go. That is past the
+    /// instruction's own frame, which is past the rooting area and every
+    /// enclosing inline frame. (`live` no longer matters: kept for the
+    /// callers' shape.)
+    fn top_off(&self, _live: usize) -> u32 {
+        self.frame_end[self.cur_frame as usize]
     }
 
-    /// Lay out the rooting area and the inline frames (§5.5). The area
-    /// holds the most managed values any instruction spills; each inline
-    /// frame sits at its parent's end.
-    fn inline_layout(&mut self, reach: &BTreeSet<mir::Block>) {
-        let f = self.f;
-        // Each frame's gap: the most values one of its `exit.inline`s roots.
-        let mut gap = vec![0u32; f.inline_frames.len() + 1];
-        for &b in &f.layout {
-            if !reach.contains(&b) {
-                continue;
-            }
-            for &i in &f.blocks[b].insts {
-                if matches!(f.insts[i].op, Opcode::ExitInline { .. }) {
-                    let fid = f.inst_frame[i] as usize;
-                    let n = u32::try_from(self.live_across(i).len()).unwrap();
-                    gap[fid] = gap[fid].max(n);
-                }
-            }
-        }
-        for (j, fr) in f.inline_frames.iter().enumerate() {
+    /// Lay out the inline frames (§5.5): each at its parent's end, the
+    /// function's own frame ending past the rooting area.
+    fn inline_layout(&mut self) {
+        for fr in &self.f.inline_frames {
             let lay = FrameLayout {
                 nargs: fr.shape.formals,
                 nlocals: fr.shape.locals,
                 rebase_vp: false,
             };
-            let below = self.frame_end[fr.parent as usize];
-            let off = below + 8 * gap[j + 1];
-            self.exit_gap.push(below);
+            let off = self.frame_end[fr.parent as usize];
             self.frame_off.push(off);
             self.frame_end.push(off + lay.top(fr.max_depth + 3));
             self.frame_layouts.push(lay);
         }
     }
 
-    /// Store `live` (managed values), boxed, to the rooting slots.
-    fn spill(&mut self, live: &[mir::Value]) -> R<()> {
-        let base = self.frame_end[self.cur_frame as usize];
-        self.spill_at(base, live)
+    /// Make the rooting area valid Values: every may-GC call's scan covers
+    /// all of it, whatever is live.
+    fn init_root_area(&mut self) {
+        if self.nslots == 0 {
+            return;
+        }
+        let undef = self.i64c(UNDEF);
+        for i in 0..self.nslots {
+            self.store_i64(self.vp, self.root_base + 8 * i, undef);
+        }
     }
 
-    fn spill_at(&mut self, base: u32, live: &[mir::Value]) -> R<()> {
-        let e = self.opsize.entry("(spill sites / values)".into()).or_default();
-        e.0 += 1;
-        e.1 += u32::try_from(live.len()).unwrap();
-        for (i, &v) in live.iter().enumerate() {
+    /// Before a may-GC call: store each of `live` (managed values live
+    /// across it) that its home slot does not hold yet. A stored value
+    /// stays stored (SSA values do not change, and the GC updates the slot
+    /// in place), so repeated calls store it once.
+    fn root(&mut self, live: &[mir::Value]) -> R<()> {
+        let mut stores = 0;
+        for &v in live {
+            if self.slotted.contains(&v) {
+                continue;
+            }
+            stores += 1;
             let t = self.ty(v);
             let w = self.get(v)?;
             let b = self.boxed(&t, w)?;
-            let off = base + 8 * u32::try_from(i).unwrap();
+            let off = self.home_off(v)?;
             self.store_i64(self.vp, off, b);
+            self.slotted.insert(v);
         }
+        // Slots holding what is live now; any other written slot may hold
+        // a dead value, which the GC must not see.
+        let holding: BTreeSet<u32> = live.iter().filter_map(|v| self.home.get(v).copied()).collect();
+        let stale: Vec<u32> = self.dirty.difference(&holding).copied().collect();
+        if !stale.is_empty() {
+            let undef = self.i64c(UNDEF);
+            for s in &stale {
+                self.store_i64(self.vp, self.root_base + 8 * s, undef);
+            }
+            stores += u32::try_from(stale.len()).unwrap();
+        }
+        self.dirty = holding;
+        self.slotted.retain(|v| live.contains(v));
+        let e = self.opsize.entry("(root sites / stores)".into()).or_default();
+        e.0 += 1;
+        e.1 += stores;
         Ok(())
     }
 
-    /// Reload `live` from the rooting slots (a GC may have moved them).
-    fn reload(&mut self, live: &[mir::Value]) -> R<()> {
-        let base = self.frame_end[self.cur_frame as usize];
-        self.reload_at(base, live)
-    }
-
-    fn reload_at(&mut self, base: u32, live: &[mir::Value]) -> R<()> {
-        for (i, &v) in live.iter().enumerate() {
-            let t = self.ty(v);
-            let off = base + 8 * u32::try_from(i).unwrap();
-            let raw = self.load_i64(self.vp, off);
-            let w = self.unboxed_managed(&t, raw);
-            self.vmap.insert(v, w);
+    /// After a may-GC call: `live`'s register copies may point to moved
+    /// objects; each is reloaded from its home slot where next used.
+    fn after_gc(&mut self, live: &[mir::Value]) {
+        for v in live {
+            self.vmap.remove(v);
         }
-        Ok(())
     }
 
     // --- instructions ------------------------------------------------------------------
@@ -1183,6 +1648,29 @@ impl<'a> Lower<'a> {
     fn inst(&mut self, inst: mir::Inst) -> R<()> {
         self.cur_frame = self.f.inst_frame[inst];
         let d = self.f.insts[inst].clone();
+        if let Opcode::FrameStore(k) = d.op {
+            let key = (self.cur_frame, k);
+            let aliased = self.mapped_formals && self.cur_frame == 0 && k >= 1 && k <= self.layout.nargs;
+            if !aliased {
+                if self.framed.get(&key) == Some(&d.args[0]) {
+                    return Ok(());
+                }
+                // A retaining store (the builder's `retain_locals`) is not
+                // needed where its value is rooted across the may-GC op it
+                // precedes (live, so in its home slot) and so is what the
+                // frame slot holds: dropping it keeps nothing alive that
+                // would not be anyway. The value stays live until the store
+                // before the op where it is not (its local overwritten, or
+                // the function ending), which writes it.
+                let v = d.args[0];
+                if let Some(&old) = self.framed.get(&key) {
+                    if self.rooted_across_next_gc(inst, v) && self.rooted_across_next_gc(inst, old) {
+                        return Ok(());
+                    }
+                }
+                self.framed.insert(key, d.args[0]);
+            }
+        }
         let a = self.args(inst)?;
         let at = |i: usize| self.f.values[d.args[i]].ty;
         match d.op {
@@ -1893,11 +2381,11 @@ impl<'a> Lower<'a> {
             Opcode::CreateThis(nslots, word) => {
                 // May GC: root what is live across it.
                 let live = self.live_across(inst);
-                self.spill(&live)?;
+                self.root(&live)?;
                 let top_off = self.top_off(live.len());
                 let top = self.add_off(self.vp, top_off);
                 let ok = self.construct_this(top, a[0], a[1], nslots, word);
-                self.reload(&live)?;
+                self.after_gc(&live);
                 let r = self.load_i64(self.vp, top_off);
                 let t = self.edge(inst, 0, &[r])?;
                 let e = self.edge(inst, 1, &[])?;
@@ -1990,11 +2478,11 @@ impl<'a> Lower<'a> {
                 // It may GC (capturing the stack): root what its throw exit
                 // reads.
                 let live = self.live_across(inst);
-                self.spill(&live)?;
+                self.root(&live)?;
                 let top_off = self.top_off(live.len());
                 let top = self.add_off(self.vp, top_off);
                 self.call(self.h.throw, &[self.cx, top, a[0]], &[]);
-                self.reload(&live)?;
+                self.after_gc(&live);
                 let e = self.edge(inst, 0, &[])?;
                 self.terminate(Terminator::Br { target: e });
             }
@@ -2082,7 +2570,7 @@ impl<'a> Lower<'a> {
                     self.cur = arr;
                     // The helper's reload rebinds the live values on its
                     // path only.
-                    let saved = self.vmap.clone();
+                    let saved = (self.vmap.clone(), self.slotted.clone(), self.dirty.clone());
                     let cell = self.alloc_inline(inst, Some(0))?;
                     let lv = self.i32c(0);
                     let live = self.live_across(inst);
@@ -2090,7 +2578,7 @@ impl<'a> Lower<'a> {
                     let t = self.edge(inst, 1, &[r])?;
                     let e = self.edge(inst, 2, &[])?;
                     self.cond_br(ok, t, e);
-                    self.vmap = saved;
+                    (self.vmap, self.slotted, self.dirty) = saved;
                     self.cur = other;
                 }
                 // The frame `[callee, this, args…, new.target]` above the
@@ -2098,7 +2586,7 @@ impl<'a> Lower<'a> {
                 // `this` sized and seeded for the site, and runs the
                 // constructor). The result lands at the frame's top.
                 let live = self.live_across(inst);
-                self.spill(&live)?;
+                self.root(&live)?;
                 let frame = self.top_off(live.len());
                 for (k, &v) in a.iter().enumerate() {
                     self.store_i64(self.vp, frame + 8 * u32::try_from(k).unwrap(), v);
@@ -2197,7 +2685,7 @@ impl<'a> Lower<'a> {
                     },
                 });
                 self.cur = join;
-                self.reload(&live)?;
+                self.after_gc(&live);
                 let t = self.edge(inst, 1, &[res_p])?;
                 let e = self.edge(inst, 2, &[])?;
                 self.cond_br(ok_p, t, e);
@@ -3823,7 +4311,7 @@ impl<'a> Lower<'a> {
             self.cur = call;
         }
         let live = self.live_across(inst);
-        self.spill(&live)?;
+        self.root(&live)?;
         let frame = self.top_off(live.len());
         for (k, &v) in ops.iter().enumerate() {
             self.store_i64(self.vp, frame + 8 * u32::try_from(k).unwrap(), v);
@@ -3890,7 +4378,7 @@ impl<'a> Lower<'a> {
         });
 
         self.cur = join;
-        self.reload(&live)?;
+        self.after_gc(&live);
         let result = self.load_i64(self.vp, top_off);
         let t = self.edge(inst, 1, &[result])?;
         let e = self.edge(inst, 2, &[])?;
@@ -4387,6 +4875,7 @@ impl<'a> Lower<'a> {
     /// inside the callee is that end.
     fn inline_enter(&mut self, d: &mir::func::InstData, a: &[Value]) -> R<()> {
         let fid = self.cur_frame as usize;
+        self.framed.retain(|&(f, _), _| f as usize != fid);
         let (base, l) = (self.frame_off[fid], self.frame_layouts[fid]);
         let max_depth = self.f.inline_frames[fid - 1].max_depth;
         // A construct also passes its new.target.
@@ -4426,18 +4915,12 @@ impl<'a> Lower<'a> {
         for k in 0..max_depth + 3 {
             self.store_i64(sp, base + l.operand(k), undef);
         }
-        // The exit gap below the frame: scanned from here on.
-        let mut g = self.exit_gap[fid];
-        while g < base {
-            self.store_i64(sp, g, undef);
-            g += 8;
-        }
         Ok(())
     }
 
     /// `exit.inline` (§5.5): finish the inlined callee in its baseline
-    /// body from `pc`. Write the operands the frame does not already hold
-    /// (write-through keeps the formals, locals and rval), the resume
+    /// body from `pc`. Write the operands (the frame holds only those
+    /// written through, the formals of a mapped `arguments`), the resume
     /// word, then call the callee's entry with `ARGC_RESUME_BIT` on its
     /// frame. The caller continues on `ok` with the callee's result, or on
     /// `err`.
@@ -4520,8 +5003,7 @@ impl<'a> Lower<'a> {
         self.store_i64(sp, base + l.backoff(), backoff);
         // The call, rooted: the caller's managed values live across it.
         let live = self.live_across(inst);
-        let gap = self.exit_gap[fid];
-        self.spill_at(gap, &live)?;
+        self.root(&live)?;
         let callee = self.load_i64(sp, base + FrameLayout::CALLEE);
         let (funcidx, script) = self.classify(callee);
         let off = self.i32c(u32::MAX);
@@ -4545,7 +5027,7 @@ impl<'a> Lower<'a> {
             tys,
         ));
         let err = self.push_val(ValueDef::PickOutput(call, 0, Type::I32));
-        self.reload_at(gap, &live)?;
+        self.after_gc(&live);
         let result = self.load_i64(sp, end);
         let ok = self.un(Operator::I32Eqz, err, Type::I32);
         let t = self.edge(inst, 0, &[result])?;

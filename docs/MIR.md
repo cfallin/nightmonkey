@@ -318,15 +318,35 @@ Fences kill them like any other type (§4).
   checks this. LICM-hoisted interior pointers are `Raw`, so they are
   rematerialized (recomputed from the managed base) after a may-GC op,
   or hoisting is limited to GC-free loops.
-- **Rooting happens during lowering**, following today's value-stack
-  push design:
-  - the lowering keeps a map from MIR value to waffle value;
-  - before a may-GC op, it pushes the live managed values onto the
-    NightStack above the current top and passes the new top;
-  - afterwards, it reloads them into fresh waffle values and updates
-    the map.
-
-  There is no function-wide slot abstraction.
+- **Rooting happens during lowering**, only where a may-GC op is, and
+  only for what is live across it:
+  - Each managed value that may be live across a may-GC op gets a home
+    slot in a fixed rooting area. Values never live at once share a
+    slot: in SSA, two values interfere iff one is live at the other's
+    definition, so greedy coloring in dominance order is exact.
+  - The lowering tracks, along the emission, where each managed value
+    is: in a register (a waffle value), in its slot, or both.
+  - Before a may-GC op, each live value not yet in its slot is stored,
+    boxed. An SSA value never changes and the GC updates the slot in
+    place, so a stored value stays stored across later calls.
+  - After the op, register copies are dropped. A value is reloaded
+    where it is next used, and kept until the next may-GC op.
+  - Unboxed numbers and booleans are never rooted. Locals stay in their
+    own representations, never written through to the baseline frame
+    (exits write them), except the formals a mapped `arguments`
+    aliases.
+  - At a block entry, each managed live-in's location is decided from
+    the edges already lowered (every one but back edges). A value that
+    may cross a may-GC op before a back edge enters only in its slot, so
+    a loop stores it once, before the loop. Otherwise it enters in a
+    register if every edge has one, or every edge but a helper's slow
+    path does (that path reloads it). Else it enters only in its slot.
+    Each edge gets its own waffle block to reconcile locations; the
+    empty ones are removed.
+  - Every may-GC op's GC scan covers the whole rooting area, which the
+    entry initializes. A slot that may hold a dead value is cleared at
+    the next may-GC op, so the GC does not keep it alive (a `WeakRef`
+    target must die once unreachable).
 
 ### 4.5 Fences versus predictions
 
@@ -677,11 +697,10 @@ baseline, and baseline has one body per script. The design:
   the callee's `JSScript*`, compared with `K`'s (the source's `addr`,
   stable since compaction is off). A miss runs the ordinary call. Up to
   a few targets get a dispatch chain (polymorphic inlining).
-- **Stack layout.** The caller frame comes first, then a rooting area
-  of fixed size (the most managed values live at any GC point), then
-  the inline frames, then the frames of real calls. The rooting area
-  and inline frames are initialized at entry, since the GC traces up to
-  `top`.
+- **Stack layout.** The caller frame comes first, then the rooting
+  area (§4.4), then the inline frames, then the frames of real calls.
+  The rooting area is initialized at entry and each inline frame at its
+  `inline.enter`, since the GC traces up to `top`.
 
 ## 6. Effects and memory
 
@@ -1155,14 +1174,13 @@ total baseline to exit into.
 - Gate: hand-written MIR for small scripts runs correctly, including
   forced exits into baseline.
 - **Done** (`wasm/mir/lower.rs`, with the driver in `wasm/mir/mod.rs`):
-  - **Values.** Each MIR value lowers to one waffle value of its
-    machine type. A managed value (`Val`, `Obj`, `Str`) that is live
-    into a block enters it as a waffle block param, because rooting
-    reloads it into a fresh value on some paths and not others.
-  - **Rooting.** Before a may-GC helper call, the managed values live
-    across it are stored boxed just above the padded formals, and the
-    helper's `top` sits above them. The entry pads the formals with
-    undefined first, so `[sp, top)` is always valid Values.
+  - **Values.** Each MIR value lowers to waffle values of its machine
+    type. A managed value (`Val`, `Obj`, `Str`) may also live in its
+    home slot (§4.4).
+  - **Rooting.** As in §4.4: home slots, stored once before the first
+    may-GC op a value is live across, reloaded lazily. The entry pads
+    the formals with undefined first and initializes the rooting area,
+    so `[sp, top)` is always valid Values.
   - **Generic ops** always take `ok_dirty` until helpers report
     cleanliness (M4). That is sound, just conservative.
   - **Exits** write the whole frame and call the baseline body with

@@ -153,6 +153,7 @@ pub fn translate_script(
             plain_env: baseline::needs_env(script) && baseline::env_is_plain(ctx.source, script),
             own_env: baseline::needs_env(script) && !baseline::env_is_plain(ctx.source, script),
             forward_resume: inline_eligible(ctx, script),
+            mapped_formals: script.has_mapped_args && script.nargs > 0,
             ctor_restamp: ctx.deleg_restamps_in.get(&sid).and_then(crate::wasm::bbv::restamp_args),
         },
         gname_bids,
