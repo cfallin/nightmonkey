@@ -114,12 +114,12 @@ pub(super) const JSCLASS_EMULATES_UNDEFINED: u32 = 1 << 6;
 //   [  0] element 0 ...
 
 pub(super) const ELEMENTS_HEADER_BYTES: u32 = 16;
-pub(super) const ELEMENTS_FLAGS_BACK: u32 = 16;
+pub(crate) const ELEMENTS_FLAGS_BACK: u32 = 16;
 pub(crate) const ELEMENTS_INITLEN_BACK: u32 = 12;
 pub(super) const ELEMENTS_CAPACITY_BACK: u32 = 8;
 pub(super) const ELEMENTS_LENGTH_BACK: u32 = 4;
 pub(super) const ELEMENTS_FLAG_FIXED: u32 = 0x1;
-pub(super) const ELEMENTS_FROZEN_FLAG: u32 = 0x40;
+pub(crate) const ELEMENTS_FROZEN_FLAG: u32 = 0x40;
 pub(super) const ELEMENTS_NON_PACKED_FLAG: u32 = 0x80;
 /// Any of these set means the dense append arm must bail to the helper.
 pub(super) const ELEMENTS_PUSH_BAIL_MASK: u32 = 0x72;

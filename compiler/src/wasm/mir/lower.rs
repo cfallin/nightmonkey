@@ -53,7 +53,7 @@ use crate::wasm::bbv::abi::{
     BINOP_LSH, BINOP_MOD, BINOP_MUL, BINOP_RSH, BINOP_SUB, BINOP_URSH, CLASS_WORD_SHALLOW,
     CLASS_WORD_RANGES, CLASS_WORD_SLOTS, IC_SET_ABSSLOT, IC_SET_RECVSHAPE, IC_SET_SLOTENC,
     IC_WAY_ADDR_PLACEHOLDER, NATIVE_SLOTS_OFFSET, CHUNK_STORE_BUFFER_OFFSET, CMP_EQ, CMP_GE, CMP_GT, CMP_LE, CMP_LT, CMP_NE, CMP_STRICTEQ, CMP_STRICTNE,
-    ELEMENTS_INITLEN_BACK, FIXED_SLOTS_BASE, FLAGS_ALL, OBJ_CLASS_IDX_OFFSET, OBJ_ELEMENTS_OFFSET,
+    ELEMENTS_FLAGS_BACK, ELEMENTS_FROZEN_FLAG, ELEMENTS_INITLEN_BACK, FIXED_SLOTS_BASE, FLAGS_ALL, OBJ_CLASS_IDX_OFFSET, OBJ_ELEMENTS_OFFSET,
     JSCONTEXT_ZONE_OFFSET, NOT_CHUNK_MASK, SHAPE_IMMUTABLE_FLAGS_OFFSET, SHAPE_IS_NATIVE_BIT,
     SHAPE_OFFSET, VAL_GCTHING_TAG_MIN, ZONE_NEEDS_BARRIER_OFFSET,
 };
@@ -1261,6 +1261,35 @@ impl<'a> Lower<'a> {
                 self.js_call(inst, self.h.get_element, &[a[0], a[1]], false)?;
             }
             Opcode::JsSetElem(strict) => {
+                // An in-bounds overwrite of a non-hole dense element inline,
+                // taking `ok_clean`: an own writable data property unless
+                // the elements are frozen. The store bypasses the engine,
+                // so it also requires no RANGES on the object's word.
+                let num = matches!(self.ty(d.args[2]), MType::Val(s) if s.tags.subset_of(TagSet::NUMBER));
+                let slow = self.body.add_block();
+                let (obj, elements, idx, addr, _) = self.dense_slot(a[0], a[1], slow);
+                let back = self.i32c(ELEMENTS_FLAGS_BACK);
+                let header = self.bin(Operator::I32Sub, elements, back, Type::I32);
+                let flags = self.load_i32(header, 0);
+                let fz = self.i32c(ELEMENTS_FROZEN_FLAG);
+                let frozen = self.bin(Operator::I32And, flags, fz, Type::I32);
+                let w = self.load_i32(obj, OBJ_CLASS_IDX_OFFSET);
+                let rb = self.i32c(CLASS_WORD_RANGES);
+                let ranges = self.bin(Operator::I32And, w, rb, Type::I32);
+                let bad = self.bin(Operator::I32Or, frozen, ranges, Type::I32);
+                let good = self.un(Operator::I32Eqz, bad, Type::I32);
+                self.check(good, slow);
+                if !num {
+                    self.pre_barrier(addr, 0);
+                }
+                self.store_i64(addr, 0, a[2]);
+                if !num {
+                    let f = self.h.post_write_barrier_elem;
+                    self.post_barrier(f, obj, idx, a[2]);
+                }
+                let t = self.edge(inst, 0, &[])?;
+                self.terminate(Terminator::Br { target: t });
+                self.cur = slow;
                 let sv = self.i32c(u32::from(strict));
                 self.js_call(inst, self.h.set_element, &[a[0], a[1], a[2], sv], false)?;
             }
@@ -1615,7 +1644,7 @@ impl<'a> Lower<'a> {
                 self.store_i64(obj, off, v);
                 if !num {
                     let s = self.i32c(slot);
-                    self.post_barrier(obj, s, v);
+                    self.post_barrier(self.h.post_write_barrier, obj, s, v);
                 }
                 vec![]
             }
@@ -1655,10 +1684,11 @@ impl<'a> Lower<'a> {
         self.cur = cont;
     }
 
-    /// The generational post-write barrier for storing boxed `v` into fixed
-    /// slot `slot` of `obj`: a nursery GC thing into a tenured object is
-    /// recorded in the store buffer.
-    fn post_barrier(&mut self, obj: Value, slot: Value, v: Value) {
+    /// The generational post-write barrier for storing boxed `v` into slot
+    /// or element `slot` of `obj`: a nursery GC thing into a tenured object
+    /// is recorded in the store buffer by `helper` (the slot or element
+    /// form).
+    fn post_barrier(&mut self, helper: Func, obj: Value, slot: Value, v: Value) {
         let cont = self.body.add_block();
         let mask = self.i32c(NOT_CHUNK_MASK);
         let chunk = self.bin(Operator::I32And, obj, mask, Type::I32);
@@ -1679,7 +1709,7 @@ impl<'a> Lower<'a> {
         self.cond_br(sb, Self::to(record), Self::to(cont));
         self.cur = record;
         let owner = self.box_tagged(TAG_OBJECT, obj);
-        self.call(self.h.post_write_barrier, &[owner, slot, v], &[]);
+        self.call(helper, &[owner, slot, v], &[]);
         self.terminate(Terminator::Br { target: Self::to(cont) });
         self.cur = cont;
     }
@@ -1721,7 +1751,7 @@ impl<'a> Lower<'a> {
         self.store_i64(addr, 0, val);
         if !num {
             let abs = self.load_i32(way, IC_SET_ABSSLOT);
-            self.post_barrier(obj, abs, val);
+            self.post_barrier(self.h.post_write_barrier, obj, abs, val);
         }
         let t = self.edge(inst, 0, &[])?;
         self.terminate(Terminator::Br { target: t });
@@ -1740,6 +1770,12 @@ impl<'a> Lower<'a> {
     /// else branches to `fail`. Pure reads: a typed array's dense
     /// initializedLength is 0, and a proxy fails the native check first.
     fn dense_element(&mut self, recv: Value, key: Value, fail: Block) -> Value {
+        self.dense_slot(recv, key, fail).4
+    }
+
+    /// `dense_element`'s checks, returning the object, its elements, the
+    /// index, the element's address and its value.
+    fn dense_slot(&mut self, recv: Value, key: Value, fail: Block) -> (Value, Value, Value, Value, Value) {
         let tag = self.tag_of(recv);
         let is_obj = self.tag_is(tag, TAG_OBJECT as u32);
         let ktag = self.tag_of(key);
@@ -1767,7 +1803,7 @@ impl<'a> Lower<'a> {
         let hole = self.tag_is(vtag, TAG_MAGIC as u32);
         let not_hole = self.un(Operator::I32Eqz, hole, Type::I32);
         self.check(not_hole, fail);
-        v
+        (obj, elements, idx, addr, v)
     }
 
     /// The helpers' atom id for MIR atom `a`, as an i32 constant.
