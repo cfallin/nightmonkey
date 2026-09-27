@@ -1046,9 +1046,7 @@ impl<'a> Lower<'a> {
                 self.def(inst, v);
             }
             Opcode::JsToBool => {
-                // A leaf: no GC, no JS.
-                let tb = self.h.to_boolean;
-                let v = self.call1(tb, &[self.cx, a[0]], Type::I32);
+                let v = self.to_bool(a[0]);
                 self.def(inst, v);
             }
 
@@ -1365,6 +1363,9 @@ impl<'a> Lower<'a> {
                 }
             },
             Opcode::JsCompare(cc) => {
+                if matches!(cc, JsCc::Eq | JsCc::Ne | JsCc::StrictEq | JsCc::StrictNe) {
+                    self.equality_fast_arm(inst, cc, a[0], a[1])?;
+                }
                 let kind = match cc {
                     JsCc::Eq => CMP_EQ,
                     JsCc::Ne => CMP_NE,
@@ -1382,6 +1383,128 @@ impl<'a> Lower<'a> {
             _ => unreachable!(),
         };
         self.js_call(inst, f, &args, false)
+    }
+
+    /// Whether an object that emulates `undefined` (`document.all`) may
+    /// exist: the runtime's fuse word, nonzero once one's class is seen.
+    fn dda_possible(&mut self) -> Value {
+        let slot = self.i32c(self.h.dda_fuse_addr_slot);
+        let addr = self.load_i32(slot, 0);
+        self.load_i32(addr, 0)
+    }
+
+    /// ToBoolean of boxed `v`, inline for int32, boolean, null, undefined
+    /// and (while no object emulates `undefined`) objects; the leaf helper
+    /// otherwise.
+    fn to_bool(&mut self, v: Value) -> Value {
+        let join = self.body.add_block();
+        let r = self.body.add_blockparam(join, Type::I32);
+        let tag = self.tag_of(v);
+        let low = self.un(Operator::I32WrapI64, v, Type::I32);
+        // int32 and boolean: the payload.
+        let int = self.tag_is(tag, TAG_INT32 as u32);
+        let boolean = self.tag_is(tag, TAG_BOOLEAN as u32);
+        let payload = self.bin(Operator::I32Or, int, boolean, Type::I32);
+        let nz = self.i32c(0);
+        let low_t = self.bin(Operator::I32Ne, low, nz, Type::I32);
+        let next = self.body.add_block();
+        self.cond_br(payload, BlockTarget { block: join, args: vec![low_t] }, Self::to(next));
+        self.cur = next;
+        let null = self.tag_is(tag, TAG_NULL as u32);
+        let undef = self.tag_is(tag, TAG_UNDEFINED as u32);
+        let nullish = self.bin(Operator::I32Or, null, undef, Type::I32);
+        let zero = self.i32c(0);
+        let next = self.body.add_block();
+        self.cond_br(nullish, BlockTarget { block: join, args: vec![zero] }, Self::to(next));
+        self.cur = next;
+        let obj = self.tag_is(tag, TAG_OBJECT as u32);
+        let (obj_blk, slow) = (self.body.add_block(), self.body.add_block());
+        self.cond_br(obj, Self::to(obj_blk), Self::to(slow));
+        self.cur = obj_blk;
+        let dda = self.dda_possible();
+        let one = self.i32c(1);
+        self.cond_br(dda, Self::to(slow), BlockTarget { block: join, args: vec![one] });
+        self.cur = slow;
+        // A leaf: no GC, no JS.
+        let t = self.call1(self.h.to_boolean, &[self.cx, v], Type::I32);
+        self.terminate(Terminator::Br { target: BlockTarget { block: join, args: vec![t] } });
+        self.cur = join;
+        r
+    }
+
+    /// The inline arm of an equality compare, taking `ok_clean` with the
+    /// result where the operands decide it by their bits: strictly, when
+    /// neither is a double, string or BigInt (so equal values have equal
+    /// bits); loosely, when both are int32s or both booleans, or both are
+    /// null, undefined or an object while no object emulates `undefined`
+    /// (then null and undefined are equal to each other and nothing else,
+    /// and objects by identity). Otherwise falls through to the helper.
+    fn equality_fast_arm(&mut self, inst: mir::Inst, cc: JsCc, a: Value, b: Value) -> R<()> {
+        let (ta, tb) = (self.tag_of(a), self.tag_of(b));
+        let bits_eq = self.bin(Operator::I64Eq, a, b, Type::I32);
+        let fast = self.body.add_block();
+        let slow = self.body.add_block();
+        let r = match cc {
+            JsCc::StrictEq | JsCc::StrictNe => {
+                // int32, boolean, undefined, null (consecutive tags), symbol
+                // or object.
+                let simple = |l: &mut Self, t: Value| {
+                    let lo = l.i32c(TAG_INT32 as u32);
+                    let rel = l.bin(Operator::I32Sub, t, lo, Type::I32);
+                    let three = l.i32c(3);
+                    let prim = l.bin(Operator::I32LeU, rel, three, Type::I32);
+                    let sym = l.tag_is(t, TAG_SYMBOL as u32);
+                    let obj = l.tag_is(t, TAG_OBJECT as u32);
+                    let x = l.bin(Operator::I32Or, prim, sym, Type::I32);
+                    l.bin(Operator::I32Or, x, obj, Type::I32)
+                };
+                let (sa, sb) = (simple(self, ta), simple(self, tb));
+                let both = self.bin(Operator::I32And, sa, sb, Type::I32);
+                self.cond_br(both, Self::to(fast), Self::to(slow));
+                self.cur = fast;
+                bits_eq
+            }
+            _ => {
+                let same = self.bin(Operator::I32Eq, ta, tb, Type::I32);
+                let int = self.tag_is(ta, TAG_INT32 as u32);
+                let boolean = self.tag_is(ta, TAG_BOOLEAN as u32);
+                let ib = self.bin(Operator::I32Or, int, boolean, Type::I32);
+                let same_ib = self.bin(Operator::I32And, same, ib, Type::I32);
+                let nullish = |l: &mut Self, t: Value| {
+                    let null = l.tag_is(t, TAG_NULL as u32);
+                    let undef = l.tag_is(t, TAG_UNDEFINED as u32);
+                    l.bin(Operator::I32Or, null, undef, Type::I32)
+                };
+                let (na, nb) = (nullish(self, ta), nullish(self, tb));
+                let oa = self.tag_is(ta, TAG_OBJECT as u32);
+                let ob = self.tag_is(tb, TAG_OBJECT as u32);
+                let ka = self.bin(Operator::I32Or, na, oa, Type::I32);
+                let kb = self.bin(Operator::I32Or, nb, ob, Type::I32);
+                let both_k = self.bin(Operator::I32And, ka, kb, Type::I32);
+                let (ib_blk, k_blk) = (self.body.add_block(), self.body.add_block());
+                self.cond_br(same_ib, Self::to(ib_blk), Self::to(k_blk));
+                self.cur = ib_blk;
+                self.terminate(Terminator::Br { target: Self::to(fast) });
+                self.cur = k_blk;
+                let dda_blk = self.body.add_block();
+                self.cond_br(both_k, Self::to(dda_blk), Self::to(slow));
+                self.cur = dda_blk;
+                let dda = self.dda_possible();
+                self.cond_br(dda, Self::to(slow), Self::to(fast));
+                self.cur = fast;
+                let both_n = self.bin(Operator::I32And, na, nb, Type::I32);
+                self.bin(Operator::I32Or, bits_eq, both_n, Type::I32)
+            }
+        };
+        let r = if matches!(cc, JsCc::Ne | JsCc::StrictNe) {
+            self.un(Operator::I32Eqz, r, Type::I32)
+        } else {
+            r
+        };
+        let t = self.edge(inst, 0, &[r])?;
+        self.terminate(Terminator::Br { target: t });
+        self.cur = slow;
+        Ok(())
     }
 
     /// Call `f` rooted; on success take `ok_dirty` with the result (its
