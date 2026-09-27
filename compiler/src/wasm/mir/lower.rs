@@ -221,9 +221,6 @@ struct Lower<'a> {
     carried: BTreeMap<mir::Block, Vec<mir::Value>>,
     /// The waffle value standing for each MIR value at the emission point.
     vmap: BTreeMap<mir::Value, Value>,
-    /// Where the rooting slots start, in bytes above `sp`: past baseline's
-    /// fixed frame and locals, over its operand slots.
-    root_base: u32,
     /// With inlined callees (§5.5): per frame id its base and end offsets
     /// from `sp` and its layout. Frame 0 is the function's, ending at
     /// `root_base`. An instruction's rooting slots start at its frame's
@@ -342,7 +339,6 @@ pub fn lower<'a>(
         live_in: BTreeMap::new(),
         carried: BTreeMap::new(),
         vmap: BTreeMap::new(),
-        root_base,
         inline: !f.inline_frames.is_empty(),
         exit_gap: vec![0],
         frame_off: vec![0],
@@ -1916,7 +1912,6 @@ impl<'a> Lower<'a> {
             Opcode::JsRt(r) => {
                 use crate::mir::ops::RtOp;
                 let h = self.h;
-                let z = self.i32c(0);
                 let (f, args) = match r {
                     RtOp::Instanceof => {
                         let cell = self.i32c(IOF_CELL_ADDR_PLACEHOLDER);
