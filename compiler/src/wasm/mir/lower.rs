@@ -249,6 +249,8 @@ struct Lower<'a> {
     pending_retain: Vec<((u32, u32), mir::Value)>,
     /// The MIR block being lowered.
     cur_mblock: mir::Block,
+    /// Whether the stamp epoch was unchanged across the last `gc_call`.
+    epoch_same: Option<Value>,
     /// Whether the emission point is on a helper's slow path: its edges'
     /// managed values are reloaded on the edge rather than at their uses.
     cold: bool,
@@ -422,6 +424,7 @@ pub fn lower<'a>(
         pending_retain: vec![],
         cur_mblock: mir::Block::from_u32(0),
         cold: false,
+        epoch_same: None,
         pending: BTreeMap::new(),
         plans: BTreeMap::new(),
         entry_dirty: BTreeMap::new(),
@@ -1544,7 +1547,10 @@ impl<'a> Lower<'a> {
         let top = self.add_off(self.vp, top_off);
         let mut full = vec![self.cx, top];
         full.extend_from_slice(args);
+        let pre = self.epoch();
         let ok = self.call1(f, &full, Type::I32);
+        let post = self.epoch();
+        self.epoch_same = Some(self.bin(Operator::I32Eq, pre, post, Type::I32));
         self.after_gc(live);
         // A helper's slow path: its edges reload what their targets keep
         // in registers.
@@ -1577,6 +1583,40 @@ impl<'a> Lower<'a> {
             self.frame_end.push(off + lay.top(fr.max_depth + 3));
             self.frame_layouts.push(lay);
         }
+    }
+
+    /// The stamp epoch (`gNightStampEpoch`, low word), which every
+    /// demotion of a stamped object's class word bumps: unchanged across
+    /// a call, no layout fact was invalidated (bbv's `emit_epoch_read`).
+    fn epoch(&mut self) -> Value {
+        let slot = self.i32c(self.h.strlit_slot + crate::region_shape::STRLIT_STAMP_EPOCH_ADDR_OFF);
+        let addr = self.load_i32(slot, 0);
+        self.load_i32(addr, 0)
+    }
+
+    /// Bump the stamp epoch (a demotion in compiled code).
+    fn bump_epoch(&mut self) {
+        let slot = self.i32c(self.h.strlit_slot + crate::region_shape::STRLIT_STAMP_EPOCH_ADDR_OFF);
+        let addr = self.load_i32(slot, 0);
+        let v = self.load_i64(addr, 0);
+        let one = self.i64c(1);
+        let n = self.bin(Operator::I64Add, v, one, Type::I64);
+        self.store_i64(addr, 0, n);
+    }
+
+    /// The success edges of a generic op after its helper `ok`: `ok_clean`
+    /// when the stamp epoch did not move across it (`epoch_same`, from
+    /// the last `gc_call` or a call's own sample), so its layout facts
+    /// hold; `ok_dirty` otherwise; `err` on failure.
+    fn clean_or_dirty(&mut self, inst: mir::Inst, ok: Value, same: Value, outs: &[Value]) -> R<()> {
+        let e = self.edge(inst, 2, &[])?;
+        let okb = self.body.add_block();
+        self.cond_br(ok, Self::to(okb), e);
+        self.cur = okb;
+        let c = self.edge(inst, 0, outs)?;
+        let d = self.edge(inst, 1, outs)?;
+        self.cond_br(same, c, d);
+        Ok(())
     }
 
     /// Make the rooting area valid Values: every may-GC call's scan covers
@@ -1684,6 +1724,7 @@ impl<'a> Lower<'a> {
     fn inst(&mut self, inst: mir::Inst) -> R<()> {
         self.cur_frame = self.f.inst_frame[inst];
         let d = self.f.insts[inst].clone();
+        self.epoch_same = None;
         if let Opcode::FrameStore(k) = d.op {
             let key = (self.cur_frame, k);
             let aliased = self.mapped_formals && self.cur_frame == 0 && k >= 1 && k <= self.layout.nargs;
@@ -2672,9 +2713,8 @@ impl<'a> Lower<'a> {
                     let lv = self.i32c(0);
                     let live = self.live_across(inst);
                     let (ok, r) = self.gc_call(self.h.new_array, &[lv, cell], &live)?;
-                    let t = self.edge(inst, 1, &[r])?;
-                    let e = self.edge(inst, 2, &[])?;
-                    self.cond_br(ok, t, e);
+                    let same = self.epoch_same.take().expect("gc_call sampled the epoch");
+                    self.clean_or_dirty(inst, ok, same, &[r])?;
                     (self.vmap, self.slotted, self.dirty, self.framed) = saved;
                     self.cur = other;
                 }
@@ -2684,6 +2724,7 @@ impl<'a> Lower<'a> {
                 // constructor). The result lands at the frame's top.
                 let live = self.live_across(inst);
                 self.root(&live)?;
+                let construct_pre = self.epoch();
                 let frame = self.top_off(live.len());
                 for (k, &v) in a.iter().enumerate() {
                     self.store_i64(self.vp, frame + 8 * u32::try_from(k).unwrap(), v);
@@ -2783,9 +2824,9 @@ impl<'a> Lower<'a> {
                 });
                 self.cur = join;
                 self.after_gc(&live);
-                let t = self.edge(inst, 1, &[res_p])?;
-                let e = self.edge(inst, 2, &[])?;
-                self.cond_br(ok_p, t, e);
+                let post = self.epoch();
+                let same = self.bin(Operator::I32Eq, construct_pre, post, Type::I32);
+                self.clean_or_dirty(inst, ok_p, same, &[res_p])?;
             }
             Opcode::GuardLayout { keys, types } => {
                 // The stamp word (`JSObject*+4`): identity is layout key + 1
@@ -3485,10 +3526,8 @@ impl<'a> Lower<'a> {
         } else {
             result
         };
-        let t = self.edge(inst, 1, &[out])?;
-        let e = self.edge(inst, 2, &[])?;
-        self.cond_br(ok, t, e);
-        Ok(())
+        let same = self.epoch_same.take().expect("gc_call sampled the epoch");
+        self.clean_or_dirty(inst, ok, same, &[out])
     }
 
     /// `load_field`/`store_field` (§4.3): with the stamp's SLOTS bit set,
@@ -4118,6 +4157,17 @@ impl<'a> Lower<'a> {
         let keep = self.i32c(!mask);
         let nw = self.bin(Operator::I32And, w, keep, Type::I32);
         self.store_i32(obj, OBJ_CLASS_IDX_OFFSET, nw);
+        // A demotion of a stamped word invalidates facts: bump the epoch
+        // (not for a mid-construction sentinel word, which no fact
+        // covers), as the runtime's `NightNoteDemotion`.
+        let sent = self.i32c(CLASS_WORD_SENTINEL);
+        let s = self.bin(Operator::I32And, w, sent, Type::I32);
+        let (bump, after) = (self.body.add_block(), self.body.add_block());
+        self.cond_br(s, Self::to(after), Self::to(bump));
+        self.cur = bump;
+        self.bump_epoch();
+        self.terminate(Terminator::Br { target: Self::to(after) });
+        self.cur = after;
         self.terminate(Terminator::Br { target: Self::to(done) });
         self.cur = done;
     }
@@ -4427,6 +4477,7 @@ impl<'a> Lower<'a> {
         }
         let live = self.live_across(inst);
         self.root(&live)?;
+        let call_pre = self.epoch();
         let frame = self.top_off(live.len());
         for (k, &v) in ops.iter().enumerate() {
             self.store_i64(self.vp, frame + 8 * u32::try_from(k).unwrap(), v);
@@ -4495,10 +4546,9 @@ impl<'a> Lower<'a> {
         self.cur = join;
         self.after_gc(&live);
         let result = self.load_i64(self.vp, top_off);
-        let t = self.edge(inst, 1, &[result])?;
-        let e = self.edge(inst, 2, &[])?;
-        self.cond_br(ok, t, e);
-        Ok(())
+        let post = self.epoch();
+        let same = self.bin(Operator::I32Eq, call_pre, post, Type::I32);
+        self.clean_or_dirty(inst, ok, same, &[result])
     }
 
     /// An object or array literal (`array_len`) from the site's

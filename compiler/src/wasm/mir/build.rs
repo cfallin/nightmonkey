@@ -342,6 +342,9 @@ const INLINE_CONSTRUCT: bool = true;
 /// Typed field accesses exit on a dirty IC arm rather than rejoin.
 const DIRTY_EXITS: bool = true;
 
+/// Generic ops keep proven layouts on their clean edge (`js_keep`).
+const KEEP_ON_CLEAN: bool = true;
+
 /// Guard a method's `this` to its predicted layouts at `FunctionThis`.
 const THIS_ENTRY_GUARD: bool = true;
 
@@ -800,6 +803,8 @@ struct Run<'s, 'a> {
     /// This op's fence renamings of `Obj` values (`fence_params`), for
     /// `repush`.
     renames: Vec<(mir::Value, Slot)>,
+    /// The pc after the op being built (`js_keep`'s exits).
+    next_pc: Option<Pc>,
 }
 
 impl<'s, 'a> Run<'s, 'a> {
@@ -838,6 +843,7 @@ impl<'s, 'a> Run<'s, 'a> {
             exit_blk: None,
             throw_blk: None,
             renames: vec![],
+            next_pc: None,
             inline_sites: 0,
             inline_insts: 0,
         }
@@ -1790,6 +1796,100 @@ impl<'s, 'a> Run<'s, 'a> {
         p
     }
 
+    /// `js_void` for an op that leaves `post` on the stack (a store's
+    /// value), keeping facts on its clean edge (`js_keep`).
+    fn js_void_keep(&mut self, op: Opcode, args: Vec<mir::Value>, post: Slot) {
+        if self.js_keep(op, args.clone(), None, Some(post)).is_none() {
+            self.js_void(op, args);
+        }
+    }
+
+    /// A generic op that keeps the frame's proven layouts on its clean
+    /// edge (bbv's epoch keep: the lowering takes `ok_clean` when the
+    /// stamp epoch did not move across the op's helper, so no class word
+    /// was demoted), its dirty edge exiting at the next pc with the op's
+    /// result (`out`) or the value it leaves (`post`). Only where there is
+    /// something to keep and the stack at the next pc is this op's
+    /// result; else `None`, and the caller fences as before.
+    fn js_keep(
+        &mut self,
+        op: Opcode,
+        args: Vec<mir::Value>,
+        out: Option<MType>,
+        post: Option<Slot>,
+    ) -> Option<Option<mir::Value>> {
+        use mir::ops::KillSite;
+        if !KEEP_ON_CLEAN {
+            return None;
+        }
+        let next = self.next_pc?;
+        if !self.st.iter().chain(&self.pre).any(|x| matches!(x.ty, Ty::Obj(..))) {
+            return None;
+        }
+        let tys: Vec<MType> = args.iter().map(|&v| self.f.ty(v)).collect();
+        let fx = mir::ops::effects(&op, &tys, &self.mm);
+        if op.kill_site(&fx) != KillSite::DirtyEdge {
+            return None;
+        }
+        let depth = self.st.len() - self.frame_len() + usize::from(post.is_some() || out.is_some());
+        if self.s.depths.at(next) != Some(u32::try_from(depth).ok()?) {
+            return None;
+        }
+        let out_ty = match out {
+            None => None,
+            Some(MType::Bool) => Some(Ty::Bool),
+            Some(MType::Val(v)) => Some(Ty::Val(v.tags)),
+            Some(_) => return None,
+        };
+        let ok = self.new_block();
+        let p = out.map(|t| self.f.add_param(ok, t));
+        let saved = (self.cur, self.live);
+        let b = self.new_block();
+        let dp = out.map(|t| self.f.add_param(b, t));
+        // The dirty edge is a fence: `Obj` slots reach the exit through
+        // weaker params.
+        let mut objs: Vec<(mir::Value, mir::Value)> = vec![];
+        for x in &self.st {
+            if matches!(x.ty, Ty::Obj(..)) && !objs.iter().any(|&(v, _)| v == x.v) {
+                objs.push((x.v, self.f.add_param(b, MType::OBJ_TOP)));
+            }
+        }
+        self.at(b);
+        let weaker = |x: Slot, objs: &[(mir::Value, mir::Value)]| match (x.ty, objs.iter().find(|&&(v, _)| v == x.v)) {
+            (Ty::Obj(k, _), Some(&(_, p))) => Slot {
+                v: p,
+                ty: Ty::ObjHint(k),
+            },
+            _ => x,
+        };
+        let mut st: Vec<Slot> = self.st.iter().map(|&x| weaker(x, &objs)).collect();
+        match (dp, post) {
+            (Some(v), _) => st.push(Slot {
+                v,
+                ty: out_ty.unwrap(),
+            }),
+            (None, Some(x)) => st.push(weaker(x, &objs)),
+            (None, None) => {}
+        }
+        let ops = self.exit_operands(next, &st);
+        let eop = self.exit_op(next, false);
+        self.term(eop, ops, vec![]);
+        (self.cur, self.live) = saved;
+        let mut dargs: Vec<EdgeArg> = dp.map(|_| vec![EdgeArg::Out(0)]).unwrap_or_default();
+        dargs.extend(objs.iter().map(|&(v, _)| EdgeArg::Value(v)));
+        let dirty = Edge { block: b, args: dargs };
+        let clean = Edge {
+            block: ok,
+            args: p.map(|_| vec![EdgeArg::Out(0)]).unwrap_or_default(),
+        };
+        let err = self.exit_block(true);
+        self.retain_locals(&op);
+        self.f.add_inst(self.cur, op, args, &[], vec![clean, dirty, Self::goto(err)]);
+        self.live = false;
+        self.at(ok);
+        Some(p)
+    }
+
     fn js_void(&mut self, op: Opcode, args: Vec<mir::Value>) {
         let ok = self.new_block();
         let err = self.exit_block(true);
@@ -2061,6 +2161,9 @@ impl<'s, 'a> Run<'s, 'a> {
     /// A generic op: both success edges continue with its output (of type
     /// `out`); an exception goes to the op's throw block.
     fn js(&mut self, op: Opcode, args: Vec<mir::Value>, out: MType) -> mir::Value {
+        if let Some(r) = self.js_keep(op, args.clone(), Some(out), None) {
+            return r.unwrap();
+        }
         let ok = self.new_block();
         let p = self.f.add_param(ok, out);
         let err = self.exit_block(true);
@@ -2702,6 +2805,7 @@ impl<'s, 'a> Run<'s, 'a> {
     fn op(&mut self, op: JSOp) -> R<()> {
         use JSOp::*;
         let pc = self.pc;
+        self.next_pc = Some(pc + op.len());
         let mut p = self.s.imms(pc);
         let int_ty = Ty::I32;
         match op {
@@ -3299,7 +3403,7 @@ impl<'s, 'a> Run<'s, 'a> {
                 let v = self.pop();
                 let env = self.pop();
                 let (e, y) = (self.boxed(env), self.boxed(v));
-                self.js_void(Opcode::JsSetName(a, op == StrictSetGName), vec![e, y]);
+                self.js_void_keep(Opcode::JsSetName(a, op == StrictSetGName), vec![e, y], v);
                 self.repush(v);
             }
             TableSwitch => {
@@ -3586,7 +3690,7 @@ impl<'s, 'a> Run<'s, 'a> {
                     }
                     None => {
                         let (x, y) = (self.boxed(recv), self.boxed(v));
-                        self.js_void(Opcode::JsSetProp(a, op == StrictSetProp), vec![x, y]);
+                        self.js_void_keep(Opcode::JsSetProp(a, op == StrictSetProp), vec![x, y], v);
                     }
                 }
                 self.repush(v);
@@ -3779,7 +3883,7 @@ impl<'s, 'a> Run<'s, 'a> {
                     }
                     None => {
                         let (x, k, y) = (self.boxed(recv), self.boxed(key), self.boxed(v));
-                        self.js_void(Opcode::JsSetElem(op == StrictSetElem), vec![x, k, y]);
+                        self.js_void_keep(Opcode::JsSetElem(op == StrictSetElem), vec![x, k, y], v);
                         self.repush(v);
                     }
                 }

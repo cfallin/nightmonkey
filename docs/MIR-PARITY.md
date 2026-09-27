@@ -68,8 +68,18 @@ Ordered by expected effect across the suite:
 
 1. Keep facts on clean edges: split `ok_clean` from `ok_dirty` in the
    builder so only the dirty/helper edge fences (then epoch/flags keeps,
-   then effect summaries for non-inlined calls).
-2. Side arms instead of exits for the common guard misses: mixed
+   then effect summaries for non-inlined calls). First step done: generic
+   ops whose result is the op's own take `ok_clean` when the stamp epoch
+   is unchanged across their helper and keep layouts there (`js_keep`);
+   ~9% fewer dynamic layout guards in richards. Still fenced: ops inside
+   diamonds (already demoted), static-kill ops (`JsGetName`, `JsLambda`,
+   `CreateThis`, ...), calls' callee effects (no flags words).
+2. Side arms instead of exits for the common guard misses. Measured:
+   deltablue exits 186k times a run at `this`-layout entry guards
+   (`BinaryConstraint.prototype.output` and callees, sid 261/254/256),
+   because a delegating constructor (`superConstructor.call(this, ...)`)
+   calls methods on `this` before its restamp; legacy's lazy class
+   facts fall back to the IC there. Also: mixed
    numeric claims as boxed numbers, `I32Ovf` overflow to f64, layout
    misses to the IC (already done for reads), SLOTS-clear and SHALLOW
    stores to the IC with the store choke, kind mismatches to the generic
