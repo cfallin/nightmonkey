@@ -51,7 +51,8 @@ use crate::wasm::baseline::layout::{
 use crate::wasm::bbv::abi::{
     BINOP_BITAND, BINOP_BITNOT, BINOP_BITOR, BINOP_BITXOR, BINOP_DEC, BINOP_DIV, BINOP_INC,
     BINOP_LSH, BINOP_MOD, BINOP_MUL, BINOP_RSH, BINOP_SUB, BINOP_URSH, CLASS_WORD_SHALLOW,
-    CLASS_WORD_RANGES, CLASS_WORD_SENTINEL, CLASS_WORD_SLOTS, EARLY_KEY_MAX, EARLY_KEY_SHIFT, IC_SET_ABSSLOT,
+    CLASS_WORD_RANGES, CLASS_WORD_SENTINEL, CLASS_WORD_SLOTS, SHAPE_SMALL_SLOTSPAN_MASK_BITS,
+    SHAPE_SMALL_SLOTSPAN_SHIFT, EARLY_KEY_MAX, EARLY_KEY_SHIFT, IC_SET_ABSSLOT,
     IC_SET_RECVSHAPE, IC_SET_SLOTENC, IC_TRANS_ABSSLOT, IC_TRANS_INLINE_HOPS, IC_TRANS_NEWSHAPE,
     IC_TRANS_OLDSHAPE, IC_TRANS_PROTO0, IC_TRANS_PROTO_HOPS, IC_TRANS_PROTO_ROW_BYTES,
     IC_TRANS_ROW_OFF, IC_TRANS_SLOTOFF, BASESHAPE_PROTO_OFFSET, IOF_CELL_ADDR_PLACEHOLDER,
@@ -1327,8 +1328,7 @@ impl<'a> Lower<'a> {
                 if let Some([layout, nfields, keep]) = self.ctor_stamp {
                     // `this` as the caller passed it: MIR never writes it.
                     let thisv = self.load_i64(self.sp, FrameLayout::THIS);
-                    let (l, n, k) = (self.i32c(layout), self.i32c(nfields), self.i32c(keep));
-                    self.call(self.h.ctor_stamp, &[thisv, l, n, k], &[]);
+                    self.ctor_stamp_inline(thisv, layout, nfields, keep);
                 }
                 if let Some(r) = self.ctor_restamp {
                     let mut args = vec![self.load_i64(self.sp, FrameLayout::THIS)];
@@ -2900,6 +2900,47 @@ impl<'a> Lower<'a> {
         let t = self.edge(inst, 0, &[])?;
         self.terminate(Terminator::Br { target: t });
         Ok(())
+    }
+
+    /// A layout constructor's first stamp of its completed `this`, inline
+    /// (bbv's `emit_class_idx_stamp_impl`; `night_runtime_ctor_stamp`'s
+    /// gates): an object still under construction whose early key is ours
+    /// or none, with a slot span covering the row, gets the layout's idx
+    /// plus the validity bits that survived construction.
+    fn ctor_stamp_inline(&mut self, thisv: Value, layout: u32, nfields: u32, keep: u32) {
+        let done = self.body.add_block();
+        let tag = self.tag_of(thisv);
+        let is_obj = self.tag_is(tag, TAG_OBJECT as u32);
+        self.check(is_obj, done);
+        let obj = self.un(Operator::I32WrapI64, thisv, Type::I32);
+        let w0 = self.load_i32(obj, OBJ_CLASS_IDX_OFFSET);
+        let sb = self.i32c(CLASS_WORD_SENTINEL);
+        let sent = self.bin(Operator::I32And, w0, sb, Type::I32);
+        self.check(sent, done);
+        let km = self.i32c(EARLY_KEY_MAX << EARLY_KEY_SHIFT);
+        let key = self.bin(Operator::I32And, w0, km, Type::I32);
+        let z = self.i32c(0);
+        let none = self.bin(Operator::I32Eq, key, z, Type::I32);
+        let mine = self.i32c((layout + 1) << EARLY_KEY_SHIFT);
+        let ours = self.bin(Operator::I32Eq, key, mine, Type::I32);
+        let owned = self.bin(Operator::I32Or, none, ours, Type::I32);
+        self.check(owned, done);
+        let shape = self.load_i32(obj, SHAPE_OFFSET);
+        let imm = self.load_i32(shape, SHAPE_IMMUTABLE_FLAGS_OFFSET);
+        let sh = self.i32c(SHAPE_SMALL_SLOTSPAN_SHIFT);
+        let span = self.bin(Operator::I32ShrU, imm, sh, Type::I32);
+        let sm = self.i32c(SHAPE_SMALL_SLOTSPAN_MASK_BITS);
+        let span = self.bin(Operator::I32And, span, sm, Type::I32);
+        let n = self.i32c(nfields);
+        let covers = self.bin(Operator::I32GeU, span, n, Type::I32);
+        self.check(covers, done);
+        let kb = self.i32c(keep);
+        let bits = self.bin(Operator::I32And, w0, kb, Type::I32);
+        let idx = self.i32c(layout + 1);
+        let w = self.bin(Operator::I32Or, idx, bits, Type::I32);
+        self.store_i32(obj, OBJ_CLASS_IDX_OFFSET, w);
+        self.terminate(Terminator::Br { target: Self::to(done) });
+        self.cur = done;
     }
 
     /// `x === k` for a `StrictConstantEq` operand `k` (the high byte its
