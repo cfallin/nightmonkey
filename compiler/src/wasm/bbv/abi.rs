@@ -182,7 +182,7 @@ pub(crate) const ZONE_NEEDS_BARRIER_OFFSET: u32 = 8;
 pub(crate) const REALM_GLOBAL_OFFSET: u32 = 72;
 pub(crate) const NOT_CHUNK_MASK: u32 = !0xF_FFFF;
 pub(crate) const CHUNK_STORE_BUFFER_OFFSET: u32 = 0;
-pub(super) const NURSERY_HEADER_BYTES: u32 = 8;
+pub(crate) const NURSERY_HEADER_BYTES: u32 = 8;
 
 // --- the compiled frame ---------------------------------------------------
 
@@ -241,11 +241,11 @@ pub(super) const CALL_CELL_ADDR_PLACEHOLDER: u32 = 0xDEAD_BEE0;
 
 /// Per-site construct cell: the first 20 bytes mirror the call cell, then
 /// `[ctorShape u32][gen u32][protoPtr u32][protoSlotEnc u32]`.
-pub(super) const CONSTRUCT_CELL_CTORSHAPE: u32 = 20;
-pub(super) const CONSTRUCT_CELL_GEN: u32 = 24;
-pub(super) const CONSTRUCT_CELL_PROTOPTR: u32 = 28;
-pub(super) const CONSTRUCT_CELL_PROTOSLOTENC: u32 = 32;
-pub(super) const CONSTRUCT_CELL_ADDR_PLACEHOLDER: u32 = 0xDEAD_C000;
+pub(crate) const CONSTRUCT_CELL_CTORSHAPE: u32 = 20;
+pub(crate) const CONSTRUCT_CELL_GEN: u32 = 24;
+pub(crate) const CONSTRUCT_CELL_PROTOPTR: u32 = 28;
+pub(crate) const CONSTRUCT_CELL_PROTOSLOTENC: u32 = 32;
+pub(crate) const CONSTRUCT_CELL_ADDR_PLACEHOLDER: u32 = 0xDEAD_C000;
 
 /// Base of the per-funcidx ctor-nslots region (u32 per funcref-table index,
 /// 0 = unknown), patched by `translate_all` once table placement is done. An

@@ -300,26 +300,19 @@ fn build_at<'a>(
         return Err("class constructor".into());
     }
     let fl = FrameLayout::of(script);
-    // A mapped arguments object aliases the formals. With no formals, and
-    // every `arguments` only forwarded (so never made: `apply_forward`),
-    // there is nothing to model: prototype.js's `Class.create` wrapper.
-    let forwards = APPLY_FWD
-        && crate::wasm::translate::compute_apply_fwd_pcs(script, &ctx.facts.apply_sites, sid.get())
-            .is_some_and(|s| !s.is_empty());
-    if script.has_mapped_args && !(forwards && script.nargs == 0) {
+    // A mapped arguments object aliases the formals. With no formals there
+    // is nothing to alias, and the object (made by the runtime, which maps
+    // by the callee) is an unmapped one plus `callee`: scheme runtimes'
+    // variadic `sc_list`, prototype.js's `Class.create` wrapper.
+    if script.has_mapped_args && script.nargs > 0 {
         return Err("mapped arguments".into());
     }
     if !ACTUALS && fl.rebase_vp {
         return Err("reads actuals".into());
     }
-    // An env chain is supported while it is fixed for the whole
-    // activation (§5.1): the callee's own environment, with no scope of
-    // this script's pushing one (those ops decline one by one).
-    if crate::wasm::baseline::needs_env(script)
-        && !crate::wasm::baseline::env_is_plain(ctx.source, script)
-    {
-        return Err("env chain".into());
-    }
+    // The env chain is fixed for the whole activation (§5.1): the callee's
+    // own environment, or the one the entry makes (`env_setup`); an op
+    // that pushes a scope declines on its own.
     let depths = StackDepths::compute(script).map_err(|e| format!("stack depths ({e})"))?;
     let mut shape = Shape::of(ctx, sid, script, fl, depths)?;
     shape.names = Some(names);

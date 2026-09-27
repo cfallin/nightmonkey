@@ -55,7 +55,8 @@ use crate::wasm::bbv::abi::{
     IC_SET_RECVSHAPE, IC_SET_SLOTENC, IC_TRANS_ABSSLOT, IC_TRANS_INLINE_HOPS, IC_TRANS_NEWSHAPE,
     IC_TRANS_OLDSHAPE, IC_TRANS_PROTO0, IC_TRANS_PROTO_HOPS, IC_TRANS_PROTO_ROW_BYTES,
     IC_TRANS_ROW_OFF, IC_TRANS_SLOTOFF, BASESHAPE_PROTO_OFFSET, IOF_CELL_ADDR_PLACEHOLDER,
-    IOF_CELL_GEN, IOF_CELL_SLOTENC,
+    IOF_CELL_GEN, IOF_CELL_SLOTENC, CONSTRUCT_CELL_ADDR_PLACEHOLDER, CONSTRUCT_CELL_CTORSHAPE,
+    CONSTRUCT_CELL_GEN, CONSTRUCT_CELL_PROTOPTR, CONSTRUCT_CELL_PROTOSLOTENC, NURSERY_HEADER_BYTES,
     IC_WAY_HOLDERPTR, IC_WAY_MONO_OFF, IC_WAY_RECVSHAPE,
     IC_WAY_ADDR_PLACEHOLDER, NATIVE_SLOTS_OFFSET, SHAPE_BASESHAPE_OFFSET, BASESHAPE_CLASP_OFFSET,
     BASESCRIPT_NIGHTFUNCINDEX_OFFSET, FUNC_FLAGS_SLOT_OFFSET, FUNCTION_FLAGS_CONSTRUCTOR, FUNC_ENV_SLOT_OFFSET, FUNC_SCRIPT_SLOT_OFFSET,
@@ -97,6 +98,7 @@ pub struct Lowered {
     pub prop_ic_patches: Vec<(Value, u32)>,
     /// `instanceof` cell placeholders, with their rows (+1).
     pub iof_cell_patches: Vec<(Value, u32)>,
+    pub construct_cell_patches: Vec<(Value, u32)>,
 }
 
 /// The resume words `f`'s exits and throws carry: the set the baseline
@@ -239,6 +241,8 @@ struct Lower<'a> {
     prop_ic_patches: Vec<(Value, u32)>,
     /// `instanceof` cell placeholders (`Outcome::Compiled::iof_cell_patches`).
     iof_cell_patches: Vec<(Value, u32)>,
+    /// Construct cell placeholders (bbv's per-site cell).
+    construct_cell_patches: Vec<(Value, u32)>,
     /// The census helper, when exits are counted (`--mir-exit-census`).
     exit_census: Option<Func>,
     ctor_stamp: Option<[u32; 3]>,
@@ -247,6 +251,7 @@ struct Lower<'a> {
     exit_hubs: BTreeMap<Vec<Option<BoxKind>>, Block>,
     strict: bool,
     plain_env: bool,
+    own_env: bool,
     forward_resume: bool,
     /// The syntactic global binding (`TranslateCtx::syn_gnames`) each
     /// global name read names, for its inline arms.
@@ -275,6 +280,9 @@ pub struct LowerOpts {
     pub strict: bool,
     /// The activation's environment is its callee's (`baseline::env_is_plain`).
     pub plain_env: bool,
+    /// The activation makes its own environment (a call object, a named
+    /// lambda's scope) at entry, fixed from then on: `env_setup`.
+    pub own_env: bool,
     /// The script may be inlined: its entry forwards a resume to its
     /// baseline body (§5.5).
     pub forward_resume: bool,
@@ -337,12 +345,14 @@ pub fn lower<'a>(
         body_off_patches: vec![],
         prop_ic_patches: vec![],
         iof_cell_patches: vec![],
+        construct_cell_patches: vec![],
         exit_census: if o.exit_census { h.census } else { None },
         ctor_stamp: o.ctor_stamp,
         ctor_restamp: o.ctor_restamp,
         exit_hubs: BTreeMap::new(),
         strict: o.strict,
         plain_env: o.plain_env,
+        own_env: o.own_env,
         forward_resume: o.forward_resume,
         gname_bids,
         gname_fused,
@@ -355,6 +365,7 @@ pub fn lower<'a>(
         baseline_calls: l.baseline_calls,
         prop_ic_patches: l.prop_ic_patches,
         iof_cell_patches: l.iof_cell_patches,
+        construct_cell_patches: l.construct_cell_patches,
     })
 }
 
@@ -843,6 +854,21 @@ impl<'a> Lower<'a> {
             self.store_i64(vp, l.operand(k), undef);
         }
         self.init_root_area();
+        if self.own_env {
+            // Every slot is valid: the GC may run. Failing, the throw has
+            // no handler (baseline's prologue: pc 0, depth 0).
+            let top = self.add_off(self.vp, self.top_off(0));
+            let script = self.script_ptr();
+            let ok = self.call1(self.h.env_setup, &[self.cx, top, self.sp, script], Type::I32);
+            let (made, fail) = (self.body.add_block(), self.body.add_block());
+            self.cond_br(ok, Self::to(made), Self::to(fail));
+            self.cur = fail;
+            let one = self.i32c(1);
+            self.ret(one);
+            self.cur = made;
+            let env = self.load_i64(top, 0);
+            self.store_i64(vp, l.env(), env);
+        }
         let params = self.f.blocks[root].params.clone();
         if params.len() != vals.len() {
             return Err("lowering: the entry root's params are not the frame".into());
@@ -1776,12 +1802,7 @@ impl<'a> Lower<'a> {
                 let direct = self.body.add_block();
                 self.cond_br(is_ctor, Self::to(direct), Self::to(generic));
                 self.cur = direct;
-                let (nv, wv, zc) = (self.i32c(nslots), self.i32c(word), self.i32c(0));
-                let made = self.call1(
-                    self.h.create_this,
-                    &[self.cx, top, callee, new_target, nv, zc, wv],
-                    Type::I32,
-                );
+                let made = self.construct_this(top, callee, new_target, nslots, word);
                 let call_b = self.body.add_block();
                 let undef = self.i64c(UNDEF);
                 self.cond_br(
@@ -2860,6 +2881,108 @@ impl<'a> Lower<'a> {
         let t = self.edge(inst, 0, &[])?;
         self.terminate(Terminator::Br { target: t });
         Ok(())
+    }
+
+    /// The construct `this` for a direct construct (bbv's
+    /// `emit_construct_this`): with the site's cell describing the callee
+    /// (its shape, under the live IC generation) and its live `.prototype`
+    /// still the cached one, a nursery bump of the cached empty `this`;
+    /// else `create_this`, which also fills the cell. Leaves `this` at
+    /// `top` and returns the ok flag (1 on the bump path).
+    fn construct_this(
+        &mut self,
+        top: Value,
+        callee: Value,
+        new_target: Value,
+        nslots: u32,
+        word: u32,
+    ) -> Value {
+        let cell = self.i32c(CONSTRUCT_CELL_ADDR_PLACEHOLDER);
+        let idx = self.atoms.next_construct_cell();
+        self.construct_cell_patches.push((cell, idx + 1));
+        let done = self.body.add_block();
+        let ok_p = self.body.add_blockparam(done, Type::I32);
+        let slow = self.body.add_block();
+        let cptr = self.un(Operator::I32WrapI64, callee, Type::I32);
+        let ashape = self.load_i32(cell, 0);
+        let cshape = self.load_i32(cell, CONSTRUCT_CELL_CTORSHAPE);
+        let cgen = self.load_i32(cell, CONSTRUCT_CELL_GEN);
+        let live_shape = self.load_i32(cptr, SHAPE_OFFSET);
+        let gen_addr = self.i32c(self.h.prop_ic_gen_base);
+        let live_gen = self.load_i32(gen_addr, 0);
+        let z = self.i32c(0);
+        let filled = self.bin(Operator::I32Ne, ashape, z, Type::I32);
+        let s_ok = self.bin(Operator::I32Eq, cshape, live_shape, Type::I32);
+        let g_ok = self.bin(Operator::I32Eq, cgen, live_gen, Type::I32);
+        let hit = self.bin(Operator::I32And, filled, s_ok, Type::I32);
+        let hit = self.bin(Operator::I32And, hit, g_ok, Type::I32);
+        self.check(hit, slow);
+        // A reassigned `.prototype` keeps the callee's shape.
+        let enc = self.load_i32(cell, CONSTRUCT_CELL_PROTOSLOTENC);
+        let one = self.i32c(1);
+        let dynamic = self.bin(Operator::I32And, enc, one, Type::I32);
+        let not1 = self.i32c(!1);
+        let off = self.bin(Operator::I32And, enc, not1, Type::I32);
+        let slots = self.load_i32(cptr, NATIVE_SLOTS_OFFSET);
+        let sb = self.select(Type::I32, slots, cptr, dynamic);
+        let addr = self.bin(Operator::I32Add, sb, off, Type::I32);
+        let pval = self.load_i64(addr, 0);
+        let pt = self.tag_of(pval);
+        let p_obj = self.tag_is(pt, TAG_OBJECT as u32);
+        let pptr = self.un(Operator::I32WrapI64, pval, Type::I32);
+        let cproto = self.load_i32(cell, CONSTRUCT_CELL_PROTOPTR);
+        let p_eq = self.bin(Operator::I32Eq, pptr, cproto, Type::I32);
+        let p_ok = self.bin(Operator::I32And, p_obj, p_eq, Type::I32);
+        self.check(p_ok, slow);
+        // Room in the nursery, then bump and fill the header.
+        let posp_slot = self.i32c(self.h.nursery_pos_slot);
+        let posp = self.load_i32(posp_slot, 0);
+        let pos = self.load_i32(posp, 0);
+        let total = self.load_i32(cell, 4);
+        let newpos = self.bin(Operator::I32Add, pos, total, Type::I32);
+        let endp_slot = self.i32c(self.h.nursery_end_slot);
+        let endp = self.load_i32(endp_slot, 0);
+        let end = self.load_i32(endp, 0);
+        let fits = self.bin(Operator::I32LeU, newpos, end, Type::I32);
+        self.check(fits, slow);
+        self.store_i32(posp, 0, newpos);
+        let hdr = self.load_i32(cell, 16);
+        self.store_i32(pos, 0, hdr);
+        let hb = self.i32c(NURSERY_HEADER_BYTES);
+        let obj = self.bin(Operator::I32Add, pos, hb, Type::I32);
+        self.store_i32(obj, SHAPE_OFFSET, ashape);
+        let wv = self.i32c(word);
+        self.store_i32(obj, OBJ_CLASS_IDX_OFFSET, wv);
+        let slotsw = self.load_i32(cell, 8);
+        self.store_i32(obj, NATIVE_SLOTS_OFFSET, slotsw);
+        let elemsw = self.load_i32(cell, 12);
+        self.store_i32(obj, OBJ_ELEMENTS_OFFSET, elemsw);
+        let payload = self.un(Operator::I64ExtendI32U, obj, Type::I64);
+        let tag = self.i64c(TAG_OBJECT << 32);
+        let this_v = self.bin(Operator::I64Or, payload, tag, Type::I64);
+        self.store_i64(top, 0, this_v);
+        let one = self.i32c(1);
+        self.terminate(Terminator::Br {
+            target: BlockTarget {
+                block: done,
+                args: vec![one],
+            },
+        });
+        self.cur = slow;
+        let (nv, wv) = (self.i32c(nslots), self.i32c(word));
+        let made = self.call1(
+            self.h.create_this,
+            &[self.cx, top, callee, new_target, nv, cell, wv],
+            Type::I32,
+        );
+        self.terminate(Terminator::Br {
+            target: BlockTarget {
+                block: done,
+                args: vec![made],
+            },
+        });
+        self.cur = done;
+        ok_p
     }
 
     /// `lhs instanceof rhs` inline (bbv's `emit_instanceof`), taking

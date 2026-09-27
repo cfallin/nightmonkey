@@ -141,6 +141,7 @@ pub fn translate_script(
             exit_census: ctx.opts.instrument.mir_exits,
             strict: script.strict,
             plain_env: baseline::needs_env(script) && baseline::env_is_plain(ctx.source, script),
+            own_env: baseline::needs_env(script) && !baseline::env_is_plain(ctx.source, script),
             forward_resume: inline_eligible(ctx, script),
             ctor_restamp: ctx.deleg_restamps_in.get(&sid).and_then(crate::wasm::bbv::restamp_args),
             ctor_stamp: ctx.stamp_ctors_in.get(&sid).map(|si| {
@@ -174,7 +175,7 @@ pub fn translate_script(
         call_cell_patches: vec![],
         alloc_cell_patches: vec![],
         iof_cell_patches: lowered.iof_cell_patches,
-        construct_cell_patches: vec![],
+        construct_cell_patches: lowered.construct_cell_patches,
         strlit_patches: vec![],
         intrinsic_cell_patches: vec![],
         prop_ic_patches: lowered.prop_ic_patches,
