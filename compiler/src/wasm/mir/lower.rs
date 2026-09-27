@@ -294,6 +294,8 @@ struct Lower<'a> {
     opsize: BTreeMap<String, (u32, u32)>,
     /// The census helper, when exits are counted (`--mir-exit-census`).
     exit_census: Option<Func>,
+    /// The census helper, when blocks are counted (`--block-census`).
+    block_census: Option<Func>,
     ctor_restamp: Option<[u32; 7]>,
     /// One exit hub per frame shape (`exit_hub`).
     exit_hubs: BTreeMap<Vec<Option<BoxKind>>, Block>,
@@ -348,6 +350,8 @@ pub struct LowerOpts {
     pub stress: u32,
     /// Count every exit (`--mir-exit-census`).
     pub exit_census: bool,
+    /// Count every MIR block's executions (`--block-census`).
+    pub block_census: bool,
     /// An init delegate's restamp arguments (`bbv::restamp_args`).
     pub ctor_restamp: Option<[u32; 7]>,
     /// Strict-mode code: a field store's generic fallback throws on failure.
@@ -441,6 +445,7 @@ pub fn lower<'a>(
         alloc_cell_patches: vec![],
         opsize: BTreeMap::new(),
         exit_census: if o.exit_census { h.census } else { None },
+        block_census: if o.block_census { h.census } else { None },
         ctor_restamp: o.ctor_restamp,
         exit_hubs: BTreeMap::new(),
         inline_hubs: BTreeMap::new(),
@@ -877,6 +882,14 @@ impl<'a> Lower<'a> {
         for b in order {
             self.cur_mblock = b;
             self.enter_block(b)?;
+            if let Some(census) = self.block_census {
+                static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let ops: Vec<String> = f.blocks[b].insts.iter().map(|&i| mir::print::mnemonic(&f.insts[i].op)).collect();
+                crate::diag_line!("night: mir block {id} sid#{} {b} {}", self.f.script, ops.join(" "));
+                let (k, i) = (self.i32c(crate::options::MIR_BLOCK_CENSUS_KIND), self.i32c(id));
+                self.call1(census, &[k, i], Type::I32);
+            }
             for &inst in &f.blocks[b].insts {
                 self.cold = false;
                 // Retaining stores still pending at a terminator that
@@ -970,13 +983,11 @@ impl<'a> Lower<'a> {
     }
 
     /// Whether `inst` may call something that GCs (a superset of where the
-    /// lowering roots: any op with an `err` or `ok_dirty` edge, and a
-    /// string constant).
+    /// lowering roots: any op with an `err` or `ok_dirty` edge).
     fn may_gc(&self, inst: mir::Inst) -> bool {
         use mir::ops::SuccRole;
         let op = &self.f.insts[inst].op;
-        matches!(op, Opcode::ConstStr(_))
-            || op.roles().iter().any(|r| matches!(r, SuccRole::Err | SuccRole::OkDirty))
+        op.roles().iter().any(|r| matches!(r, SuccRole::Err | SuccRole::OkDirty))
     }
 
     /// Home slots: every managed value live across a may-GC instruction
@@ -1518,47 +1529,6 @@ impl<'a> Lower<'a> {
             }
         }
         s.into_iter().filter(|&v| is_managed(&self.ty(v))).collect()
-    }
-
-    /// The managed values live across non-terminator `inst`: live after it,
-    /// other than its results.
-    fn live_after(&self, inst: mir::Inst) -> Vec<mir::Value> {
-        let f = self.f;
-        let b = f
-            .layout
-            .iter()
-            .copied()
-            .find(|&b| f.blocks[b].insts.contains(&inst))
-            .expect("inst in a block");
-        let mut live: BTreeSet<mir::Value> = BTreeSet::new();
-        for s in f.succs(b) {
-            if let Some(l) = self.live_in.get(&s) {
-                live.extend(l.iter().copied());
-            }
-        }
-        for &i in f.blocks[b].insts.iter().rev() {
-            if i == inst {
-                break;
-            }
-            let d = &f.insts[i];
-            for r in &d.results {
-                live.remove(r);
-            }
-            live.extend(d.args.iter().copied());
-            for e in &d.succs {
-                for a in &e.args {
-                    if let EdgeArg::Value(v) = a {
-                        live.insert(*v);
-                    }
-                }
-            }
-        }
-        for r in &f.insts[inst].results {
-            live.remove(r);
-        }
-        live.into_iter()
-            .filter(|&v| is_managed(&self.ty(v)))
-            .collect()
     }
 
     /// Call may-GC helper `f(cx, top, args...)` with every value in `live`
@@ -2167,7 +2137,7 @@ impl<'a> Lower<'a> {
                     self.cur = ic;
                 }
                 let probe = self.body.add_block();
-                self.get_ic_way0(inst, a[0], way_base, probe)?;
+                self.get_ic_ways(inst, a[0], way_base, cache * INLINE_IC_STRIDE, probe)?;
                 self.cur = probe;
                 let r = self.call(self.h.ic_get_poly, &[a[0], at, way_base], &[Type::I64]);
                 let tag = self.tag_of(r);
@@ -2339,7 +2309,16 @@ impl<'a> Lower<'a> {
                         K::Float64 => {
                             self.op(Operator::F64Store { memory: m }, &[addr, v], None);
                         }
-                        K::Uint8Clamped => return Err("lowering: store_ta to a Uint8ClampedArray".into()),
+                        K::Uint8Clamped => {
+                            // An int32 clamped to 0..=255.
+                            let z = self.i32c(0);
+                            let neg = self.bin(Operator::I32LtS, v, z, Type::I32);
+                            let lo = self.select(Type::I32, z, v, neg);
+                            let hi = self.i32c(255);
+                            let big = self.bin(Operator::I32GtS, lo, hi, Type::I32);
+                            let c = self.select(Type::I32, hi, lo, big);
+                            self.op(Operator::I32Store8 { memory: m }, &[addr, c], None);
+                        }
                     }
                     vec![]
                 };
@@ -2441,6 +2420,24 @@ impl<'a> Lower<'a> {
                 let t = self.edge(inst, 0, &[r])?;
                 let e = self.edge(inst, 1, &[])?;
                 self.cond_br(ok, t, e);
+            }
+            Opcode::ObjEmulatesUndef => {
+                // Only while some object's class emulates `undefined` (the
+                // runtime's fuse) can one be falsy; the leaf says.
+                let (yes, no, join) = (self.body.add_block(), self.body.add_block(), self.body.add_block());
+                let r = self.body.add_blockparam(join, Type::I32);
+                let dda = self.dda_possible();
+                self.cond_br(dda, Self::to(yes), Self::to(no));
+                self.cur = no;
+                let z = self.i32c(0);
+                self.terminate(Terminator::Br { target: BlockTarget { block: join, args: vec![z] } });
+                self.cur = yes;
+                let boxed = self.box_tagged(TAG_OBJECT, a[0]);
+                let t = self.call1(self.h.to_boolean, &[self.cx, boxed], Type::I32);
+                let f = self.un(Operator::I32Eqz, t, Type::I32);
+                self.terminate(Terminator::Br { target: BlockTarget { block: join, args: vec![f] } });
+                self.cur = join;
+                self.def(inst, r);
             }
             Opcode::FnIsCtor => {
                 let flags = self.load_i32(a[0], FUNC_FLAGS_SLOT_OFFSET);
@@ -2797,12 +2794,13 @@ impl<'a> Lower<'a> {
                 self.js_call(inst, self.h.set_name, &[a[0], at, a[1], sv], false)?;
             }
             Opcode::ConstStr(name) => {
-                // The atom's string, through the (may-GC) helper, with the
-                // values live past this instruction rooted.
-                let at = self.atom(name);
-                let live = self.live_after(inst);
-                let (_ok, r) = self.gc_call(self.h.string, &[at], &live)?;
-                let v = self.un(Operator::I32WrapI64, r, Type::I32);
+                // The atom itself, from the startup-filled atom table (a
+                // pinned atom never moves), as bbv's `emit_string_literal`:
+                // one load, no allocation.
+                let id = self.atoms.intern_chars(self.mm.atoms[name].chars());
+                let slot = self.i32c(self.h.atom_table_slot);
+                let tbl = self.load_i32(slot, 0);
+                let v = self.load_i32(tbl, 4 * id);
                 self.def(inst, v);
             }
             op => {
@@ -3576,19 +3574,36 @@ impl<'a> Lower<'a> {
         self.cur = cont;
     }
 
-    /// A get IC's way 0 inline (bbv's `emit_get_ic_inline_arms`, one way):
-    /// with `recv` an object of the way's shape, the value from its own
-    /// fixed slot, or through the way's holder (a prototype method) while
-    /// the holder keeps its shape, taking `ok_clean`; else `probe`.
-    fn get_ic_way0(&mut self, inst: mir::Inst, recv: Value, way: Value, probe: Block) -> R<()> {
+    /// A get IC's inline ways (bbv's `emit_get_ic_inline_arms`): with
+    /// `recv` an object whose shape one of the site's ways names (way 0 at
+    /// `way0`, the rest `INLINE_IC_WAY_BYTES` apart from its row offset
+    /// `way_off`), the value from its own fixed slot, or through the way's
+    /// holder (a prototype method) while the holder keeps its shape,
+    /// taking `ok_clean`; else `probe`.
+    fn get_ic_ways(&mut self, inst: mir::Inst, recv: Value, way0: Value, way_off: u32, probe: Block) -> R<()> {
+        use crate::region_shape::{INLINE_IC_WAYS, INLINE_IC_WAY_BYTES};
         let tag = self.tag_of(recv);
         let is_obj = self.tag_is(tag, TAG_OBJECT as u32);
         self.check(is_obj, probe);
         let obj = self.un(Operator::I32WrapI64, recv, Type::I32);
         let shape = self.load_i32(obj, SHAPE_OFFSET);
-        let wshape = self.load_i32(way, IC_WAY_RECVSHAPE);
-        let hit = self.bin(Operator::I32Eq, shape, wshape, Type::I32);
-        self.check(hit, probe);
+        let hit_b = self.body.add_block();
+        let way = self.body.add_blockparam(hit_b, Type::I32);
+        for w in 0..INLINE_IC_WAYS {
+            let wb = if w == 0 {
+                way0
+            } else {
+                let v = self.i32c(IC_WAY_ADDR_PLACEHOLDER);
+                self.prop_ic_patches.push((v, way_off + w * INLINE_IC_WAY_BYTES));
+                v
+            };
+            let wshape = self.load_i32(wb, IC_WAY_RECVSHAPE);
+            let m = self.bin(Operator::I32Eq, shape, wshape, Type::I32);
+            let next = if w + 1 < INLINE_IC_WAYS { self.body.add_block() } else { probe };
+            self.cond_br(m, BlockTarget { block: hit_b, args: vec![wb] }, Self::to(next));
+            self.cur = next;
+        }
+        self.cur = hit_b;
         let moff = self.load_i32(way, IC_WAY_MONO_OFF);
         let (own, tail) = (self.body.add_block(), self.body.add_block());
         self.cond_br(moff, Self::to(own), Self::to(tail));

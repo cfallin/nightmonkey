@@ -414,6 +414,7 @@ pub fn mnemonic(op: &Opcode) -> String {
         Construct(..) => "construct".into(),
         CreateThis(..) => "create_this".into(),
         FnIsCtor => "fn.is_ctor".into(),
+        ObjEmulatesUndef => "obj.emulates_undef".into(),
         CtorStamp(..) => "ctor.stamp".into(),
         CallNative(_) => "call_native".into(),
     }

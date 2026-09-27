@@ -1509,6 +1509,7 @@ fn template(mn: &str) -> Option<Opcode> {
         Construct(0, 0),
         CreateThis(0, 0),
         FnIsCtor,
+        ObjEmulatesUndef,
         CtorStamp(0, 0, 0),
         CallNative(NativeId::from_u32(0)),
     ];

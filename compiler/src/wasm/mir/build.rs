@@ -1033,8 +1033,7 @@ impl<'s, 'a> Run<'s, 'a> {
     /// the call), and drops a store of what the frame holds on the path.
     fn retain_locals(&mut self, op: &Opcode) {
         use mir::ops::SuccRole;
-        let may_gc = matches!(op, Opcode::ConstStr(_))
-            || op.roles().iter().any(|r| matches!(r, SuccRole::Err | SuccRole::OkDirty));
+        let may_gc = op.roles().iter().any(|r| matches!(r, SuccRole::Err | SuccRole::OkDirty));
         if may_gc {
             self.retain_all();
         }
@@ -2259,6 +2258,53 @@ impl<'s, 'a> Run<'s, 'a> {
     }
 
     /// `!c` for a raw bool: a diamond.
+    /// `x == null`: null or undefined, or an object that emulates
+    /// `undefined`.
+    fn loose_nullish(&mut self, x: Slot) -> mir::Value {
+        let tags = x.ty.tags();
+        let nullish = TagSet::prims(PRIM_NULL | PRIM_UNDEFINED);
+        let v = self.boxed(x);
+        if tags.intersect(TagSet::OBJECT).is_empty() {
+            return self.tag_test(v, nullish);
+        }
+        let (o, prim, j) = (self.new_block(), self.new_block(), self.new_block());
+        let r = self.f.add_param(j, MType::Bool);
+        let ob = self.f.add_param(o, MType::OBJ_TOP);
+        self.term(
+            Opcode::GuardUnbox(UnboxKind::Obj),
+            vec![v],
+            vec![
+                Edge {
+                    block: o,
+                    args: vec![EdgeArg::Out(0)],
+                },
+                Self::goto(prim),
+            ],
+        );
+        self.at(o);
+        let e = self.inst(Opcode::ObjEmulatesUndef, vec![ob], Some(MType::Bool));
+        self.term(
+            Opcode::Jump,
+            vec![],
+            vec![Edge {
+                block: j,
+                args: vec![EdgeArg::Value(e)],
+            }],
+        );
+        self.at(prim);
+        let t = self.tag_test(v, nullish);
+        self.term(
+            Opcode::Jump,
+            vec![],
+            vec![Edge {
+                block: j,
+                args: vec![EdgeArg::Value(t)],
+            }],
+        );
+        self.at(j);
+        r
+    }
+
     fn not(&mut self, c: mir::Value) -> mir::Value {
         let (t, e, j) = (self.new_block(), self.new_block(), self.new_block());
         let p = self.f.add_param(j, MType::Bool);
@@ -2889,20 +2935,21 @@ impl<'s, 'a> Run<'s, 'a> {
                     }
                     _ => {
                         let (x, y) = (self.boxed(a), self.boxed(b));
+                        // Neither operand a BigInt or an object (whose
+                        // valueOf might give one): a Number, or a TypeError.
+                        // For `+`, neither a string or an object either (no
+                        // concatenation) for a numeric result.
+                        let free = |s: Slot, t: TagSet| s.ty.tags().intersect(t).is_empty();
+                        let big = TagSet::prims(PRIM_BIGINT).union(TagSet::OBJECT);
+                        let no_big = free(a, big) || free(b, big);
+                        let strish = TagSet::STRING.union(TagSet::OBJECT);
+                        let numeric = TagSet::prims(crate::opsem::NUM | PRIM_BIGINT);
+                        let arith = if no_big { TagSet::NUMBER } else { numeric };
                         let (jop, tags) = match op {
-                            Add => (
-                                Opcode::JsAdd,
-                                TagSet::prims(crate::opsem::NUM | PRIM_BIGINT)
-                                    .union(TagSet::STRING),
-                            ),
-                            Sub => (
-                                Opcode::JsBinop(JsBinop::Sub),
-                                TagSet::prims(crate::opsem::NUM | PRIM_BIGINT),
-                            ),
-                            _ => (
-                                Opcode::JsBinop(JsBinop::Mul),
-                                TagSet::prims(crate::opsem::NUM | PRIM_BIGINT),
-                            ),
+                            Add if free(a, strish) && free(b, strish) => (Opcode::JsAdd, arith),
+                            Add => (Opcode::JsAdd, numeric.union(TagSet::STRING)),
+                            Sub => (Opcode::JsBinop(JsBinop::Sub), arith),
+                            _ => (Opcode::JsBinop(JsBinop::Mul), arith),
                         };
                         let r = self.js(jop, vec![x, y], MType::val(tags));
                         self.push(r, Ty::Val(tags));
@@ -3062,6 +3109,31 @@ impl<'s, 'a> Run<'s, 'a> {
                     StrictEq => (Cc::Eq, JsCc::StrictEq),
                     _ => (Cc::Ne, JsCc::StrictNe),
                 };
+                // Against a null or undefined constant: tag tests, which
+                // run no user code (no fence), as bbv's.
+                let nullish = |t: Ty| {
+                    let tags = t.tags();
+                    !tags.is_empty() && tags.subset_of(TagSet::prims(PRIM_NULL | PRIM_UNDEFINED))
+                };
+                let equality = matches!(op, Eq | Ne | StrictEq | StrictNe);
+                let konst = if equality && nullish(b.ty) {
+                    Some((a, b))
+                } else if equality && nullish(a.ty) {
+                    Some((b, a))
+                } else {
+                    None
+                };
+                if let Some((x, k)) = konst {
+                    let r = if matches!(op, StrictEq | StrictNe) {
+                        let v = self.boxed(x);
+                        self.tag_test(v, k.ty.tags())
+                    } else {
+                        self.loose_nullish(x)
+                    };
+                    let r = if matches!(op, Ne | StrictNe) { self.not(r) } else { r };
+                    self.push(r, Ty::Bool);
+                    return Ok(());
+                }
                 let r = match (a.ty.num(), b.ty.num()) {
                     (Some(Num::I32), Some(Num::I32)) => {
                         let (x, y) = (self.as_i32(a), self.as_i32(b));
@@ -3601,23 +3673,47 @@ impl<'s, 'a> Run<'s, 'a> {
                 let v = self.pop();
                 let key = self.pop();
                 let recv = self.pop();
-                let ta = self.ta_elem(pc, recv, key).and_then(|(o, i, k)| {
-                    // The value as the kind stores it, raw: an int32 for an
-                    // integer kind (not clamped), a number for a float one.
-                    use crate::opsem::TaKind as K;
-                    match (k, v.ty.num()) {
-                        (K::Uint8Clamped, _) | (K::Uint32, _) => None,
-                        (k, Some(_)) if k.is_float() => Some((o, i, self.as_f64(v))),
-                        (_, Some(Num::I32)) => Some((o, i, self.as_i32(v))),
-                        _ => None,
-                    }
+                // The value as the kind stores it, raw: an int32 for an
+                // integer kind (Uint8Clamped clamps it), a number for a
+                // float one. A value of unknown type is unboxed at run
+                // time, as bbv's typed-array store arm does; a miss (or a
+                // double into an integer kind) takes the generic op.
+                let ta = self.ta_elem(pc, recv, key).and_then(|(o, i, k)| match (k.is_float(), v.ty.num()) {
+                    (true, Some(_)) => Some((o, i, k, Some(self.as_f64(v)))),
+                    (false, Some(Num::I32)) => Some((o, i, k, Some(self.as_i32(v)))),
+                    (_, None) if !matches!(v.ty, Ty::Dead) => Some((o, i, k, None)),
+                    _ => None,
                 });
-                if let Some((o, i, raw)) = ta {
-                    // The element store inline; out of bounds, the generic
-                    // op (which ignores it).
+                if let Some((o, i, k, raw)) = ta {
                     self.demote_objs();
                     let v = self.demote(v);
                     let (ok, generic, join) = (self.new_block(), self.new_block(), self.new_block());
+                    let raw = match raw {
+                        Some(r) => r,
+                        None => {
+                            let (kind, ty) = if k.is_float() {
+                                (UnboxKind::F64Num, MType::F64_TOP)
+                            } else {
+                                (UnboxKind::I32, MType::I32_TOP)
+                            };
+                            let unboxed = self.new_block();
+                            let r = self.f.add_param(unboxed, ty);
+                            let y = self.boxed(v);
+                            self.term(
+                                Opcode::GuardUnbox(kind),
+                                vec![y],
+                                vec![
+                                    Edge {
+                                        block: unboxed,
+                                        args: vec![EdgeArg::Out(0)],
+                                    },
+                                    Self::goto(generic),
+                                ],
+                            );
+                            self.at(unboxed);
+                            r
+                        }
+                    };
                     self.term(
                         Opcode::StoreTa,
                         vec![o, i, raw],
@@ -3860,15 +3956,35 @@ impl<'s, 'a> Run<'s, 'a> {
 
     fn js_binop(&mut self, k: JsBinop, a: Slot, b: Slot) {
         let (x, y) = (self.boxed(a), self.boxed(b));
+        // A BigInt result needs both operands BigInt after ToNumeric; an
+        // operand that is no BigInt and no object (whose valueOf might
+        // give one) makes it a Number, or a TypeError for mixing.
+        let big_free = |s: Slot| {
+            s.ty
+                .tags()
+                .intersect(TagSet::prims(PRIM_BIGINT).union(TagSet::OBJECT))
+                .is_empty()
+        };
+        let no_big = big_free(a) || big_free(b);
         let tags = match k {
             JsBinop::Ursh => TagSet::NUMBER,
+            JsBinop::BitAnd | JsBinop::BitOr | JsBinop::BitXor | JsBinop::Lsh | JsBinop::Rsh if no_big => {
+                TagSet::INT32
+            }
             JsBinop::BitAnd | JsBinop::BitOr | JsBinop::BitXor | JsBinop::Lsh | JsBinop::Rsh => {
                 TagSet::prims(PRIM_INT32 | PRIM_BIGINT)
             }
+            _ if no_big => TagSet::NUMBER,
             _ => TagSet::prims(crate::opsem::NUM | PRIM_BIGINT),
         };
         let r = self.js(Opcode::JsBinop(k), vec![x, y], MType::val(tags));
-        self.push(r, Ty::Val(tags));
+        if tags == TagSet::INT32 {
+            // Always an int32: unboxed, the guard never fails.
+            let i = self.guard(Opcode::GuardUnbox(UnboxKind::I32), vec![r], MType::I32_TOP);
+            self.push(i, Ty::I32);
+        } else {
+            self.push(r, Ty::Val(tags));
+        }
     }
 
     fn js_unop(&mut self, u: JsUnop, a: Slot) {

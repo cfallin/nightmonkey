@@ -43,3 +43,23 @@ assertEq(sum_d(nan, 1), NaN);
 var c = new Uint8ClampedArray(4);
 fill_u(c, 4, 254);                                   // clamped: an exit
 assertEq(c[3], 255);
+
+// Stores of values of unknown type (copied through a join, or mixed):
+// unboxed at run time; a double into an integer kind, a string, or an
+// out-of-bounds index takes the generic path. Uint8Clamped clamps.
+function copyInto(dst, src, n) { for (var i = 0; i < n; i++) dst[i] = src[i]; return dst; }
+function storeMixed(dst, vals) { for (var i = 0; i < vals.length; i++) dst[i] = vals[i]; return dst; }
+for (var round = 0; round < 30; round++) {
+  var src = new Uint8Array([1, 2, 250, 255, 0, 7]);
+  var d8 = copyInto(new Uint8Array(6), src, 7);
+  assertEq(Array.prototype.join.call(d8), "1,2,250,255,0,7");
+  var mixed = [300, -5, 2.5, "7", 1e10, -1];
+  var c = storeMixed(new Uint8ClampedArray(6), mixed);
+  assertEq(Array.prototype.join.call(c), "255,0,2,7,255,0");
+  var u = storeMixed(new Uint8Array(6), mixed);
+  assertEq(Array.prototype.join.call(u), "44,251,2,7,0,255");
+  var u32 = storeMixed(new Uint32Array(6), mixed);
+  assertEq(Array.prototype.join.call(u32), "300,4294967291,2,7,1410065408,4294967295");
+  var f = storeMixed(new Float64Array(6), mixed);
+  assertEq(Array.prototype.join.call(f), "300,-5,2.5,7,10000000000,-1");
+}

@@ -443,6 +443,9 @@ pub enum Opcode {
     /// Whether function `f` is a constructor (its flags): an arrow
     /// function or a method is not.
     FnIsCtor,
+    /// Whether object `o` emulates `undefined` (`document.all`): what
+    /// loose equality with null or undefined asks of an object.
+    ObjEmulatesUndef,
     /// A layout constructor's first stamp of its completed `this`
     /// (layout, field count, kept bits): a no-op unless `this` is an
     /// object of this constructor still under construction.
@@ -1082,19 +1085,33 @@ pub fn signature(op: &Opcode, args: &[Type], m: &Module) -> SigResult {
             arity(args, 2)?;
             val(&args[0], "js.add")?;
             val(&args[1], "js.add")?;
-            Sig::output(Type::val(number_or_bigint.union(TagSet::STRING)))
+            // No string or object operand (whose ToPrimitive might give a
+            // string): no concatenation.
+            let strish = TagSet::STRING.union(TagSet::OBJECT);
+            if free_of(&args[0], strish) && free_of(&args[1], strish) {
+                Sig::output(Type::val(if no_bigint(args) { TagSet::NUMBER } else { number_or_bigint }))
+            } else {
+                Sig::output(Type::val(number_or_bigint.union(TagSet::STRING)))
+            }
         }
         JsBinop(b) => {
             arity(args, 2)?;
             val(&args[0], "js.binop")?;
             val(&args[1], "js.binop")?;
+            let nb = no_bigint(args);
             Sig::output(Type::val(match b {
                 self::JsBinop::Ursh => TagSet::NUMBER,
                 self::JsBinop::BitAnd
                 | self::JsBinop::BitOr
                 | self::JsBinop::BitXor
                 | self::JsBinop::Lsh
+                | self::JsBinop::Rsh if nb => TagSet::INT32,
+                self::JsBinop::BitAnd
+                | self::JsBinop::BitOr
+                | self::JsBinop::BitXor
+                | self::JsBinop::Lsh
                 | self::JsBinop::Rsh => TagSet::prims(PRIM_INT32 | PRIM_BIGINT),
+                _ if nb => TagSet::NUMBER,
                 _ => number_or_bigint,
             }))
         }
@@ -1243,6 +1260,11 @@ pub fn signature(op: &Opcode, args: &[Type], m: &Module) -> SigResult {
         FnIsCtor => {
             arity(args, 1)?;
             obj(&args[0], "fn.is_ctor")?;
+            Sig::result(Type::Bool)
+        }
+        ObjEmulatesUndef => {
+            arity(args, 1)?;
+            obj(&args[0], "obj.emulates_undef")?;
             Sig::result(Type::Bool)
         }
         CtorStamp(..) => {
@@ -1668,6 +1690,23 @@ fn elements_root(o: Option<&ObjInfo>, m: &Module) -> Option<crate::ids::RegionRo
 
 /// The effect summary of `op` on operands of types `args`. Total: an
 /// ill-typed op gets the summary its opcode implies with wildcard regions.
+/// Whether value type `t` has none of `tags`.
+fn free_of(t: &Type, tags: TagSet) -> bool {
+    match t {
+        Type::Val(v) => v.tags.intersect(tags).is_empty(),
+        _ => false,
+    }
+}
+
+/// Whether a numeric operator on `args` cannot yield a BigInt: that needs
+/// both operands BigInt after ToNumeric, and one that is no BigInt and no
+/// object (whose valueOf might give one) makes the result a Number, or a
+/// TypeError for mixing.
+fn no_bigint(args: &[Type]) -> bool {
+    let big = TagSet::prims(PRIM_BIGINT).union(TagSet::OBJECT);
+    args.iter().any(|t| free_of(t, big))
+}
+
 pub fn effects(op: &Opcode, args: &[Type], m: &Module) -> Effects {
     use Opcode::*;
     let recv = args.first().and_then(|t| t.obj_info());

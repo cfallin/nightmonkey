@@ -149,6 +149,7 @@ pub fn translate_script(
         lower::LowerOpts {
             stress: ctx.opts.mir_stress,
             exit_census: ctx.opts.instrument.mir_exits,
+            block_census: ctx.opts.instrument.blocks,
             strict: script.strict,
             plain_env: baseline::needs_env(script) && baseline::env_is_plain(ctx.source, script),
             own_env: baseline::needs_env(script) && !baseline::env_is_plain(ctx.source, script),

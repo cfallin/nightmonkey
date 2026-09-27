@@ -181,6 +181,8 @@ pub struct Instrumentation {
 pub const MIR_EXIT_CENSUS_KIND: u32 = 90;
 /// The census kind of MIR property-get IC misses (with `--mir-exit-census`).
 pub const MIR_GET_MISS_CENSUS_KIND: u32 = 91;
+/// Census kind for `--block-census` under MIR: one count per MIR block.
+pub const MIR_BLOCK_CENSUS_KIND: u32 = 92;
 
 /// Which compiled tiers a script may use (`docs/BASELINE.md` §5).
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
