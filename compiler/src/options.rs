@@ -170,7 +170,15 @@ pub struct Instrumentation {
     /// executed op, which no emitted-IR census can give (`bbv/blockcen.rs`,
     /// joined by `tools/blockprof.py`).
     pub blocks: bool,
+    /// Emit `night_runtime_census(90, id)` at every MIR exit, and print the
+    /// static `night: mir exit <id> sid#<s> pc <p> <mode>` map while
+    /// compiling: how often each exit is taken, which is where a MIR body's
+    /// time goes to baseline.
+    pub mir_exits: bool,
 }
+
+/// The census kind of MIR exits (`Instrumentation::mir_exits`).
+pub const MIR_EXIT_CENSUS_KIND: u32 = 90;
 
 /// Which compiled tiers a script may use (`docs/BASELINE.md` §5).
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
@@ -283,6 +291,7 @@ impl Options {
             }
             "--census" => self.instrument.census = true,
             "--guard-census" => self.instrument.guards = true,
+            "--mir-exit-census" => self.instrument.mir_exits = true,
             "--block-census" => self.instrument.blocks = true,
             _ if flag.starts_with("--dump-bytecode=") => {
                 let list = &flag["--dump-bytecode=".len()..];

@@ -790,7 +790,13 @@ impl Parser {
                 "fuse" => {
                     self.decl_id("F", "fuse", self.m.fuses.len())?;
                     let name = self.string()?;
-                    self.m.fuses.push(FuseDef { name });
+                    let addr = if self.eat_word("addr") {
+                        self.expect_punct("=")?;
+                        self.int()?
+                    } else {
+                        0
+                    };
+                    self.m.fuses.push(FuseDef { name, addr });
                 }
                 "binding" => {
                     self.decl_id("G", "binding", self.m.bindings.len())?;

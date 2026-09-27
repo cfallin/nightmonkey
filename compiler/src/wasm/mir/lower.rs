@@ -51,9 +51,10 @@ use crate::wasm::baseline::layout::{
 use crate::wasm::bbv::abi::{
     BINOP_BITAND, BINOP_BITNOT, BINOP_BITOR, BINOP_BITXOR, BINOP_DEC, BINOP_DIV, BINOP_INC,
     BINOP_LSH, BINOP_MOD, BINOP_MUL, BINOP_RSH, BINOP_SUB, BINOP_URSH, CLASS_WORD_SHALLOW,
-    CLASS_WORD_SLOTS, CMP_EQ, CMP_GE, CMP_GT, CMP_LE, CMP_LT, CMP_NE, CMP_STRICTEQ, CMP_STRICTNE,
+    CLASS_WORD_RANGES, CLASS_WORD_SLOTS, CHUNK_STORE_BUFFER_OFFSET, CMP_EQ, CMP_GE, CMP_GT, CMP_LE, CMP_LT, CMP_NE, CMP_STRICTEQ, CMP_STRICTNE,
     ELEMENTS_INITLEN_BACK, FIXED_SLOTS_BASE, FLAGS_ALL, OBJ_CLASS_IDX_OFFSET, OBJ_ELEMENTS_OFFSET,
-    SHAPE_IMMUTABLE_FLAGS_OFFSET, SHAPE_IS_NATIVE_BIT, SHAPE_OFFSET,
+    JSCONTEXT_ZONE_OFFSET, NOT_CHUNK_MASK, SHAPE_IMMUTABLE_FLAGS_OFFSET, SHAPE_IS_NATIVE_BIT,
+    SHAPE_OFFSET, VAL_GCTHING_TAG_MIN, ZONE_NEEDS_BARRIER_OFFSET,
 };
 use crate::wasm::translate::{
     AtomTable, Helpers, MAGIC_UNINITIALIZED_LEXICAL, TAG_BIGINT_HI, TAG_BOOLEAN, TAG_CLEAR,
@@ -171,6 +172,24 @@ struct Lower<'a> {
     atoms: &'a mut AtomTable,
     /// Adapter-offset placeholders (`Outcome::Compiled::body_off_patches`).
     body_off_patches: Vec<Value>,
+    /// The census helper, when exits are counted (`--mir-exit-census`).
+    exit_census: Option<Func>,
+    ctor_stamp: Option<[u32; 3]>,
+    strict: bool,
+}
+
+/// Per-script lowering choices besides the function itself.
+#[derive(Clone, Copy, Default)]
+pub struct LowerOpts {
+    /// The stress mode's period (`Options::mir_stress`); 0 = off.
+    pub stress: u32,
+    /// Count every exit (`--mir-exit-census`).
+    pub exit_census: bool,
+    /// A layout constructor's ctor-exit stamp arguments (layout, field
+    /// count, kept bits), as baseline's `Gen::ctor_stamp`.
+    pub ctor_stamp: Option<[u32; 3]>,
+    /// Strict-mode code: a field store's generic fallback throws on failure.
+    pub strict: bool,
 }
 
 /// Lower `f` (a function of `mm`, whose baseline frame is `layout`) into a
@@ -183,7 +202,7 @@ pub fn lower<'a>(
     f: &'a mir::Func,
     layout: FrameLayout,
     max_depth: u32,
-    stress: u32,
+    o: LowerOpts,
 ) -> R<Lowered> {
     if layout.rebase_vp {
         return Err("lowering: a script that reads its actuals".into());
@@ -215,12 +234,15 @@ pub fn lower<'a>(
         root_base,
         max_depth,
         baseline_calls: vec![],
-        stress,
+        stress: o.stress,
         has_onramps: f.roots.iter().any(|r| r.kind != RootKind::Entry),
         onramp_flag: argc,
         mm,
         atoms,
         body_off_patches: vec![],
+        exit_census: if o.exit_census { h.census } else { None },
+        ctor_stamp: o.ctor_stamp,
+        strict: o.strict,
     };
     l.run()?;
     Ok(Lowered {
@@ -1052,6 +1074,12 @@ impl<'a> Lower<'a> {
                 });
             }
             Opcode::Return => {
+                if let Some([layout, nfields, keep]) = self.ctor_stamp {
+                    // `this` as the caller passed it: MIR never writes it.
+                    let thisv = self.load_i64(self.sp, FrameLayout::THIS);
+                    let (l, n, k) = (self.i32c(layout), self.i32c(nfields), self.i32c(keep));
+                    self.call(self.h.ctor_stamp, &[thisv, l, n, k], &[]);
+                }
                 self.store_i64(self.retval_out, 0, a[0]);
                 let z = self.i32c(0);
                 self.ret(z);
@@ -1231,6 +1259,17 @@ impl<'a> Lower<'a> {
                 }
                 self.guard(inst, ok, &[a[0]])?;
             }
+            Opcode::CheckFuse(fuse) => {
+                let addr = self.mm.fuses[fuse].addr;
+                if addr == 0 {
+                    return Err(format!("lowering: {fuse} has no fuse word"));
+                }
+                let base = self.i32c(addr);
+                let w = self.load_i32(base, 0);
+                let one = self.i32c(1);
+                let ok = self.bin(Operator::I32Eq, w, one, Type::I32);
+                self.guard(inst, ok, &[])?;
+            }
             Opcode::LoadField(name) => self.field_op(inst, name, a[0], None)?,
             Opcode::StoreField(name) => self.field_op(inst, name, a[0], Some(a[1]))?,
             Opcode::JsBoxThis => {
@@ -1364,9 +1403,9 @@ impl<'a> Lower<'a> {
     /// `load_field`/`store_field` (§4.3): with the stamp's SLOTS bit set,
     /// the field is in its predicted fixed slot, accessed directly (the
     /// `ok_clean` edge). Otherwise the generic property helper does it,
-    /// staying in MIR (`ok_dirty`, or `err`). A store's value conforms to
-    /// the field's claim, a number over a number, so it needs no barriers
-    /// and keeps the stamp's TYPES bit.
+    /// staying in MIR (`ok_dirty`, or `err`). A store takes the fixed slot
+    /// only where it keeps the stamp's bits true (see below), with GC
+    /// barriers unless the value is a number.
     fn field_op(
         &mut self,
         inst: mir::Inst,
@@ -1387,18 +1426,42 @@ impl<'a> Lower<'a> {
             .and_then(|l| l.field(name))
             .ok_or("lowering: a field op on an undescribed field")?
             .0;
-        let off = FIXED_SLOTS_BASE + 8 * u32::try_from(slot).unwrap();
+        let slot = u32::try_from(slot).unwrap();
+        let off = FIXED_SLOTS_BASE + 8 * slot;
+        // A store of anything but a number: may overwrite or write a GC
+        // thing (barriers), and would falsify a TYPES claim.
+        let num = val.is_some()
+            && matches!(self.ty(self.f.insts[inst].args[1]), MType::Val(s) if s.tags.subset_of(TagSet::NUMBER));
         let w = self.load_i32(obj, OBJ_CLASS_IDX_OFFSET);
-        let bit = self.i32c(CLASS_WORD_SLOTS);
-        let slots = self.bin(Operator::I32And, w, bit, Type::I32);
+        let fast_ok = if val.is_none() {
+            let bit = self.i32c(CLASS_WORD_SLOTS);
+            self.bin(Operator::I32And, w, bit, Type::I32)
+        } else {
+            // A store keeps the object's validity bits true only if it
+            // cannot break them: RANGES is consumed checklessly (every
+            // unchecked store drops it, so it must be clear), and TYPES
+            // survives a number store only. Anything else goes through the
+            // engine, which maintains the bits.
+            let mask = CLASS_WORD_SLOTS | CLASS_WORD_RANGES | if num { 0 } else { CLASS_WORD_SHALLOW };
+            let m = self.i32c(mask);
+            let bits = self.bin(Operator::I32And, w, m, Type::I32);
+            let want = self.i32c(CLASS_WORD_SLOTS);
+            self.bin(Operator::I32Eq, bits, want, Type::I32)
+        };
         let (fast, slow) = (self.body.add_block(), self.body.add_block());
-        self.cond_br(slots, Self::to(fast), Self::to(slow));
+        self.cond_br(fast_ok, Self::to(fast), Self::to(slow));
 
         self.cur = fast;
         let outs = match val {
             None => vec![self.load_i64(obj, off)],
             Some(v) => {
+                if !num {
+                    self.pre_barrier(obj, off);
+                }
                 self.store_i64(obj, off, v);
+                if !num {
+                    self.post_barrier(obj, slot, v);
+                }
                 vec![]
             }
         };
@@ -1412,8 +1475,8 @@ impl<'a> Lower<'a> {
         let (ok, r) = match val {
             None => self.gc_call(self.h.get_property, &[boxed, at], &live)?,
             Some(v) => {
-                let z = self.i32c(0);
-                self.gc_call(self.h.set_property, &[boxed, at, v, z], &live)?
+                let strict = self.i32c(u32::from(self.strict));
+                self.gc_call(self.h.set_property, &[boxed, at, v, strict], &live)?
             }
         };
         let outs = if val.is_none() { vec![r] } else { vec![] };
@@ -1421,6 +1484,50 @@ impl<'a> Lower<'a> {
         let e = self.edge(inst, 2, &[])?;
         self.cond_br(ok, t, e);
         Ok(())
+    }
+
+    /// The incremental pre-write barrier on the slot at `obj + off`: while
+    /// the zone is marking, mark the value about to be overwritten.
+    fn pre_barrier(&mut self, obj: Value, off: u32) {
+        let zone = self.load_i32(self.cx, JSCONTEXT_ZONE_OFFSET);
+        let flag = self.load_i32(zone, ZONE_NEEDS_BARRIER_OFFSET);
+        let (marking, cont) = (self.body.add_block(), self.body.add_block());
+        self.cond_br(flag, Self::to(marking), Self::to(cont));
+        self.cur = marking;
+        let old = self.load_i64(obj, off);
+        self.call(self.h.pre_write_barrier, &[old], &[]);
+        self.terminate(Terminator::Br { target: Self::to(cont) });
+        self.cur = cont;
+    }
+
+    /// The generational post-write barrier for storing boxed `v` into fixed
+    /// slot `slot` of `obj`: a nursery GC thing into a tenured object is
+    /// recorded in the store buffer.
+    fn post_barrier(&mut self, obj: Value, slot: u32, v: Value) {
+        let cont = self.body.add_block();
+        let mask = self.i32c(NOT_CHUNK_MASK);
+        let chunk = self.bin(Operator::I32And, obj, mask, Type::I32);
+        let owner_sb = self.load_i32(chunk, CHUNK_STORE_BUFFER_OFFSET);
+        let tenured = self.body.add_block();
+        self.cond_br(owner_sb, Self::to(cont), Self::to(tenured));
+        self.cur = tenured;
+        let tag = self.tag_of(v);
+        let min = self.i32c(VAL_GCTHING_TAG_MIN);
+        let is_gc = self.bin(Operator::I32GeU, tag, min, Type::I32);
+        let gc = self.body.add_block();
+        self.cond_br(is_gc, Self::to(gc), Self::to(cont));
+        self.cur = gc;
+        let cell = self.un(Operator::I32WrapI64, v, Type::I32);
+        let chunk = self.bin(Operator::I32And, cell, mask, Type::I32);
+        let sb = self.load_i32(chunk, CHUNK_STORE_BUFFER_OFFSET);
+        let record = self.body.add_block();
+        self.cond_br(sb, Self::to(record), Self::to(cont));
+        self.cur = record;
+        let owner = self.box_tagged(TAG_OBJECT, obj);
+        let s = self.i32c(slot);
+        self.call(self.h.post_write_barrier, &[owner, s, v], &[]);
+        self.terminate(Terminator::Br { target: Self::to(cont) });
+        self.cur = cont;
     }
 
     /// Branch to `fail` unless `cond`.
@@ -1586,6 +1693,21 @@ impl<'a> Lower<'a> {
     ) -> R<()> {
         let fp = frame_parts(ops, nargs, nlocals).ok_or("lowering: malformed exit")?;
         let dp = frame_parts(dead, nargs, nlocals).ok_or("lowering: malformed exit")?;
+        if let Some(census) = self.exit_census {
+            static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            crate::diag_line!(
+                "night: mir exit {id} sid#{} pc {} {:?}",
+                self.f.script,
+                w.pc,
+                w.mode
+            );
+            let (k, i) = (
+                self.i32c(crate::options::MIR_EXIT_CENSUS_KIND),
+                self.i32c(id),
+            );
+            self.call1(census, &[k, i], Type::I32);
+        }
         let (sp, vp) = (self.sp, self.sp);
         let l = self.layout;
         // A `dead` operand's slot keeps the frame's (valid) value.

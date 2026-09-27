@@ -112,6 +112,25 @@ impl Ty {
     }
 }
 
+/// Whether every field of layout `k` has a number claim (so its objects
+/// keep the TYPES bit through engine-path stores); false for a layout no
+/// constructor describes.
+fn numeric_layout(ctx: &crate::wasm::translate::TranslateCtx<'_>, k: u32) -> bool {
+    let mut rows = ctx
+        .stamp_ctors_in
+        .values()
+        .chain(ctx.construct_sites_in.values())
+        .filter(|si| si.layout_id == k)
+        .peekable();
+    rows.peek().is_some()
+        && rows.all(|si| {
+            si.masks.iter().all(|m| {
+                let p = m.prims();
+                !p.is_empty() && p.subset_of(crate::opsem::NUM)
+            })
+        })
+}
+
 /// A property access the analysis predicts: the receiver's layouts
 /// `[lo, hi]`, whether the field's claim is backed by the stamp's TYPES
 /// bit (a number), and whether it is int32-only.
@@ -121,6 +140,9 @@ struct TypedSite {
     hi: u32,
     types: bool,
     int32: bool,
+    /// The analysis's value claim, to guard at the def when the stamp
+    /// does not back it (`!types`).
+    claim: crate::facts::Claim,
 }
 
 impl TypedSite {
@@ -153,6 +175,7 @@ impl Slot {
 /// Build the MIR body for `script`, or decline with a reason.
 pub fn build(
     ctx: &TranslateCtx,
+    names: &crate::ids::Names,
     sid: ScriptId,
     script: &Script,
     is_global: bool,
@@ -185,7 +208,17 @@ pub fn build(
         return Err("env chain".into());
     }
     let depths = StackDepths::compute(script).map_err(|e| format!("stack depths ({e})"))?;
-    let shape = Shape::of(ctx, sid, script, fl, depths)?;
+    let mut shape = Shape::of(ctx, sid, script, fl, depths)?;
+    for (i, &gc) in script.gcthings.iter().enumerate() {
+        if gc.is_other() {
+            continue;
+        }
+        if let crate::source::SourceObject::String(s) = ctx.source.object(gc) {
+            if let Some(fg) = names.lookup(s.chars()).and_then(|n| ctx.fused_gnames.get(&n)) {
+                shape.fused.insert(u32::try_from(i).unwrap(), *fg);
+            }
+        }
+    }
     let mut table: BTreeMap<Pc, Vec<Ty>> = BTreeMap::new();
     // Within a run, a block's entry types join every forward edge into it
     // (`Run::pending`), so a run misses only what a loop's back edges
@@ -381,6 +414,8 @@ struct Shape<'a> {
     /// `&`, `^`, shifts, or another such add or sub): their int32 form can
     /// wrap instead of checking for overflow (§10.6's numeric demand).
     wrap_ok: std::collections::BTreeSet<Pc>,
+    /// Per gcthing index naming a fused global: its fuse and literal.
+    fused: BTreeMap<u32, crate::wasm::translate::FusedGname>,
 }
 
 impl<'a> Shape<'a> {
@@ -421,6 +456,7 @@ impl<'a> Shape<'a> {
             loops,
             live,
             wrap_ok,
+            fused: BTreeMap::new(),
         })
     }
 
@@ -800,6 +836,44 @@ impl<'s, 'a> Run<'s, 'a> {
         p
     }
 
+    /// A fused global's read (§3): while its fuse is armed the read is the
+    /// literal, else exit here. False (nothing emitted) for a literal that
+    /// is not a primitive constant.
+    fn fused_gname(&mut self, name: mir::entity::AtomId, fg: crate::wasm::translate::FusedGname) -> bool {
+        use crate::wasm::translate::{TAG_BOOLEAN, TAG_CLEAR, TAG_INT32, TAG_NULL, TAG_UNDEFINED};
+        let (tag, payload) = (fg.boxed >> 32, fg.boxed as u32);
+        if !(tag == TAG_INT32
+            || tag < u64::from(TAG_CLEAR)
+            || tag == TAG_BOOLEAN
+            || tag == TAG_NULL
+            || tag == TAG_UNDEFINED)
+        {
+            return false;
+        }
+        let found = self.mm.fuses.iter().find(|(_, d)| d.addr == fg.fuse_addr).map(|(f, _)| f);
+        let fid = match found {
+            Some(f) => f,
+            None => self.mm.fuses.push(mir::module::FuseDef {
+                name: self.mm.atoms[name].to_string(),
+                addr: fg.fuse_addr,
+            }),
+        };
+        self.guard(Opcode::CheckFuse(fid), vec![], MType::Fact(mir::types::FactKind::Fuse(fid)));
+        let (v, ty) = if tag == TAG_INT32 {
+            (self.const_i32(payload as i32), Ty::I32)
+        } else if tag < u64::from(TAG_CLEAR) {
+            (self.const_f64(f64::from_bits(fg.boxed)), Ty::F64)
+        } else if tag == TAG_BOOLEAN {
+            (self.inst(Opcode::ConstBool(payload != 0), vec![], Some(MType::Bool)), Ty::Bool)
+        } else if tag == TAG_NULL {
+            (self.const_val(ConstVal::Null), Ty::Val(TagSet::prims(PRIM_NULL)))
+        } else {
+            (self.const_val(ConstVal::Undefined), Ty::Val(TagSet::prims(PRIM_UNDEFINED)))
+        };
+        self.push(v, ty);
+        true
+    }
+
     /// The atom for gcthing `index` (a name), in the module's table.
     fn atom(&mut self, index: u32) -> R<mir::entity::AtomId> {
         let gc = *self
@@ -827,15 +901,20 @@ impl<'s, 'a> Run<'s, 'a> {
         let prims = ps.claim.prims();
         // TYPES maintains only numberness today (§4.6): a claim is a
         // number claim, and only where the receivers can carry the bit.
+        // Outside bbv every store goes through the engine, which drops the
+        // bit on any non-number store to any field, so it survives only on
+        // layouts whose fields are all numbers.
         let types = !ps.claim.is_none()
             && ps.shallow_possible
             && !prims.is_empty()
-            && prims.subset_of(crate::opsem::NUM);
+            && prims.subset_of(crate::opsem::NUM)
+            && (ps.layout_id..=ps.hi_layout_id).all(|k| numeric_layout(self.s.ctx, k));
         let site = TypedSite {
             lo: ps.layout_id,
             hi: ps.hi_layout_id,
             types,
             int32: types && prims.subset_of(PRIM_INT32),
+            claim: ps.claim,
         };
         let claim = site.claim_ty();
         let slot = usize::try_from(ps.slot).unwrap();
@@ -2047,7 +2126,13 @@ impl<'s, 'a> Run<'s, 'a> {
                 if self.s.next_is_typeof(pc, op) {
                     return Err("GetGName for typeof".into());
                 }
-                let a = self.atom(p.next_uint32().unwrap())?;
+                let index = p.next_uint32().unwrap();
+                let a = self.atom(index)?;
+                if let Some(&fg) = self.s.fused.get(&index) {
+                    if self.fused_gname(a, fg) {
+                        return Ok(());
+                    }
+                }
                 let r = self.js_static(Opcode::JsGetName(a), vec![], MType::VAL_TOP);
                 self.push(r, Ty::Val(TagSet::ALL));
             }
@@ -2064,13 +2149,11 @@ impl<'s, 'a> Run<'s, 'a> {
                         let v =
                             self.guard(Opcode::GuardUnbox(UnboxKind::I32), vec![r], MType::I32_TOP);
                         self.push(v, Ty::I32);
+                    } else if site.types {
+                        self.push(r, Ty::Val(TagSet::NUMBER));
                     } else {
-                        let tags = if site.types {
-                            TagSet::NUMBER
-                        } else {
-                            TagSet::ALL
-                        };
-                        self.push(r, Ty::Val(tags));
+                        self.push(r, Ty::Val(TagSet::ALL));
+                        self.guard_result(site.claim, pc + op.len());
                     }
                 } else {
                     let x = self.boxed(recv);
@@ -2080,41 +2163,30 @@ impl<'s, 'a> Run<'s, 'a> {
                     self.guard_result(claim.unwrap_or_default(), pc + op.len());
                 }
             }
-            SetProp | StrictSetProp
-                if {
-                    let v = self.top();
-                    v.ty.num().is_some()
-                } =>
-            {
-                let a = self.atom(p.next_uint32().unwrap())?;
-                match self.typed_site(pc, a).filter(|s| s.types) {
-                    Some(site) => {
-                        // A number into a field claimed as a number: the
-                        // store keeps the claim, so no conformance check,
-                        // and a number over a number needs no barriers.
-                        let v = self.pop();
-                        let recv = self.pop();
-                        let o = self.guard_layout(recv, &site);
-                        let x = self.boxed(v);
-                        let x = self.weaken(x, MType::val(TagSet::NUMBER));
-                        self.js_void(Opcode::StoreField(a), vec![o, x]);
-                        self.st.push(v);
-                    }
-                    None => {
-                        let v = self.pop();
-                        let recv = self.pop();
-                        let (x, y) = (self.boxed(recv), self.boxed(v));
-                        self.js_void(Opcode::JsSetProp(a, op == StrictSetProp), vec![x, y]);
-                        self.st.push(v);
-                    }
-                }
-            }
             SetProp | StrictSetProp => {
                 let a = self.atom(p.next_uint32().unwrap())?;
                 let v = self.pop();
                 let recv = self.pop();
-                let (x, y) = (self.boxed(recv), self.boxed(v));
-                self.js_void(Opcode::JsSetProp(a, op == StrictSetProp), vec![x, y]);
+                let num = v.ty.num().is_some();
+                // A field of the predicted layout: a number into a field
+                // the stamp's TYPES claims as one keeps the claim (no
+                // conformance check, and a number over a number needs no
+                // barriers); without a TYPES claim, any value, and the
+                // store's own check keeps the object's bits.
+                match self.typed_site(pc, a).filter(|s| num || !s.types) {
+                    Some(site) => {
+                        let o = self.guard_layout(recv, &site);
+                        let mut x = self.boxed(v);
+                        if site.types {
+                            x = self.weaken(x, MType::val(TagSet::NUMBER));
+                        }
+                        self.js_void(Opcode::StoreField(a), vec![o, x]);
+                    }
+                    None => {
+                        let (x, y) = (self.boxed(recv), self.boxed(v));
+                        self.js_void(Opcode::JsSetProp(a, op == StrictSetProp), vec![x, y]);
+                    }
+                }
                 self.st.push(v);
             }
             GetElem => {

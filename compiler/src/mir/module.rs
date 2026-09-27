@@ -48,6 +48,9 @@ pub struct SnapObjDef {
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct FuseDef {
     pub name: String,
+    /// The fuse word's address (armed while it reads 1); 0 in a module
+    /// with no runtime behind it.
+    pub addr: u32,
 }
 
 /// A global binding, with the type its fast-path load may assume.

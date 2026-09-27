@@ -4185,6 +4185,30 @@ int32_t night_runtime_mir_stress(uint32_t period) {
   return period != 0 && ++count % period == 0 ? 1 : 0;
 }
 
+// The compiled bbv tier's `emit_class_idx_stamp_impl` (first-stamp form),
+// as a helper: the same ownership and span gates, the same new word, no
+// epoch bump (a sentinel word carries no facts).
+void night_runtime_ctor_stamp(uint64_t thisBits, uint32_t layoutId,
+                              uint32_t nFields, uint32_t keepBits) {
+  JS::Value v = JS::Value::fromRawBits(thisBits);
+  if (!v.isObject() || !v.toObject().is<js::NativeObject>()) {
+    return;
+  }
+  js::NativeObject* obj = &v.toObject().as<js::NativeObject>();
+  uint32_t w0 = obj->externalWord();
+  if (!(w0 & js::night::kWordConstructing)) {
+    return;
+  }
+  uint32_t key = (w0 >> 18) & 0x0FFF;
+  if (key != 0 && key != layoutId + 1) {
+    return;
+  }
+  if (obj->slotSpan() < nFields) {
+    return;
+  }
+  obj->setExternalWord((layoutId + 1) | (w0 & keepBits));
+}
+
 // `FinalYieldRval`: close the completed generator.
 bool night_runtime_gen_final(JSContext* cx, uint32_t top, uint64_t gen) {
   SetNightTop(cx, top);

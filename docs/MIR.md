@@ -1279,10 +1279,56 @@ the numbers call for it.
   whose result reaches only truncating ops (`|`, `&`, `^`, shifts, or
   another such add) is `i32.*.wrap`: no overflow exit. The builder finds
   them with a per-block stack simulation over the bytecode.
+- **Guard folding (§10.1), first part** (`mir::opt`). A guard dominated
+  by the same guard on the same value, with no fence between that kills
+  its output's type, takes the dominating guard's output; block params
+  whose incoming values all agree are forwarded. `check.fuse` is not
+  folded yet.
+- **Exit census.** `--mir-exit-census` counts every exit at runtime
+  (census kind 90) and prints the static map `night: mir exit <id>
+  sid#<s> pc <p> <mode>` while compiling. It found the next item.
+- **Stamping outside bbv.** Nothing stamped objects outside the legacy
+  tier, so every `guard.layout` failed and MIR exited to baseline at
+  every typed access (richards took millions of exits). Now:
+  - a baseline `new` passes the construct site's sized allocation and
+    early stamp word, computed as bbv does
+    (`bbv::construct_nslots`/`construct_alloc_word`, shared);
+  - every return of a layout constructor (baseline or MIR) calls
+    `night_runtime_ctor_stamp`, bbv's first-stamp gates as a leaf
+    helper: the CONSTRUCTING sentinel with our early key or none, a
+    slot span covering the layout, then the idx plus the surviving
+    validity bits;
+  - restamps (init delegates, fill scripts) are bbv-only still.
+- **TYPES only on all-number layouts.** Outside bbv every store goes
+  through the engine or MIR, and the engine drops TYPES on any
+  non-number store to any field. So a constructor that stores one
+  object field loses the bit for all of them. `types` is now requested
+  only for layouts whose fields all carry number claims. Elsewhere a
+  typed load is guarded at its def against the analysis's claim, as the
+  generic reads are.
+- **Typed stores of any value** into a layout without a TYPES claim.
+  The lowering's fast path requires SLOTS, no RANGES (consumed
+  checklessly, so an unchecked store must not keep it), and no TYPES
+  unless the value is a number; anything else takes the generic helper
+  (with the script's strictness), which maintains the bits. A store of a
+  possible GC thing runs the incremental pre-barrier (zone flag inline)
+  and the generational post-barrier (tenured owner, nursery value)
+  inline, calling the runtime's barrier helpers only when they fire.
+- **Fused globals (§3).** A `GetGName` of a global the runtime has
+  fused to a primitive literal is `check.fuse F` (exit if the fuse word
+  no longer reads 1) and then the literal as a typed constant.
+  `FuseDef` gained the fuse word's address (`fuse F0 = "K" addr=N`).
+- Measured at this point (Octane, in-process, best of two, versus
+  `--pipeline baseline`): richards 424 → 634, crypto 3187 → 3780,
+  deltablue 597 → 650, box2d 1970 → 2109; the rest are within noise
+  or slightly below baseline (compile time: MIR scripts carry two
+  bodies). The legacy tier is still 2-10x ahead; the remaining cost is
+  mostly generic property access at sites without predictions and
+  generic compares.
 
 **M5. Remaining v1 coverage**
 - Elements and typed arrays, including array stamping in the analysis.
-- Globals and fuse facts.
+- Globals: fused literals are done; syntactic bindings (`gcell`) remain.
 - Constructors (`init_field`/`publish_layout`).
 - Environment ops.
 - Accurate flags words.

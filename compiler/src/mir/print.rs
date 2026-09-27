@@ -500,12 +500,16 @@ pub fn print_module(m: &Module) -> String {
             writeln!(out, "  snap {s} = {}", kind_str(d.kind)).unwrap();
         }
         for (f, d) in m.fuses.iter() {
-            writeln!(
+            write!(
                 out,
                 "  fuse {f} = {}",
                 atom_str(&JsString::from(d.name.as_str()))
             )
             .unwrap();
+            if d.addr != 0 {
+                write!(out, " addr={}", d.addr).unwrap();
+            }
+            writeln!(out).unwrap();
         }
         for (b, d) in m.bindings.iter() {
             writeln!(

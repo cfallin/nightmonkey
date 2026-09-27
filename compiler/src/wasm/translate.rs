@@ -698,6 +698,9 @@ pub struct Helpers {
     /// `night_runtime_mir_stress(period i32) -> i32` (leaf): 1 on every
     /// `period`-th call, the MIR guard-failure stress mode's trigger.
     pub mir_stress: Func,
+    /// `night_runtime_ctor_stamp(this i64, layout i32, nfields i32, keep i32)`
+    /// (leaf): the baseline and MIR tiers' ctor-exit stamp.
+    pub ctor_stamp: Func,
     /// `night_runtime_set_fun_name(cx, top, fun i64, name i64, prefixKind i32) -> ok`:
     /// `JSOp::SetFunName` -- set the inferred name on an anonymous function.
     /// Leaves `fun` on the stack (no out-slot).
@@ -3618,6 +3621,11 @@ mod tests {
         let no_extra_indexed = stub(&mut m, nei_sig, true, "night_runtime_no_extra_indexed");
         let gen_is_closing = stub(&mut m, nei_sig, true, "night_runtime_gen_is_closing");
         let mir_stress = stub(&mut m, nei_sig, true, "night_runtime_mir_stress");
+        let cs_sig = m.signatures.push(SignatureData {
+            params: vec![Type::I64, Type::I32, Type::I32, Type::I32],
+            returns: vec![],
+        });
+        let ctor_stamp = stub(&mut m, cs_sig, false, "night_runtime_ctor_stamp");
         // math_unary: (kind i32, x f64) -> f64; math_pow: (x f64, y f64) -> f64.
         let mu_sig = m.signatures.push(SignatureData {
             params: vec![Type::I32, Type::F64],
@@ -3935,6 +3943,7 @@ mod tests {
                 no_extra_indexed,
                 gen_is_closing,
                 mir_stress,
+                ctor_stamp,
             },
         )
     }
@@ -6258,7 +6267,10 @@ mod tests {
                     f,
                     layout,
                     f.frame.depths.values().copied().max().unwrap_or(0),
-                    3,
+                    crate::wasm::mir::lower::LowerOpts {
+                        stress: 3,
+                        ..Default::default()
+                    },
                 )
                 .unwrap_or_else(|e| panic!("{name}: {e}"));
                 let mut body = lowered.body;

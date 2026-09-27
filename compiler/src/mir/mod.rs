@@ -19,6 +19,7 @@ pub mod entity;
 pub mod func;
 pub mod module;
 pub mod ops;
+pub mod opt;
 pub mod parse;
 pub mod print;
 pub mod types;

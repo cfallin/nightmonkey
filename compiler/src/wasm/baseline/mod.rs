@@ -85,7 +85,7 @@ pub fn build_body(
     ctx: &TranslateCtx,
     m: &mut Module,
     atoms: &mut AtomTable,
-    _source_id: ScriptId,
+    source_id: ScriptId,
     script: &Script,
     is_global: bool,
     resumes: &[layout::ResumeWord],
@@ -133,7 +133,7 @@ pub fn build_body(
     let sig = ctx.helpers.night_abi_sig2;
     let body = FunctionBody::new(m, sig);
     let mut gen = match codegen::Gen::new(
-        ctx, atoms, script, is_global, body, depths, resumes, onramps,
+        ctx, source_id, atoms, script, is_global, body, depths, resumes, onramps,
     ) {
         Ok(g) => g,
         Err(e) => return Ok(Err(e)),
@@ -152,7 +152,7 @@ pub fn build_body(
     if ctx.opts.diagnostics.stats {
         crate::diag_line!(
             "night: baseline body sid#{} blocks {} values {} bytecode {}",
-            _source_id,
+            source_id,
             gen.body.blocks.len(),
             gen.body.values.len(),
             script.bytecode.len()

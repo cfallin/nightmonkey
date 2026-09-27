@@ -27,7 +27,8 @@ use super::layout::{
     ARGC_RESUME_BIT, ERR_DEOPT,
 };
 use crate::bytecode::{BytecodeParser, JSOp, Script, TryNoteKind};
-use crate::ids::Pc;
+use crate::ids::{Pc, ScriptId, Site};
+use crate::wasm::bbv::{construct_alloc_word, construct_nslots, ctor_stamp_keep_bits};
 use crate::source::{ScopeData, SourceObject};
 use crate::wasm::bbv::abi::{
     BINOP_BITAND, BINOP_BITNOT, BINOP_BITOR, BINOP_BITXOR, BINOP_DEC, BINOP_DIV, BINOP_INC,
@@ -66,6 +67,11 @@ enum Close {
 
 pub(super) struct Gen<'a> {
     ctx: &'a TranslateCtx<'a>,
+    sid: ScriptId,
+    /// A layout constructor's ctor-exit stamp (`night_runtime_ctor_stamp`
+    /// arguments after `this`): without it no object a baseline or MIR
+    /// constructor builds is ever stamped, and every layout guard misses.
+    ctor_stamp: Option<[u32; 3]>,
     atoms: &'a mut AtomTable,
     script: &'a Script,
     is_global: bool,
@@ -168,6 +174,7 @@ fn binop_kind(op: JSOp) -> u32 {
 impl<'a> Gen<'a> {
     pub(super) fn new(
         ctx: &'a TranslateCtx<'a>,
+        sid: ScriptId,
         atoms: &'a mut AtomTable,
         script: &'a Script,
         is_global: bool,
@@ -188,6 +195,14 @@ impl<'a> Gen<'a> {
             (p(0), p(1), p(2), p(3), p(4), p(5));
         Ok(Gen {
             ctx,
+            sid,
+            ctor_stamp: ctx.stamp_ctors_in.get(&sid).map(|si| {
+                [
+                    si.layout_id,
+                    u32::try_from(si.fields.len()).unwrap(),
+                    ctor_stamp_keep_bits(si),
+                ]
+            }),
             atoms,
             script,
             is_global,
@@ -1323,6 +1338,11 @@ impl<'a> Gen<'a> {
     }
 
     fn ret(&mut self, v: Value) {
+        if let Some([layout, nfields, keep]) = self.ctor_stamp {
+            let thisv = self.load_i64(self.sp, FrameLayout::THIS);
+            let (l, n, k) = (self.i32c(layout), self.i32c(nfields), self.i32c(keep));
+            self.call(self.h.ctor_stamp, &[thisv, l, n, k], None);
+        }
         self.store_i64(self.retval_out, 0, v);
         let zero = self.i32c(0);
         let flags = self.i32c(FLAGS_ALL);
@@ -2063,8 +2083,23 @@ impl<'a> Gen<'a> {
             }
             New | NewContent | SuperCall => {
                 let argc = u32::from(p.next_uint16().unwrap());
-                let nslots = self.i32c(NO_NSLOTS);
-                let stamp = self.i32c(0);
+                // The construct site's sized allocation and early stamp word,
+                // as bbv computes them: the ctor's exit stamp needs both.
+                let site = Site::new(self.sid, self.pc);
+                let mono = match self.ctx.facts.scripted_targets(site) {
+                    [s] => Some(*s),
+                    _ => None,
+                };
+                let (n, w) = if op == SuperCall {
+                    (NO_NSLOTS, 0)
+                } else {
+                    (
+                        construct_nslots(self.ctx, mono, site),
+                        construct_alloc_word(self.ctx, mono, site),
+                    )
+                };
+                let nslots = self.i32c(n);
+                let stamp = self.i32c(w);
                 self.call_op(h.construct, argc, argc + 3, &[nslots, stamp]);
             }
             SpreadCall | SpreadNew | SpreadSuperCall => {

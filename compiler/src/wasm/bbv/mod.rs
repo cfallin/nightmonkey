@@ -167,6 +167,55 @@ fn early_stamp_word(k_plus_1: u32, keep_shallow: bool, keep_ranges: bool) -> u32
     }
 }
 
+/// The ctor full-layout slot count for a `new` at `site` whose likely
+/// callee is `mono`, or `NO_NSLOTS` (shared with the baseline tier).
+pub(crate) fn construct_nslots(ctx: &TranslateCtx<'_>, mono: Option<ScriptId>, site: Site) -> u32 {
+    if let Some(f) = mono {
+        if let Some(&n) = ctx.ctor_nslots_in.get(&f) {
+            return n;
+        }
+    }
+    if let Some(si) = ctx.construct_sites_in.get(&site) {
+        return u32::try_from(si.fields.len()).unwrap().min(16);
+    }
+    NO_NSLOTS
+}
+
+/// The allocation-time class word for a `new` at `site` whose likely
+/// callee is `mono` (shared with the baseline tier).
+pub(crate) fn construct_alloc_word(ctx: &TranslateCtx<'_>, mono: Option<ScriptId>, site: Site) -> u32 {
+    let word_of = |si: &StampCtorIn| {
+        early_stamp_word(
+            si.layout_id + 1,
+            si.masks.iter().any(|m| m.prims() != Prims::EMPTY),
+            si.ranges.iter().any(Option::is_some),
+        )
+    };
+    if let Some(f) = mono {
+        if let Some(si) = ctx.stamp_ctors_in.get(&f) {
+            return word_of(si);
+        }
+    }
+    if let Some(si) = ctx.construct_sites_in.get(&site) {
+        return word_of(si);
+    }
+    // No key: SLOTS still seeds -- the delegate flows' static add
+    // checks maintain it (positions are absolute, so an inconsistent
+    // flow self-detects by position mismatch), and every unchecked
+    // add path clears it conservatively (engine keyless clear; the
+    // compiled runtime form's keyless arm).
+    CLASS_WORD_SENTINEL | CLASS_WORD_SHALLOW | CLASS_WORD_SLOTS | CLASS_WORD_RANGES
+}
+
+/// The validity bits a ctor-exit stamp of `si` carries forward: SLOTS,
+/// plus SHALLOW/RANGES only when the layout has masked fields / range
+/// claims (see `emit_class_idx_stamp_impl`).
+pub(crate) fn ctor_stamp_keep_bits(si: &StampCtorIn) -> u32 {
+    CLASS_WORD_SLOTS
+        | if si.masks.iter().any(|m| m.prims() != Prims::EMPTY) { CLASS_WORD_SHALLOW } else { 0 }
+        | if si.ranges.iter().any(Option::is_some) { CLASS_WORD_RANGES } else { 0 }
+}
+
 // --- block keys ----------------------------------------------------------
 
 /// Pc-space cap. Scripts are capped at 128 KiB of bytecode (the translate

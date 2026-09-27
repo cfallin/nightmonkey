@@ -584,3 +584,37 @@ fn dump_fixtures() {
         println!("==== {name}\n{}", print_module(&parse(src).unwrap()));
     }
 }
+
+// --- passes -------------------------------------------------------------
+
+/// Guard folding (§10.1): the second receiver guard pair folds against the
+/// first; after a call, object-ness still folds (it is invariant), but the
+/// layout claim died on the call's dirty edge, so that guard stays.
+#[test]
+fn fold_guards_across_a_fence() {
+    let src = "module {\n  layout L3 = { x: val{int32,double} }\n}\n\
+func @s1 (formals=1, locals=0, depths={0:0}) {\n  root entry b0\n\
+b0(v0: obj{Function(s1)}, v1: val, v2: val):\n  guard.unbox.obj v2 -> ok b1(v3: obj), fail b9\n\
+b1(v3: obj):\n  guard.layout v3 L3 types -> ok b2(v4: obj{L3 types}), fail b9\n\
+b2(v4: obj{L3 types}):\n  guard.unbox.obj v2 -> ok b3(v5: obj), fail b9\n\
+b3(v5: obj):\n  guard.layout v5 L3 types -> ok b4(v6: obj{L3 types}), fail b9\n\
+b4(v6: obj{L3 types}):\n  v7 = const.val undefined\n  call v1, v7 -> ok_clean b5(v8: val), ok_dirty b11(v11: val), err b10\n\
+b11(v11: val):\n  jump b5(v11)\n\
+b5(v8: val):\n  guard.unbox.obj v2 -> ok b6(v9: obj), fail b9\n\
+b6(v9: obj):\n  guard.layout v9 L3 types -> ok b7(v10: obj{L3 types}), fail b9\n\
+b7(v10: obj{L3 types}):\n  return v8\n\
+b9:\n  exit pc=0 this=v1 args=[v2] locals=[] rval=v1 stack=[]\n\
+b10:\n  exit.throw pc=0 this=v1 args=[v2] locals=[] rval=v1 stack=[]\n}\n";
+    let mut m = parse_ok(src);
+    verify_module(&m).expect("valid before");
+    let mut f = m.funcs.pop().unwrap();
+    let n = crate::mir::opt::optimize(&m, &mut f);
+    m.funcs.push(f);
+    if let Err(es) = verify_module(&m) {
+        panic!("invalid after folding: {:?}\n{}", es, print_module(&m));
+    }
+    assert_eq!(n, 3, "{}", print_module(&m));
+    let text = print_module(&m);
+    assert_eq!(text.matches("guard.layout").count(), 2, "{text}");
+    assert_eq!(text.matches("guard.unbox.obj").count(), 1, "{text}");
+}

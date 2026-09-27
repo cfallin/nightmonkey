@@ -393,6 +393,14 @@ NIGHT_RUNTIME_EXPORT(night_runtime_gen_is_closing)
 int32_t night_runtime_gen_is_closing(JSContext* cx);
 NIGHT_RUNTIME_EXPORT(night_runtime_mir_stress)
 int32_t night_runtime_mir_stress(uint32_t period);
+// The ctor-exit stamp for the baseline and MIR tiers: stamp a completed
+// constructor `this` (boxed) with layout `layoutId` when its word still
+// carries the CONSTRUCTING sentinel with our early key (or none) and its
+// slot span covers the layout's `nFields`, keeping the `keepBits` validity
+// bits that survived construction. Leaf.
+NIGHT_RUNTIME_EXPORT(night_runtime_ctor_stamp)
+void night_runtime_ctor_stamp(uint64_t thisBits, uint32_t layoutId,
+                              uint32_t nFields, uint32_t keepBits);
 
 // `key in obj` (JSOp::In): boxed boolean to the out-slot; throws when `obj`
 // is not an object. May GC (proxy hooks).

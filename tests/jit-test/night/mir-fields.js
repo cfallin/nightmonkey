@@ -57,3 +57,29 @@ assertEq(churn(ps), 4950);
 var d = new Point(5, 6);
 delete d.x;
 assertEq(Number.isNaN(len2(d)), true);
+
+// Object stores into a mixed layout's fields: the store's barriers. A
+// tenured node gets fresh nursery objects, which must survive a minor GC.
+function Cell(v) { this.v = v; this.link = null; this.tag = 0; }
+function relink(c, n) { for (var i = 0; i < n; i++) { c.link = { k: i }; c.tag = i; } return c.link.k; }
+var cell = new Cell(1);
+gc();
+assertEq(relink(cell, 100), 99);
+minorgc();
+assertEq(cell.link.k, 99);
+gc();
+assertEq(cell.link.k, 99);
+function chain(n) { var c = new Cell(0); var h = c; for (var i = 1; i < n; i++) { var d = new Cell(i); c.link = d; c = d; } return h; }
+function chainSum(h) { var t = 0; while (h) { t += h.v; h = h.link; } return t; }
+var h = chain(200);
+minorgc();
+gc();
+assertEq(chainSum(h), 19900);
+
+// A strict store into a frozen object of the predicted layout throws.
+function setLink(c, v) { "use strict"; c.link = v; return c.link; }
+assertEq(setLink(new Cell(0), 5), 5);
+var fc = Object.freeze(new Cell(0));
+var threw2 = false;
+try { setLink(fc, 6); } catch (e) { threw2 = e instanceof TypeError; }
+assertEq(threw2, true);

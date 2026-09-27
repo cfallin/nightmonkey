@@ -23,10 +23,16 @@ pub fn translate_script(
     script: &Script,
     is_global: bool,
 ) -> Result<Result<Outcome, String>, String> {
-    let (mm, f) = match build::build(ctx, sid, script, is_global) {
+    let (mm, mut f) = match build::build(ctx, &atoms.names, sid, script, is_global) {
         Ok(x) => x,
         Err(reason) => return Ok(Err(reason)),
     };
+    // Guard folding (§10.1). The builder guards locally at every use;
+    // this merges them, and the validator checks the result.
+    let folded = crate::mir::opt::optimize(&mm, &mut f);
+    if ctx.opts.diagnostics.stats && folded > 0 {
+        crate::diag_line!("night: mir sid#{sid} folded {folded} guards");
+    }
     if let Err(es) = crate::mir::verify(&mm, &f) {
         let first = es.first().map(|e| e.to_string()).unwrap_or_default();
         if ctx.opts.diagnostics.mir {
@@ -67,7 +73,18 @@ pub fn translate_script(
         &f,
         baseline::layout::FrameLayout::of(script),
         baseline::layout::StackDepths::compute(script)?.max,
-        ctx.opts.mir_stress,
+        lower::LowerOpts {
+            stress: ctx.opts.mir_stress,
+            exit_census: ctx.opts.instrument.mir_exits,
+            strict: script.strict,
+            ctor_stamp: ctx.stamp_ctors_in.get(&sid).map(|si| {
+                [
+                    si.layout_id,
+                    u32::try_from(si.fields.len()).unwrap(),
+                    crate::wasm::bbv::ctor_stamp_keep_bits(si),
+                ]
+            }),
+        },
     ) {
         Ok(l) => l,
         Err(reason) => return Ok(Err(reason)),

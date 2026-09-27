@@ -2304,49 +2304,13 @@ impl<'a> Bbv<'a> {
 
     /// The ctor full-layout slot count for the `new` at `pc`.
     pub(super) fn construct_nslots(&self, pc: Pc) -> u32 {
-        if let Some(f) = self.likely_mono(pc) {
-            if let Some(&n) = self.ctx.ctor_nslots_in.get(&f) {
-                return n;
-            }
-        }
-        if let Some(si) = self
-            .ctx
-            .construct_sites_in
-            .get(&Site::new(self.source_id, self.evid_pc(pc)))
-        {
-            return u32::try_from(si.fields.len()).unwrap().min(16);
-        }
-        NO_NSLOTS
+        construct_nslots(self.ctx, self.likely_mono(pc), Site::new(self.source_id, self.evid_pc(pc)))
     }
 
     /// The allocation-time class word for the construct at `pc` (copied
     /// from translate.rs `construct_alloc_word`).
     pub(super) fn construct_alloc_word(&self, pc: Pc) -> u32 {
-        let word_of = |si: &StampCtorIn| {
-            early_stamp_word(
-                si.layout_id + 1,
-                si.masks.iter().any(|m| m.prims() != Prims::EMPTY),
-                si.ranges.iter().any(Option::is_some),
-            )
-        };
-        if let Some(f) = self.likely_mono(pc) {
-            if let Some(si) = self.ctx.stamp_ctors_in.get(&f) {
-                return word_of(si);
-            }
-        }
-        if let Some(si) = self
-            .ctx
-            .construct_sites_in
-            .get(&Site::new(self.source_id, self.evid_pc(pc)))
-        {
-            return word_of(si);
-        }
-        // No key: SLOTS still seeds -- the delegate flows' static add
-        // checks maintain it (positions are absolute, so an inconsistent
-        // flow self-detects by position mismatch), and every unchecked
-        // add path clears it conservatively (engine keyless clear; the
-        // compiled runtime form's keyless arm).
-        CLASS_WORD_SENTINEL | CLASS_WORD_SHALLOW | CLASS_WORD_SLOTS | CLASS_WORD_RANGES
+        construct_alloc_word(self.ctx, self.likely_mono(pc), Site::new(self.source_id, self.evid_pc(pc)))
     }
 
     /// Create the construct `this` for the `new` at `pc`: per-site construct
