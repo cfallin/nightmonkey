@@ -1143,6 +1143,9 @@ impl<'a> Lower<'a> {
     }
 
     fn spill_at(&mut self, base: u32, live: &[mir::Value]) -> R<()> {
+        let e = self.opsize.entry("(spill sites / values)".into()).or_default();
+        e.0 += 1;
+        e.1 += u32::try_from(live.len()).unwrap();
         for (i, &v) in live.iter().enumerate() {
             let t = self.ty(v);
             let w = self.get(v)?;
@@ -1940,8 +1943,13 @@ impl<'a> Lower<'a> {
                         (h.new_array, vec![lv, cell])
                     }
                     RtOp::InitProp(name, attrs) => {
-                        let (at, av, none) = (self.atom(name), self.i32c(attrs), self.i32c(u32::MAX));
-                        (h.init_prop, vec![a[0], at, a[1], av, none])
+                        let site = if attrs == crate::wasm::bbv::abi::INIT_ATTR_ENUMERATE {
+                            self.init_prop_inline(inst, a[0], a[1])?
+                        } else {
+                            u32::MAX
+                        };
+                        let (at, av, sv) = (self.atom(name), self.i32c(attrs), self.i32c(site));
+                        (h.init_prop, vec![a[0], at, a[1], av, sv])
                     }
                     RtOp::InitElem(attrs) => {
                         let av = self.i32c(attrs);
@@ -2045,6 +2053,29 @@ impl<'a> Lower<'a> {
                 self.exit_inline(inst, &d, &a, pc, nargs, nlocals, throw)?
             }
             Opcode::Construct(nslots, word) => {
+                // `new Array()` (bbv's bump arm): the pristine Array
+                // constructor, as its own new.target, makes what `[]` does.
+                if a.len() == 3 && self.names_atom("Array") {
+                    let (callee, nt) = (a[0], a[2]);
+                    let is_arr = self.builtin_is(callee, crate::wasm::translate::BC_ARRAY_CTOR);
+                    let same = self.bin(Operator::I64Eq, callee, nt, Type::I32);
+                    let m = self.bin(Operator::I32And, is_arr, same, Type::I32);
+                    let (arr, other) = (self.body.add_block(), self.body.add_block());
+                    self.cond_br(m, Self::to(arr), Self::to(other));
+                    self.cur = arr;
+                    // The helper's reload rebinds the live values on its
+                    // path only.
+                    let saved = self.vmap.clone();
+                    let cell = self.alloc_inline(inst, Some(0))?;
+                    let lv = self.i32c(0);
+                    let live = self.live_across(inst);
+                    let (ok, r) = self.gc_call(self.h.new_array, &[lv, cell], &live)?;
+                    let t = self.edge(inst, 1, &[r])?;
+                    let e = self.edge(inst, 2, &[])?;
+                    self.cond_br(ok, t, e);
+                    self.vmap = saved;
+                    self.cur = other;
+                }
                 // The frame `[callee, this, args…, new.target]` above the
                 // rooting slots, then the runtime's construct (it creates
                 // `this` sized and seeded for the site, and runs the
@@ -3767,6 +3798,13 @@ impl<'a> Lower<'a> {
             self.pop_arm(inst, ops, call)?;
             self.cur = call;
         }
+        // A leaf: nothing to root yet.
+        let (funcidx, script, native) = self.classify_native(ops[0]);
+        if ops.len() == 3 || ops.len() == 4 {
+            let call = self.body.add_block();
+            self.math_arms(inst, ops, native, call)?;
+            self.cur = call;
+        }
         let live = self.live_across(inst);
         self.spill(&live)?;
         let frame = self.top_off(live.len());
@@ -3778,7 +3816,6 @@ impl<'a> Lower<'a> {
         let base = self.add_off(self.vp, frame);
         let top = self.add_off(self.vp, top_off);
         let z = self.i32c(0);
-        let (funcidx, script) = self.classify(ops[0]);
         let limit_addr = self.i32c(self.h.night_stack_limit_base);
         let limit = self.load_i32(limit_addr, 0);
         let hi = self.add_off(top, HEADROOM);
@@ -3900,6 +3937,160 @@ impl<'a> Lower<'a> {
         self.terminate(Terminator::Br { target: t });
         self.cur = slow;
         Ok(cell)
+    }
+
+    /// `InitProp` on a literal under construction (bbv's `emit_init_prop`):
+    /// replay the site's add transition from its IC row (the helper fills
+    /// it) while the literal has the row's old shape: store the value in
+    /// the fresh slot (no pre-barrier: nothing was there), swap in the new
+    /// shape, taking `ok_clean`. Literals carry no class word, so no stamp
+    /// bit needs keeping. Returns the site's cache index, with `cur` on
+    /// the miss.
+    fn init_prop_inline(&mut self, inst: mir::Inst, objv: Value, val: Value) -> R<u32> {
+        let cache = self.atoms.next_prop_cache();
+        let slow = self.body.add_block();
+        let obj = self.un(Operator::I32WrapI64, objv, Type::I32);
+        let shape = self.load_i32(obj, SHAPE_OFFSET);
+        let row = self.i32c(IC_WAY_ADDR_PLACEHOLDER);
+        self.prop_ic_patches.push((row, cache * INLINE_IC_STRIDE + IC_TRANS_ROW_OFF));
+        let old = self.load_i32(row, IC_TRANS_OLDSHAPE);
+        let same = self.bin(Operator::I32Eq, old, shape, Type::I32);
+        self.check(same, slow);
+        let off = self.load_i32(row, IC_TRANS_SLOTOFF);
+        self.check(off, slow);
+        let addr = self.bin(Operator::I32Add, obj, off, Type::I32);
+        self.store_i64(addr, 0, val);
+        let new_s = self.load_i32(row, IC_TRANS_NEWSHAPE);
+        self.store_i32(obj, SHAPE_OFFSET, new_s);
+        let abs = self.load_i32(row, IC_TRANS_ABSSLOT);
+        self.post_barrier(self.h.post_write_barrier, obj, abs, val);
+        let t = self.edge(inst, 0, &[])?;
+        self.terminate(Terminator::Br { target: t });
+        self.cur = slow;
+        Ok(cache)
+    }
+
+    /// Native `Math` calls on numbers (bbv's arms), matched by the callee's
+    /// `JSNative` against the pristine natives table, so a replaced or
+    /// self-hosted clone is told apart without fuses: one-argument
+    /// sqrt/abs/floor/ceil/trunc/fround inline, sin/cos by a leaf, clz32;
+    /// two-argument min/max inline, pow by a leaf, imul. The result takes
+    /// `ok_clean`; anything else goes to `other`.
+    fn math_arms(&mut self, inst: mir::Inst, ops: &[Value], native: Value, other: Block) -> R<()> {
+        use crate::wasm::translate::{
+            MN_ABS, MN_CEIL, MN_CLZ32, MN_COS, MN_FLOOR, MN_FROUND, MN_IMUL, MN_MAX, MN_MIN, MN_POW,
+            MN_SIN, MN_SQRT, MN_TRUNC,
+        };
+        self.check(native, other);
+        let cp = self.un(Operator::I32WrapI64, ops[0], Type::I32);
+        let nf = self.load_i32(cp, FUNC_ENV_SLOT_OFFSET);
+        let is = |s: &mut Self, idx: u32| {
+            let c = s.i32c(s.h.math_natives_base + 4 * idx);
+            let slot = s.load_i32(c, 0);
+            s.bin(Operator::I32Eq, nf, slot, Type::I32)
+        };
+        let is_num = |s: &mut Self, v: Value| {
+            let t = s.tag_of(v);
+            let k = s.i32c(TAG_INT32 as u32);
+            s.bin(Operator::I32LeU, t, k, Type::I32)
+        };
+        let done = self.body.add_block();
+        let res = self.body.add_blockparam(done, Type::F64);
+        if ops.len() == 3 {
+            let x = ops[2];
+            let num = is_num(self, x);
+            self.check(num, other);
+            let f = self.to_f64(x);
+            let (sqrt, abs, floor, ceil) = (is(self, MN_SQRT), is(self, MN_ABS), is(self, MN_FLOOR), is(self, MN_CEIL));
+            let (trunc, fround, sin, cos) = (is(self, MN_TRUNC), is(self, MN_FROUND), is(self, MN_SIN), is(self, MN_COS));
+            let clz = is(self, MN_CLZ32);
+            // clz32: ToUint32 then i32.clz (|f| < 2^63 truncates exactly).
+            let (clz_b, rest) = (self.body.add_block(), self.body.add_block());
+            self.cond_br(clz, Self::to(clz_b), Self::to(rest));
+            self.cur = clz_b;
+            let af = self.un(Operator::F64Abs, f, Type::F64);
+            let lim = self.f64c(9223372036854775808.0f64.to_bits());
+            let ok = self.bin(Operator::F64Lt, af, lim, Type::I32);
+            self.check(ok, other);
+            let i = self.un(Operator::I64TruncSatF64S, f, Type::I64);
+            let i = self.un(Operator::I32WrapI64, i, Type::I32);
+            let c = self.un(Operator::I32Clz, i, Type::I32);
+            let r = self.box_tagged(TAG_INT32, c);
+            let t = self.edge(inst, 0, &[r])?;
+            self.terminate(Terminator::Br { target: t });
+            self.cur = rest;
+            let trig = self.bin(Operator::I32Or, sin, cos, Type::I32);
+            let (trig_b, opc) = (self.body.add_block(), self.body.add_block());
+            self.cond_br(trig, Self::to(trig_b), Self::to(opc));
+            self.cur = trig_b;
+            let r = self.call1(self.h.math_unary, &[cos, f], Type::F64);
+            self.terminate(Terminator::Br { target: BlockTarget { block: done, args: vec![r] } });
+            self.cur = opc;
+            let a = self.bin(Operator::I32Or, sqrt, abs, Type::I32);
+            let b = self.bin(Operator::I32Or, floor, ceil, Type::I32);
+            let c = self.bin(Operator::I32Or, trunc, fround, Type::I32);
+            let any = self.bin(Operator::I32Or, a, b, Type::I32);
+            let any = self.bin(Operator::I32Or, any, c, Type::I32);
+            self.check(any, other);
+            let r_sqrt = self.un(Operator::F64Sqrt, f, Type::F64);
+            let r_abs = self.un(Operator::F64Abs, f, Type::F64);
+            let r_floor = self.un(Operator::F64Floor, f, Type::F64);
+            let r_ceil = self.un(Operator::F64Ceil, f, Type::F64);
+            let r_trunc = self.un(Operator::F64Trunc, f, Type::F64);
+            let f32v = self.un(Operator::F32DemoteF64, f, Type::F32);
+            let r_fround = self.un(Operator::F64PromoteF32, f32v, Type::F64);
+            let sel = self.select(Type::F64, r_trunc, r_fround, trunc);
+            let sel = self.select(Type::F64, r_ceil, sel, ceil);
+            let sel = self.select(Type::F64, r_floor, sel, floor);
+            let sel = self.select(Type::F64, r_abs, sel, abs);
+            let r = self.select(Type::F64, r_sqrt, sel, sqrt);
+            self.terminate(Terminator::Br { target: BlockTarget { block: done, args: vec![r] } });
+        } else {
+            let (x, y) = (ops[2], ops[3]);
+            let nx = is_num(self, x);
+            let ny = is_num(self, y);
+            let both = self.bin(Operator::I32And, nx, ny, Type::I32);
+            self.check(both, other);
+            let (fx, fy) = (self.to_f64(x), self.to_f64(y));
+            let (min, max, pow, imul) = (is(self, MN_MIN), is(self, MN_MAX), is(self, MN_POW), is(self, MN_IMUL));
+            let (imul_b, rest) = (self.body.add_block(), self.body.add_block());
+            self.cond_br(imul, Self::to(imul_b), Self::to(rest));
+            // imul: ToInt32 of each (|f| < 2^63 truncates exactly), i32.mul.
+            self.cur = imul_b;
+            let lim = self.f64c(9223372036854775808.0f64.to_bits());
+            let ax = self.un(Operator::F64Abs, fx, Type::F64);
+            let ay = self.un(Operator::F64Abs, fy, Type::F64);
+            let sx = self.bin(Operator::F64Lt, ax, lim, Type::I32);
+            let sy = self.bin(Operator::F64Lt, ay, lim, Type::I32);
+            let safe = self.bin(Operator::I32And, sx, sy, Type::I32);
+            self.check(safe, other);
+            let ix = self.un(Operator::I64TruncSatF64S, fx, Type::I64);
+            let ix = self.un(Operator::I32WrapI64, ix, Type::I32);
+            let iy = self.un(Operator::I64TruncSatF64S, fy, Type::I64);
+            let iy = self.un(Operator::I32WrapI64, iy, Type::I32);
+            let m = self.bin(Operator::I32Mul, ix, iy, Type::I32);
+            let r = self.box_tagged(TAG_INT32, m);
+            let t = self.edge(inst, 0, &[r])?;
+            self.terminate(Terminator::Br { target: t });
+            self.cur = rest;
+            let (pow_b, mm) = (self.body.add_block(), self.body.add_block());
+            self.cond_br(pow, Self::to(pow_b), Self::to(mm));
+            self.cur = pow_b;
+            let r = self.call1(self.h.math_pow, &[fx, fy], Type::F64);
+            self.terminate(Terminator::Br { target: BlockTarget { block: done, args: vec![r] } });
+            self.cur = mm;
+            let any = self.bin(Operator::I32Or, min, max, Type::I32);
+            self.check(any, other);
+            let r_min = self.bin(Operator::F64Min, fx, fy, Type::F64);
+            let r_max = self.bin(Operator::F64Max, fx, fy, Type::F64);
+            let r = self.select(Type::F64, r_min, r_max, min);
+            self.terminate(Terminator::Br { target: BlockTarget { block: done, args: vec![r] } });
+        }
+        self.cur = done;
+        let b = self.box_number(res);
+        let t = self.edge(inst, 0, &[b])?;
+        self.terminate(Terminator::Br { target: t });
+        Ok(())
     }
 
     /// Whether the function names atom `s` (a builtin arm's gate, as bbv's
@@ -4068,6 +4259,13 @@ impl<'a> Lower<'a> {
     /// `night_call_classify` of boxed `callee`: its funcref-table index (0
     /// when not compiled or not a scripted function) and its `JSScript*`.
     fn classify(&mut self, callee: Value) -> (Value, Value) {
+        let (f, s, _) = self.classify_native(callee);
+        (f, s)
+    }
+
+    /// `classify`, and whether the callee is a native function (known
+    /// only on a cell miss: the cell holds scripted callees).
+    fn classify_native(&mut self, callee: Value) -> (Value, Value, Value) {
         // The site's value cell (bbv's `emit_inline_classify`): the steady
         // state is one callee repeating, and a hit is the whole classify.
         // The fill caches tenured functions only, and a major GC zeroes
@@ -4080,16 +4278,18 @@ impl<'a> Lower<'a> {
         let done = self.body.add_block();
         let fp = self.body.add_blockparam(done, Type::I32);
         let sp = self.body.add_blockparam(done, Type::I32);
+        let np = self.body.add_blockparam(done, Type::I32);
         let cached = self.load_i64(cell, 0);
         let f = self.load_i32(cell, CALL_CELL_FUNCIDX);
         let sc = self.load_i32(cell, CALL_CELL_SCRIPT);
         let hit = self.bin(Operator::I64Eq, callee, cached, Type::I32);
         let miss = self.body.add_block();
+        let z = self.i32c(0);
         self.cond_br(
             hit,
             BlockTarget {
                 block: done,
-                args: vec![f, sc],
+                args: vec![f, sc, z],
             },
             Self::to(miss),
         );
@@ -4108,14 +4308,15 @@ impl<'a> Lower<'a> {
         ));
         let funcidx = self.push_val(ValueDef::PickOutput(cls, 0, Type::I32));
         let script = self.push_val(ValueDef::PickOutput(cls, 1, Type::I32));
+        let native = self.push_val(ValueDef::PickOutput(cls, 2, Type::I32));
         self.terminate(Terminator::Br {
             target: BlockTarget {
                 block: done,
-                args: vec![funcidx, script],
+                args: vec![funcidx, script, native],
             },
         });
         self.cur = done;
-        (fp, sp)
+        (fp, sp, np)
     }
 
     /// `inline.enter` (§5.5): the inlined callee's frame, as its

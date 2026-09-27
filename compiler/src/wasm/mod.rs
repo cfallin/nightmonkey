@@ -2078,6 +2078,25 @@ pub fn translate_all(
                 extra_bodies,
                 extra_call_patches,
             } => {
+                if opts.diagnostics.stats {
+                    let (mut calls, mut stores) = (0, 0);
+                    for (_, d) in body.values.entries() {
+                        match d {
+                            waffle::ValueDef::Operator(
+                                waffle::Operator::Call { .. } | waffle::Operator::CallIndirect { .. },
+                                ..,
+                            ) => calls += 1,
+                            waffle::ValueDef::Operator(waffle::Operator::I64Store { .. }, ..) => stores += 1,
+                            _ => {}
+                        }
+                    }
+                    crate::diag_line!(
+                        "night: body sid#{} blocks {} values {} calls {calls} i64stores {stores}",
+                        id.id(),
+                        body.blocks.len(),
+                        body.values.len()
+                    );
+                }
                 let f = m.funcs.push(FuncDecl::Body(
                     sig,
                     format!("night_script_{}", id.id()),

@@ -205,6 +205,22 @@ fn numeric_layout(ctx: &crate::wasm::translate::TranslateCtx<'_>, k: u32) -> boo
 }
 
 impl<'a> Shape<'a> {
+    /// Whether callee `k` is small enough to inline at `pc` among
+    /// `ntargets` targets: bbv's caps, 150 bytes of bytecode for one
+    /// target (200 in a loop), 500 each for several.
+    fn fits_site(&self, k: ScriptId, pc: Pc, ntargets: usize) -> bool {
+        let in_loop = self.loops.iter().any(|(&h, &e)| h <= pc && pc < e);
+        let cap = match (ntargets, in_loop) {
+            (1, false) => 150,
+            (1, true) => 200,
+            _ => crate::constants::MAX_INLINE_POLY_BYTES,
+        };
+        matches!(
+            self.ctx.source.object(crate::source::SourceObjectId::new(k.get())),
+            crate::source::SourceObject::Script(ks) if ks.bytecode.len() <= cap
+        )
+    }
+
     /// Whether nothing in the script catches or closes on a throw (only
     /// loop notes; not a generator): baseline's landing for any throw is
     /// its error return, which reads nothing of the frame.
@@ -330,7 +346,7 @@ const DIRTY_EXITS: bool = true;
 const THIS_ENTRY_GUARD: bool = true;
 
 /// How deep inlining nests: a caller's callees, and theirs.
-const MAX_INLINE_DEPTH: u32 = 2;
+const MAX_INLINE_DEPTH: u32 = 4;
 /// The most MIR instructions a callee may have to be inlined.
 const MAX_INLINE_INSTS: usize = 2000;
 /// The most call sites one function inlines into (bbv's per-caller splice
@@ -3748,7 +3764,9 @@ impl<'s, 'a> Run<'s, 'a> {
                 };
                 let nslots = crate::wasm::bbv::construct_nslots(self.s.ctx, mono, site);
                 let word = crate::wasm::bbv::construct_alloc_word(self.s.ctx, mono, site);
-                let callee = mono.and_then(|k| Some((k, self.s.callee(k)?)));
+                let callee = mono
+                    .filter(|&k| self.s.fits_site(k, pc, 1))
+                    .and_then(|k| Some((k, self.s.callee(k)?)));
                 let r = match callee {
                     Some((k, c)) if INLINE_CONSTRUCT && self.inline_budget(c.f.insts.len()) => {
                         self.inline_construct(k, &c, &vals, nslots, word)
@@ -3762,13 +3780,12 @@ impl<'s, 'a> Run<'s, 'a> {
                 let n = self.st.len();
                 let operands: Vec<Slot> = self.st.drain(n - argc - 2..).collect();
                 let vals: Vec<mir::Value> = operands.into_iter().map(|x| self.boxed(x)).collect();
-                let targets: Vec<(ScriptId, std::rc::Rc<super::inline::Callee>)> = self
-                    .s
-                    .ctx
-                    .facts
-                    .scripted_targets(self.site(pc))
+                let sids = self.s.ctx.facts.scripted_targets(self.site(pc));
+                let n = sids.len();
+                let targets: Vec<(ScriptId, std::rc::Rc<super::inline::Callee>)> = sids
                     .iter()
                     .take(MAX_INLINE_TARGETS + 1)
+                    .filter(|&&k| self.s.fits_site(k, pc, n))
                     .filter_map(|&k| Some((k, self.s.callee(k)?)))
                     .collect();
                 let r = if argc == 2 && self.s.apply_fwd.as_ref().is_some_and(|f| f.contains(&pc)) {

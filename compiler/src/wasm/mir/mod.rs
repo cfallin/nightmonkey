@@ -162,6 +162,13 @@ pub fn translate_script(
         Ok(l) => l,
         Err(reason) => return Ok(Err(reason)),
     };
+    // A lowering bug (a value used where its definition does not
+    // dominate) shows here, not at module serialization.
+    if ctx.opts.strict_coverage || ctx.opts.mir_stress > 0 {
+        if let Err(e) = lowered.body.validate() {
+            return Err(format!("mir: sid#{sid}: lowered body is not valid SSA: {e}"));
+        }
+    }
     let params: usize = lowered.body.blocks.values().map(|b| b.params.len()).sum();
     let edge_args: usize = lowered
         .body
