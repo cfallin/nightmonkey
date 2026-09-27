@@ -35,7 +35,7 @@ pub(super) const VAL_GCTHING_TAG_MIN: u32 = 0xFFFF_FF86;
 // unrelated fields there.
 
 pub(crate) const SHAPE_OFFSET: u32 = 0;
-pub(super) const OBJ_CLASS_IDX_OFFSET: u32 = 4;
+pub(crate) const OBJ_CLASS_IDX_OFFSET: u32 = 4;
 pub(super) const OBJ_SLOTS_OFFSET: u32 = 8;
 pub(crate) const OBJ_ELEMENTS_OFFSET: u32 = 12;
 pub(crate) const FIXED_SLOTS_BASE: u32 = 16;
@@ -63,7 +63,7 @@ pub(super) const NATIVE_SLOTS_OFFSET: u32 = 8;
 /// shifted down 16, for the arms that load only the half they test.
 pub(super) const OBJ_CLASS_FLAGS_OFFSET: u32 = 6;
 pub(crate) const CLASS_WORD_SHALLOW: u32 = 0x0001_0000;
-pub(super) const CLASS_WORD_SLOTS: u32 = 0x0002_0000;
+pub(crate) const CLASS_WORD_SLOTS: u32 = 0x0002_0000;
 /// The predicted VALUE RANGES of the layout's masked fields hold. Unlike
 /// TYPES -- whose engine-wide claim is only numberness, with the finer mask
 /// re-checked at every load -- this one is consumed checklessly, so it gets a

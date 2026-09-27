@@ -134,3 +134,22 @@ function nest(n) {
 }
 assertEq(nest(3), 9000000);
 assertEq(nest(60), 3132900000000);
+
+// Int32 adds whose result only reaches ToInt32 wrap instead of exiting.
+function wrapAdd(a, b) { return (a + b) | 0; }
+assertEq(wrapAdd(2147483647, 1), -2147483648);
+assertEq(wrapAdd(-2147483648, -1), 2147483647);
+assertEq(wrapAdd(1, 2), 3);
+function wrapChain(a, b, c) { return (a + b - c) & 0xffff; }
+assertEq(wrapChain(2147483647, 2147483647, -5), 3);
+function wrapLoop(n) {
+  var h = 0;
+  for (var i = 0; i < n; i++) h = (h * 31 | 0) + i | 0;
+  return h;
+}
+assertEq(wrapLoop(1000), 562641396);
+// A sum also used untruncated must not wrap.
+function both(a, b) { var s = a + b; return [s | 0, s]; }
+assertEq(String(both(2147483647, 1)), "-2147483648,2147483648");
+function shifted(a, b) { return (a + b) >>> 0; }
+assertEq(shifted(2147483647, 1), 2147483648);

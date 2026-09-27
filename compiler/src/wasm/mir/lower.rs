@@ -50,8 +50,10 @@ use crate::wasm::baseline::layout::{
 };
 use crate::wasm::bbv::abi::{
     BINOP_BITAND, BINOP_BITNOT, BINOP_BITOR, BINOP_BITXOR, BINOP_DEC, BINOP_DIV, BINOP_INC,
-    BINOP_LSH, BINOP_MOD, BINOP_MUL, BINOP_RSH, BINOP_SUB, BINOP_URSH, CMP_EQ, CMP_GE, CMP_GT,
-    CMP_LE, CMP_LT, CMP_NE, CMP_STRICTEQ, CMP_STRICTNE, FLAGS_ALL,
+    BINOP_LSH, BINOP_MOD, BINOP_MUL, BINOP_RSH, BINOP_SUB, BINOP_URSH, CLASS_WORD_SHALLOW,
+    CLASS_WORD_SLOTS, CMP_EQ, CMP_GE, CMP_GT, CMP_LE, CMP_LT, CMP_NE, CMP_STRICTEQ, CMP_STRICTNE,
+    ELEMENTS_INITLEN_BACK, FIXED_SLOTS_BASE, FLAGS_ALL, OBJ_CLASS_IDX_OFFSET, OBJ_ELEMENTS_OFFSET,
+    SHAPE_IMMUTABLE_FLAGS_OFFSET, SHAPE_IS_NATIVE_BIT, SHAPE_OFFSET,
 };
 use crate::wasm::translate::{
     AtomTable, Helpers, MAGIC_UNINITIALIZED_LEXICAL, TAG_BIGINT_HI, TAG_BOOLEAN, TAG_CLEAR,
@@ -153,9 +155,11 @@ struct Lower<'a> {
     carried: BTreeMap<mir::Block, Vec<mir::Value>>,
     /// The waffle value standing for each MIR value at the emission point.
     vmap: BTreeMap<mir::Value, Value>,
-    /// Where the rooting slots start, in bytes above `sp`: just past the
-    /// padded formals.
+    /// Where the rooting slots start, in bytes above `sp`: past the whole
+    /// baseline frame, at its deepest operand stack.
     root_base: u32,
+    /// The baseline frame's deepest operand stack.
+    max_depth: u32,
     baseline_calls: Vec<Value>,
     /// The stress mode's period (`Options::mir_stress`); 0 = off.
     stress: u32,
@@ -178,6 +182,7 @@ pub fn lower<'a>(
     atoms: &'a mut AtomTable,
     f: &'a mir::Func,
     layout: FrameLayout,
+    max_depth: u32,
     stress: u32,
 ) -> R<Lowered> {
     if layout.rebase_vp {
@@ -187,7 +192,10 @@ pub fn lower<'a>(
     let entry = body.entry;
     let p = |i: usize| body.blocks[entry].params[i].1;
     let (cx, sp, argc, retval_out, script_param, new_target) = (p(0), p(1), p(2), p(3), p(4), p(5));
-    let root_base = FrameLayout::ARGS + 8 * layout.nargs;
+    // Rooting slots and callee frames go above the whole baseline frame,
+    // which therefore always holds valid Values (a fresh entry initializes
+    // it): an exit can leave a dead slot as it is.
+    let root_base = layout.operand(max_depth);
     let mut l = Lower {
         h,
         f,
@@ -205,6 +213,7 @@ pub fn lower<'a>(
         carried: BTreeMap::new(),
         vmap: BTreeMap::new(),
         root_base,
+        max_depth,
         baseline_calls: vec![],
         stress,
         has_onramps: f.roots.iter().any(|r| r.kind != RootKind::Entry),
@@ -646,6 +655,24 @@ impl<'a> Lower<'a> {
             self.store_i64(self.sp, off, v);
             vals.push(v);
         }
+        // The rest of the baseline frame, as its prologue would set it: the
+        // GC traces it (it is below every `top` MIR publishes), and exits
+        // leave dead slots as they find them.
+        let l = self.layout;
+        let vp = self.sp;
+        for j in 0..l.nlocals {
+            self.store_i64(vp, l.local(j), undef);
+        }
+        for off in [l.env(), l.args_obj(), l.rval()] {
+            self.store_i64(vp, off, undef);
+        }
+        self.store_i64(vp, l.new_target(), self.new_target);
+        let zero = self.i64c(TAG_INT32 << 32);
+        self.store_i64(vp, l.resume(), zero);
+        self.store_i64(vp, l.backoff(), zero);
+        for k in 0..self.max_depth {
+            self.store_i64(vp, l.operand(k), undef);
+        }
         let params = self.f.blocks[root].params.clone();
         if params.len() != vals.len() {
             return Err("lowering: the entry root's params are not the frame".into());
@@ -686,6 +713,12 @@ impl<'a> Lower<'a> {
         vals.push(self.load_i64(vp, l.rval()));
         for k in 0..depth {
             vals.push(self.load_i64(vp, l.operand(k)));
+        }
+        // Baseline's operand slots above its current depth are stale; MIR's
+        // rooting `top` covers them, so make them valid.
+        let undef = self.i64c(UNDEF);
+        for k in depth..self.max_depth {
+            self.store_i64(vp, l.operand(k), undef);
         }
         if vals.len() != self.f.blocks[root].params.len() {
             return Err("lowering: an onramp root's params are not the frame".into());
@@ -762,6 +795,47 @@ impl<'a> Lower<'a> {
         s.into_iter().filter(|&v| is_managed(&self.ty(v))).collect()
     }
 
+    /// The managed values live across non-terminator `inst`: live after it,
+    /// other than its results.
+    fn live_after(&self, inst: mir::Inst) -> Vec<mir::Value> {
+        let f = self.f;
+        let b = f
+            .layout
+            .iter()
+            .copied()
+            .find(|&b| f.blocks[b].insts.contains(&inst))
+            .expect("inst in a block");
+        let mut live: BTreeSet<mir::Value> = BTreeSet::new();
+        for s in f.succs(b) {
+            if let Some(l) = self.live_in.get(&s) {
+                live.extend(l.iter().copied());
+            }
+        }
+        for &i in f.blocks[b].insts.iter().rev() {
+            if i == inst {
+                break;
+            }
+            let d = &f.insts[i];
+            for r in &d.results {
+                live.remove(r);
+            }
+            live.extend(d.args.iter().copied());
+            for e in &d.succs {
+                for a in &e.args {
+                    if let EdgeArg::Value(v) = a {
+                        live.insert(*v);
+                    }
+                }
+            }
+        }
+        for r in &f.insts[inst].results {
+            live.remove(r);
+        }
+        live.into_iter()
+            .filter(|&v| is_managed(&self.ty(v)))
+            .collect()
+    }
+
     /// Call may-GC helper `f(cx, top, args...)` with every value in `live`
     /// rooted, reloading them afterwards. Returns the helper's i32 status
     /// and the boxed result it wrote at `top`.
@@ -821,6 +895,7 @@ impl<'a> Lower<'a> {
                     ConstVal::Int32(n) => (TAG_INT32 << 32) | u64::from(n as u32),
                     ConstVal::Double(bits) => bits,
                     ConstVal::Uninitialized => (TAG_MAGIC << 32) | MAGIC_UNINITIALIZED_LEXICAL,
+                    ConstVal::Dead => UNDEF,
                 };
                 let v = self.i64c(bits);
                 self.def(inst, v);
@@ -988,7 +1063,18 @@ impl<'a> Lower<'a> {
                 } else {
                     ResumeMode::Throw
                 };
-                self.exit(ResumeWord { pc, mode }, &a, nargs, nlocals)?;
+                let dead: Vec<bool> = d
+                    .args
+                    .iter()
+                    .map(|&v| {
+                        matches!(
+                            self.f.values[v].def,
+                            mir::func::ValueDef::Result(i, _)
+                                if self.f.insts[i].op == Opcode::ConstVal(ConstVal::Dead)
+                        )
+                    })
+                    .collect();
+                self.exit(ResumeWord { pc, mode }, &a, &dead, nargs, nlocals)?;
             }
             Opcode::GuardUnbox(k) => {
                 let v = a[0];
@@ -1107,6 +1193,14 @@ impl<'a> Lower<'a> {
                 self.js_call(inst, self.h.set_property, &[a[0], at, a[1], sv], false)?;
             }
             Opcode::JsGetElem => {
+                // An in-bounds, non-hole dense element of a native object
+                // inline (as baseline does), taking `ok_clean`; everything
+                // else through the helper.
+                let slow = self.body.add_block();
+                let v = self.dense_element(a[0], a[1], slow);
+                let t = self.edge(inst, 0, &[v])?;
+                self.terminate(Terminator::Br { target: t });
+                self.cur = slow;
                 self.js_call(inst, self.h.get_element, &[a[0], a[1]], false)?;
             }
             Opcode::JsSetElem(strict) => {
@@ -1114,6 +1208,52 @@ impl<'a> Lower<'a> {
                 self.js_call(inst, self.h.set_element, &[a[0], a[1], a[2], sv], false)?;
             }
             Opcode::Call => self.js_call_op(inst, &a)?,
+            Opcode::GuardLayout { keys, types } => {
+                // The stamp word (`JSObject*+4`): identity is layout key + 1
+                // in the low 16 bits; TYPES is the SHALLOW bit (§4.3).
+                let w = self.load_i32(a[0], OBJ_CLASS_IDX_OFFSET);
+                let m = self.i32c(0xFFFF);
+                let id = self.bin(Operator::I32And, w, m, Type::I32);
+                let lo = self.i32c(keys.lo.get() + 1);
+                let mut ok = if keys.lo == keys.hi {
+                    self.bin(Operator::I32Eq, id, lo, Type::I32)
+                } else {
+                    let rel = self.bin(Operator::I32Sub, id, lo, Type::I32);
+                    let span = self.i32c(keys.hi.get() - keys.lo.get());
+                    self.bin(Operator::I32LeU, rel, span, Type::I32)
+                };
+                if types {
+                    let bit = self.i32c(CLASS_WORD_SHALLOW);
+                    let t = self.bin(Operator::I32And, w, bit, Type::I32);
+                    let z = self.i32c(0);
+                    let t = self.bin(Operator::I32Ne, t, z, Type::I32);
+                    ok = self.bin(Operator::I32And, ok, t, Type::I32);
+                }
+                self.guard(inst, ok, &[a[0]])?;
+            }
+            Opcode::LoadField(name) => self.field_op(inst, name, a[0], None)?,
+            Opcode::StoreField(name) => self.field_op(inst, name, a[0], Some(a[1]))?,
+            Opcode::JsBoxThis => {
+                self.js_call(inst, self.h.box_nonstrict_this, &[a[0]], false)?;
+            }
+            Opcode::JsBindGName(name) => {
+                let at = self.atom(name);
+                self.js_call(inst, self.h.bind_unqualified_gname, &[at], false)?;
+            }
+            Opcode::JsSetName(name, strict) => {
+                let at = self.atom(name);
+                let sv = self.i32c(u32::from(strict));
+                self.js_call(inst, self.h.set_name, &[a[0], at, a[1], sv], false)?;
+            }
+            Opcode::ConstStr(name) => {
+                // The atom's string, through the (may-GC) helper, with the
+                // values live past this instruction rooted.
+                let at = self.atom(name);
+                let live = self.live_after(inst);
+                let (_ok, r) = self.gc_call(self.h.string, &[at], &live)?;
+                let v = self.un(Operator::I32WrapI64, r, Type::I32);
+                self.def(inst, v);
+            }
             op => {
                 return Err(format!(
                     "lowering: {} is not lowered yet",
@@ -1219,6 +1359,110 @@ impl<'a> Lower<'a> {
         let e = self.edge(inst, 2, &[])?;
         self.cond_br(ok, t, e);
         Ok(())
+    }
+
+    /// `load_field`/`store_field` (§4.3): with the stamp's SLOTS bit set,
+    /// the field is in its predicted fixed slot, accessed directly (the
+    /// `ok_clean` edge). Otherwise the generic property helper does it,
+    /// staying in MIR (`ok_dirty`, or `err`). A store's value conforms to
+    /// the field's claim, a number over a number, so it needs no barriers
+    /// and keeps the stamp's TYPES bit.
+    fn field_op(
+        &mut self,
+        inst: mir::Inst,
+        name: mir::entity::AtomId,
+        obj: Value,
+        val: Option<Value>,
+    ) -> R<()> {
+        let recv_ty = self.ty(self.f.insts[inst].args[0]);
+        let keys = recv_ty
+            .obj_info()
+            .and_then(|o| o.layout)
+            .ok_or("lowering: a field op without a layout claim")?
+            .keys;
+        let slot = self
+            .mm
+            .layouts
+            .get(&keys.lo)
+            .and_then(|l| l.field(name))
+            .ok_or("lowering: a field op on an undescribed field")?
+            .0;
+        let off = FIXED_SLOTS_BASE + 8 * u32::try_from(slot).unwrap();
+        let w = self.load_i32(obj, OBJ_CLASS_IDX_OFFSET);
+        let bit = self.i32c(CLASS_WORD_SLOTS);
+        let slots = self.bin(Operator::I32And, w, bit, Type::I32);
+        let (fast, slow) = (self.body.add_block(), self.body.add_block());
+        self.cond_br(slots, Self::to(fast), Self::to(slow));
+
+        self.cur = fast;
+        let outs = match val {
+            None => vec![self.load_i64(obj, off)],
+            Some(v) => {
+                self.store_i64(obj, off, v);
+                vec![]
+            }
+        };
+        let t = self.edge(inst, 0, &outs)?;
+        self.terminate(Terminator::Br { target: t });
+
+        self.cur = slow;
+        let boxed = self.box_tagged(TAG_OBJECT, obj);
+        let at = self.atom(name);
+        let live = self.live_across(inst);
+        let (ok, r) = match val {
+            None => self.gc_call(self.h.get_property, &[boxed, at], &live)?,
+            Some(v) => {
+                let z = self.i32c(0);
+                self.gc_call(self.h.set_property, &[boxed, at, v, z], &live)?
+            }
+        };
+        let outs = if val.is_none() { vec![r] } else { vec![] };
+        let t = self.edge(inst, 1, &outs)?;
+        let e = self.edge(inst, 2, &[])?;
+        self.cond_br(ok, t, e);
+        Ok(())
+    }
+
+    /// Branch to `fail` unless `cond`.
+    fn check(&mut self, cond: Value, fail: Block) {
+        let cont = self.body.add_block();
+        self.cond_br(cond, Self::to(cont), Self::to(fail));
+        self.cur = cont;
+    }
+
+    /// Element `key` of `recv` (both boxed) when `recv` is a native object,
+    /// `key` an int32, and the element an initialized, non-hole dense one;
+    /// else branches to `fail`. Pure reads: a typed array's dense
+    /// initializedLength is 0, and a proxy fails the native check first.
+    fn dense_element(&mut self, recv: Value, key: Value, fail: Block) -> Value {
+        let tag = self.tag_of(recv);
+        let is_obj = self.tag_is(tag, TAG_OBJECT as u32);
+        let ktag = self.tag_of(key);
+        let is_int = self.tag_is(ktag, TAG_INT32 as u32);
+        let both = self.bin(Operator::I32And, is_obj, is_int, Type::I32);
+        self.check(both, fail);
+        let obj = self.un(Operator::I32WrapI64, recv, Type::I32);
+        let shape = self.load_i32(obj, SHAPE_OFFSET);
+        let flags = self.load_i32(shape, SHAPE_IMMUTABLE_FLAGS_OFFSET);
+        let bit = self.i32c(SHAPE_IS_NATIVE_BIT);
+        let native = self.bin(Operator::I32And, flags, bit, Type::I32);
+        self.check(native, fail);
+        let elements = self.load_i32(obj, OBJ_ELEMENTS_OFFSET);
+        let back = self.i32c(ELEMENTS_INITLEN_BACK);
+        let header = self.bin(Operator::I32Sub, elements, back, Type::I32);
+        let initlen = self.load_i32(header, 0);
+        let idx = self.un(Operator::I32WrapI64, key, Type::I32);
+        let in_bounds = self.bin(Operator::I32LtU, idx, initlen, Type::I32);
+        self.check(in_bounds, fail);
+        let eight = self.i32c(8);
+        let off = self.bin(Operator::I32Mul, idx, eight, Type::I32);
+        let addr = self.bin(Operator::I32Add, elements, off, Type::I32);
+        let v = self.load_i64(addr, 0);
+        let vtag = self.tag_of(v);
+        let hole = self.tag_is(vtag, TAG_MAGIC as u32);
+        let not_hole = self.un(Operator::I32Eqz, hole, Type::I32);
+        self.check(not_hole, fail);
+        v
     }
 
     /// The helpers' atom id for MIR atom `a`, as an i32 constant.
@@ -1332,18 +1576,33 @@ impl<'a> Lower<'a> {
     /// Write the baseline frame for `w` from an exit's operands (`this`,
     /// formals, locals, rval, stack; all boxed), then run the baseline body
     /// from there and return its result.
-    fn exit(&mut self, w: ResumeWord, ops: &[Value], nargs: u32, nlocals: u32) -> R<()> {
+    fn exit(
+        &mut self,
+        w: ResumeWord,
+        ops: &[Value],
+        dead: &[bool],
+        nargs: u32,
+        nlocals: u32,
+    ) -> R<()> {
         let fp = frame_parts(ops, nargs, nlocals).ok_or("lowering: malformed exit")?;
+        let dp = frame_parts(dead, nargs, nlocals).ok_or("lowering: malformed exit")?;
         let (sp, vp) = (self.sp, self.sp);
         let l = self.layout;
+        // A `dead` operand's slot keeps the frame's (valid) value.
         self.store_i64(sp, FrameLayout::THIS, *fp.this);
-        for (i, &v) in fp.args.iter().enumerate() {
-            self.store_i64(sp, l.arg(u32::try_from(i).unwrap()), v);
+        for (i, (&v, &d)) in fp.args.iter().zip(dp.args).enumerate() {
+            if !d {
+                self.store_i64(sp, l.arg(u32::try_from(i).unwrap()), v);
+            }
         }
-        for (j, &v) in fp.locals.iter().enumerate() {
-            self.store_i64(vp, l.local(u32::try_from(j).unwrap()), v);
+        for (j, (&v, &d)) in fp.locals.iter().zip(dp.locals).enumerate() {
+            if !d {
+                self.store_i64(vp, l.local(u32::try_from(j).unwrap()), v);
+            }
         }
-        self.store_i64(vp, l.rval(), *fp.rval);
+        if !*dp.rval {
+            self.store_i64(vp, l.rval(), *fp.rval);
+        }
         for (k, &v) in fp.stack.iter().enumerate() {
             self.store_i64(vp, l.operand(u32::try_from(k).unwrap()), v);
         }

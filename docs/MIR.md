@@ -522,13 +522,27 @@ exit pc, this, [args…], [locals…], rval, [stack…]   -- every operand : Val
      that baseline caller, which resumes itself. A JS frame therefore
      never uses more than three native frames.
 
-  MIR does not maintain a baseline frame while it runs. It uses the
-  NightStack only for GC rooting, above the caller-built
-  `[callee, this, args…]`, and only across may-GC ops. The exit writes
-  the whole frame at once.
+  MIR does not maintain a baseline frame's *contents* while it runs.
+  It uses the NightStack for GC rooting and for callee frames, and
+  places both *above* the whole baseline frame (past its deepest
+  operand stack). The frame itself stays a set of valid Values:
+  - a fresh entry initializes it as baseline's prologue would;
+  - an onramp entry finds it valid, and clears the operand slots above
+    the header's depth.
+
+  The GC can therefore trace it at any time. An exit writes only the
+  slots live at its pc; a dead one is passed as `const.val dead` and
+  keeps the frame's value (the liveness pruning below).
 - **Each exit lowers its own stores.** Values reloaded after rooting are
   different waffle values on different paths, so exit blocks are never
   shared across predecessors in waffle.
+- **Liveness pruning (implemented).** The builder computes the backward
+  liveness of `this`, the formals, the locals and the rval over the
+  bytecode. A slot dead at a block's entry takes no block param, and one
+  dead at an exit's pc goes as `const.val dead`. Without this, a
+  function with hundreds of locals has blocks × locals params and
+  exits × locals stores; Octane's mandreel ran the in-process compiler
+  out of memory.
 - **Reserved extensions:** a parent-frame chain (for inlining) and
   virtual-object recipes (for scalar replacement). v1's validator
   rejects both.
@@ -1143,6 +1157,15 @@ declines for everything else).
   - **The stress mode** is `--mir-stress N`. Every lowered guard also
     fails on every `N`th guard executed program-wide (a runtime counter,
     `night_runtime_mir_stress`).
+  - **The fixpoint, revised.** Within a run, an edge to a block not yet
+    entered goes through a trampoline that the block's entry fills in.
+    So a block's entry types join every forward edge of the same run,
+    and only a loop's back edges can call for another run. The first
+    version needed a run per forward block that widened, and failed to
+    converge on large functions.
+  - **Size.** Scripts over 32 KiB of bytecode stay in baseline. A MIR
+    script carries two bodies, and the gate keeps the batch's memory in
+    bounds.
   - **Gate met** (2026-09-26):
     - `--pipeline mir --strict-coverage` passes the full jit-test lane;
     - so does `--pipeline mir --mir-stress 3`;
@@ -1222,6 +1245,40 @@ the numbers call for it.
     `IsNullOrUndefined` as a `guard.tags` whose failure edge merges
     back.
   - The stress mode fails only guards whose failure exits.
+  - Also `js.box_this` (sloppy `this`), `const.str` (lowered through
+    the atom helper, with rooting at a non-terminator), `js.bindgname`
+    and `js.setname[.strict]` (global assignment), and switch statements
+    (`TableSwitch` as `switch`, plus `Case` and `Default`).
+  - **Guard-at-defs on results.** A generic element or property read,
+    or a call, has its result guarded to the analysis's claim
+    (`elem_sites`, `field_sites`, `call_types`). The op has happened, so
+    a failure exits at the *next* pc with the unguarded result on the
+    stack.
+  - A generic element read tries an in-bounds dense element inline.
+    The runtime's `get_element` helper gained the same arm.
+- **M4b, first part: typed property access.**
+  - A `GetProp` at a site with a `prop_sites` prediction becomes
+    `guard.unbox.obj`, then `guard.layout keys {types}`, then
+    `load_field`. It is guarded locally at every use; folding comes
+    next.
+  - The module's layouts are filled from those sites. A slot the
+    module does not describe is a `hole` (`Layout.fields` is
+    `Vec<Option<FieldDef>>`).
+  - `types` is asked for only where the claim is a number and the
+    site's receivers can carry the bit: TYPES maintains numberness only
+    (§4.6). An int32-only claim is then one `guard.unbox.i32` on the
+    loaded value.
+  - A `SetProp` of a number into a number-claimed field becomes
+    `store_field`. A number over a number needs no barriers and keeps
+    TYPES.
+  - The lowering tests SLOTS locally: the fixed slot on a hit
+    (`ok_clean`), the generic helper otherwise (`ok_dirty`).
+  - **Validator rule relaxed:** a field whose claim is `Val(⊤)` needs no
+    `types` on the receiver, since TYPES says nothing about it.
+- **Numeric demand, the simple case (from §10.6).** An int32 `Add`/`Sub`
+  whose result reaches only truncating ops (`|`, `&`, `^`, shifts, or
+  another such add) is `i32.*.wrap`: no overflow exit. The builder finds
+  them with a per-block stack simulation over the bytecode.
 
 **M5. Remaining v1 coverage**
 - Elements and typed arrays, including array stamping in the analysis.

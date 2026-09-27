@@ -32,6 +32,10 @@ pub enum ConstVal {
     /// The TDZ sentinel (`JS_UNINITIALIZED_LEXICAL`), a magic value: what an
     /// uninitialized `let`/`const` binding holds.
     Uninitialized,
+    /// Any valid value: an exit operand for a frame slot that is dead at
+    /// the exit's pc (§5.1's liveness pruning). The lowering leaves such a
+    /// slot as the frame already has it.
+    Dead,
 }
 
 /// The target of an unbox.
@@ -306,6 +310,15 @@ pub enum Opcode {
     JsGetElem,
     JsSetElem(bool),
     JsGetName(AtomId),
+    /// Sloppy-mode `this` that is not an object: the global `this` for
+    /// null/undefined, a wrapper object for a primitive.
+    JsBoxThis,
+    /// The binding object for an unqualified global assignment
+    /// (`BindUnqualifiedGName`).
+    JsBindGName(AtomId),
+    /// `env.name = v` for a global or name assignment (`SetGName`), strict
+    /// or sloppy.
+    JsSetName(AtomId, bool),
 
     // Objects.
     LoadField(AtomId),
@@ -410,8 +423,9 @@ impl Opcode {
             | StrCharCodeAt
             | InitField(_) => OK_FAIL.to_vec(),
             JsAdd | JsBinop(_) | JsUnop(_) | JsCompare(_) | JsToNumeric | JsGetProp(_)
-            | JsSetProp(..) | JsGetElem | JsSetElem(_) | LoadField(_) | StoreField(_) | Call
-            | CallDirect | Construct | CallNative(_) => CLEAN_DIRTY_ERR.to_vec(),
+            | JsSetProp(..) | JsGetElem | JsSetElem(_) | JsBoxThis | JsBindGName(_)
+            | JsSetName(..) | LoadField(_) | StoreField(_) | Call | CallDirect | Construct
+            | CallNative(_) => CLEAN_DIRTY_ERR.to_vec(),
             // No dynamic effect report: the kill is static, on `ok`.
             JsGetName(_) => OK_ERR.to_vec(),
             _ => vec![],
@@ -581,6 +595,7 @@ pub fn const_val_type(c: ConstVal) -> Type {
             StrInfo::TOP,
         )),
         ConstVal::Uninitialized => Type::val(TagSet::MAGIC),
+        ConstVal::Dead => Type::VAL_TOP,
     }
 }
 
@@ -1007,12 +1022,29 @@ pub fn signature(op: &Opcode, args: &[Type], m: &Module) -> SigResult {
             arity(args, 0)?;
             Sig::output(Type::VAL_TOP)
         }
+        JsBoxThis => {
+            arity(args, 1)?;
+            val(&args[0], "js.box_this")?;
+            Sig::output(Type::val(TagSet::OBJECT))
+        }
+        JsBindGName(_) => {
+            arity(args, 0)?;
+            Sig::output(Type::val(TagSet::OBJECT))
+        }
+        JsSetName(..) => {
+            arity(args, 2)?;
+            val(&args[0], "js.setname env")?;
+            val(&args[1], "js.setname value")?;
+            Sig::none()
+        }
 
         LoadField(name) => {
             arity(args, 1)?;
             let o = obj(&args[0], "load_field")?;
             let (c, claims) = field_claims(&o, *name, m, "load_field")?;
-            want(c.types, || {
+            // `types` backs a field's claim; a field claimed as `Val(⊤)`
+            // needs none.
+            want(c.types || claims.iter().all(Type::is_val_top), || {
                 "load_field: receiver's layout claim lacks `types`".into()
             })?;
             let mut t = claims[0];
@@ -1025,7 +1057,7 @@ pub fn signature(op: &Opcode, args: &[Type], m: &Module) -> SigResult {
             arity(args, 2)?;
             let o = obj(&args[0], "store_field")?;
             let (c, claims) = field_claims(&o, *name, m, "store_field")?;
-            want(c.types, || {
+            want(c.types || claims.iter().all(Type::is_val_top), || {
                 "store_field: receiver's layout claim lacks `types`".into()
             })?;
             for claim in &claims {
@@ -1057,7 +1089,9 @@ pub fn signature(op: &Opcode, args: &[Type], m: &Module) -> SigResult {
             let f = layout
                 .fields
                 .get(n as usize)
-                .ok_or("init_field: every field is already initialized")?;
+                .ok_or("init_field: every field is already initialized")?
+                .as_ref()
+                .ok_or("init_field: the next field is not described")?;
             want(f.name == *name, || {
                 format!(
                     "init_field: next field is {}, not {}",
@@ -1413,13 +1447,15 @@ pub fn effects(op: &Opcode, args: &[Type], m: &Module) -> Effects {
     let mut fx = Effects::PURE;
     match op {
         JsAdd | JsBinop(_) | JsUnop(_) | JsCompare(_) | JsToNumeric | JsGetProp(_)
-        | JsSetProp(..) | JsGetElem | JsSetElem(_) => {
+        | JsSetProp(..) | JsGetElem | JsSetElem(_) | JsBoxThis | JsBindGName(_) | JsSetName(..) => {
             return Effects::generic(FlagsEffect::Dynamic)
         }
         JsGetName(_) => return Effects::generic(FlagsEffect::Bits(FlagBits::ALL)),
         Call | CallDirect | Construct | CallNative(_) => {
             return Effects::generic(FlagsEffect::Callee)
         }
+        // The atom's string: its lowering calls a may-GC helper.
+        ConstStr(_) => fx.may_gc = true,
         LoadField(name) => {
             // SLOTS is tested locally; the IC arm may GC and reports dirt.
             fx.reads = vec![field_region(recv, *name)];
@@ -1498,11 +1534,11 @@ mod tests {
             LayoutKey::new(3),
             Layout {
                 fields: vec![
-                    FieldDef {
+                    Some(FieldDef {
                         name: x,
                         claim: Type::val(TagSet::INT32),
-                    },
-                    FieldDef {
+                    }),
+                    Some(FieldDef {
                         name: o,
                         claim: Type::Val(VSet::new(
                             TagSet::OBJECT,
@@ -1518,7 +1554,7 @@ mod tests {
                             },
                             StrInfo::TOP,
                         )),
-                    },
+                    }),
                 ],
                 elements: None,
             },

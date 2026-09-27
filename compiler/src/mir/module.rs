@@ -18,10 +18,11 @@ pub struct FieldDef {
     pub claim: Type,
 }
 
-/// A predicted instance layout. Field `i` is fixed slot `i`.
+/// A predicted instance layout. Field `i` is fixed slot `i`; a `None`
+/// is a slot the module does not describe (`hole` in the text format).
 #[derive(Clone, PartialEq, Eq, Debug, Default)]
 pub struct Layout {
-    pub fields: Vec<FieldDef>,
+    pub fields: Vec<Option<FieldDef>>,
     /// For array layouts: the class region the stamp proves, which names
     /// the `Elements`/`ArrayLength` alias regions of its accesses.
     pub elements: Option<RegionRoot>,
@@ -29,7 +30,10 @@ pub struct Layout {
 
 impl Layout {
     pub fn field(&self, name: AtomId) -> Option<(usize, &FieldDef)> {
-        self.fields.iter().enumerate().find(|(_, f)| f.name == name)
+        self.fields
+            .iter()
+            .enumerate()
+            .find_map(|(i, f)| f.as_ref().filter(|f| f.name == name).map(|f| (i, f)))
     }
 }
 

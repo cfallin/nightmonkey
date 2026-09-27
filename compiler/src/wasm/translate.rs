@@ -6250,9 +6250,17 @@ mod tests {
                     rebase_vp: false,
                 };
                 let mut atoms = AtomTable::new(Names::default());
-                let lowered =
-                    crate::wasm::mir::lower::lower(&mut m, helpers, &mm, &mut atoms, f, layout, 3)
-                        .unwrap_or_else(|e| panic!("{name}: {e}"));
+                let lowered = crate::wasm::mir::lower::lower(
+                    &mut m,
+                    helpers,
+                    &mm,
+                    &mut atoms,
+                    f,
+                    layout,
+                    f.frame.depths.values().copied().max().unwrap_or(0),
+                    3,
+                )
+                .unwrap_or_else(|e| panic!("{name}: {e}"));
                 let mut body = lowered.body;
                 // The exits' baseline body: the function itself stands in
                 // (same signature).

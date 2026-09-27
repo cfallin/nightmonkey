@@ -294,6 +294,21 @@ fn falls_through(op: JSOp) -> bool {
     )
 }
 
+/// Every op's successors, by pc: its branch targets, and the next pc if it
+/// falls through. (Exception edges are not included.)
+pub fn successors(script: &Script) -> BTreeMap<Pc, (JSOp, Vec<Pc>)> {
+    let ops = script.parser().visit(Collect { ops: vec![] }).ops;
+    ops.into_iter()
+        .map(|o| {
+            let mut succs = o.targets;
+            if falls_through(o.op) {
+                succs.push(o.pc + o.len);
+            }
+            (o.pc, (o.op, succs))
+        })
+        .collect()
+}
+
 /// The pcs that start a basic block: pc 0, every branch target, every
 /// catch/finally handler, and the fall-through of every op that branches.
 /// Computed over all ops, reachable or not.

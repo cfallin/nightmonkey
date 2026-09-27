@@ -1,0 +1,9 @@
+# jit-tests excluded only under `--pipeline mir` (NIGHT_OPTIONS), on top of
+# jit-test-excludes.txt and jit-test-excludes-baseline.txt.
+
+# GC-introspection artifact: the test relies on a local that is dead
+# (overwritten, never read again) still keeping its object alive across an
+# incremental GC. MIR roots only live values (its frame slots are
+# liveness-pruned, docs/MIR.md §5.1), as an optimizing JIT does; the
+# interpreter and baseline keep every local slot until it is overwritten.
+gc/compartment-revived-gc.js

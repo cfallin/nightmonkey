@@ -66,6 +66,7 @@ pub fn translate_script(
         atoms,
         &f,
         baseline::layout::FrameLayout::of(script),
+        baseline::layout::StackDepths::compute(script)?.max,
         ctx.opts.mir_stress,
     ) {
         Ok(l) => l,

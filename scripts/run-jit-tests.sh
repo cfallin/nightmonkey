@@ -8,7 +8,8 @@
 # test in-process and also skips tests/jit-test-excludes.txt; NIGHT_INPROCESS_OFF=1
 # runs the same shell with the tier off (the interpreter-only lane).
 # NIGHT_OPTIONS passes compiler flags; with `--pipeline baseline` or `mir` the
-# lane also skips tests/jit-test-excludes-baseline.txt.
+# lane also skips tests/jit-test-excludes-baseline.txt, and with `mir`
+# tests/jit-test-excludes-mir.txt.
 set -euo pipefail
 
 if [ $# -lt 1 ]; then
@@ -37,6 +38,10 @@ if [ "${NIGHT_INPROCESS_OFF:-0}" != 1 ]; then
   case " ${NIGHT_OPTIONS:-} " in
     *" --pipeline baseline "* | *" --pipeline mir "*)
       cat "$here/tests/jit-test-excludes-baseline.txt" >> "$combined" ;;
+  esac
+  case " ${NIGHT_OPTIONS:-} " in
+    *" --pipeline mir "*)
+      cat "$here/tests/jit-test-excludes-mir.txt" >> "$combined" ;;
   esac
 fi
 

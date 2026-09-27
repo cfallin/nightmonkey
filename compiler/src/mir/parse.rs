@@ -755,10 +755,14 @@ impl Parser {
                     self.expect_punct("{")?;
                     let mut fields = vec![];
                     while !self.eat_punct("}") {
-                        let name = self.atom()?;
-                        self.expect_punct(":")?;
-                        let claim = self.ty()?;
-                        fields.push(FieldDef { name, claim });
+                        if self.eat_word("hole") {
+                            fields.push(None);
+                        } else {
+                            let name = self.atom()?;
+                            self.expect_punct(":")?;
+                            let claim = self.ty()?;
+                            fields.push(Some(FieldDef { name, claim }));
+                        }
                         if !self.eat_punct(",") {
                             self.expect_punct("}")?;
                             break;
@@ -1142,6 +1146,7 @@ impl Parser {
                     "int32" => crate::mir::ops::ConstVal::Int32(self.int()?),
                     "double" => crate::mir::ops::ConstVal::Double(self.f64_bits()?),
                     "uninitialized" => crate::mir::ops::ConstVal::Uninitialized,
+                    "dead" => crate::mir::ops::ConstVal::Dead,
                     _ => return self.err(format!("bad const.val literal `{w}`")),
                 })
             }
@@ -1165,6 +1170,8 @@ impl Parser {
             JsTypeofEq(_) => JsTypeofEq(self.int()?),
             JsConstantStrictEq(_) => JsConstantStrictEq(self.int()?),
             JsGetName(_) => JsGetName(self.atom()?),
+            JsBindGName(_) => JsBindGName(self.atom()?),
+            JsSetName(_, strict) => JsSetName(self.atom()?, strict),
             LoadField(_) => LoadField(self.atom()?),
             StoreField(_) => StoreField(self.atom()?),
             InitField(_) => InitField(self.atom()?),
@@ -1406,6 +1413,10 @@ fn template(mn: &str) -> Option<Opcode> {
         JsSetElem(false),
         JsSetElem(true),
         JsGetName(placeholder_atom),
+        JsBoxThis,
+        JsBindGName(placeholder_atom),
+        JsSetName(placeholder_atom, false),
+        JsSetName(placeholder_atom, true),
         LoadField(placeholder_atom),
         StoreField(placeholder_atom),
         InitField(placeholder_atom),

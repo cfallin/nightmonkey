@@ -73,7 +73,7 @@ pub fn atom_str(s: &JsString) -> String {
 
 /// Words the parser gives meaning in an atom's position.
 fn is_reserved_word(s: &str) -> bool {
-    matches!(s, "types")
+    matches!(s, "types" | "hole")
 }
 
 pub fn tags_str(t: TagSet) -> String {
@@ -352,6 +352,10 @@ pub fn mnemonic(op: &Opcode) -> String {
         JsSetElem(false) => "js.setelem".into(),
         JsSetElem(true) => "js.setelem.strict".into(),
         JsGetName(_) => "js.getname".into(),
+        JsBoxThis => "js.box_this".into(),
+        JsBindGName(_) => "js.bindgname".into(),
+        JsSetName(_, false) => "js.setname".into(),
+        JsSetName(_, true) => "js.setname.strict".into(),
         LoadField(_) => "load_field".into(),
         StoreField(_) => "store_field".into(),
         InitField(_) => "init_field".into(),
@@ -392,6 +396,7 @@ fn immediates(m: &Module, op: &Opcode) -> Option<String> {
             crate::mir::ops::ConstVal::Int32(n) => format!("int32 {n}"),
             crate::mir::ops::ConstVal::Double(bits) => format!("double {}", f64_str(*bits)),
             crate::mir::ops::ConstVal::Uninitialized => "uninitialized".into(),
+            crate::mir::ops::ConstVal::Dead => "dead".into(),
         },
         JsTypeofEq(k) => k.to_string(),
         JsConstantStrictEq(k) => k.to_string(),
@@ -403,6 +408,8 @@ fn immediates(m: &Module, op: &Opcode) -> Option<String> {
         | JsGetProp(a)
         | JsSetProp(a, _)
         | JsGetName(a)
+        | JsBindGName(a)
+        | JsSetName(a, _)
         | LoadField(a)
         | StoreField(a)
         | InitField(a) => atom(Some(m), *a),
@@ -470,12 +477,13 @@ pub fn print_module(m: &Module) -> String {
             let fields: Vec<_> = l
                 .fields
                 .iter()
-                .map(|f| {
-                    format!(
+                .map(|f| match f {
+                    Some(f) => format!(
                         "{}: {}",
                         atom(Some(m), f.name),
                         type_str_in(Some(m), &f.claim)
-                    )
+                    ),
+                    None => "hole".into(),
                 })
                 .collect();
             if fields.is_empty() {

@@ -74,6 +74,11 @@ struct Verifier<'a> {
     rpo_index: BTreeMap<Block, usize>,
     /// Immediate dominators; roots map to `None` (the virtual root).
     idom: BTreeMap<Block, Option<Block>>,
+    /// Pre/post numbers of each block in the dominator tree, for O(1)
+    /// dominance queries.
+    dom_num: BTreeMap<Block, (u32, u32)>,
+    /// Where each instruction sits: its block and position.
+    inst_pos: BTreeMap<Inst, (Block, usize)>,
     sigs: EntityMap<Inst, Option<Sig>>,
     live_in: BTreeMap<Block, BTreeSet<Value>>,
 }
@@ -333,17 +338,46 @@ impl<'a> Verifier<'a> {
             .into_iter()
             .filter_map(|(b, d)| d.map(|d| (b, d)))
             .collect();
+        // Number the dominator tree (children of the virtual root are the
+        // roots) so that `a` dominates `b` iff `b`'s interval nests in
+        // `a`'s.
+        let mut children: BTreeMap<Option<Block>, Vec<Block>> = BTreeMap::new();
+        for (&b, &d) in &self.idom {
+            children.entry(d).or_default().push(b);
+        }
+        let mut n = 0u32;
+        let mut stack: Vec<(Block, bool)> = children
+            .get(&None)
+            .map(|c| c.iter().rev().map(|&b| (b, false)).collect())
+            .unwrap_or_default();
+        let mut pre: BTreeMap<Block, u32> = BTreeMap::new();
+        while let Some((b, done)) = stack.pop() {
+            if done {
+                self.dom_num.insert(b, (pre[&b], n));
+                n += 1;
+                continue;
+            }
+            pre.insert(b, n);
+            n += 1;
+            stack.push((b, true));
+            if let Some(c) = children.get(&Some(b)) {
+                stack.extend(c.iter().rev().map(|&c| (c, false)));
+            }
+        }
+        for (b, bd) in f.blocks.iter() {
+            if self.reachable(b) {
+                for (i, &inst) in bd.insts.iter().enumerate() {
+                    self.inst_pos.insert(inst, (b, i));
+                }
+            }
+        }
     }
 
     fn dominates(&self, a: Block, b: Block) -> bool {
-        let mut cur = Some(b);
-        while let Some(x) = cur {
-            if x == a {
-                return true;
-            }
-            cur = self.idom.get(&x).copied().flatten();
+        match (self.dom_num.get(&a), self.dom_num.get(&b)) {
+            (Some(&(apre, apost)), Some(&(bpre, bpost))) => apre <= bpre && bpost <= apost,
+            _ => false,
         }
-        false
     }
 
     fn reachable(&self, b: Block) -> bool {
@@ -354,11 +388,14 @@ impl<'a> Verifier<'a> {
     fn def_point(&self, v: Value) -> Option<(Block, isize)> {
         match self.f.values.get(v)?.def {
             ValueDef::Param(b, _) => Some((b, -1)),
-            ValueDef::Result(inst, _) => {
-                let b = self.inst_block[inst]?;
-                let pos = self.f.blocks[b].insts.iter().position(|&i| i == inst)?;
-                Some((b, pos as isize))
-            }
+            ValueDef::Result(inst, _) => match self.inst_pos.get(&inst) {
+                Some(&(b, pos)) => Some((b, pos as isize)),
+                None => {
+                    let b = self.inst_block[inst]?;
+                    let pos = self.f.blocks[b].insts.iter().position(|&i| i == inst)?;
+                    Some((b, pos as isize))
+                }
+            },
             ValueDef::Unused => None,
         }
     }
@@ -673,6 +710,12 @@ impl<'a> Verifier<'a> {
                 let arg_tys: Vec<Type> = d.args.iter().map(|&v| self.ty(v)).collect();
                 let fx = effects(&d.op, &arg_tys, self.m);
                 let site = d.op.kill_site(&fx);
+                if site == KillSite::None && !fx.may_gc {
+                    // Neither a fence nor a GC point: nothing to check
+                    // (and no need to build the live set's copy).
+                    self.step_back(inst, &mut live);
+                    continue;
+                }
                 let name = mnemonic(&d.op);
                 let across: Vec<Value> = live
                     .iter()
@@ -921,6 +964,8 @@ pub fn verify(m: &Module, f: &Func) -> Result<(), Vec<VerifyError>> {
         rpo: vec![],
         rpo_index: BTreeMap::new(),
         idom: BTreeMap::new(),
+        dom_num: BTreeMap::new(),
+        inst_pos: BTreeMap::new(),
         sigs: EntityMap::new(),
         live_in: BTreeMap::new(),
     };

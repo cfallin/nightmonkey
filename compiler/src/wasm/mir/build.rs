@@ -34,7 +34,9 @@ use crate::mir::func::{Edge, EdgeArg, FrameShape, LoopDecl, Root, RootKind};
 use crate::mir::ops::{
     ArithOp, BitOp, Cc, ConstVal, F64Op, JsBinop, JsCc, JsUnop, MathFn, NumRepr, Opcode, UnboxKind,
 };
-use crate::mir::types::{ObjInfo, ObjKind, TagSet, Type as MType};
+use crate::mir::types::{
+    KeyRange, LayoutClaim, LayoutState, ObjInfo, ObjKind, TagSet, Type as MType,
+};
 use crate::opsem::{PRIM_BIGINT, PRIM_INT32, PRIM_NULL, PRIM_UNDEFINED};
 use crate::wasm::baseline::layout::{self, FrameLayout, StackDepths};
 use crate::wasm::translate::TranslateCtx;
@@ -48,6 +50,10 @@ enum Ty {
     F64,
     Bool,
     Val(TagSet),
+    /// A local, formal or rval that is dead here (never read before it is
+    /// next written): no value, no block param. An exit passes it as
+    /// `const.val dead`.
+    Dead,
 }
 
 /// A number's raw representation, for arithmetic.
@@ -64,6 +70,7 @@ impl Ty {
             Ty::F64 => MType::F64_TOP,
             Ty::Bool => MType::Bool,
             Ty::Val(t) => MType::val(t),
+            Ty::Dead => unreachable!("a dead slot has no type"),
         }
     }
 
@@ -73,21 +80,23 @@ impl Ty {
             Ty::F64 => TagSet::NUMBER,
             Ty::Bool => TagSet::BOOLEAN,
             Ty::Val(t) => t,
+            Ty::Dead => TagSet::NONE,
         }
     }
 
     fn join(self, o: Ty) -> Ty {
         match (self, o) {
             (a, b) if a == b => a,
+            (Ty::Dead, x) | (x, Ty::Dead) => x,
             (Ty::I32, Ty::F64) | (Ty::F64, Ty::I32) => Ty::F64,
             (a, b) => Ty::Val(a.tags().union(b.tags())),
         }
     }
 
     /// Whether a value of type `self` can be passed where `o` is expected
-    /// (after `convert`).
+    /// (after `convert`). Anything fits a dead slot.
     fn fits(self, o: Ty) -> bool {
-        self.join(o) == o
+        o == Ty::Dead || (self != Ty::Dead && self.join(o) == o)
     }
 
     /// The raw number representation this type unboxes to without a
@@ -103,11 +112,42 @@ impl Ty {
     }
 }
 
+/// A property access the analysis predicts: the receiver's layouts
+/// `[lo, hi]`, whether the field's claim is backed by the stamp's TYPES
+/// bit (a number), and whether it is int32-only.
+#[derive(Clone, Copy, Debug)]
+struct TypedSite {
+    lo: u32,
+    hi: u32,
+    types: bool,
+    int32: bool,
+}
+
+impl TypedSite {
+    fn claim_ty(&self) -> MType {
+        if self.types {
+            MType::val(TagSet::NUMBER)
+        } else {
+            MType::VAL_TOP
+        }
+    }
+}
+
 /// A frame slot: the SSA value holding it now, and its type.
 #[derive(Clone, Copy, Debug)]
 struct Slot {
     v: mir::Value,
     ty: Ty,
+}
+
+impl Slot {
+    /// A dead slot (`Ty::Dead`): its value is never used.
+    fn dead() -> Slot {
+        Slot {
+            v: mir::Value::from_u32(u32::MAX),
+            ty: Ty::Dead,
+        }
+    }
 }
 
 /// Build the MIR body for `script`, or decline with a reason.
@@ -119,6 +159,17 @@ pub fn build(
 ) -> Result<(mir::Module, mir::Func), String> {
     if is_global {
         return Err("global script".into());
+    }
+    // A MIR script carries two bodies (MIR and baseline), and MIR bodies
+    // are larger than baseline's per bytecode byte (exit blocks, block
+    // params). An Emscripten-sized function would dominate the batch's
+    // memory and compile time for little gain, so it stays in baseline.
+    const MAX_MIR_BYTECODE: usize = 32 * 1024;
+    if script.bytecode.len() > MAX_MIR_BYTECODE {
+        return Err(format!(
+            "too large for MIR ({} bytecode bytes)",
+            script.bytecode.len()
+        ));
     }
     if script.is_generator_or_async {
         return Err("generator or async".into());
@@ -136,12 +187,14 @@ pub fn build(
     let depths = StackDepths::compute(script).map_err(|e| format!("stack depths ({e})"))?;
     let shape = Shape::of(ctx, sid, script, fl, depths)?;
     let mut table: BTreeMap<Pc, Vec<Ty>> = BTreeMap::new();
-    // Each run either reaches a fixpoint or widens some entry type, and
-    // there are finitely many widenings; the bound is a backstop.
-    for _ in 0..64 {
+    // Within a run, a block's entry types join every forward edge into it
+    // (`Run::pending`), so a run misses only what a loop's back edges
+    // bring. Each rerun widens some loop header's entry types, and there
+    // are finitely many widenings; the bound is a backstop.
+    for _ in 0..256 {
         let mut run = Run::new(&shape, &table);
         run.build()?;
-        if run.out == table {
+        if !run.widen {
             let mm = std::mem::take(&mut run.mm);
             return Ok((mm, run.finish()));
         }
@@ -162,6 +215,152 @@ struct Op {
     op: JSOp,
 }
 
+/// Backward liveness of the frame slots before the operand stack: `this`
+/// (always live: the caller's frame), formals, locals and rval, per pc.
+fn liveness(script: &Script, nargs: u32, nlocals: u32) -> BTreeMap<Pc, Vec<bool>> {
+    let n = (2 + nargs + nlocals) as usize;
+    let rval = n - 1;
+    let succs = layout::successors(script);
+    // Each op's (uses, defs) over slot indices.
+    let effect = |pc: Pc, op: JSOp| -> (Option<usize>, Option<usize>) {
+        let mut p = script.parser();
+        p.advance(usize::try_from(pc.get()).unwrap() + 1)
+            .expect("op in range");
+        match op {
+            JSOp::GetLocal => (
+                Some(1 + nargs as usize + p.next_uint24().unwrap() as usize),
+                None,
+            ),
+            JSOp::SetLocal | JSOp::InitLexical => (
+                None,
+                Some(1 + nargs as usize + p.next_uint24().unwrap() as usize),
+            ),
+            JSOp::GetArg => (Some(1 + usize::from(p.next_uint16().unwrap())), None),
+            JSOp::SetArg => (None, Some(1 + usize::from(p.next_uint16().unwrap()))),
+            JSOp::GetRval | JSOp::RetRval => (Some(rval), None),
+            JSOp::SetRval => (None, Some(rval)),
+            _ => (None, None),
+        }
+    };
+    let mut live: BTreeMap<Pc, Vec<bool>> = succs.keys().map(|&pc| (pc, vec![false; n])).collect();
+    let pcs: Vec<Pc> = succs.keys().copied().rev().collect();
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for &pc in &pcs {
+            let (op, ss) = &succs[&pc];
+            let mut l = vec![false; n];
+            for s in ss {
+                if let Some(ls) = live.get(s) {
+                    for (a, b) in l.iter_mut().zip(ls) {
+                        *a |= *b;
+                    }
+                }
+            }
+            let (u, d) = effect(pc, *op);
+            if let Some(d) = d.filter(|&d| d < n) {
+                l[d] = false;
+            }
+            if let Some(u) = u.filter(|&u| u < n) {
+                l[u] = true;
+            }
+            l[0] = true;
+            if live[&pc] != l {
+                live.insert(pc, l);
+                changed = true;
+            }
+        }
+    }
+    live
+}
+
+/// The `Add`/`Sub` ops whose result is consumed, directly on the operand
+/// stack within its basic block, only by truncating ops (ToInt32 of it)
+/// or by other such adds and subs. A sum of int32s, and of such sums, is
+/// exact as a double well within 2^53, and ToInt32 of it is the sum
+/// modulo 2^32: the int32 wrapping add. (Not `Mul`: a double product can
+/// round, which is what `Math.imul` is for.)
+fn int32_demand(script: &Script, ops: &[Op]) -> std::collections::BTreeSet<Pc> {
+    use std::collections::{BTreeMap, BTreeSet};
+    let leaders = layout::leaders(script);
+    // Per producer pc: its consumers' pcs, or `None` for a use the model
+    // does not follow (a stack shuffle, a block boundary, a second use).
+    let mut consumers: BTreeMap<Pc, Vec<Option<Pc>>> = BTreeMap::new();
+    let mut stack: Vec<Option<Pc>> = vec![];
+    for o in ops {
+        if leaders.contains(&o.pc) {
+            for p in stack.drain(..).flatten() {
+                consumers.entry(p).or_default().push(None);
+            }
+        }
+        let (Some(nuses), ndefs) = (o.op.nuses(), o.op.ndefs()) else {
+            for p in stack.drain(..).flatten() {
+                consumers.entry(p).or_default().push(None);
+            }
+            continue;
+        };
+        let nuses = nuses as usize;
+        let simple = !matches!(
+            o.op,
+            JSOp::Dup | JSOp::Dup2 | JSOp::DupAt | JSOp::Swap | JSOp::Pick | JSOp::Unpick
+        );
+        if stack.len() < nuses {
+            // Entered mid-stack (after a leader): the unknown values below.
+            let missing = nuses - stack.len();
+            stack.splice(0..0, std::iter::repeat_n(None, missing));
+        }
+        for p in stack.drain(stack.len() - nuses..).flatten() {
+            consumers
+                .entry(p)
+                .or_default()
+                .push(if simple { Some(o.pc) } else { None });
+        }
+        for _ in 0..ndefs {
+            stack.push(if ndefs == 1 && simple {
+                Some(o.pc)
+            } else {
+                None
+            });
+        }
+    }
+    for p in stack.drain(..).flatten() {
+        consumers.entry(p).or_default().push(None);
+    }
+    let op_at: BTreeMap<Pc, JSOp> = ops.iter().map(|o| (o.pc, o.op)).collect();
+    let truncating = |op: JSOp| {
+        matches!(
+            op,
+            JSOp::BitOr
+                | JSOp::BitAnd
+                | JSOp::BitXor
+                | JSOp::Lsh
+                | JSOp::Rsh
+                | JSOp::Ursh
+                | JSOp::BitNot
+        )
+    };
+    let mut ok: BTreeSet<Pc> = BTreeSet::new();
+    // Consumers come after producers: walk backward so a consuming add's
+    // verdict is known first.
+    for o in ops.iter().rev() {
+        if !matches!(o.op, JSOp::Add | JSOp::Sub) {
+            continue;
+        }
+        let Some(cs) = consumers.get(&o.pc) else {
+            continue;
+        };
+        let all = !cs.is_empty()
+            && cs.iter().all(|c| match c {
+                Some(c) => truncating(op_at[c]) || ok.contains(c),
+                None => false,
+            });
+        if all {
+            ok.insert(o.pc);
+        }
+    }
+    ok
+}
+
 /// What the runs share: the script's decoded shape.
 struct Shape<'a> {
     ctx: &'a TranslateCtx<'a>,
@@ -174,6 +373,14 @@ struct Shape<'a> {
     leaders: std::collections::BTreeSet<Pc>,
     /// Loop intervals `[header, end)`.
     loops: BTreeMap<Pc, Pc>,
+    /// Per pc, which of the frame's first `frame_len` slots (`this`,
+    /// formals, locals, rval) are live on entry to the op there: read
+    /// before they are next written, on some path.
+    live: BTreeMap<Pc, Vec<bool>>,
+    /// The `Add`/`Sub` ops whose result only ever reaches ToInt32 (`|`,
+    /// `&`, `^`, shifts, or another such add or sub): their int32 form can
+    /// wrap instead of checking for overflow (§10.6's numeric demand).
+    wrap_ok: std::collections::BTreeSet<Pc>,
 }
 
 impl<'a> Shape<'a> {
@@ -200,6 +407,8 @@ impl<'a> Shape<'a> {
             .into_iter()
             .map(|(h, e)| (Pc::new(h), Pc::new(e)))
             .collect();
+        let live = liveness(script, fl.nargs, fl.nlocals);
+        let wrap_ok = int32_demand(script, &ops);
         Ok(Shape {
             ctx,
             sid,
@@ -210,6 +419,8 @@ impl<'a> Shape<'a> {
             ops,
             leaders: layout::leaders(script),
             loops,
+            live,
+            wrap_ok,
         })
     }
 
@@ -265,6 +476,16 @@ struct Run<'s, 'a> {
     mm: mir::Module,
     blocks: BTreeMap<Pc, mir::Block>,
     preheaders: BTreeMap<Pc, mir::Block>,
+    /// The entry types of every block entered so far this run.
+    entry_types: BTreeMap<Pc, Vec<Ty>>,
+    /// Edges to blocks not entered yet: a trampoline block per edge, with
+    /// the frame's types there and the edge's source pc. Entering the
+    /// block joins them into its entry types, then fills each trampoline
+    /// with the conversions and the jump.
+    pending: BTreeMap<Pc, Vec<(mir::Block, Vec<Ty>, Option<Pc>)>>,
+    /// Whether a back edge brought types wider than its loop header's: the
+    /// run is not the last.
+    widen: bool,
     cur: mir::Block,
     /// Whether `cur` is open.
     live: bool,
@@ -295,6 +516,9 @@ impl<'s, 'a> Run<'s, 'a> {
             mm: mir::Module::default(),
             blocks: BTreeMap::new(),
             preheaders: BTreeMap::new(),
+            entry_types: BTreeMap::new(),
+            pending: BTreeMap::new(),
+            widen: false,
             cur,
             live: true,
             st: vec![],
@@ -446,17 +670,32 @@ impl<'s, 'a> Run<'s, 'a> {
 
     /// The frame `st` as exit operands at `pc`, all `Val(⊤)`, recording the
     /// stack depth there.
-    fn exit_operands(&mut self, st: &[Slot]) -> Vec<mir::Value> {
+    fn exit_operands(&mut self, pc: Pc, st: &[Slot]) -> Vec<mir::Value> {
         let depth = st.len() - self.frame_len();
         self.f
             .frame
             .depths
-            .insert(self.pc, u32::try_from(depth).unwrap());
-        st.iter().map(|&x| self.val_top(x)).collect()
+            .insert(pc, u32::try_from(depth).unwrap());
+        // A slot dead at the exit's pc goes as `const.val dead`: baseline
+        // never reads it before writing it, so the frame keeps whatever
+        // (valid) value it has.
+        let live = self.s.live.get(&pc).cloned();
+        let mut dead = None;
+        let mut ops = vec![];
+        for (i, &x) in st.iter().enumerate() {
+            let is_dead = x.ty == Ty::Dead || live.as_ref().is_some_and(|l| i < l.len() && !l[i]);
+            if is_dead {
+                let d = *dead.get_or_insert_with(|| self.const_val(ConstVal::Dead));
+                ops.push(d);
+            } else {
+                ops.push(self.val_top(x));
+            }
+        }
+        ops
     }
 
-    fn exit_op(&self, throw: bool) -> Opcode {
-        let (pc, nargs, nlocals) = (self.pc, self.s.nargs, self.s.nlocals);
+    fn exit_op(&self, pc: Pc, throw: bool) -> Opcode {
+        let (nargs, nlocals) = (self.s.nargs, self.s.nlocals);
         if throw {
             Opcode::ExitThrow { pc, nargs, nlocals }
         } else {
@@ -474,8 +713,8 @@ impl<'s, 'a> Run<'s, 'a> {
         let b = self.new_block();
         self.at(b);
         let pre = self.pre.clone();
-        let ops = self.exit_operands(&pre);
-        let op = self.exit_op(throw);
+        let ops = self.exit_operands(self.pc, &pre);
+        let op = self.exit_op(self.pc, throw);
         self.term(op, ops, vec![]);
         (self.cur, self.live) = saved;
         if throw {
@@ -484,6 +723,60 @@ impl<'s, 'a> Run<'s, 'a> {
             self.exit_blk = Some(b);
         }
         b
+    }
+
+    /// Guard-at-defs (§8) for the result of the op just built, on top of
+    /// the stack: guard it to the analysis's prediction `claim`. The op has
+    /// happened, so a failure exits at `next`, the successor pc, with the
+    /// result unguarded on the stack (§5.1's resume rule).
+    fn guard_result(&mut self, claim: crate::facts::Claim, next: Pc) {
+        let prims = claim.prims();
+        if claim.is_none() || claim.is_object() || prims.is_empty() {
+            return;
+        }
+        let (op, ty) = if prims.subset_of(PRIM_INT32) {
+            (Opcode::GuardUnbox(UnboxKind::I32), Ty::I32)
+        } else if prims.subset_of(crate::opsem::NUM) {
+            (Opcode::GuardUnbox(UnboxKind::F64Num), Ty::F64)
+        } else {
+            return;
+        };
+        let x = self.top();
+        if !matches!(x.ty, Ty::Val(_)) {
+            return;
+        }
+        let depth = self.st.len() - self.frame_len();
+        if self.s.depths.at(next) != Some(u32::try_from(depth).unwrap()) {
+            return;
+        }
+        let st = self.st.clone();
+        let saved = (self.cur, self.live);
+        let fail = self.new_block();
+        self.at(fail);
+        let ops = self.exit_operands(next, &st);
+        let eop = self.exit_op(next, false);
+        self.term(eop, ops, vec![]);
+        (self.cur, self.live) = saved;
+        let ok = self.new_block();
+        let p = self.f.add_param(ok, ty.mir());
+        self.term(
+            op,
+            vec![x.v],
+            vec![
+                Edge {
+                    block: ok,
+                    args: vec![EdgeArg::Out(0)],
+                },
+                Self::goto(fail),
+            ],
+        );
+        self.at(ok);
+        self.st.pop();
+        self.push(p, ty);
+    }
+
+    fn site(&self, pc: Pc) -> crate::ids::Site {
+        crate::ids::Site::new(self.s.sid, pc)
     }
 
     /// A fallible check: continue on success with its output (of type
@@ -519,6 +812,79 @@ impl<'s, 'a> Run<'s, 'a> {
             crate::source::SourceObject::String(s) => Ok(self.mm.intern_atom(s.chars())),
             _ => Err(format!("name index {index} is not a string")),
         }
+    }
+
+    /// The analysis's layout prediction for the property access at `pc`
+    /// (`prop_sites`), with its field recorded in the module's layouts;
+    /// `None` without one, or when it disagrees with another site's
+    /// description of the same slot.
+    fn typed_site(&mut self, pc: Pc, name: mir::entity::AtomId) -> Option<TypedSite> {
+        let ps = self
+            .s
+            .ctx
+            .prop_sites_in
+            .get(&crate::ids::Site::new(self.s.sid, pc))?;
+        let prims = ps.claim.prims();
+        // TYPES maintains only numberness today (§4.6): a claim is a
+        // number claim, and only where the receivers can carry the bit.
+        let types = !ps.claim.is_none()
+            && ps.shallow_possible
+            && !prims.is_empty()
+            && prims.subset_of(crate::opsem::NUM);
+        let site = TypedSite {
+            lo: ps.layout_id,
+            hi: ps.hi_layout_id,
+            types,
+            int32: types && prims.subset_of(PRIM_INT32),
+        };
+        let claim = site.claim_ty();
+        let slot = usize::try_from(ps.slot).unwrap();
+        for k in site.lo..=site.hi {
+            let l = self
+                .mm
+                .layouts
+                .entry(crate::ids::LayoutKey::new(k))
+                .or_default();
+            if l.fields.len() <= slot {
+                l.fields.resize(slot + 1, None);
+            }
+            match &l.fields[slot] {
+                None => {
+                    l.fields[slot] = Some(mir::module::FieldDef { name, claim });
+                }
+                Some(f) if f.name == name && f.claim == claim => {}
+                Some(_) => return None,
+            }
+        }
+        Some(site)
+    }
+
+    /// Guard a receiver to an object of the site's layouts (§4.3): an
+    /// object tag test, then the stamp compare, both exiting at the op's
+    /// pc on failure.
+    fn guard_layout(&mut self, recv: Slot, site: &TypedSite) -> mir::Value {
+        let x = self.boxed(recv);
+        let o = self.guard(Opcode::GuardUnbox(UnboxKind::Obj), vec![x], MType::OBJ_TOP);
+        let keys = KeyRange {
+            lo: crate::ids::LayoutKey::new(site.lo),
+            hi: crate::ids::LayoutKey::new(site.hi),
+        };
+        let t = MType::Obj(ObjInfo {
+            layout: Some(LayoutClaim {
+                keys,
+                types: site.types,
+                state: LayoutState::Published,
+            }),
+            ..ObjInfo::TOP
+        });
+        self.guard(
+            Opcode::GuardLayout {
+                keys,
+                types: site.types,
+            },
+            vec![o],
+            t,
+        )
     }
 
     /// A generic op with a static kill (`ok`, `err`): the builder attaches
@@ -583,10 +949,10 @@ impl<'s, 'a> Run<'s, 'a> {
     /// for the entry root): a loop's preheader when the edge comes from
     /// outside the loop.
     fn block_for(&mut self, pc: Pc, from: Option<Pc>) -> Option<mir::Block> {
-        let tys = self.table.get(&pc)?.clone();
+        let tys = self.entry_types.get(&pc)?.clone();
         let make = |r: &mut Self| {
             let b = r.new_block();
-            for t in &tys {
+            for t in tys.iter().filter(|&&t| t != Ty::Dead) {
                 r.f.add_param(b, t.mir());
             }
             b
@@ -626,10 +992,12 @@ impl<'s, 'a> Run<'s, 'a> {
         Some(p)
     }
 
-    /// The edge from the current point (the op at `from`) to leader `to`,
-    /// converting the frame to its entry types. `None` when `to` has no
-    /// entry types yet, or narrower ones than the frame's: the run is then
-    /// not the last, and the edge is left out.
+    /// The edge from the current point (the op at `from`) to leader `to`.
+    /// - `to` not entered yet (a forward edge): a trampoline that `to`'s
+    ///   entry fills in.
+    /// - `to` entered (a loop's back edge): convert the frame to its entry
+    ///   types. `None` when they are narrower than the frame's: the run is
+    ///   then not the last (`widen`), and the edge is left out.
     fn edge_to(&mut self, to: Pc, from: Option<Pc>) -> Option<Edge> {
         let tys: Vec<Ty> = self.st.iter().map(|x| x.ty).collect();
         match self.out.get_mut(&to) {
@@ -642,8 +1010,23 @@ impl<'s, 'a> Run<'s, 'a> {
                 self.out.insert(to, tys.clone());
             }
         }
-        let want = self.table.get(&to)?.clone();
+        let Some(want) = self.entry_types.get(&to).cloned() else {
+            let t = self.new_block();
+            let args = self
+                .st
+                .clone()
+                .iter()
+                .filter(|x| x.ty != Ty::Dead)
+                .map(|x| {
+                    self.f.add_param(t, x.ty.mir());
+                    EdgeArg::Value(x.v)
+                })
+                .collect();
+            self.pending.entry(to).or_default().push((t, tys, from));
+            return Some(Edge { block: t, args });
+        };
         if want.len() != tys.len() || !tys.iter().zip(&want).all(|(a, b)| a.fits(*b)) {
+            self.widen = true;
             return None;
         }
         let block = self.block_for(to, from)?;
@@ -651,6 +1034,7 @@ impl<'s, 'a> Run<'s, 'a> {
         let args = st
             .iter()
             .zip(&want)
+            .filter(|(_, &t)| t != Ty::Dead)
             .map(|(&x, &t)| EdgeArg::Value(self.convert(x, t)))
             .collect();
         Some(Edge { block, args })
@@ -675,6 +1059,7 @@ impl<'s, 'a> Run<'s, 'a> {
     /// ToBoolean of `x` as a raw bool.
     fn truthy(&mut self, x: Slot) -> mir::Value {
         match x.ty {
+            Ty::Dead => unreachable!("a dead slot is never read"),
             Ty::Bool => x.v,
             Ty::I32 => {
                 let z = self.const_i32(0);
@@ -796,19 +1181,20 @@ impl<'s, 'a> Run<'s, 'a> {
                     let from = if i > 0 { Some(ops[i - 1].pc) } else { None };
                     self.jump_to(pc, from);
                 }
-                match self.table.get(&pc) {
-                    Some(tys) if self.s.depths.at(pc).is_some() => {
-                        let tys = tys.clone();
-                        let b = self.block_for(pc, Some(pc)).unwrap();
-                        let params = self.f.blocks[b].params.clone();
-                        self.st = params
-                            .iter()
-                            .zip(&tys)
-                            .map(|(&v, &ty)| Slot { v, ty })
-                            .collect();
-                        self.at(b);
-                    }
-                    _ => {}
+                if let Some(tys) = self.enter(pc) {
+                    let b = self.block_for(pc, Some(pc)).unwrap();
+                    let mut params = self.f.blocks[b].params.clone().into_iter();
+                    self.st = tys
+                        .iter()
+                        .map(|&ty| match ty {
+                            Ty::Dead => Slot::dead(),
+                            ty => Slot {
+                                v: params.next().unwrap(),
+                                ty,
+                            },
+                        })
+                        .collect();
+                    self.at(b);
                 }
             }
             if self.live {
@@ -861,7 +1247,7 @@ impl<'s, 'a> Run<'s, 'a> {
     /// success it enters the preheader; on failure it re-deopts at `h`
     /// with its own params.
     fn onramp_root(&mut self, h: Pc) {
-        let tys = self.table[&h].clone();
+        let tys = self.entry_types[&h].clone();
         let p = self.preheaders[&h];
         let o = self.new_block();
         self.f.roots.push(Root {
@@ -890,6 +1276,7 @@ impl<'s, 'a> Run<'s, 'a> {
         let mut args = vec![];
         for (&v, &t) in params.iter().zip(&tys) {
             let op = match t {
+                Ty::Dead => continue,
                 Ty::I32 => Some(Opcode::GuardUnbox(UnboxKind::I32)),
                 Ty::F64 => Some(Opcode::GuardUnbox(UnboxKind::F64Num)),
                 Ty::Bool => Some(Opcode::GuardUnbox(UnboxKind::Bool)),
@@ -917,6 +1304,65 @@ impl<'s, 'a> Run<'s, 'a> {
             args.push(EdgeArg::Value(out));
         }
         self.term(Opcode::Jump, vec![], vec![Edge { block: p, args }]);
+    }
+
+    /// Enter leader `pc`: its entry types are the table's (what back edges
+    /// brought in earlier runs) joined with every forward edge of this run.
+    /// Fills the pending trampolines. `None` if nothing reaches it.
+    fn enter(&mut self, pc: Pc) -> Option<Vec<Ty>> {
+        let pending = self.pending.remove(&pc).unwrap_or_default();
+        let mut tys = self.table.get(&pc).cloned();
+        for (_, t, _) in &pending {
+            tys = Some(match tys {
+                None => t.clone(),
+                Some(mut a) => {
+                    for (x, y) in a.iter_mut().zip(t) {
+                        *x = x.join(*y);
+                    }
+                    a
+                }
+            });
+        }
+        let mut tys = tys?;
+        self.s.depths.at(pc)?;
+        // Slots dead here take no param.
+        let live = &self.s.live[&pc];
+        for (t, &l) in tys.iter_mut().zip(live) {
+            if !l {
+                *t = Ty::Dead;
+            }
+        }
+        self.entry_types.insert(pc, tys.clone());
+        let saved = (self.cur, self.live);
+        for (t, ttys, from) in pending {
+            let target = self.block_for(pc, from).unwrap();
+            self.at(t);
+            let params = self.f.blocks[t].params.clone();
+            let mut params = params.into_iter();
+            let mut args = vec![];
+            for (&from_ty, &to_ty) in ttys.iter().zip(&tys) {
+                let v = if from_ty == Ty::Dead {
+                    None
+                } else {
+                    params.next()
+                };
+                if to_ty == Ty::Dead {
+                    continue;
+                }
+                let v = v.expect("a slot live at a block is live on each edge into it");
+                args.push(EdgeArg::Value(self.convert(Slot { v, ty: from_ty }, to_ty)));
+            }
+            self.term(
+                Opcode::Jump,
+                vec![],
+                vec![Edge {
+                    block: target,
+                    args,
+                }],
+            );
+        }
+        (self.cur, self.live) = saved;
+        Some(tys)
     }
 
     /// The entry root: callee, `this`, formals. Formals with a claim are
@@ -1105,6 +1551,14 @@ impl<'s, 'a> Run<'s, 'a> {
                     _ => ArithOp::Mul,
                 };
                 match (a.ty.num(), b.ty.num()) {
+                    (Some(Num::I32), Some(Num::I32))
+                        if arith != ArithOp::Mul && self.s.wrap_ok.contains(&pc) =>
+                    {
+                        // Only ToInt32 of the result is ever observed.
+                        let (x, y) = (self.as_i32(a), self.as_i32(b));
+                        let r = self.inst(Opcode::I32Wrap(arith), vec![x, y], Some(MType::I32_TOP));
+                        self.push(r, Ty::I32);
+                    }
                     (Some(Num::I32), Some(Num::I32)) => {
                         let (x, y) = (self.as_i32(a), self.as_i32(b));
                         let r = self.guard(Opcode::I32Ovf(arith), vec![x, y], MType::I32_TOP);
@@ -1356,9 +1810,199 @@ impl<'s, 'a> Run<'s, 'a> {
                 self.term(Opcode::Return, vec![v], vec![]);
             }
 
-            FunctionThis if self.s.script.strict => {
+            FunctionThis => {
                 let x = self.st[0];
-                self.st.push(x);
+                if self.s.script.strict || x.ty.tags().is_nonempty_subset_of(TagSet::OBJECT) {
+                    self.st.push(x);
+                } else {
+                    // Sloppy: an object `this` is itself; anything else is
+                    // boxed (null and undefined become the global `this`).
+                    let obj = TagSet::OBJECT;
+                    let (t, e, j) = (self.new_block(), self.new_block(), self.new_block());
+                    let p = self.f.add_param(t, MType::val(obj));
+                    let r = self.f.add_param(j, MType::val(obj));
+                    let v = self.boxed(x);
+                    self.term(
+                        Opcode::GuardTags(obj),
+                        vec![v],
+                        vec![
+                            Edge {
+                                block: t,
+                                args: vec![EdgeArg::Out(0)],
+                            },
+                            Self::goto(e),
+                        ],
+                    );
+                    self.at(t);
+                    self.term(
+                        Opcode::Jump,
+                        vec![],
+                        vec![Edge {
+                            block: j,
+                            args: vec![EdgeArg::Value(p)],
+                        }],
+                    );
+                    self.at(e);
+                    let b = self.js(Opcode::JsBoxThis, vec![v], MType::val(obj));
+                    self.term(
+                        Opcode::Jump,
+                        vec![],
+                        vec![Edge {
+                            block: j,
+                            args: vec![EdgeArg::Value(b)],
+                        }],
+                    );
+                    self.at(j);
+                    self.push(r, Ty::Val(obj));
+                }
+            }
+            String => {
+                let a = self.atom(p.next_uint32().unwrap())?;
+                let s = self.inst(
+                    Opcode::ConstStr(a),
+                    vec![],
+                    Some(MType::Str(mir::types::StrInfo { atom: Some(a) })),
+                );
+                let x = Slot {
+                    v: s,
+                    ty: Ty::Val(TagSet::STRING),
+                };
+                let t = mir::ops::box_type(&self.f.ty(s)).expect("strings box");
+                let v = self.inst(Opcode::Box, vec![x.v], Some(t));
+                let v = self.weaken(v, MType::val(TagSet::STRING));
+                self.push(v, Ty::Val(TagSet::STRING));
+            }
+            BindUnqualifiedGName => {
+                let a = self.atom(p.next_uint32().unwrap())?;
+                let r = self.js(Opcode::JsBindGName(a), vec![], MType::val(TagSet::OBJECT));
+                self.push(r, Ty::Val(TagSet::OBJECT));
+            }
+            SetGName | StrictSetGName => {
+                let a = self.atom(p.next_uint32().unwrap())?;
+                let v = self.pop();
+                let env = self.pop();
+                let (e, y) = (self.boxed(env), self.boxed(v));
+                self.js_void(Opcode::JsSetName(a, op == StrictSetGName), vec![e, y]);
+                self.st.push(v);
+            }
+            TableSwitch => {
+                let default_off = p.next_int32().unwrap();
+                let low = p.next_int32().unwrap();
+                let high = p.next_int32().unwrap();
+                let first = p.next_uint24().unwrap() as usize;
+                let x = self.pop();
+                let n = usize::try_from((i64::from(high) - i64::from(low) + 1).max(0)).unwrap();
+                let default = pc.branch(default_off);
+                let mut targets = vec![];
+                for k in 0..n {
+                    let t = *self
+                        .s
+                        .script
+                        .resume_offsets
+                        .get(first + k)
+                        .ok_or("TableSwitch resume index out of range")?;
+                    targets.push(t);
+                }
+                // An int32, or a double that is exactly one, selects a case;
+                // anything else takes the default.
+                let i = match x.ty {
+                    Ty::I32 => x.v,
+                    Ty::F64 | Ty::Val(_) => {
+                        let f = match x.ty {
+                            Ty::F64 => x.v,
+                            _ => {
+                                let d = self.new_block();
+                                let o = self.f.add_param(d, MType::F64_TOP);
+                                let Some(de) = self.edge_to(default, Some(pc)) else {
+                                    self.term(Opcode::Unreachable, vec![], vec![]);
+                                    return Ok(());
+                                };
+                                self.term(
+                                    Opcode::GuardUnbox(UnboxKind::F64Num),
+                                    vec![x.v],
+                                    vec![
+                                        Edge {
+                                            block: d,
+                                            args: vec![EdgeArg::Out(0)],
+                                        },
+                                        de,
+                                    ],
+                                );
+                                self.at(d);
+                                o
+                            }
+                        };
+                        // -0 selects case 0 as +0 does: `x + 0` is +0 for
+                        // either zero and `x` otherwise.
+                        let z = self.const_f64(0.0);
+                        let f = self.inst(
+                            Opcode::F64Arith(F64Op::Add),
+                            vec![f, z],
+                            Some(MType::F64_TOP),
+                        );
+                        let d = self.new_block();
+                        let o = self.f.add_param(d, MType::I32_TOP);
+                        let Some(de) = self.edge_to(default, Some(pc)) else {
+                            self.term(Opcode::Unreachable, vec![], vec![]);
+                            return Ok(());
+                        };
+                        self.term(
+                            Opcode::F64ToIntExact,
+                            vec![f],
+                            vec![
+                                Edge {
+                                    block: d,
+                                    args: vec![EdgeArg::Out(0)],
+                                },
+                                de,
+                            ],
+                        );
+                        self.at(d);
+                        o
+                    }
+                    Ty::Bool => {
+                        self.jump_to(default, Some(pc));
+                        return Ok(());
+                    }
+                    Ty::Dead => unreachable!("a dead slot is never read"),
+                };
+                let lo = self.const_i32(low);
+                let idx = self.inst(
+                    Opcode::I32Wrap(ArithOp::Sub),
+                    vec![i, lo],
+                    Some(MType::I32_TOP),
+                );
+                let mut edges = vec![];
+                for t in targets.into_iter().chain([default]) {
+                    match self.edge_to(t, Some(pc)) {
+                        Some(e) => edges.push(e),
+                        None => {
+                            self.term(Opcode::Unreachable, vec![], vec![]);
+                            return Ok(());
+                        }
+                    }
+                }
+                self.term(Opcode::Switch(u32::try_from(n).unwrap()), vec![idx], edges);
+            }
+            Case => {
+                // [lval, cond]: true pops both and jumps; false keeps lval.
+                let off = p.next_int32().unwrap();
+                let c = self.pop();
+                let t = self.truthy(c);
+                let (target, next) = (pc.branch(off), pc + op.len());
+                let ne = self.edge_to(next, Some(pc));
+                let lval = self.pop();
+                let te = self.edge_to(target, Some(pc));
+                self.st.push(lval);
+                match (te, ne) {
+                    (Some(te), Some(ne)) => self.term(Opcode::Br, vec![t], vec![te, ne]),
+                    _ => self.term(Opcode::Unreachable, vec![], vec![]),
+                }
+            }
+            Default => {
+                let off = p.next_int32().unwrap();
+                self.pop();
+                self.jump_to(pc.branch(off), Some(pc));
             }
             StrictConstantEq | StrictConstantNe => {
                 let operand = p.next_uint16().unwrap();
@@ -1410,9 +2054,60 @@ impl<'s, 'a> Run<'s, 'a> {
             GetProp => {
                 let a = self.atom(p.next_uint32().unwrap())?;
                 let recv = self.pop();
-                let x = self.boxed(recv);
-                let r = self.js(Opcode::JsGetProp(a), vec![x], MType::VAL_TOP);
-                self.push(r, Ty::Val(TagSet::ALL));
+                if let Some(site) = self.typed_site(pc, a) {
+                    // The predicted layout: guard the receiver's class
+                    // locally, then load the field (§4.3).
+                    let o = self.guard_layout(recv, &site);
+                    let claim = site.claim_ty();
+                    let r = self.js(Opcode::LoadField(a), vec![o], claim);
+                    if site.int32 {
+                        let v =
+                            self.guard(Opcode::GuardUnbox(UnboxKind::I32), vec![r], MType::I32_TOP);
+                        self.push(v, Ty::I32);
+                    } else {
+                        let tags = if site.types {
+                            TagSet::NUMBER
+                        } else {
+                            TagSet::ALL
+                        };
+                        self.push(r, Ty::Val(tags));
+                    }
+                } else {
+                    let x = self.boxed(recv);
+                    let r = self.js(Opcode::JsGetProp(a), vec![x], MType::VAL_TOP);
+                    self.push(r, Ty::Val(TagSet::ALL));
+                    let claim = self.s.ctx.facts.field_sites.get(&self.site(pc)).copied();
+                    self.guard_result(claim.unwrap_or_default(), pc + op.len());
+                }
+            }
+            SetProp | StrictSetProp
+                if {
+                    let v = self.top();
+                    v.ty.num().is_some()
+                } =>
+            {
+                let a = self.atom(p.next_uint32().unwrap())?;
+                match self.typed_site(pc, a).filter(|s| s.types) {
+                    Some(site) => {
+                        // A number into a field claimed as a number: the
+                        // store keeps the claim, so no conformance check,
+                        // and a number over a number needs no barriers.
+                        let v = self.pop();
+                        let recv = self.pop();
+                        let o = self.guard_layout(recv, &site);
+                        let x = self.boxed(v);
+                        let x = self.weaken(x, MType::val(TagSet::NUMBER));
+                        self.js_void(Opcode::StoreField(a), vec![o, x]);
+                        self.st.push(v);
+                    }
+                    None => {
+                        let v = self.pop();
+                        let recv = self.pop();
+                        let (x, y) = (self.boxed(recv), self.boxed(v));
+                        self.js_void(Opcode::JsSetProp(a, op == StrictSetProp), vec![x, y]);
+                        self.st.push(v);
+                    }
+                }
             }
             SetProp | StrictSetProp => {
                 let a = self.atom(p.next_uint32().unwrap())?;
@@ -1428,6 +2123,8 @@ impl<'s, 'a> Run<'s, 'a> {
                 let (x, k) = (self.boxed(recv), self.boxed(key));
                 let r = self.js(Opcode::JsGetElem, vec![x, k], MType::VAL_TOP);
                 self.push(r, Ty::Val(TagSet::ALL));
+                let claim = self.s.ctx.facts.elem_sites.get(&self.site(pc)).copied();
+                self.guard_result(claim.unwrap_or_default(), pc + op.len());
             }
             SetElem | StrictSetElem => {
                 let v = self.pop();
@@ -1444,6 +2141,8 @@ impl<'s, 'a> Run<'s, 'a> {
                 let vals: Vec<mir::Value> = operands.into_iter().map(|x| self.boxed(x)).collect();
                 let r = self.js(Opcode::Call, vals, MType::VAL_TOP);
                 self.push(r, Ty::Val(TagSet::ALL));
+                let claim = self.s.ctx.facts.call_types.get(&self.site(pc)).copied();
+                self.guard_result(claim.unwrap_or_default(), pc + op.len());
             }
 
             op => return Err(format!("{op:?}")),

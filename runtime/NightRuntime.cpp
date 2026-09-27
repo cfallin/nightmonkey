@@ -2908,6 +2908,25 @@ bool night_runtime_set_name(JSContext* cx, uint32_t top, uint64_t env,
 bool night_runtime_get_element(JSContext* cx, uint32_t top, uint64_t recv,
                                uint64_t key) {
   SetNightTop(cx, top);
+  // In-bounds, non-hole dense element of a native object: an own data
+  // property, so the read is the element itself. BBV and baseline inline
+  // this arm; the MIR tier's generic element read reaches it here.
+  {
+    JS::Value rv = JS::Value::fromRawBits(recv);
+    JS::Value kv = JS::Value::fromRawBits(key);
+    if (rv.isObject() && kv.isInt32() && kv.toInt32() >= 0 &&
+        rv.toObject().is<js::NativeObject>()) {
+      js::NativeObject* nobj = &rv.toObject().as<js::NativeObject>();
+      uint32_t idx = uint32_t(kv.toInt32());
+      if (idx < nobj->getDenseInitializedLength()) {
+        JS::Value v = nobj->getDenseElement(idx);
+        if (!v.isMagic(JS_ELEMENTS_HOLE)) {
+          WriteNightOut(top, v.asRawBits());
+          return true;
+        }
+      }
+    }
+  }
   // Typed-array fast path (pure: no GC, no user code): the inline dense arm
   // rejects typed arrays (their dense initializedLength is 0), so their
   // in-bounds int32-keyed reads land here.
