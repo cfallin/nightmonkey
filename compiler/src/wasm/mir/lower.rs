@@ -221,12 +221,14 @@ struct Lower<'a> {
     /// Where the rooting slots start, in bytes above `sp`: past baseline's
     /// fixed frame and locals, over its operand slots.
     root_base: u32,
-    /// With inlined callees (§5.5): the rooting area's size in slots (the
-    /// most managed values live anywhere), and per frame id its base and
-    /// end offsets from `sp` and its layout. Frame 0 is the function's;
-    /// its end is the rooting area's.
+    /// With inlined callees (§5.5): per frame id its base and end offsets
+    /// from `sp` and its layout. Frame 0 is the function's, ending at
+    /// `root_base`. An instruction's rooting slots start at its frame's
+    /// end (a helper's GC scan stops past them), except an `exit.inline`'s:
+    /// those go in the gap below its frame (`exit_gap`, from its parent's
+    /// end), which the frame's baseline body does not overwrite.
     inline: bool,
-    root_slots: u32,
+    exit_gap: Vec<u32>,
     frame_off: Vec<u32>,
     frame_end: Vec<u32>,
     frame_layouts: Vec<FrameLayout>,
@@ -338,7 +340,7 @@ pub fn lower<'a>(
         vmap: BTreeMap::new(),
         root_base,
         inline: !f.inline_frames.is_empty(),
-        root_slots: 0,
+        exit_gap: vec![0],
         frame_off: vec![0],
         frame_end: vec![root_base],
         frame_layouts: vec![layout],
@@ -893,7 +895,6 @@ impl<'a> Lower<'a> {
         let zero = self.i64c(TAG_INT32 << 32);
         self.store_i64(vp, l.resume(), zero);
         self.store_i64(vp, l.backoff(), zero);
-        self.init_root_area();
         if self.own_env {
             // Every slot is valid: the GC may run. Failing, the throw has
             // no handler (baseline's prologue: pc 0, depth 0).
@@ -958,7 +959,6 @@ impl<'a> Lower<'a> {
         for k in 0..depth {
             vals.push(self.load_i64(vp, l.operand(k)));
         }
-        self.init_root_area();
         if vals.len() != self.f.blocks[root].params.len() {
             return Err("lowering: an onramp root's params are not the frame".into());
         }
@@ -1097,64 +1097,55 @@ impl<'a> Lower<'a> {
     /// instruction's own inline frame (the rooting area, of fixed size,
     /// sits below every inline frame).
     fn top_off(&self, live: usize) -> u32 {
-        if self.inline {
-            self.frame_end[self.cur_frame as usize]
-        } else {
-            self.root_base + 8 * u32::try_from(live).unwrap()
-        }
+        self.frame_end[self.cur_frame as usize] + 8 * u32::try_from(live).unwrap()
     }
 
     /// Lay out the rooting area and the inline frames (§5.5). The area
-    /// holds at most the managed values live into a block plus those
-    /// defined in it; each inline frame sits at its parent's end.
+    /// holds the most managed values any instruction spills; each inline
+    /// frame sits at its parent's end.
     fn inline_layout(&mut self, reach: &BTreeSet<mir::Block>) {
         let f = self.f;
-        let mut r = 0usize;
+        // Each frame's gap: the most values one of its `exit.inline`s roots.
+        let mut gap = vec![0u32; f.inline_frames.len() + 1];
         for &b in &f.layout {
             if !reach.contains(&b) {
                 continue;
             }
-            let mut n = self.live_in[&b].iter().filter(|&&v| is_managed(&self.ty(v))).count();
-            n += f.blocks[b].params.iter().filter(|&&v| is_managed(&self.ty(v))).count();
-            for &inst in &f.blocks[b].insts {
-                n += f.insts[inst].results.iter().filter(|&&v| is_managed(&self.ty(v))).count();
+            for &i in &f.blocks[b].insts {
+                if matches!(f.insts[i].op, Opcode::ExitInline { .. }) {
+                    let fid = f.inst_frame[i] as usize;
+                    let n = u32::try_from(self.live_across(i).len()).unwrap();
+                    gap[fid] = gap[fid].max(n);
+                }
             }
-            r = r.max(n);
         }
-        self.root_slots = u32::try_from(r).unwrap();
-        self.frame_end[0] = self.root_base + 8 * self.root_slots;
-        for fr in &f.inline_frames {
+        for (j, fr) in f.inline_frames.iter().enumerate() {
             let lay = FrameLayout {
                 nargs: fr.shape.formals,
                 nlocals: fr.shape.locals,
                 rebase_vp: false,
             };
-            let off = self.frame_end[fr.parent as usize];
+            let below = self.frame_end[fr.parent as usize];
+            let off = below + 8 * gap[j + 1];
+            self.exit_gap.push(below);
             self.frame_off.push(off);
             self.frame_end.push(off + lay.top(fr.max_depth + 3));
             self.frame_layouts.push(lay);
         }
     }
 
-    /// Make the rooting area valid Values: with inline frames, helpers'
-    /// GC scan limit lies above it whatever is live.
-    fn init_root_area(&mut self) {
-        if !self.inline {
-            return;
-        }
-        let undef = self.i64c(UNDEF);
-        for i in 0..self.root_slots {
-            self.store_i64(self.vp, self.root_base + 8 * i, undef);
-        }
-    }
-
     /// Store `live` (managed values), boxed, to the rooting slots.
     fn spill(&mut self, live: &[mir::Value]) -> R<()> {
+        let base = self.frame_end[self.cur_frame as usize];
+        self.spill_at(base, live)
+    }
+
+    fn spill_at(&mut self, base: u32, live: &[mir::Value]) -> R<()> {
         for (i, &v) in live.iter().enumerate() {
             let t = self.ty(v);
             let w = self.get(v)?;
             let b = self.boxed(&t, w)?;
-            let off = self.root_base + 8 * u32::try_from(i).unwrap();
+            let off = base + 8 * u32::try_from(i).unwrap();
             self.store_i64(self.vp, off, b);
         }
         Ok(())
@@ -1162,9 +1153,14 @@ impl<'a> Lower<'a> {
 
     /// Reload `live` from the rooting slots (a GC may have moved them).
     fn reload(&mut self, live: &[mir::Value]) -> R<()> {
+        let base = self.frame_end[self.cur_frame as usize];
+        self.reload_at(base, live)
+    }
+
+    fn reload_at(&mut self, base: u32, live: &[mir::Value]) -> R<()> {
         for (i, &v) in live.iter().enumerate() {
             let t = self.ty(v);
-            let off = self.root_base + 8 * u32::try_from(i).unwrap();
+            let off = base + 8 * u32::try_from(i).unwrap();
             let raw = self.load_i64(self.vp, off);
             let w = self.unboxed_managed(&t, raw);
             self.vmap.insert(v, w);
@@ -3931,6 +3927,12 @@ impl<'a> Lower<'a> {
         for k in 0..max_depth + 3 {
             self.store_i64(sp, base + l.operand(k), undef);
         }
+        // The exit gap below the frame: scanned from here on.
+        let mut g = self.exit_gap[fid];
+        while g < base {
+            self.store_i64(sp, g, undef);
+            g += 8;
+        }
         Ok(())
     }
 
@@ -4019,7 +4021,8 @@ impl<'a> Lower<'a> {
         self.store_i64(sp, base + l.backoff(), backoff);
         // The call, rooted: the caller's managed values live across it.
         let live = self.live_across(inst);
-        self.spill(&live)?;
+        let gap = self.exit_gap[fid];
+        self.spill_at(gap, &live)?;
         let callee = self.load_i64(sp, base + FrameLayout::CALLEE);
         let (funcidx, script) = self.classify(callee);
         let off = self.i32c(u32::MAX);
@@ -4043,7 +4046,7 @@ impl<'a> Lower<'a> {
             tys,
         ));
         let err = self.push_val(ValueDef::PickOutput(call, 0, Type::I32));
-        self.reload(&live)?;
+        self.reload_at(gap, &live)?;
         let result = self.load_i64(sp, end);
         let ok = self.un(Operator::I32Eqz, err, Type::I32);
         let t = self.edge(inst, 0, &[result])?;

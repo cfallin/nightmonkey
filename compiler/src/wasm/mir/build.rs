@@ -205,6 +205,18 @@ fn numeric_layout(ctx: &crate::wasm::translate::TranslateCtx<'_>, k: u32) -> boo
 }
 
 impl<'a> Shape<'a> {
+    /// Whether nothing in the script catches or closes on a throw (only
+    /// loop notes; not a generator): baseline's landing for any throw is
+    /// its error return, which reads nothing of the frame.
+    fn throws_uncaught(&self) -> bool {
+        !self.script.is_generator_or_async
+            && self
+                .script
+                .try_notes
+                .iter()
+                .all(|t| t.kind == crate::bytecode::TryNoteKind::Loop)
+    }
+
     /// Callee `k` built for inlining here (§5.5), if it may be: an
     /// inline-eligible script that is not this one, not a constructor
     /// that stamps its `this`, and small enough once built.
@@ -1166,7 +1178,17 @@ impl<'s, 'a> Run<'s, 'a> {
         let b = self.new_block();
         self.at(b);
         let pre = self.pre.clone();
-        let ops = self.exit_operands(self.pc, &pre);
+        let ops = if throw && self.s.throws_uncaught() {
+            // Baseline's landing for it only returns the error: no state.
+            self.f
+                .frame
+                .depths
+                .insert(self.pc, u32::try_from(pre.len() - self.frame_len()).unwrap());
+            let d = self.const_val(ConstVal::Dead);
+            vec![d; pre.len()]
+        } else {
+            self.exit_operands(self.pc, &pre)
+        };
         let op = self.exit_op(self.pc, throw);
         self.term(op, ops, vec![]);
         (self.cur, self.live) = saved;
