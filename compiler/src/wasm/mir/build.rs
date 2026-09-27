@@ -614,7 +614,12 @@ impl<'a> Shape<'a> {
     }
 
     /// The entry type the analysis predicts for formal `i` (guard-at-defs).
+    /// A formal some call leaves out takes none: its `undefined` would
+    /// fail the entry guard on every such call.
     fn arg_claim(&self, i: u32) -> Ty {
+        if self.ctx.facts.omitted_formals.contains(&(self.sid, i)) {
+            return Ty::Val(TagSet::ALL);
+        }
         let claim = self
             .ctx
             .facts

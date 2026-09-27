@@ -397,6 +397,10 @@ pub struct LikelyFacts {
     /// side continues with the fact; a def whose type already implies
     /// the claim takes no guard and keeps the tighter type.
     pub arg_types: HashMap<(ScriptId, ArgIndex), Claim>,
+    /// (script, formal index from 0) pairs some analyzed call leaves out,
+    /// so the formal may read `undefined` whatever its `arg_types` claim:
+    /// that claim is then good at its uses, not at entry.
+    pub omitted_formals: HashSet<(ScriptId, u32)>,
     /// Per-formal VALUE class range (emitted layout-key space), the
     /// advisory sibling of `arg_types`: the entry ctx carries it as a
     /// `likely_cls` hint, unguarded; the first use that needs the identity

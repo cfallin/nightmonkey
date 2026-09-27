@@ -172,6 +172,18 @@ impl Solver<'_> {
             });
             self.engine.raise(dst, &v, at.user);
         }
+        // The formals the call leaves out read `undefined`. Recorded, not
+        // raised: without path sensitivity, `undefined` reaches the
+        // arithmetic its `== null` tests guard and marks the operands
+        // fractional (crypto's multipliers).
+        let passed = u32::try_from(args.len().saturating_sub(skip)).unwrap();
+        let nargs = match self.source.object(crate::source::SourceObjectId::new(f.get())) {
+            crate::source::SourceObject::Script(s) => u32::from(s.nargs),
+            _ => 0,
+        };
+        for i in passed..nargs {
+            self.omitted_formals.insert((f, i));
+        }
     }
 
     /// Bind `tk` into `f`'s receiver row at `cx`, unless the this-assertion

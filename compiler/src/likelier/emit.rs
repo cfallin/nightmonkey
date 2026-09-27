@@ -1768,6 +1768,7 @@ impl Solver<'_> {
         let mut facts = LikelyFacts::default();
         let mut caps = CapDrops::default();
         self.emit_value_claims(&mut facts);
+        facts.omitted_formals = self.omitted_formals.clone();
         let deleg = self.emit_call_sites(&mut facts, &mut caps);
         // The analysis half of the speculation trace (see `viz`).
         if let Some(mut out) = super::viz::stream(self.opts) {

@@ -48,3 +48,11 @@ function G(a, b) { gc(); this.s = a + b; }
 function mkG(v) { return new G(v, 1).s; }
 for (var i = 0; i < 30; i++) assertEq(mkG(i), i + 1);
 assertEq(mkG("z"), "z1");
+
+// A constructor some sites call with fewer arguments: the omitted formal
+// reads `undefined` (MIR does not guard it at entry).
+function V(name, init) { this.value = init || 0; this.name = name; }
+for (var i = 0; i < 100; i++) {
+  assertEq(new V("a", i).value, i);
+  assertEq(new V("b").value, 0);
+}

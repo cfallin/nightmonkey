@@ -123,6 +123,8 @@ pub struct Solver<'a> {
     /// Diagnostic counters for this run (see [`stats::Stats`]).
     pub stats: stats::Stats,
     pub escaped: calls::Escaped,
+    /// Formals some analyzed call leaves out (`facts::omitted_formals`).
+    pub omitted_formals: rustc_hash::FxHashSet<(ScriptId, u32)>,
     /// Receiver-kind census per property-read site: the least precise
     /// receiver the site was ever evaluated with.
     pub site_recv: HashMap<Site, RecvKind>,
@@ -294,6 +296,7 @@ impl<'a> Solver<'a> {
             ctxs: calls::Ctxs::new(),
             stats: stats::Stats::default(),
             escaped: calls::Escaped::default(),
+            omitted_formals: Default::default(),
             site_recv: HashMap::default(),
             site_calls: HashMap::default(),
             site_likely_calls: HashMap::default(),
