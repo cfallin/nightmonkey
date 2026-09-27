@@ -38,6 +38,8 @@ pub(crate) fn inline_eligible(ctx: &TranslateCtx, script: &Script) -> bool {
         && !script.is_class_ctor
         && !script.has_mapped_args
         && !baseline::layout::FrameLayout::of(script).rebase_vp
+        // No handler or close: `inline::splice` sends every throw straight
+        // to the call site.
         && script.try_notes.iter().all(|t| t.kind == TryNoteKind::Loop)
         // The actuals ops read the frame they run in, which for an inlined
         // copy is not the callee's (`ArgumentsLength` is not in
@@ -180,6 +182,11 @@ pub fn translate_script(
             f.roots.len(),
             f.inline_frames.len()
         );
+    }
+    if ctx.opts.diagnostics.opsize {
+        for (op, (n, vals)) in &lowered.opsize {
+            crate::diag_line!("night: mir opsize sid#{sid} {op} n {n} values {vals}");
+        }
     }
     Ok(Ok(Outcome::Compiled {
         sig: ctx.helpers.night_abi_sig2,

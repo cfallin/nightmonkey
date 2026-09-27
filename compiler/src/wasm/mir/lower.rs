@@ -104,6 +104,9 @@ pub struct Lowered {
     pub iof_cell_patches: Vec<(Value, u32)>,
     pub construct_cell_patches: Vec<(Value, u32)>,
     pub call_cell_patches: Vec<(Value, u32)>,
+    /// Per mnemonic: how many instructions, and the wasm values they
+    /// lowered to (`--dump-opsize`).
+    pub opsize: BTreeMap<String, (u32, u32)>,
 }
 
 /// The resume words `f`'s exits and throws carry: the set the baseline
@@ -248,6 +251,7 @@ struct Lower<'a> {
     construct_cell_patches: Vec<(Value, u32)>,
     /// Call value cell placeholders (bbv's per-site cell; 0: the trash row).
     call_cell_patches: Vec<(Value, u32)>,
+    opsize: BTreeMap<String, (u32, u32)>,
     /// The census helper, when exits are counted (`--mir-exit-census`).
     exit_census: Option<Func>,
     ctor_restamp: Option<[u32; 7]>,
@@ -350,6 +354,7 @@ pub fn lower<'a>(
         iof_cell_patches: vec![],
         construct_cell_patches: vec![],
         call_cell_patches: vec![],
+        opsize: BTreeMap::new(),
         exit_census: if o.exit_census { h.census } else { None },
         ctor_restamp: o.ctor_restamp,
         exit_hubs: BTreeMap::new(),
@@ -370,6 +375,7 @@ pub fn lower<'a>(
         iof_cell_patches: l.iof_cell_patches,
         construct_cell_patches: l.construct_cell_patches,
         call_cell_patches: l.call_cell_patches,
+        opsize: l.opsize,
     })
 }
 
@@ -763,7 +769,14 @@ impl<'a> Lower<'a> {
                 k += 1;
             }
             for &inst in &f.blocks[b].insts {
+                let before = self.body.values.len();
                 self.inst(inst)?;
+                let e = self
+                    .opsize
+                    .entry(mir::print::mnemonic(&f.insts[inst].op))
+                    .or_default();
+                e.0 += 1;
+                e.1 += u32::try_from(self.body.values.len() - before).unwrap();
             }
         }
         Ok(())

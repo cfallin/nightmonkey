@@ -4,8 +4,10 @@
 //! The callee keeps a real baseline-format frame (an inline frame), kept
 //! current by write-through, so each of its exits becomes an
 //! `exit.inline`: finish the callee in its baseline body, then continue
-//! the caller. Its `return`s become edges to the call's continuation, and
-//! its onramp roots are dropped (the copy is entered only at the call).
+//! the caller. Its throws, which nothing in it catches, go straight to the
+//! call's exception edge. Its `return`s become edges to the call's
+//! continuation, and its onramp roots are dropped (the copy is entered
+//! only at the call).
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -225,12 +227,11 @@ pub(crate) fn splice(
                     nlocals,
                     throw: false,
                 },
-                Opcode::ExitThrow { pc, nargs, nlocals } => Opcode::ExitInline {
-                    pc,
-                    nargs,
-                    nlocals,
-                    throw: true,
-                },
+                // No handler of an inline-eligible callee covers any pc
+                // (it has only loop notes) and its environment needs no
+                // unwinding, so its baseline body would only return the
+                // error: the exception propagates to the call site.
+                Opcode::ExitThrow { .. } => Opcode::Jump,
                 op => maps.op(op)?,
             };
             let tys: Vec<Type> = d
@@ -244,6 +245,7 @@ pub(crate) fn splice(
             }
             f.inst_frame[ni] = frame(kf.inst_frame[i]);
             f.witnesses[ni] = match op {
+                Opcode::Jump if matches!(d.op, Opcode::ExitThrow { .. }) => None,
                 // Finishing the callee may do anything.
                 Opcode::ExitInline { .. } => Some(mir::func::Witness {
                     may_kill: mir::types::KillPattern::ALL,
@@ -266,7 +268,11 @@ pub(crate) fn splice(
                 block: join,
                 args: vec![EdgeArg::Value(args[0])],
             }],
-            Opcode::Exit { .. } | Opcode::ExitThrow { .. } => vec![
+            Opcode::ExitThrow { .. } => vec![Edge {
+                block: err,
+                args: vec![],
+            }],
+            Opcode::Exit { .. } => vec![
                 Edge {
                     block: join,
                     args: vec![EdgeArg::Out(0)],
@@ -297,7 +303,11 @@ pub(crate) fn splice(
                 .collect::<Result<_, String>>()?,
         };
         let nd = &mut f.insts[ni];
-        nd.args = if d.op == Opcode::Return { vec![] } else { args };
+        nd.args = if matches!(d.op, Opcode::Return | Opcode::ExitThrow { .. }) {
+            vec![]
+        } else {
+            args
+        };
         nd.succs = succs;
     }
     for l in &kf.loops {
