@@ -16,6 +16,31 @@ use crate::mir::types::{is_subtype, Type};
 /// A guard's identity: its op (with its static params) and its operand.
 type GuardKey = (Opcode, Value);
 
+/// Whether edge `k` of terminator `t` is a fence that kills a component
+/// of `v`'s type.
+fn fence_kills(m: &Module, f: &Func, t: Inst, k: usize, v: Value) -> bool {
+    let d = &f.insts[t];
+    let tys: Vec<Type> = d.args.iter().map(|&a| f.values[a].ty).collect();
+    let fx = effects(&d.op, &tys, m);
+    let fence_role = match d.op.kill_site(&fx) {
+        KillSite::OkEdge => SuccRole::Ok,
+        KillSite::DirtyEdge => SuccRole::OkDirty,
+        KillSite::Op => return fx.kill.matches(&f.values[v].ty),
+        KillSite::None => return false,
+    };
+    let role = d.op.roles().get(k).copied();
+    (role == Some(fence_role) || role == Some(SuccRole::Err)) && fx.kill.matches(&f.values[v].ty)
+}
+
+/// A guard's operand up to unboxing: `unbox` is a pure function of its
+/// operand, so guards on two unboxings of one value are the same guard.
+fn canon(f: &Func, v: Value) -> Value {
+    match f.values[v].def {
+        ValueDef::Result(i, 0) if matches!(f.insts[i].op, Opcode::Unbox(_)) => f.insts[i].args[0],
+        _ => v,
+    }
+}
+
 fn is_guard(op: &Opcode) -> bool {
     matches!(
         op,
@@ -175,7 +200,7 @@ pub fn optimize(m: &Module, f: &mut Func) -> usize {
     let mut total = 0;
     loop {
         let n = fold_guards(m, f);
-        forward_params(f);
+        forward_params(m, f);
         total += n;
         if n == 0 {
             return total;
@@ -183,11 +208,14 @@ pub fn optimize(m: &Module, f: &mut Func) -> usize {
     }
 }
 
-/// Replace each param of a (non-root) block with a single predecessor
-/// edge by the value that edge passes, when it passes a value (not a
-/// terminator output). The value's type is at most the param's, so every
-/// use stays well-typed.
-pub fn forward_params(f: &mut Func) {
+/// Replace each param of a (non-root) block that every incoming edge
+/// passes the same value (or the param itself, around a loop) by that
+/// value, when it is a value (not a terminator output). The value's type
+/// is at most the param's, so every use stays well-typed. Not across a
+/// fence edge that kills a component of the value's type: that param is
+/// what weakens it (§5's fence rule). To a fixpoint: forwarding one param
+/// can make another redundant.
+pub fn forward_params(m: &Module, f: &mut Func) {
     let roots: BTreeSet<Block> = f.roots.iter().map(|r| r.block).collect();
     let mut incoming: BTreeMap<Block, Vec<(Inst, usize)>> = BTreeMap::new();
     for &b in &f.layout {
@@ -198,35 +226,78 @@ pub fn forward_params(f: &mut Func) {
         }
     }
     let mut subst: BTreeMap<Value, Value> = BTreeMap::new();
-    for &b in &f.layout {
-        if roots.contains(&b) {
-            continue;
+    let resolve = |subst: &BTreeMap<Value, Value>, mut v: Value| {
+        while let Some(&w) = subst.get(&v) {
+            v = w;
         }
-        let Some([(t, k)]) = incoming.get(&b).map(|v| v.as_slice()) else {
-            continue;
-        };
-        let (t, k) = (*t, *k);
-        let edge = f.insts[t].succs[k].clone();
-        let params = f.blocks[b].params.clone();
-        let mut keep_params = vec![];
-        let mut keep_args = vec![];
-        for (&p, &a) in params.iter().zip(&edge.args) {
-            match a {
-                EdgeArg::Value(v) if v != p => {
-                    subst.insert(p, v);
+        v
+    };
+    loop {
+        let mut changed = false;
+        for &b in &f.layout {
+            if roots.contains(&b) {
+                continue;
+            }
+            let Some(inc) = incoming.get(&b) else { continue };
+            let params = f.blocks[b].params.clone();
+            let mut drop = vec![];
+            for (n, &p) in params.iter().enumerate() {
+                let mut only: Option<Value> = None;
+                let mut ok = true;
+                for &(t, k) in inc {
+                    match f.insts[t].succs[k].args[n] {
+                        EdgeArg::Value(v) => {
+                            let v = resolve(&subst, v);
+                            if v == p {
+                                continue;
+                            }
+                            if fence_kills(m, f, t, k, v) {
+                                ok = false;
+                                break;
+                            }
+                            if only.is_some_and(|o| o != v) {
+                                ok = false;
+                                break;
+                            }
+                            only = Some(v);
+                        }
+                        _ => {
+                            ok = false;
+                            break;
+                        }
+                    }
                 }
-                a => {
-                    keep_params.push(p);
-                    keep_args.push(a);
+                if let (true, Some(v)) = (ok, only) {
+                    subst.insert(p, v);
+                    drop.push(n);
                 }
             }
-        }
-        if keep_params.len() != params.len() {
-            f.blocks[b].params = keep_params;
-            f.insts[t].succs[k].args = keep_args;
+            if drop.is_empty() {
+                continue;
+            }
+            changed = true;
+            let keep = |n: &usize| !drop.contains(n);
+            f.blocks[b].params = params
+                .iter()
+                .enumerate()
+                .filter(|(n, _)| keep(n))
+                .map(|(_, &p)| p)
+                .collect();
+            for &(t, k) in inc {
+                let args = std::mem::take(&mut f.insts[t].succs[k].args);
+                f.insts[t].succs[k].args = args
+                    .into_iter()
+                    .enumerate()
+                    .filter(|(n, _)| keep(n))
+                    .map(|(_, a)| a)
+                    .collect();
+            }
             for (n, &p) in f.blocks[b].params.clone().iter().enumerate() {
                 f.values[p].def = ValueDef::Param(b, n as u32);
             }
+        }
+        if !changed {
+            break;
         }
     }
     if subst.is_empty() {
@@ -313,7 +384,7 @@ pub fn fold_guards(m: &Module, f: &mut Func) -> usize {
                 }
                 if role == SuccRole::Ok && is_guard(&d.op) {
                     if let Some(v) = ok_output(f, e) {
-                        a.insert((d.op, d.args[0]), v);
+                        a.insert((d.op, canon(f, d.args[0])), v);
                     }
                 }
                 out.push((e.block, a));
@@ -379,15 +450,27 @@ pub fn fold_guards(m: &Module, f: &mut Func) -> usize {
             None => {
                 // A guard ends its block, so what reaches it is the
                 // block's entry set.
+                // The same guard, or one of its kind on the same value
+                // whose output implies this one's (a layout within the
+                // range guarded here).
                 let avail = avail_in.get(&b).cloned().flatten().unwrap_or_default();
-                match avail.get(&(d.op, x)) {
-                    Some(&v1) => {
-                        let db = def_block(f, v1, &inst_block);
-                        (db.is_some_and(|db| db != b && cfg.dominates(db, b)))
-                            .then(|| (None, v1, f.values[v1].ty))
-                    }
-                    None => None,
-                }
+                let cx = canon(f, x);
+                let mut hits: Vec<Value> = avail
+                    .iter()
+                    .filter(|((op, y), v1)| {
+                        *y == cx
+                            && (*op == d.op
+                                || (std::mem::discriminant(op) == std::mem::discriminant(&d.op)
+                                    && is_subtype(&f.values[**v1].ty, &want)))
+                    })
+                    .map(|(_, &v1)| v1)
+                    .collect();
+                hits.sort();
+                hits.into_iter().find_map(|v1| {
+                    let db = def_block(f, v1, &inst_block);
+                    (db.is_some_and(|db| db != b && cfg.dominates(db, b)))
+                        .then(|| (None, v1, f.values[v1].ty))
+                })
             }
         };
         let Some((unbox, v, vt)) = known else {

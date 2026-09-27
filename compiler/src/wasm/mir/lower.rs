@@ -51,7 +51,7 @@ use crate::wasm::baseline::layout::{
 use crate::wasm::bbv::abi::{
     BINOP_BITAND, BINOP_BITNOT, BINOP_BITOR, BINOP_BITXOR, BINOP_DEC, BINOP_DIV, BINOP_INC,
     BINOP_LSH, BINOP_MOD, BINOP_MUL, BINOP_RSH, BINOP_SUB, BINOP_URSH, CLASS_WORD_SHALLOW,
-    CLASS_WORD_RANGES, CLASS_WORD_SLOTS, EARLY_KEY_MAX, EARLY_KEY_SHIFT, IC_SET_ABSSLOT,
+    CLASS_WORD_RANGES, CLASS_WORD_SENTINEL, CLASS_WORD_SLOTS, EARLY_KEY_MAX, EARLY_KEY_SHIFT, IC_SET_ABSSLOT,
     IC_SET_RECVSHAPE, IC_SET_SLOTENC, IC_TRANS_ABSSLOT, IC_TRANS_INLINE_HOPS, IC_TRANS_NEWSHAPE,
     IC_TRANS_OLDSHAPE, IC_TRANS_PROTO0, IC_TRANS_PROTO_HOPS, IC_TRANS_PROTO_ROW_BYTES,
     IC_TRANS_ROW_OFF, IC_TRANS_SLOTOFF, BASESHAPE_PROTO_OFFSET, IOF_CELL_ADDR_PLACEHOLDER,
@@ -628,6 +628,33 @@ impl<'a> Lower<'a> {
     }
 
     /// Blocks reachable from a root.
+    /// The reachable blocks in reverse postorder from the roots.
+    fn rpo(&self) -> Vec<mir::Block> {
+        let mut seen = BTreeSet::new();
+        let mut post = vec![];
+        for r in &self.f.roots {
+            if !seen.insert(r.block) {
+                continue;
+            }
+            let mut stack = vec![(r.block, self.f.succs(r.block), 0usize)];
+            while let Some((b, succs, i)) = stack.last_mut() {
+                if *i < succs.len() {
+                    let s = succs[*i];
+                    *i += 1;
+                    if seen.insert(s) {
+                        let ss = self.f.succs(s);
+                        stack.push((s, ss, 0));
+                    }
+                } else {
+                    post.push(*b);
+                    stack.pop();
+                }
+            }
+        }
+        post.reverse();
+        post
+    }
+
     fn reachable(&self) -> BTreeSet<mir::Block> {
         let mut seen = BTreeSet::new();
         let mut work: Vec<mir::Block> = self.f.roots.iter().map(|r| r.block).collect();
@@ -711,10 +738,9 @@ impl<'a> Lower<'a> {
             self.blocks.insert(b, wb);
         }
         self.entry()?;
-        for &b in &f.layout {
-            if !reach.contains(&b) {
-                continue;
-            }
+        // In reverse postorder, so a block's dominators, which define the
+        // unmanaged values it uses directly, are lowered before it.
+        for b in self.rpo() {
             self.cur = self.blocks[&b];
             let wparams: Vec<Value> = self.body.blocks[self.cur]
                 .params
@@ -2582,11 +2608,11 @@ impl<'a> Lower<'a> {
             self.bin(Operator::I32And, w, bit, Type::I32)
         } else {
             // A store keeps the object's validity bits true only if it
-            // cannot break them: RANGES is consumed checklessly (every
-            // unchecked store drops it, so it must be clear), and TYPES
-            // survives a number store only. Anything else goes through the
-            // engine, which maintains the bits.
-            let mask = CLASS_WORD_SLOTS | CLASS_WORD_RANGES | if num { 0 } else { CLASS_WORD_SHALLOW };
+            // cannot break them: TYPES survives a number store only (a
+            // MIR claim may rest on it; the engine maintains it), and
+            // RANGES, consumed checklessly but by no MIR claim, is dropped
+            // on the way (`drop_ranges`).
+            let mask = CLASS_WORD_SLOTS | if num { 0 } else { CLASS_WORD_SHALLOW };
             let m = self.i32c(mask);
             let bits = self.bin(Operator::I32And, w, m, Type::I32);
             let want = self.i32c(CLASS_WORD_SLOTS);
@@ -2599,6 +2625,7 @@ impl<'a> Lower<'a> {
         let outs = match val {
             None => vec![self.load_i64(obj, off)],
             Some(v) => {
+                self.clear_bits(obj, w, CLASS_WORD_RANGES);
                 if !num {
                     self.pre_barrier(obj, off);
                 }
@@ -2734,10 +2761,7 @@ impl<'a> Lower<'a> {
         let hit = self.bin(Operator::I32Eq, shape, cached, Type::I32);
         self.check(hit, slow);
         let w = self.load_i32(obj, OBJ_CLASS_IDX_OFFSET);
-        let m = self.i32c(CLASS_WORD_RANGES | if num { 0 } else { CLASS_WORD_SHALLOW });
-        let bits = self.bin(Operator::I32And, w, m, Type::I32);
-        let clean = self.un(Operator::I32Eqz, bits, Type::I32);
-        self.check(clean, slow);
+        self.check_store_bits(obj, w, num, slow);
         // The slot: `enc & 1` selects the dynamic slots over the object,
         // `enc & !1` is the byte offset from that base.
         let enc = self.load_i32(way, IC_SET_SLOTENC);
@@ -2844,10 +2868,7 @@ impl<'a> Lower<'a> {
         }
         // The class word.
         let w = self.load_i32(obj, OBJ_CLASS_IDX_OFFSET);
-        let m = self.i32c(CLASS_WORD_RANGES | if num { 0 } else { CLASS_WORD_SHALLOW });
-        let bad = self.bin(Operator::I32And, w, m, Type::I32);
-        let clean = self.un(Operator::I32Eqz, bad, Type::I32);
-        self.check(clean, slow);
+        self.check_store_bits(obj, w, num, slow);
         let sb = self.i32c(CLASS_WORD_SLOTS);
         let slots = self.bin(Operator::I32And, w, sb, Type::I32);
         let (keyed, go) = (self.body.add_block(), self.body.add_block());
@@ -2889,6 +2910,40 @@ impl<'a> Lower<'a> {
         let t = self.edge(inst, 0, &[])?;
         self.terminate(Terminator::Br { target: t });
         Ok(())
+    }
+
+    /// An inline store's duty to the receiver's class word `w`: RANGES is
+    /// consumed checklessly, but by no MIR claim, so it is dropped here
+    /// rather than sent to the engine; TYPES survives a number store, and
+    /// a non-number one clears it only on an object still under
+    /// construction (the CONSTRUCTING sentinel: no guard can have proven
+    /// it, so no claim rests on it); on a published one it goes to
+    /// `slow`, where the engine keeps the bit.
+    fn check_store_bits(&mut self, obj: Value, w: Value, num: bool, slow: Block) {
+        if !num {
+            let m = self.i32c(CLASS_WORD_SHALLOW | CLASS_WORD_SENTINEL);
+            let bits = self.bin(Operator::I32And, w, m, Type::I32);
+            let pub_shallow = self.i32c(CLASS_WORD_SHALLOW);
+            let bad = self.bin(Operator::I32Eq, bits, pub_shallow, Type::I32);
+            let ok = self.un(Operator::I32Eqz, bad, Type::I32);
+            self.check(ok, slow);
+        }
+        let mask = CLASS_WORD_RANGES | if num { 0 } else { CLASS_WORD_SHALLOW };
+        self.clear_bits(obj, w, mask);
+    }
+
+    /// Clear `mask`'s bits of `obj`'s class word `w`, if any is set.
+    fn clear_bits(&mut self, obj: Value, w: Value, mask: u32) {
+        let m = self.i32c(mask);
+        let bits = self.bin(Operator::I32And, w, m, Type::I32);
+        let (clr, done) = (self.body.add_block(), self.body.add_block());
+        self.cond_br(bits, Self::to(clr), Self::to(done));
+        self.cur = clr;
+        let keep = self.i32c(!mask);
+        let nw = self.bin(Operator::I32And, w, keep, Type::I32);
+        self.store_i32(obj, OBJ_CLASS_IDX_OFFSET, nw);
+        self.terminate(Terminator::Br { target: Self::to(done) });
+        self.cur = done;
     }
 
     /// The construct `this` for a direct construct (bbv's

@@ -10,6 +10,8 @@
 //! wasm-jit-runner <module.wasm> [guest args...]
 //! ```
 //!
+//! `WJR_JITDUMP=1` writes a jitdump for `perf inject --jit` (instruction-
+//! level annotation of the compiled code).
 //! `WJR_PERFMAP=1` writes a `/tmp/perf-<pid>.map` for the compiled code
 //! (the guest and the functions it adds), so `perf report` can name it.
 
@@ -135,6 +137,9 @@ fn run() -> Result<()> {
     config.async_stack_size(MAX_WASM_STACK + 16 * 1024 * 1024);
     if std::env::var_os("WJR_PERFMAP").is_some() {
         config.profiler(wasmtime::ProfilingStrategy::PerfMap);
+    }
+    if std::env::var_os("WJR_JITDUMP").is_some() {
+        config.profiler(wasmtime::ProfilingStrategy::JitDump);
     }
     let engine = Engine::new(&config)?;
 

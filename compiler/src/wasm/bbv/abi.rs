@@ -72,7 +72,7 @@ pub(crate) const CLASS_WORD_SLOTS: u32 = 0x0002_0000;
 /// unconditional clear can never corrupt a key mid-construction; the key gave
 /// up its 13th bit for it.
 pub(crate) const CLASS_WORD_RANGES: u32 = 0x4000_0000;
-pub(super) const CLASS_WORD_SENTINEL: u32 = 0x8000_0000;
+pub(crate) const CLASS_WORD_SENTINEL: u32 = 0x8000_0000;
 /// Post-stamp reuse of the lowest early-key bit (the key space is dead
 /// once the idx is stamped): an unpredicted-key add landed BEYOND the
 /// object's own layout length, so its own prefix predictions still hold

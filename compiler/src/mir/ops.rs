@@ -1193,8 +1193,8 @@ pub fn signature(op: &Opcode, args: &[Type], m: &Module) -> SigResult {
         FrameStore(_) => {
             arity(args, 1)?;
             want(
-                matches!(args[0], Type::Val(_) | Type::I32(_) | Type::F64(_) | Type::Bool),
-                || "frame.store: expected a val, i32, f64 or bool".into(),
+                matches!(args[0], Type::Val(_) | Type::I32(_) | Type::F64(_) | Type::Bool | Type::Obj(_)),
+                || "frame.store: expected a val, i32, f64, bool or obj".into(),
             )?;
             Sig::none()
         }
@@ -1214,11 +1214,11 @@ pub fn signature(op: &Opcode, args: &[Type], m: &Module) -> SigResult {
             arity(args, 1)?;
             let o = obj(&args[0], "load_field")?;
             let (c, claims) = field_claims(&o, *name, m, "load_field")?;
-            // `types` backs a field's claim; a field claimed as `Val(⊤)`
-            // needs none.
-            want(c.types || claims.iter().all(Type::is_val_top), || {
-                "load_field: receiver's layout claim lacks `types`".into()
-            })?;
+            // `types` backs a field's claim: without it (the identity
+            // alone) the value is any `Val`, to be guarded at the def.
+            if !c.types {
+                return Ok(Sig::output(Type::VAL_TOP));
+            }
             let mut t = claims[0];
             for c in &claims[1..] {
                 t = join(&t, c).ok_or("load_field: field claims disagree in representation")?;
@@ -1229,9 +1229,12 @@ pub fn signature(op: &Opcode, args: &[Type], m: &Module) -> SigResult {
             arity(args, 2)?;
             let o = obj(&args[0], "store_field")?;
             let (c, claims) = field_claims(&o, *name, m, "store_field")?;
-            want(c.types || claims.iter().all(Type::is_val_top), || {
-                "store_field: receiver's layout claim lacks `types`".into()
-            })?;
+            // Without `types` there is no claim to keep: any value, and
+            // the store's own check maintains the bits (§4.3).
+            if !c.types {
+                val(&args[1], "store_field value")?;
+                return Ok(Sig::none());
+            }
             for claim in &claims {
                 want(is_subtype(&args[1], claim), || {
                     format!(

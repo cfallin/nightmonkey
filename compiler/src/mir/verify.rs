@@ -675,15 +675,16 @@ impl<'a> Verifier<'a> {
     // --- 5, 6, 7. fences, predictions, GC -------------------------------------
 
     /// A shared throw block: no params, only upcasts and constants, ending
-    /// in `exit.throw`. Nothing in one relies on a killable component, so
-    /// an `err` edge into one need not weaken (§5.3: it has no params).
+    /// in `exit.throw` (or, spliced into a caller, `exit.inline.throw`).
+    /// Nothing in one relies on a killable component, so an `err` edge
+    /// into one need not weaken (§5.3: it has no params).
     fn is_throw_block(&self, b: Block) -> bool {
         let bd = &self.f.blocks[b];
         bd.params.is_empty()
             && bd.insts.iter().enumerate().all(|(i, &inst)| {
                 let op = &self.f.insts[inst].op;
                 if i + 1 == bd.insts.len() {
-                    matches!(op, Opcode::ExitThrow { .. })
+                    matches!(op, Opcode::ExitThrow { .. } | Opcode::ExitInline { throw: true, .. })
                 } else {
                     matches!(
                         op,

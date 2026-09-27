@@ -51,6 +51,16 @@ enum Ty {
     F64,
     Bool,
     Val(TagSet),
+    /// An object of one of `keys`' layouts, with its TYPES bit if the
+    /// flag says so: the raw object (`obj{L…}`), proven by a guard that
+    /// dominates (§4.3). The slot keeps the proof across joins and loops,
+    /// so the field accesses through it take no guard of their own.
+    Obj(KeyRange, bool),
+    /// An object proven of `keys`' layouts before a fence that may have
+    /// changed that (a call, a generic op): the raw object (`obj`). A
+    /// field access through it guards the layout again, exiting on a miss
+    /// (identity rarely changes), and refines the slot back to `Obj`.
+    ObjHint(KeyRange),
     /// A local, formal or rval that is dead here (never read before it is
     /// next written): no value, no block param. An exit passes it as
     /// `const.val dead`.
@@ -71,6 +81,15 @@ impl Ty {
             Ty::F64 => MType::F64_TOP,
             Ty::Bool => MType::Bool,
             Ty::Val(t) => MType::val(t),
+            Ty::Obj(keys, types) => MType::Obj(ObjInfo {
+                layout: Some(LayoutClaim {
+                    keys,
+                    types,
+                    state: LayoutState::Published,
+                }),
+                ..ObjInfo::TOP
+            }),
+            Ty::ObjHint(_) => MType::OBJ_TOP,
             Ty::Dead => unreachable!("a dead slot has no type"),
         }
     }
@@ -81,6 +100,7 @@ impl Ty {
             Ty::F64 => TagSet::NUMBER,
             Ty::Bool => TagSet::BOOLEAN,
             Ty::Val(t) => t,
+            Ty::Obj(..) | Ty::ObjHint(_) => TagSet::OBJECT,
             Ty::Dead => TagSet::NONE,
         }
     }
@@ -90,6 +110,10 @@ impl Ty {
             (a, b) if a == b => a,
             (Ty::Dead, x) | (x, Ty::Dead) => x,
             (Ty::I32, Ty::F64) | (Ty::F64, Ty::I32) => Ty::F64,
+            (Ty::Obj(k1, t1), Ty::Obj(k2, t2)) => Ty::Obj(k1.hull(&k2), t1 && t2),
+            (Ty::Obj(k1, _) | Ty::ObjHint(k1), Ty::Obj(k2, _) | Ty::ObjHint(k2)) => {
+                Ty::ObjHint(k1.hull(&k2))
+            }
             (a, b) => Ty::Val(a.tags().union(b.tags())),
         }
     }
@@ -263,6 +287,12 @@ pub fn build<'a>(
 ) -> Result<(mir::Module, mir::Func), String> {
     build_at(ctx, names, sid, script, is_global, 0)
 }
+
+/// Typed field accesses exit on a dirty IC arm rather than rejoin.
+const DIRTY_EXITS: bool = true;
+
+/// Guard a method's `this` to its predicted layouts at `FunctionThis`.
+const THIS_ENTRY_GUARD: bool = true;
 
 /// How deep inlining nests: a caller's callees, and theirs.
 const MAX_INLINE_DEPTH: u32 = 2;
@@ -670,6 +700,9 @@ struct Run<'s, 'a> {
     pre: Vec<Slot>,
     exit_blk: Option<mir::Block>,
     throw_blk: Option<mir::Block>,
+    /// This op's fence renamings of `Obj` values (`fence_params`), for
+    /// `repush`.
+    renames: Vec<(mir::Value, Slot)>,
 }
 
 impl<'s, 'a> Run<'s, 'a> {
@@ -701,6 +734,7 @@ impl<'s, 'a> Run<'s, 'a> {
             pre: vec![],
             exit_blk: None,
             throw_blk: None,
+            renames: vec![],
         }
     }
 
@@ -730,9 +764,107 @@ impl<'s, 'a> Run<'s, 'a> {
             .unwrap_or_else(|| mir::Value::from_u32(0))
     }
 
-    fn term(&mut self, op: Opcode, args: Vec<mir::Value>, succs: Vec<Edge>) {
+    fn term(&mut self, op: Opcode, args: Vec<mir::Value>, mut succs: Vec<Edge>) {
+        self.fence_params(&op, &args, &mut succs);
         self.f.add_inst(self.cur, op, args, &[], succs);
         self.live = false;
+    }
+
+    /// A terminator that may change what an `Obj` slot proves (a call, a
+    /// generic op: it kills layout claims on an edge the build continues
+    /// on) weakens each such slot's value to `obj` first, in the current
+    /// block (§5's fence rule), and the slot continues as `ObjHint`.
+    /// Operands the op popped are renamed the same way (`repush`). Throw
+    /// exits need nothing: they only box.
+    fn fence_params(&mut self, op: &Opcode, args: &[mir::Value], succs: &mut [Edge]) {
+        let _ = succs;
+        let tys: Vec<MType> = args.iter().map(|&v| self.f.ty(v)).collect();
+        let fx = mir::ops::effects(op, &tys, &self.mm);
+        if !matches!(
+            op.kill_site(&fx),
+            mir::ops::KillSite::OkEdge | mir::ops::KillSite::DirtyEdge
+        ) {
+            return;
+        }
+        let mut done: Vec<(mir::Value, Slot)> = vec![];
+        let olds: Vec<Slot> = self.st.iter().chain(&self.pre).copied().collect();
+        for x in olds {
+            let Ty::Obj(k, _) = x.ty else { continue };
+            if !fx.kill.matches(&x.ty.mir()) || done.iter().any(|&(v, _)| v == x.v) {
+                continue;
+            }
+            let y = Slot {
+                v: self.weaken(x.v, MType::OBJ_TOP),
+                ty: Ty::ObjHint(k),
+            };
+            done.push((x.v, y));
+        }
+        if done.is_empty() {
+            return;
+        }
+        for (v, y) in done {
+            for x in self.st.iter_mut().chain(self.pre.iter_mut()).filter(|x| x.v == v) {
+                *x = y;
+            }
+            self.renames.push((v, y));
+        }
+        // An exit at this op's pc made before the fence may be reached
+        // after it: the next one is made from the renamed state.
+        self.exit_blk = None;
+    }
+
+    /// Push `x`, an operand this op popped, back: as its fence renamed it,
+    /// if one did (`fence_params`).
+    fn repush(&mut self, x: Slot) {
+        let y = self
+            .renames
+            .iter()
+            .rev()
+            .find(|(v, _)| *v == x.v)
+            .map_or(x, |&(_, y)| y);
+        self.st.push(y);
+    }
+
+    /// `x`, as `ObjHint` if it is an `Obj`.
+    fn demote(&mut self, x: Slot) -> Slot {
+        match x.ty {
+            Ty::Obj(k, _) => Slot {
+                v: self.weaken(x.v, MType::OBJ_TOP),
+                ty: Ty::ObjHint(k),
+            },
+            _ => x,
+        }
+    }
+
+    /// Every `Obj` slot, as `ObjHint`: in the state and in this op's
+    /// pre-state (which its exits are made from; exits made before are
+    /// dropped, an inlined callee's reaching its caller's through
+    /// `exit.inline`), for `repush` too.
+    fn demote_objs(&mut self) {
+        let mut done: Vec<(mir::Value, Slot)> = vec![];
+        let olds: Vec<Slot> = self.st.iter().chain(&self.pre).copied().collect();
+        for x in olds {
+            let Ty::Obj(k, _) = x.ty else { continue };
+            if done.iter().any(|&(v, _)| v == x.v) {
+                continue;
+            }
+            let y = Slot {
+                v: self.weaken(x.v, MType::OBJ_TOP),
+                ty: Ty::ObjHint(k),
+            };
+            done.push((x.v, y));
+        }
+        if done.is_empty() {
+            return;
+        }
+        for (v, y) in done {
+            for x in self.st.iter_mut().chain(self.pre.iter_mut()).filter(|x| x.v == v) {
+                *x = y;
+            }
+            self.renames.push((v, y));
+        }
+        self.exit_blk = None;
+        self.throw_blk = None;
     }
 
     fn goto(block: mir::Block) -> Edge {
@@ -791,6 +923,9 @@ impl<'s, 'a> Run<'s, 'a> {
         match (x.ty, to) {
             (a, b) if a == b => x.v,
             (Ty::I32, Ty::F64) => self.inst(Opcode::I32ToF64, vec![x.v], Some(MType::F64_TOP)),
+            (Ty::Obj(..), Ty::Obj(..) | Ty::ObjHint(_)) | (Ty::ObjHint(_), Ty::ObjHint(_)) => {
+                self.weaken(x.v, to.mir())
+            }
             (_, Ty::Val(t)) => {
                 let v = self.boxed(x);
                 self.weaken(v, MType::val(t))
@@ -1019,6 +1154,76 @@ impl<'s, 'a> Run<'s, 'a> {
         p
     }
 
+    /// A method's `this`, guarded once to the layouts the analysis
+    /// predicts for it (`this_layouts`), exiting here (nothing has
+    /// happened yet) on a miss. Its field accesses then fold their own
+    /// guards into this one while no fence intervenes (§10.1), and their
+    /// IC fallbacks go with them.
+    fn guard_this_layout(&mut self) {
+        if !THIS_ENTRY_GUARD {
+            return;
+        }
+        let ctx = self.s.ctx;
+        let sid = self.s.sid;
+        let Some(&(lo, hi)) = ctx.facts.this_layouts.get(&sid) else {
+            return;
+        };
+        // A constructor's `this` is still being built.
+        if ctx.stamp_ctors_in.contains_key(&sid)
+            || ctx.deleg_restamps_in.contains_key(&sid)
+            || ctx.this_layouts_in.get(&sid).is_some_and(|l| l.init_home)
+        {
+            return;
+        }
+        let x = self.top();
+        let v = self.boxed(x);
+        let o = self.guard(Opcode::GuardUnbox(UnboxKind::Obj), vec![v], MType::OBJ_TOP);
+        let keys = KeyRange { lo, hi };
+        let ty = Ty::Obj(keys, false);
+        let g = self.guard(Opcode::GuardLayout { keys, types: false }, vec![o], ty.mir());
+        self.st.pop();
+        self.push(g, ty);
+    }
+
+    /// Receiver `recv` of a typed site, when its slot type proves the
+    /// site's layouts: the object (for an `ObjHint`, guarded again,
+    /// exiting here on a miss, and every slot holding it refined), and
+    /// the site as it applies to it: with TYPES only if the slot has the
+    /// bit proven (a site that would guard for the bit reads under
+    /// identity alone, and its claim is guarded at the def).
+    fn proven_recv(&mut self, recv: Slot, site: &TypedSite) -> Option<(mir::Value, TypedSite)> {
+        let (keys, types) = match recv.ty {
+            Ty::Obj(keys, types) => (keys, Some(types)),
+            Ty::ObjHint(keys) => (keys, None),
+            _ => return None,
+        };
+        let want = KeyRange {
+            lo: crate::ids::LayoutKey::new(site.lo),
+            hi: crate::ids::LayoutKey::new(site.hi),
+        };
+        if !want.contains(&keys) {
+            return None;
+        }
+        let site = TypedSite {
+            types: site.types && types == Some(true),
+            ..*site
+        };
+        let o = match types {
+            Some(_) => recv.v,
+            None => {
+                let ty = Ty::Obj(keys, false);
+                let g = self.guard(Opcode::GuardLayout { keys, types: false }, vec![recv.v], ty.mir());
+                for x in self.st.iter_mut() {
+                    if x.v == recv.v {
+                        *x = Slot { v: g, ty };
+                    }
+                }
+                g
+            }
+        };
+        Some((o, site))
+    }
+
     /// A fused global's read (§3): while its fuse is armed the read is the
     /// literal, else exit here. False (nothing emitted) for a literal that
     /// is not a primitive constant.
@@ -1188,19 +1393,15 @@ impl<'s, 'a> Run<'s, 'a> {
         let ok = self.new_block();
         let p = self.f.add_param(ok, out);
         let err = self.exit_block(true);
-        let (inst, _) = self.f.add_inst(
-            self.cur,
-            op,
-            args,
-            &[],
-            vec![
-                Edge {
-                    block: ok,
-                    args: vec![EdgeArg::Out(0)],
-                },
-                Self::goto(err),
-            ],
-        );
+        let mut succs = vec![
+            Edge {
+                block: ok,
+                args: vec![EdgeArg::Out(0)],
+            },
+            Self::goto(err),
+        ];
+        self.fence_params(&op, &args, &mut succs);
+        let (inst, _) = self.f.add_inst(self.cur, op, args, &[], succs);
         self.f.witnesses[inst] = Some(mir::func::Witness {
             may_kill: mir::types::KillPattern::ALL,
         });
@@ -1211,6 +1412,86 @@ impl<'s, 'a> Run<'s, 'a> {
 
     /// A generic op with no output: both success edges continue; an
     /// exception goes to the op's throw block.
+    /// A typed field access (`load_field`/`store_field`) whose `ok_dirty`
+    /// edge (its IC arm reported dirt: a SLOTS miss) exits at `next`, the
+    /// successor pc, with `post` on the stack (the op has happened). The
+    /// clean path then keeps every fact, so the accesses after it fold
+    /// their guards (§4.2). Returns the result, if `out`. Without a stack
+    /// depth at `next`, both edges continue, as `js` has them.
+    fn js_dirty_exits(
+        &mut self,
+        op: Opcode,
+        args: Vec<mir::Value>,
+        out: Option<MType>,
+        next: Pc,
+        post: Option<Slot>,
+    ) -> Option<mir::Value> {
+        let ok = self.new_block();
+        let p = out.map(|t| self.f.add_param(ok, t));
+        let depth = self.st.len() - self.frame_len() + usize::from(post.is_some() || out.is_some());
+        let dirty = if DIRTY_EXITS && self.s.depths.at(next) == Some(u32::try_from(depth).unwrap()) {
+            let saved = (self.cur, self.live);
+            let b = self.new_block();
+            let dp = out.map(|_| self.f.add_param(b, MType::VAL_TOP));
+            // The dirty edge is a fence: `Obj` slots reach the exit
+            // through weaker params (`fence_params`).
+            let mut objs: Vec<(mir::Value, mir::Value)> = vec![];
+            for x in &self.st {
+                if matches!(x.ty, Ty::Obj(..)) && !objs.iter().any(|&(v, _)| v == x.v) {
+                    objs.push((x.v, self.f.add_param(b, MType::OBJ_TOP)));
+                }
+            }
+            self.at(b);
+            let mut st = self.st.clone();
+            for x in st.iter_mut() {
+                if let (Ty::Obj(k, _), Some(&(_, p))) = (x.ty, objs.iter().find(|&&(v, _)| v == x.v)) {
+                    *x = Slot {
+                        v: p,
+                        ty: Ty::ObjHint(k),
+                    };
+                }
+            }
+            let post = post.map(|x| match (x.ty, objs.iter().find(|&&(v, _)| v == x.v)) {
+                (Ty::Obj(k, _), Some(&(_, p))) => Slot {
+                    v: p,
+                    ty: Ty::ObjHint(k),
+                },
+                _ => x,
+            });
+            match (dp, post) {
+                (Some(v), _) => st.push(Slot {
+                    v,
+                    ty: Ty::Val(TagSet::ALL),
+                }),
+                (None, Some(x)) => st.push(x),
+                (None, None) => {}
+            }
+            let ops = self.exit_operands(next, &st);
+            let eop = self.exit_op(next, false);
+            self.term(eop, ops, vec![]);
+            (self.cur, self.live) = saved;
+            let mut args: Vec<EdgeArg> = dp.map(|_| vec![EdgeArg::Out(0)]).unwrap_or_default();
+            args.extend(objs.iter().map(|&(v, _)| EdgeArg::Value(v)));
+            Edge { block: b, args }
+        } else {
+            Edge {
+                block: ok,
+                args: p.map(|_| vec![EdgeArg::Out(0)]).unwrap_or_default(),
+            }
+        };
+        let clean = Edge {
+            block: ok,
+            args: p.map(|_| vec![EdgeArg::Out(0)]).unwrap_or_default(),
+        };
+        let err = self.exit_block(true);
+        // Not `term`: the dirty edge's params are made above, and the
+        // clean edge is no fence.
+        self.f.add_inst(self.cur, op, args, &[], vec![clean, dirty, Self::goto(err)]);
+        self.live = false;
+        self.at(ok);
+        p
+    }
+
     fn js_void(&mut self, op: Opcode, args: Vec<mir::Value>) {
         let ok = self.new_block();
         let err = self.exit_block(true);
@@ -1232,6 +1513,9 @@ impl<'s, 'a> Run<'s, 'a> {
         vals: &[mir::Value],
         fallback: Option<(Opcode, Vec<mir::Value>)>,
     ) -> mir::Value {
+        // The spliced callees' fences know nothing of this frame's `Obj`
+        // slots: they continue as `ObjHint` through it.
+        self.demote_objs();
         let join = self.new_block();
         let result = self.f.add_param(join, MType::VAL_TOP);
         let err = self.exit_block(true);
@@ -1322,6 +1606,8 @@ impl<'s, 'a> Run<'s, 'a> {
         if targets.is_empty() || targets.len() > MAX_INLINE_TARGETS {
             return self.js(helper.0, helper.1, MType::VAL_TOP);
         }
+        // Arms with fences meet at `join`: `Obj` slots go in as `ObjHint`.
+        self.demote_objs();
         let join = self.new_block();
         let result = self.f.add_param(join, MType::VAL_TOP);
         let (fast, slow) = (self.new_block(), self.new_block());
@@ -1494,6 +1780,7 @@ impl<'s, 'a> Run<'s, 'a> {
         match x.ty {
             Ty::Dead => unreachable!("a dead slot is never read"),
             Ty::Bool => x.v,
+            Ty::Obj(..) | Ty::ObjHint(_) => self.inst(Opcode::ConstBool(true), vec![], Some(MType::Bool)),
             Ty::I32 => {
                 let z = self.const_i32(0);
                 self.inst(
@@ -1657,6 +1944,7 @@ impl<'s, 'a> Run<'s, 'a> {
                 }
                 self.pc = pc;
                 self.pre = self.st.clone();
+                self.renames.clear();
                 self.exit_blk = None;
                 self.throw_blk = None;
                 self.op(op)?;
@@ -1734,6 +2022,40 @@ impl<'s, 'a> Run<'s, 'a> {
                 Ty::Bool => Some(Opcode::GuardUnbox(UnboxKind::Bool)),
                 Ty::Val(tags) if tags == TagSet::ALL => None,
                 Ty::Val(tags) => Some(Opcode::GuardTags(tags)),
+                Ty::ObjHint(_) => Some(Opcode::GuardUnbox(UnboxKind::Obj)),
+                Ty::Obj(keys, types) => {
+                    // Unbox, then the layout.
+                    let ok = self.new_block();
+                    let o = self.f.add_param(ok, MType::OBJ_TOP);
+                    self.term(
+                        Opcode::GuardUnbox(UnboxKind::Obj),
+                        vec![v],
+                        vec![
+                            Edge {
+                                block: ok,
+                                args: vec![EdgeArg::Out(0)],
+                            },
+                            Self::goto(fail),
+                        ],
+                    );
+                    self.at(ok);
+                    let ok = self.new_block();
+                    let out = self.f.add_param(ok, t.mir());
+                    self.term(
+                        Opcode::GuardLayout { keys, types },
+                        vec![o],
+                        vec![
+                            Edge {
+                                block: ok,
+                                args: vec![EdgeArg::Out(0)],
+                            },
+                            Self::goto(fail),
+                        ],
+                    );
+                    self.at(ok);
+                    args.push(EdgeArg::Value(out));
+                    continue;
+                }
             };
             let Some(op) = op else {
                 args.push(EdgeArg::Value(v));
@@ -2302,6 +2624,7 @@ impl<'s, 'a> Run<'s, 'a> {
                 } else {
                     // Sloppy: an object `this` is itself; anything else is
                     // boxed (null and undefined become the global `this`).
+                    self.demote_objs();
                     let obj = TagSet::OBJECT;
                     let (t, e, j) = (self.new_block(), self.new_block(), self.new_block());
                     let p = self.f.add_param(t, MType::val(obj));
@@ -2340,6 +2663,7 @@ impl<'s, 'a> Run<'s, 'a> {
                     self.at(j);
                     self.push(r, Ty::Val(obj));
                 }
+                self.guard_this_layout();
             }
             String => {
                 let a = self.atom(p.next_uint32().unwrap())?;
@@ -2368,7 +2692,7 @@ impl<'s, 'a> Run<'s, 'a> {
                 let env = self.pop();
                 let (e, y) = (self.boxed(env), self.boxed(v));
                 self.js_void(Opcode::JsSetName(a, op == StrictSetGName), vec![e, y]);
-                self.st.push(v);
+                self.repush(v);
             }
             TableSwitch => {
                 let default_off = p.next_int32().unwrap();
@@ -2445,7 +2769,7 @@ impl<'s, 'a> Run<'s, 'a> {
                         self.at(d);
                         o
                     }
-                    Ty::Bool => {
+                    Ty::Bool | Ty::Obj(..) | Ty::ObjHint(_) => {
                         self.jump_to(default, Some(pc));
                         return Ok(());
                     }
@@ -2548,19 +2872,31 @@ impl<'s, 'a> Run<'s, 'a> {
             GetProp => {
                 let a = self.atom(p.next_uint32().unwrap())?;
                 let recv = self.pop();
-                if let Some(site) = self.typed_site(pc, a) {
+                let site = self.typed_site(pc, a);
+                if let Some((o, site)) = site.and_then(|site| self.proven_recv(recv, &site)) {
+                    let r = self
+                        .js_dirty_exits(Opcode::LoadField(a), vec![o], Some(site.claim_ty()), pc + op.len(), None)
+                        .unwrap();
+                    let r = self.weaken(r, MType::VAL_TOP);
+                    self.push(r, Ty::Val(TagSet::ALL));
+                    self.guard_result(site.claim, pc + op.len(), false);
+                } else if let Some(site) = site {
                     // The predicted layout: guard the receiver's class
                     // locally, then load the field (§4.3). A receiver of
                     // another layout reads through the IC instead of
                     // exiting: a prediction that is wrong for some receivers
                     // must not send the rest of the activation to baseline
-                    // every time. The claim is guarded after the join.
+                    // every time. The claim is guarded after the join. The
+                    // IC arm is a fence: `Obj` slots meet as `ObjHint`.
+                    self.demote_objs();
                     let x = self.boxed(recv);
                     let join = self.new_block();
                     let jr = self.f.add_param(join, MType::VAL_TOP);
                     let generic = self.new_block();
                     let o = self.guard_layout_or(x, &site, generic);
-                    let r = self.js(Opcode::LoadField(a), vec![o], site.claim_ty());
+                    let r = self
+                        .js_dirty_exits(Opcode::LoadField(a), vec![o], Some(site.claim_ty()), pc + op.len(), None)
+                        .unwrap();
                     let r = self.weaken(r, MType::VAL_TOP);
                     self.term(
                         Opcode::Jump,
@@ -2601,7 +2937,26 @@ impl<'s, 'a> Run<'s, 'a> {
                 // conformance check, and a number over a number needs no
                 // barriers); without a TYPES claim, any value, and the
                 // store's own check keeps the object's bits.
-                match self.typed_site(pc, a).filter(|s| num || !s.types) {
+                let site = self.typed_site(pc, a).filter(|s| num || !s.types);
+                let proven = site.and_then(|site| self.proven_recv(recv, &site));
+                // The IC arm of an unproven typed store is a fence the two
+                // arms meet after: `Obj` slots (and the value, pushed back
+                // after it) go in as `ObjHint`.
+                let v = if site.is_some() && proven.is_none() {
+                    self.demote_objs();
+                    self.demote(v)
+                } else {
+                    v
+                };
+                match site {
+                    Some(_) if proven.is_some() => {
+                        let (o, site) = proven.unwrap();
+                        let mut x = self.boxed(v);
+                        if site.types {
+                            x = self.weaken(x, MType::val(TagSet::NUMBER));
+                        }
+                        self.js_dirty_exits(Opcode::StoreField(a), vec![o, x], None, pc + op.len(), Some(v));
+                    }
                     Some(site) => {
                         // As for a typed read: another layout's receiver
                         // stores through the IC rather than exiting.
@@ -2613,7 +2968,7 @@ impl<'s, 'a> Run<'s, 'a> {
                         if site.types {
                             x = self.weaken(x, MType::val(TagSet::NUMBER));
                         }
-                        self.js_void(Opcode::StoreField(a), vec![o, x]);
+                        self.js_dirty_exits(Opcode::StoreField(a), vec![o, x], None, pc + op.len(), Some(v));
                         self.term(Opcode::Jump, vec![], vec![Self::goto(join)]);
                         self.at(generic);
                         let y = self.boxed(v);
@@ -2626,7 +2981,7 @@ impl<'s, 'a> Run<'s, 'a> {
                         self.js_void(Opcode::JsSetProp(a, op == StrictSetProp), vec![x, y]);
                     }
                 }
-                self.st.push(v);
+                self.repush(v);
             }
             GetElem => {
                 let key = self.pop();
@@ -2643,7 +2998,7 @@ impl<'s, 'a> Run<'s, 'a> {
                 let recv = self.pop();
                 let (x, k, y) = (self.boxed(recv), self.boxed(key), self.boxed(v));
                 self.js_void(Opcode::JsSetElem(op == StrictSetElem), vec![x, k, y]);
-                self.st.push(v);
+                self.repush(v);
             }
             // Generic operations through their runtime helpers.
             Instanceof | In | HasOwn if RT_OPS => {
