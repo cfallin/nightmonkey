@@ -143,6 +143,7 @@ pub(crate) fn splice(
     parent: u32,
     enter: Block,
     operands: &[Value],
+    new_target: Option<Value>,
     join: Block,
     err: Block,
 ) -> Result<(), String> {
@@ -308,7 +309,11 @@ pub(crate) fn splice(
         }
     }
     // Enter: write the callee's frame, then its entry with the operands.
-    let (enter_inst, _) = f.add_inst(enter, Opcode::InlineEnter, operands.to_vec(), &[], vec![]);
+    // A construct's frame also gets its new.target (`inline.enter`'s last
+    // operand); the entry's params are callee, this and the formals.
+    let mut enter_ops = operands.to_vec();
+    enter_ops.extend(new_target);
+    let (enter_inst, _) = f.add_inst(enter, Opcode::InlineEnter, enter_ops, &[], vec![]);
     f.inst_frame[enter_inst] = base;
     let (jump, _) = f.add_inst(
         enter,

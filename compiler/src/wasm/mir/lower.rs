@@ -250,7 +250,6 @@ struct Lower<'a> {
     call_cell_patches: Vec<(Value, u32)>,
     /// The census helper, when exits are counted (`--mir-exit-census`).
     exit_census: Option<Func>,
-    ctor_stamp: Option<[u32; 3]>,
     ctor_restamp: Option<[u32; 7]>,
     /// One exit hub per frame shape (`exit_hub`).
     exit_hubs: BTreeMap<Vec<Option<BoxKind>>, Block>,
@@ -276,9 +275,6 @@ pub struct LowerOpts {
     pub stress: u32,
     /// Count every exit (`--mir-exit-census`).
     pub exit_census: bool,
-    /// A layout constructor's ctor-exit stamp arguments (layout, field
-    /// count, kept bits), as baseline's `Gen::ctor_stamp`.
-    pub ctor_stamp: Option<[u32; 3]>,
     /// An init delegate's restamp arguments (`bbv::restamp_args`).
     pub ctor_restamp: Option<[u32; 7]>,
     /// Strict-mode code: a field store's generic fallback throws on failure.
@@ -355,7 +351,6 @@ pub fn lower<'a>(
         construct_cell_patches: vec![],
         call_cell_patches: vec![],
         exit_census: if o.exit_census { h.census } else { None },
-        ctor_stamp: o.ctor_stamp,
         ctor_restamp: o.ctor_restamp,
         exit_hubs: BTreeMap::new(),
         strict: o.strict,
@@ -1341,11 +1336,6 @@ impl<'a> Lower<'a> {
                 });
             }
             Opcode::Return => {
-                if let Some([layout, nfields, keep]) = self.ctor_stamp {
-                    // `this` as the caller passed it: MIR never writes it.
-                    let thisv = self.load_i64(self.sp, FrameLayout::THIS);
-                    self.ctor_stamp_inline(thisv, layout, nfields, keep);
-                }
                 if let Some(r) = self.ctor_restamp {
                     let mut args = vec![self.load_i64(self.sp, FrameLayout::THIS)];
                     for x in r {
@@ -1883,6 +1873,28 @@ impl<'a> Lower<'a> {
                 self.terminate(Terminator::Br { target: e });
             }
             Opcode::InlineEnter => self.inline_enter(&d, &a)?,
+            Opcode::CreateThis(nslots, word) => {
+                // May GC: root what is live across it.
+                let live = self.live_across(inst);
+                self.spill(&live)?;
+                let top_off = self.top_off(live.len());
+                let top = self.add_off(self.vp, top_off);
+                let ok = self.construct_this(top, a[0], a[1], nslots, word);
+                self.reload(&live)?;
+                let r = self.load_i64(self.vp, top_off);
+                let t = self.edge(inst, 0, &[r])?;
+                let e = self.edge(inst, 1, &[])?;
+                self.cond_br(ok, t, e);
+            }
+            Opcode::FnIsCtor => {
+                let flags = self.load_i32(a[0], FUNC_FLAGS_SLOT_OFFSET);
+                let cbit = self.i32c(FUNCTION_FLAGS_CONSTRUCTOR);
+                let c = self.bin(Operator::I32And, flags, cbit, Type::I32);
+                let z = self.i32c(0);
+                let v = self.bin(Operator::I32Ne, c, z, Type::I32);
+                self.def(inst, v);
+            }
+            Opcode::CtorStamp(layout, nfields, keep) => self.ctor_stamp_inline(a[0], layout, nfields, keep),
             Opcode::JsRt(r) => {
                 use crate::mir::ops::RtOp;
                 let h = self.h;
@@ -3832,7 +3844,9 @@ impl<'a> Lower<'a> {
         let fid = self.cur_frame as usize;
         let (base, l) = (self.frame_off[fid], self.frame_layouts[fid]);
         let max_depth = self.f.inline_frames[fid - 1].max_depth;
-        if a.len() != 2 + l.nargs as usize {
+        // A construct also passes its new.target.
+        let construct = a.len() == 3 + l.nargs as usize;
+        if a.len() != 2 + l.nargs as usize && !construct {
             return Err("lowering: inline.enter needs callee, this and every formal".into());
         }
         let mut boxed = vec![];
@@ -3858,7 +3872,8 @@ impl<'a> Lower<'a> {
         let env = self.load_i64(fun, FUNC_ENV_SLOT_OFFSET);
         self.store_i64(sp, base + l.env(), env);
         self.store_i64(sp, base + l.args_obj(), undef);
-        self.store_i64(sp, base + l.new_target(), undef);
+        let nt = if construct { boxed[boxed.len() - 1] } else { undef };
+        self.store_i64(sp, base + l.new_target(), nt);
         self.store_i64(sp, base + l.rval(), undef);
         let zero = self.i64c(TAG_INT32 << 32);
         self.store_i64(sp, base + l.resume(), zero);

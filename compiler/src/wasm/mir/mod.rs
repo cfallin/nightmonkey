@@ -18,7 +18,11 @@ use waffle::Module;
 const INLINING: bool = true;
 
 /// The most bytecode a script may have to be inlined (§5.5).
-pub(crate) const INLINE_MAX_BYTECODE: usize = 200;
+pub(crate) const INLINE_MAX_BYTECODE: usize = 500;
+
+/// The most MIR instructions a function may have, inlined callees and
+/// all.
+const MAX_MIR_INSTS: usize = 60_000;
 
 /// Whether `script` may be inlined into a MIR caller (§5.5): small, and
 /// without the constructs an inline frame does not model. A property of
@@ -64,6 +68,11 @@ pub fn translate_script(
         Ok(x) => x,
         Err(reason) => return Ok(Err(reason)),
     };
+    // Past a size, the body (at tens of bytes of wasm per instruction)
+    // would approach wasm's function size limit: baseline alone.
+    if f.insts.len() > MAX_MIR_INSTS {
+        return Ok(Err("too large for MIR after inlining".into()));
+    }
     // Guard folding (§10.1). The builder guards locally at every use;
     // this merges them, and the validator checks the result.
     let folded = crate::mir::opt::optimize(&mm, &mut f);
@@ -143,13 +152,6 @@ pub fn translate_script(
             own_env: baseline::needs_env(script) && !baseline::env_is_plain(ctx.source, script),
             forward_resume: inline_eligible(ctx, script),
             ctor_restamp: ctx.deleg_restamps_in.get(&sid).and_then(crate::wasm::bbv::restamp_args),
-            ctor_stamp: ctx.stamp_ctors_in.get(&sid).map(|si| {
-                [
-                    si.layout_id,
-                    u32::try_from(si.fields.len()).unwrap(),
-                    crate::wasm::bbv::ctor_stamp_keep_bits(si),
-                ]
-            }),
         },
         gname_bids,
         gname_fused,
@@ -158,12 +160,25 @@ pub fn translate_script(
         Ok(l) => l,
         Err(reason) => return Ok(Err(reason)),
     };
+    let params: usize = lowered.body.blocks.values().map(|b| b.params.len()).sum();
+    let edge_args: usize = lowered
+        .body
+        .blocks
+        .values()
+        .map(|b| {
+            let mut n = 0;
+            b.terminator.visit_targets(|t| n += t.args.len());
+            n
+        })
+        .sum();
     if ctx.opts.diagnostics.stats {
         crate::diag_line!(
-            "night: mir body sid#{sid} blocks {} values {} bytecode {}",
+            "night: mir body sid#{sid} blocks {} values {} bytecode {} params {params} edge_args {edge_args} roots {} inlined {}",
             lowered.body.blocks.len(),
             lowered.body.values.len(),
-            script.bytecode.len()
+            script.bytecode.len(),
+            f.roots.len(),
+            f.inline_frames.len()
         );
     }
     Ok(Ok(Outcome::Compiled {

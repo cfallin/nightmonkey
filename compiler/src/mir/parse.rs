@@ -1214,6 +1214,18 @@ impl Parser {
             ActualArgOr(_) => ActualArgOr(self.int()?),
             JsIsBuiltin(_) => JsIsBuiltin(self.int()?),
             FrameStore(_) => FrameStore(self.int()?),
+            CreateThis(..) => {
+                let n = self.int()?;
+                self.expect_punct(",")?;
+                CreateThis(n, self.int()?)
+            }
+            CtorStamp(..) => {
+                let l = self.int()?;
+                self.expect_punct(",")?;
+                let n = self.int()?;
+                self.expect_punct(",")?;
+                CtorStamp(l, n, self.int()?)
+            }
             Construct(..) => {
                 let n = self.int()?;
                 self.expect_punct(",")?;
@@ -1495,6 +1507,9 @@ fn template(mn: &str) -> Option<Opcode> {
         Call,
         CallDirect,
         Construct(0, 0),
+        CreateThis(0, 0),
+        FnIsCtor,
+        CtorStamp(0, 0, 0),
         CallNative(NativeId::from_u32(0)),
     ];
     for k in UnboxKind::ALL {

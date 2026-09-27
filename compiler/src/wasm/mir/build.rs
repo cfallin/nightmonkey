@@ -229,10 +229,7 @@ impl<'a> Shape<'a> {
         };
         // A stamping constructor or an init delegate stamps `this` at its
         // returns, which an inlined copy's returns would skip.
-        if !super::inline_eligible(self.ctx, ks)
-            || self.ctx.stamp_ctors_in.contains_key(&k)
-            || self.ctx.deleg_restamps_in.contains_key(&k)
-        {
+        if !super::inline_eligible(self.ctx, ks) || self.ctx.deleg_restamps_in.contains_key(&k) {
             return None;
         }
         let (mut mm, f) = build_at(self.ctx, names, k, ks, false, self.inline_depth + 1).ok()?;
@@ -311,6 +308,9 @@ const HOIST_NATIVE: bool = true;
 /// are read and written through the object.
 const MAPPED_ARGS: bool = true;
 
+/// `new` of a site's one constructor is inlined.
+const INLINE_CONSTRUCT: bool = true;
+
 /// Typed field accesses exit on a dirty IC arm rather than rejoin.
 const DIRTY_EXITS: bool = true;
 
@@ -320,7 +320,13 @@ const THIS_ENTRY_GUARD: bool = true;
 /// How deep inlining nests: a caller's callees, and theirs.
 const MAX_INLINE_DEPTH: u32 = 2;
 /// The most MIR instructions a callee may have to be inlined.
-const MAX_INLINE_INSTS: usize = 800;
+const MAX_INLINE_INSTS: usize = 2000;
+/// The most call sites one function inlines into (bbv's per-caller splice
+/// cap: past a few sites the code growth costs more than the calls).
+const MAX_INLINE_SITES: u32 = 8;
+/// The most callee instructions one function splices in, over all its
+/// sites: a body past wasm's function size limit fails the module.
+const MAX_INLINE_TOTAL_INSTS: usize = 6000;
 /// The most targets a call site inlines (a guard chain on the script).
 const MAX_INLINE_TARGETS: usize = 4;
 
@@ -746,6 +752,10 @@ struct Run<'s, 'a> {
     pre: Vec<Slot>,
     exit_blk: Option<mir::Block>,
     throw_blk: Option<mir::Block>,
+    /// Call sites this run has inlined into (`MAX_INLINE_SITES`), and the
+    /// callee instructions they spliced (`MAX_INLINE_TOTAL_INSTS`).
+    inline_sites: u32,
+    inline_insts: usize,
     /// This op's fence renamings of `Obj` values (`fence_params`), for
     /// `repush`.
     renames: Vec<(mir::Value, Slot)>,
@@ -787,6 +797,8 @@ impl<'s, 'a> Run<'s, 'a> {
             exit_blk: None,
             throw_blk: None,
             renames: vec![],
+            inline_sites: 0,
+            inline_insts: 0,
         }
     }
 
@@ -886,6 +898,34 @@ impl<'s, 'a> Run<'s, 'a> {
             },
             _ => x,
         }
+    }
+
+    /// Whether this function may inline one more site whose callees add
+    /// `insts` instructions (`MAX_INLINE_SITES`, `MAX_INLINE_TOTAL_INSTS`),
+    /// counting it if so.
+    fn inline_budget(&mut self, insts: usize) -> bool {
+        if self.inline_sites >= MAX_INLINE_SITES || self.inline_insts + insts > MAX_INLINE_TOTAL_INSTS {
+            return false;
+        }
+        self.inline_sites += 1;
+        self.inline_insts += insts;
+        true
+    }
+
+    /// At a layout constructor's return, the first stamp of its completed
+    /// `this` (a no-op unless `this` is still under construction, so a
+    /// call without `new` stamps nothing); an inlined copy stamps too.
+    fn ctor_stamp(&mut self) {
+        let Some(si) = self.s.ctx.stamp_ctors_in.get(&self.s.sid) else {
+            return;
+        };
+        let op = Opcode::CtorStamp(
+            si.layout_id,
+            u32::try_from(si.fields.len()).unwrap(),
+            crate::wasm::bbv::ctor_stamp_keep_bits(si),
+        );
+        let t = self.boxed(self.st[0]);
+        self.inst(op, vec![t], None);
     }
 
     /// Whether the script's formals are its mapped `arguments` object's.
@@ -1733,7 +1773,7 @@ impl<'s, 'a> Run<'s, 'a> {
             }
             let saved_mm = self.mm.clone();
             let saved_frames = self.f.inline_frames.len();
-            match super::inline::splice(&mut self.mm, &mut self.f, callee, 0, hit, &operands, join, err) {
+            match super::inline::splice(&mut self.mm, &mut self.f, callee, 0, hit, &operands, None, join, err) {
                 Ok(()) => {
                     self.mm.script_addrs.insert(*k, callee.mm.script_addrs[k]);
                 }
@@ -1754,6 +1794,118 @@ impl<'s, 'a> Run<'s, 'a> {
         };
         let (op, args) = fallback.unwrap_or((Opcode::Call, vals.to_vec()));
         self.term(op, args, vec![e.clone(), e, Self::goto(err)]);
+        self.at(join);
+        result
+    }
+
+    /// `new F(args…)` of the site's one constructor inlined (§5.5): with
+    /// the callee that script's function, `this` is made as a direct
+    /// construct makes it (`create_this`), the body is spliced with its
+    /// frame's new.target, and the result is the body's value if an
+    /// object, else `this`; any other callee takes the generic construct.
+    /// Operands `callee, is_constructing, args…, new.target`.
+    fn inline_construct(
+        &mut self,
+        k: ScriptId,
+        callee: &std::rc::Rc<super::inline::Callee>,
+        vals: &[mir::Value],
+        nslots: u32,
+        word: u32,
+    ) -> mir::Value {
+        self.demote_objs();
+        let nt = vals[vals.len() - 1];
+        let join = self.new_block();
+        let result = self.f.add_param(join, MType::val(TagSet::OBJECT));
+        let err = self.exit_block(true);
+        let generic = self.new_block();
+        let obj_b = self.new_block();
+        let obj = self.f.add_param(obj_b, MType::OBJ_TOP);
+        self.term(
+            Opcode::GuardUnbox(UnboxKind::Obj),
+            vec![vals[0]],
+            vec![
+                Edge {
+                    block: obj_b,
+                    args: vec![EdgeArg::Out(0)],
+                },
+                Self::goto(generic),
+            ],
+        );
+        self.at(obj_b);
+        let hit = self.new_block();
+        let kt = MType::Obj(ObjInfo::kind(ObjKind::Function(Some(k))));
+        let kobj = self.f.add_param(hit, kt);
+        self.term(
+            Opcode::GuardScript(k),
+            vec![obj],
+            vec![
+                Edge {
+                    block: hit,
+                    args: vec![EdgeArg::Out(0)],
+                },
+                Self::goto(generic),
+            ],
+        );
+        self.at(hit);
+        // Not a constructor (an arrow function, a method): the generic
+        // construct throws.
+        let is_ctor = self.inst(Opcode::FnIsCtor, vec![kobj], Some(MType::Bool));
+        let ctor = self.new_block();
+        self.term(Opcode::Br, vec![is_ctor], vec![Self::goto(ctor), Self::goto(generic)]);
+        self.at(ctor);
+        let this = self.js_static(Opcode::CreateThis(nslots, word), vec![vals[0], nt], MType::val(TagSet::OBJECT));
+        let nformals = callee.f.frame.formals as usize;
+        let nargs = vals.len() - 3;
+        let mut operands = vec![kobj, this];
+        let undef = self.const_val(ConstVal::Undefined);
+        for i in 0..nformals {
+            operands.push(if i < nargs { vals[2 + i] } else { undef });
+        }
+        // The body's value, then the construct's result rule.
+        let ret = self.new_block();
+        let r = self.f.add_param(ret, MType::VAL_TOP);
+        let saved_mm = self.mm.clone();
+        let saved_frames = self.f.inline_frames.len();
+        let here = self.cur;
+        match super::inline::splice(&mut self.mm, &mut self.f, callee, 0, here, &operands, Some(nt), ret, err) {
+            Ok(()) => {
+                self.mm.script_addrs.insert(k, callee.mm.script_addrs[&k]);
+                self.live = false;
+                self.at(ret);
+                let t = self.new_block();
+                self.term(
+                    Opcode::GuardTags(TagSet::OBJECT),
+                    vec![r],
+                    vec![
+                        Edge {
+                            block: join,
+                            args: vec![EdgeArg::Out(0)],
+                        },
+                        Self::goto(t),
+                    ],
+                );
+                self.at(t);
+                self.term(
+                    Opcode::Jump,
+                    vec![],
+                    vec![Edge {
+                        block: join,
+                        args: vec![EdgeArg::Value(this)],
+                    }],
+                );
+            }
+            Err(_) => {
+                self.mm = saved_mm;
+                self.f.inline_frames.truncate(saved_frames);
+                self.term(Opcode::Jump, vec![], vec![Self::goto(generic)]);
+            }
+        }
+        self.at(generic);
+        let e = Edge {
+            block: join,
+            args: vec![EdgeArg::Out(0)],
+        };
+        self.term(Opcode::Construct(nslots, word), vals.to_vec(), vec![e.clone(), e, Self::goto(err)]);
         self.at(join);
         result
     }
@@ -2161,6 +2313,9 @@ impl<'s, 'a> Run<'s, 'a> {
             .max();
         match outer {
             None => true,
+            // Inlined callees make the loops around it bigger than their
+            // bytecode says, and the duplication with them.
+            Some(_) if !self.f.inline_frames.is_empty() => false,
             Some(len) => len <= self.s.ctx.opts.inner_onramp_bytes(),
         }
     }
@@ -2873,11 +3028,13 @@ impl<'s, 'a> Run<'s, 'a> {
             Return => {
                 let x = self.pop();
                 let v = self.boxed(x);
+                self.ctor_stamp();
                 self.term(Opcode::Return, vec![v], vec![]);
             }
             RetRval => {
                 let x = self.st[self.rval_ix()];
                 let v = self.boxed(x);
+                self.ctor_stamp();
                 self.term(Opcode::Return, vec![v], vec![]);
             }
 
@@ -3569,7 +3726,13 @@ impl<'s, 'a> Run<'s, 'a> {
                 };
                 let nslots = crate::wasm::bbv::construct_nslots(self.s.ctx, mono, site);
                 let word = crate::wasm::bbv::construct_alloc_word(self.s.ctx, mono, site);
-                let r = self.js(Opcode::Construct(nslots, word), vals, MType::val(TagSet::OBJECT));
+                let callee = mono.and_then(|k| Some((k, self.s.callee(k)?)));
+                let r = match callee {
+                    Some((k, c)) if INLINE_CONSTRUCT && self.inline_budget(c.f.insts.len()) => {
+                        self.inline_construct(k, &c, &vals, nslots, word)
+                    }
+                    _ => self.js(Opcode::Construct(nslots, word), vals, MType::val(TagSet::OBJECT)),
+                };
                 self.push(r, Ty::Val(TagSet::OBJECT));
             }
             Call | CallIgnoresRv | CallContent => {
@@ -3588,7 +3751,10 @@ impl<'s, 'a> Run<'s, 'a> {
                     .collect();
                 let r = if argc == 2 && self.s.apply_fwd.as_ref().is_some_and(|f| f.contains(&pc)) {
                     self.apply_forward(&vals)
-                } else if targets.is_empty() || targets.len() > MAX_INLINE_TARGETS {
+                } else if targets.is_empty()
+                    || targets.len() > MAX_INLINE_TARGETS
+                    || !self.inline_budget(targets.iter().map(|(_, c)| c.f.insts.len()).sum())
+                {
                     self.js(Opcode::Call, vals, MType::VAL_TOP)
                 } else {
                     self.inline_call(&targets, &vals, None)

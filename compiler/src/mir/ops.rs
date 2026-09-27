@@ -436,6 +436,17 @@ pub enum Opcode {
     /// new.target. The site's sized-allocation slot count and early stamp
     /// word (`bbv::construct_nslots`/`construct_alloc_word`).
     Construct(u32, u32),
+    /// The `this` of a construct (`callee, new.target`): a fresh object
+    /// sized `nslots` and seeded with the alloc word, as a direct construct
+    /// makes it (the site's construct cell, else `create_this`).
+    CreateThis(u32, u32),
+    /// Whether function `f` is a constructor (its flags): an arrow
+    /// function or a method is not.
+    FnIsCtor,
+    /// A layout constructor's first stamp of its completed `this`
+    /// (layout, field count, kept bits): a no-op unless `this` is an
+    /// object of this constructor still under construction.
+    CtorStamp(u32, u32, u32),
     CallNative(NativeId),
 }
 
@@ -514,7 +525,7 @@ impl Opcode {
             | JsSetName(..) | LoadField(_) | StoreField(_) | Call | CallDirect | Construct(..)
             | CallNative(_) => CLEAN_DIRTY_ERR.to_vec(),
             // No dynamic effect report: the kill is static, on `ok`.
-            JsGetName(_) | JsLambda(_) | ExitInline { .. } => OK_ERR.to_vec(),
+            JsGetName(_) | JsLambda(_) | CreateThis(..) | ExitInline { .. } => OK_ERR.to_vec(),
             JsRt(_) | ApplyFwd => CLEAN_DIRTY_ERR.to_vec(),
             ArgsObject | RestArray(_) => OK_ERR.to_vec(),
             JsThrow => vec![SuccRole::Err],
@@ -1223,6 +1234,22 @@ pub fn signature(op: &Opcode, args: &[Type], m: &Module) -> SigResult {
             )?;
             Sig::none()
         }
+        CreateThis(..) => {
+            arity(args, 2)?;
+            val(&args[0], "create_this callee")?;
+            val(&args[1], "create_this new.target")?;
+            Sig::output(Type::val(TagSet::OBJECT))
+        }
+        FnIsCtor => {
+            arity(args, 1)?;
+            obj(&args[0], "fn.is_ctor")?;
+            Sig::result(Type::Bool)
+        }
+        CtorStamp(..) => {
+            arity(args, 1)?;
+            val(&args[0], "ctor.stamp")?;
+            Sig::none()
+        }
         JsLambda(_) => {
             arity(args, 1)?;
             want_kind(&obj(&args[0], "js.lambda")?, ObjKind::Env, "js.lambda")?;
@@ -1659,6 +1686,13 @@ pub fn effects(op: &Opcode, args: &[Type], m: &Module) -> Effects {
         // An allocation, but reported as generic: it runs no JS, yet a GC
         // may move anything.
         JsLambda(_) => return Effects::generic(FlagsEffect::Bits(FlagBits::ALL)),
+        // `.prototype` of the callee: conservatively generic.
+        CreateThis(..) => return Effects::generic(FlagsEffect::Bits(FlagBits::ALL)),
+        // Writes the class word of an object no guard can have proven.
+        CtorStamp(..) => {
+            fx.writes = vec![Region::Unknown];
+            fx.flags = FlagsEffect::Bits(FlagBits::MUT_THIS);
+        }
         // The rest of the callee, in baseline: anything.
         ExitInline { .. } => return Effects::generic(FlagsEffect::Bits(FlagBits::ALL)),
         Call | CallDirect | Construct(..) | CallNative(_) => {

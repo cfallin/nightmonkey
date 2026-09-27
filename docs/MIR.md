@@ -1578,6 +1578,29 @@ which found the helper calls the ICs cannot avoid:
   char of a linear string inline; `String.fromCharCode(c < 256)` is a
   static unit string (crypto's 5M misses).
 
+**M5h. Inlining constructors; inlining limits (2026-09-27).**
+- `new F(…)` of a site's one constructor is inlined: with the callee
+  that script's function and a constructor (`fn.is_ctor`: not an arrow
+  function or a method), `create_this` makes `this` as a direct construct
+  does (the site's construct cell, else the runtime), the body is spliced
+  with its frame's new.target (`inline.enter`'s extra operand), and the
+  result is the body's value if an object (`guard.tags`), else `this`.
+  A layout constructor's stamp is now an op the builder emits at every
+  return (`ctor.stamp`, a no-op unless `this` is under construction), so
+  an inlined copy stamps too, and stamping constructors are inlinable.
+- Inlining limits as bbv's: callees up to 500 bytes of bytecode and 2000
+  MIR instructions, at most 8 inlined sites and 6000 spliced
+  instructions per function (per built function: an inlined callee has
+  its own), nesting 2 deep; a function past 60000 instructions stays in
+  baseline. With inlined callees, only outermost loops get onramp roots:
+  an inner loop's side entry makes waffle's reducifier duplicate the
+  loops around it, inlined code and all (a pdfjs body reached 8.9 MB,
+  past wasm's function size limit).
+- The 500-byte limit is a trade: richards (its task methods are ~400
+  bytes) gains 12% over 300 bytes, earley-boyer loses 9%; the cause of
+  the latter is not yet known.
+- Allocation micro-benchmark: 176 -> 116 ms (bbv 100).
+
 **M6. The rest of §10**: box/unbox cleanup, memory optimizations, and
 numeric optimizations, each with its guard-count and instruction-count
 tests.
