@@ -81,7 +81,7 @@ use crate::wasm::bbv::abi::{
 };
 use crate::wasm::translate::{
     AtomTable, Helpers, APPEND_CACHE_ENTRY_BYTES, APPEND_CACHE_SIZE, BC_ARR_POP, BC_ARR_PUSH,
-    ELEMENTS_POP_BAIL_MASK, INLINE_IC_STRIDE, MAGIC_IS_CONSTRUCTING, MAGIC_UNINITIALIZED_LEXICAL, TAG_BIGINT_HI, TAG_BOOLEAN, TAG_CLEAR,
+    ELEMENTS_POP_BAIL_MASK, INLINE_IC_STRIDE, MAGIC_GENERATOR_CLOSING, MAGIC_IS_CONSTRUCTING, MAGIC_UNINITIALIZED_LEXICAL, TAG_BIGINT_HI, TAG_BOOLEAN, TAG_CLEAR,
     TAG_INT32, TAG_MAGIC, TAG_NULL, TAG_OBJECT, TAG_STRING, TAG_SYMBOL, TAG_UNDEFINED,
 };
 
@@ -353,6 +353,7 @@ struct Lower<'a> {
     plain_env: bool,
     own_env: bool,
     forward_resume: bool,
+    is_gen: bool,
     mapped_formals: bool,
     /// The syntactic global binding (`TranslateCtx::syn_gnames`) each
     /// global name read names, for its inline arms.
@@ -408,6 +409,9 @@ pub struct LowerOpts {
     /// The script may be inlined: its entry forwards a resume to its
     /// baseline body (§5.5).
     pub forward_resume: bool,
+    /// A generator or async body: its entry also takes a generator's
+    /// resume (`EnterNightResume`) to the yield's `Resume` root.
+    pub is_gen: bool,
     /// The script's formals are a mapped `arguments`'s, which may write
     /// them behind MIR's back: their frame stores are never dropped.
     pub mapped_formals: bool,
@@ -500,6 +504,7 @@ pub fn lower<'a>(
         plain_env: o.plain_env,
         own_env: o.own_env,
         forward_resume: o.forward_resume,
+        is_gen: o.is_gen,
         mapped_formals: o.mapped_formals,
         gname_bids,
         gname_fused,
@@ -807,6 +812,12 @@ impl<'a> Lower<'a> {
         let vs = self.f.insts[inst].args.clone();
         let mut out = vec![];
         for v in vs {
+            // A ghost (`Fact`) has no representation: a placeholder no
+            // lowering reads.
+            if machine(&self.ty(v)).is_none() {
+                out.push(self.i32c(0));
+                continue;
+            }
             let w = self.value_here(v)?;
             self.vmap.insert(v, w);
             out.push(w);
@@ -1378,7 +1389,7 @@ impl<'a> Lower<'a> {
             .iter()
             .filter_map(|r| match r.kind {
                 RootKind::Onramp(pc) => Some((pc, r.block)),
-                RootKind::Entry => None,
+                RootKind::Entry | RootKind::Resume { .. } => None,
             })
             .collect();
         if !onramps.is_empty() {
@@ -1401,6 +1412,18 @@ impl<'a> Lower<'a> {
                 self.cur = no;
             }
             self.terminate(Terminator::Unreachable);
+            self.cur = fresh;
+        }
+        if self.is_gen {
+            // A generator's resume stages the generator-closing magic as
+            // `this`, which no call passes (`EnterNightResume`).
+            let thisv = self.load_i64(self.sp, FrameLayout::THIS);
+            let magic = self.i64c((TAG_MAGIC << 32) | MAGIC_GENERATOR_CLOSING);
+            let is_resume = self.bin(Operator::I64Eq, thisv, magic, Type::I32);
+            let (res, fresh) = (self.body.add_block(), self.body.add_block());
+            self.cond_br(is_resume, Self::to(res), Self::to(fresh));
+            self.cur = res;
+            self.gen_resume_dispatch()?;
             self.cur = fresh;
         }
         let root = self
@@ -1491,6 +1514,77 @@ impl<'a> Lower<'a> {
     /// Enter onramp root `root` (loop header `pc`) with the baseline
     /// frame's state at `pc`: `this`, formals, locals, rval and the
     /// operand stack.
+    /// A generator's resume (baseline's `finalize_gen_dispatch`): read
+    /// the descriptor `EnterNightResume` staged over the locals, set the
+    /// fixed slots a fresh prologue would, restore the locals, operands
+    /// and environment from the generator, push the resume protocol's
+    /// `[sent value, generator, resume kind]` at the landing's depth, and
+    /// enter the `Resume` root for the saved resume index.
+    fn gen_resume_dispatch(&mut self) -> R<()> {
+        let l = self.layout;
+        let vp = self.vp;
+        let desc = self.add_off(vp, l.local_base());
+        let ridx = self.load_i32(desc, 0);
+        let roots: Vec<(u32, Pc, mir::Block)> = self
+            .f
+            .roots
+            .iter()
+            .filter_map(|r| match r.kind {
+                RootKind::Resume { index, pc } => Some((index, pc, r.block)),
+                _ => None,
+            })
+            .collect();
+        // A yield this body has no root for (one in catch code, which is
+        // baseline's, suspended there after an exit): baseline's own
+        // resume dispatch, with the descriptor untouched.
+        let other = self.body.add_block();
+        let max_k = roots.iter().map(|&(k, _, _)| k).max().unwrap_or(0);
+        let mut targets = vec![Self::to(other); (max_k + 1) as usize];
+        let disp = self.cur;
+        for (k, pc, root) in roots {
+            let b = self.body.add_block();
+            targets[k as usize] = Self::to(b);
+            self.cur = b;
+            let desc = self.add_off(vp, l.local_base());
+            let rkind = self.load_i32(desc, 4);
+            let rgen = self.load_i64(desc, 8);
+            let rarg = self.load_i64(desc, 16);
+            let undef = self.i64c(UNDEF);
+            for off in [l.env(), l.args_obj(), l.new_target(), l.rval()] {
+                self.store_i64(vp, off, undef);
+            }
+            let zero = self.i64c(TAG_INT32 << 32);
+            self.store_i64(vp, l.resume(), zero);
+            self.store_i64(vp, l.backoff(), zero);
+            let lp = self.add_off(vp, l.local_base());
+            let nl = self.i32c(l.nlocals);
+            let ep = if self.plain_env || self.own_env {
+                self.add_off(vp, l.env())
+            } else {
+                self.i32c(0)
+            };
+            let ops = self.add_off(vp, l.operand_base());
+            self.call(self.h.gen_restore, &[self.cx, rgen, lp, nl, ep, ops], &[Type::I32]);
+            let depth = *self.f.frame.depths.get(&pc).ok_or("lowering: no depth at a resume root")?;
+            let saved = depth.checked_sub(3).ok_or("lowering: a resume landing below depth 3")?;
+            self.store_i64(vp, l.operand(saved), rarg);
+            self.store_i64(vp, l.operand(saved + 1), rgen);
+            let kind = self.box_tagged(TAG_INT32, rkind);
+            self.store_i64(vp, l.operand(saved + 2), kind);
+            self.enter_onramp(pc, root)?;
+        }
+        self.cur = disp;
+        self.terminate(Terminator::Select {
+            value: ridx,
+            targets,
+            default: Self::to(other),
+        });
+        self.cur = other;
+        let argc = self.argc;
+        self.tail_to_baseline(argc);
+        Ok(())
+    }
+
     fn enter_onramp(&mut self, pc: Pc, root: mir::Block) -> R<()> {
         let l = self.layout;
         let (sp, vp) = (self.sp, self.vp);
@@ -2012,6 +2106,14 @@ impl<'a> Lower<'a> {
                 self.ret(z);
             }
             Opcode::Unreachable => self.terminate(Terminator::Unreachable),
+            Opcode::GenSuspend { index, nargs, nlocals, initial, .. } => {
+                self.gen_suspend(inst, &a, index, nargs, nlocals, initial)?;
+            }
+            Opcode::IsGenClosing => {
+                let m = self.i64c((TAG_MAGIC << 32) | MAGIC_GENERATOR_CLOSING);
+                let r = self.bin(Operator::I64Eq, a[0], m, Type::I32);
+                self.def(inst, r);
+            }
             Opcode::Exit { pc, nargs, nlocals } | Opcode::ExitThrow { pc, nargs, nlocals } => {
                 let mode = if matches!(d.op, Opcode::Exit { .. }) {
                     ResumeMode::Continue
@@ -2429,6 +2531,38 @@ impl<'a> Lower<'a> {
                 }
                 let sv = self.i32c(u32::from(strict));
                 self.js_call(inst, self.h.set_element, &[a[0], a[1], a[2], sv], false)?;
+            }
+            Opcode::LengthArray => {
+                // The elements header's length word, unsigned.
+                let elements = self.load_i32(a[0], OBJ_ELEMENTS_OFFSET);
+                let back = self.i32c(ELEMENTS_LENGTH_BACK);
+                let la = self.bin(Operator::I32Sub, elements, back, Type::I32);
+                let len = self.load_i32(la, 0);
+                let r = self.un(Operator::I64ExtendI32U, len, Type::I64);
+                self.def(inst, r);
+            }
+            Opcode::LengthString => {
+                let len = self.load_i32(a[0], STRING_LENGTH_OFFSET);
+                self.def(inst, len);
+            }
+            Opcode::IntToI32 => {
+                let x = a[0];
+                let lo = self.i64c(i64::from(i32::MIN) as u64);
+                let hi = self.i64c(i64::from(i32::MAX) as u64);
+                let ge = self.bin(Operator::I64GeS, x, lo, Type::I32);
+                let le = self.bin(Operator::I64LeS, x, hi, Type::I32);
+                let ok = self.bin(Operator::I32And, ge, le, Type::I32);
+                let i = self.un(Operator::I32WrapI64, x, Type::I32);
+                self.guard(inst, ok, &[i])?;
+            }
+            Opcode::GuardKind(ObjKind::Array) => {
+                let shape = self.load_i32(a[0], SHAPE_OFFSET);
+                let base = self.load_i32(shape, SHAPE_BASESHAPE_OFFSET);
+                let clasp = self.load_i32(base, BASESHAPE_CLASP_OFFSET);
+                let aslot = self.i32c(self.h.array_class_slot);
+                let arr_class = self.load_i32(aslot, 0);
+                let is_arr = self.bin(Operator::I32Eq, clasp, arr_class, Type::I32);
+                self.guard(inst, is_arr, &[a[0]])?;
             }
             Opcode::LengthTa => {
                 // Its length slot's payload (a detached one reads 0).
@@ -2868,6 +3002,32 @@ impl<'a> Lower<'a> {
                         (h.fun_with_proto, vec![env, a[0], script, iv])
                     }
                     RtOp::CheckReturn => (h.check_return, vec![a[0], a[1]]),
+                    RtOp::CreateGenerator => {
+                        let callee = self.load_i64(self.sp, FrameLayout::CALLEE);
+                        let env = if self.plain_env || self.own_env {
+                            self.frame_env()
+                        } else {
+                            self.i64c(UNDEF)
+                        };
+                        (h.create_generator, vec![callee, env])
+                    }
+                    RtOp::GenFinal => (h.gen_final, vec![a[0]]),
+                    RtOp::GenCheckResume => {
+                        let k = self.un(Operator::I32WrapI64, a[2], Type::I32);
+                        let rval = self.add_off(self.vp, self.frame_off[self.cur_frame as usize] + self.layout.rval());
+                        (h.gen_check_resume, vec![a[1], a[0], k, rval])
+                    }
+                    RtOp::AsyncAwait(resolve) => {
+                        let f = if resolve != 0 { h.async_resolve } else { h.async_await };
+                        (f, vec![a[1], a[0]])
+                    }
+                    RtOp::AsyncReject => (h.async_reject, vec![a[2], a[0], a[1]]),
+                    RtOp::CanSkipAwait => (h.can_skip_await, vec![a[0]]),
+                    RtOp::MaybeExtractAwait => {
+                        let can = self.un(Operator::I32WrapI64, a[1], Type::I32);
+                        (h.maybe_extract_await, vec![a[0], can])
+                    }
+                    RtOp::Resume => (h.resume, vec![a[0], a[1], a[2]]),
                     RtOp::AddDisposable(hint) => {
                         let env = self.frame_env();
                         let hv = self.i32c(hint);
@@ -3236,6 +3396,54 @@ impl<'a> Lower<'a> {
                 let ok = self.bin(Operator::I32Eq, w, one, Type::I32);
                 self.guard(inst, ok, &[])?;
             }
+            Opcode::CheckBinding(b, write) => {
+                let slot = self.mm.bindings[b].slot;
+                if !write {
+                    // A read of a binding whose value fuse is armed
+                    // (`gGlobalVals`) needs no slot: `load_gname` takes the
+                    // value there. Straight to `ok`.
+                    let vals = self.i32c(self.h.global_vals_base + 16 * slot);
+                    let fw = self.load_i32(vals, 8);
+                    let one = self.i32c(1);
+                    let armed = self.bin(Operator::I32Eq, fw, one, Type::I32);
+                    let chk = self.body.add_block();
+                    let t = self.edge(inst, 0, &[])?;
+                    self.cond_br(armed, t, Self::to(chk));
+                    self.cur = chk;
+                }
+                let ok = self.binding_ok(slot, write);
+                self.guard(inst, ok, &[])?;
+            }
+            Opcode::LoadGName(b) => {
+                // The value fuse's copy while armed, else the slot.
+                let slot = self.mm.bindings[b].slot;
+                let vals = self.i32c(self.h.global_vals_base + 16 * slot);
+                let fw = self.load_i32(vals, 8);
+                let one = self.i32c(1);
+                let armed = self.bin(Operator::I32Eq, fw, one, Type::I32);
+                let (hit, miss, join) = (self.body.add_block(), self.body.add_block(), self.body.add_block());
+                let r = self.body.add_blockparam(join, Type::I64);
+                self.cond_br(armed, Self::to(hit), Self::to(miss));
+                self.cur = hit;
+                let v = self.load_i64(vals, 0);
+                self.terminate(Terminator::Br {
+                    target: BlockTarget { block: join, args: vec![v] },
+                });
+                self.cur = miss;
+                let addr = self.binding_addr(slot);
+                let v = self.load_i64(addr, 0);
+                self.terminate(Terminator::Br {
+                    target: BlockTarget { block: join, args: vec![v] },
+                });
+                self.cur = join;
+                self.def(inst, r);
+            }
+            Opcode::StoreGName(b) => {
+                let def = &self.mm.bindings[b];
+                let (slot, name) = (def.slot, def.name);
+                let fused = self.gname_fused.get(&name).copied();
+                self.binding_store(slot, a[1], fused);
+            }
             Opcode::LoadField(name) => self.field_op(inst, name, a[0], None)?,
             Opcode::StoreField(name) => self.field_op(inst, name, a[0], Some(a[1]))?,
             Opcode::JsBoxThis => {
@@ -3444,6 +3652,151 @@ impl<'a> Lower<'a> {
     /// while the global's shape is the one the row was resolved against;
     /// else the resolve leaf (no GC) and the slot. Falls through to the
     /// generic helper when the binding is not cacheable (lexicals, TDZ).
+    /// `check.binding` (§3): binding row `slot` resolved against the
+    /// global object's live shape (writable too, for `write`), re-resolved
+    /// by the leaf when it is not. The row then says where the slot is.
+    fn binding_ok(&mut self, slot: u32, write: bool) -> Value {
+        let base = self.i32c(self.h.global_slots_base);
+        let entry0 = self.load_i32(base, 8 * slot);
+        let shape0 = self.load_i32(base, 8 * slot + 4);
+        let usable = |l: &mut Self, e: Value| {
+            let one = l.i32c(1);
+            let r = l.bin(Operator::I32And, e, one, Type::I32);
+            if !write {
+                return r;
+            }
+            let two = l.i32c(2);
+            let sh = l.bin(Operator::I32ShrU, e, two, Type::I32);
+            let w = l.bin(Operator::I32And, sh, one, Type::I32);
+            l.bin(Operator::I32And, r, w, Type::I32)
+        };
+        let u0 = usable(self, entry0);
+        let realm = self.load_i32(self.cx, JSCONTEXT_REALM_OFFSET);
+        let global = self.load_i32(realm, REALM_GLOBAL_OFFSET);
+        let live = self.load_i32(global, SHAPE_OFFSET);
+        let same = self.bin(Operator::I32Eq, shape0, live, Type::I32);
+        let hit = self.bin(Operator::I32And, u0, same, Type::I32);
+        let join = self.body.add_block();
+        let ok = self.body.add_blockparam(join, Type::I32);
+        let resolve_b = self.body.add_block();
+        self.cond_br(hit, BlockTarget { block: join, args: vec![hit] }, Self::to(resolve_b));
+        self.cur = resolve_b;
+        let b = self.i32c(slot);
+        let entry1 = self.call1(self.h.resolve_global_slot_guarded, &[self.cx, b], Type::I32);
+        let u1 = usable(self, entry1);
+        self.terminate(Terminator::Br {
+            target: BlockTarget { block: join, args: vec![u1] },
+        });
+        self.cur = join;
+        ok
+    }
+
+    /// The address of binding row `slot`'s global slot, the row resolved
+    /// (bit 1 of the entry selects the dynamic slots; `entry & !7` is the
+    /// byte offset from that base, past the fixed-slot header when fixed).
+    fn binding_addr(&mut self, slot: u32) -> Value {
+        let base = self.i32c(self.h.global_slots_base);
+        let entry = self.load_i32(base, 8 * slot);
+        let realm = self.load_i32(self.cx, JSCONTEXT_REALM_OFFSET);
+        let global = self.load_i32(realm, REALM_GLOBAL_OFFSET);
+        let one = self.i32c(1);
+        let sh = self.bin(Operator::I32ShrU, entry, one, Type::I32);
+        let dynamic = self.bin(Operator::I32And, sh, one, Type::I32);
+        let m = self.i32c(!7);
+        let idx8 = self.bin(Operator::I32And, entry, m, Type::I32);
+        let z = self.i32c(0);
+        let fb = self.i32c(FIXED_SLOTS_BASE);
+        let add = self.select(Type::I32, z, fb, dynamic);
+        let off = self.bin(Operator::I32Add, idx8, add, Type::I32);
+        let slots = self.load_i32(global, NATIVE_SLOTS_OFFSET);
+        let slot_base = self.select(Type::I32, slots, global, dynamic);
+        self.bin(Operator::I32Add, slot_base, off, Type::I32)
+    }
+
+    /// `store_gname` (§3): the resolved, writable slot of binding row
+    /// `slot` takes `val`, with the barriers, the binding's value fuse and
+    /// the bind epoch as the syntactic global store keeps them, and a
+    /// fused literal's fuse (`gname_set_arms`' tail).
+    fn binding_store(&mut self, slot: u32, val: Value, fused: Option<crate::wasm::translate::FusedGname>) {
+        let addr = self.binding_addr(slot);
+        self.pre_barrier(addr, 0);
+        self.store_i64(addr, 0, val);
+        let base = self.i32c(self.h.global_slots_base);
+        let entry = self.load_i32(base, 8 * slot);
+        let realm = self.load_i32(self.cx, JSCONTEXT_REALM_OFFSET);
+        let global = self.load_i32(realm, REALM_GLOBAL_OFFSET);
+        let live = self.load_i32(global, SHAPE_OFFSET);
+        let one = self.i32c(1);
+        let sh = self.bin(Operator::I32ShrU, entry, one, Type::I32);
+        let dynamic = self.bin(Operator::I32And, sh, one, Type::I32);
+        let three = self.i32c(3);
+        let idx = self.bin(Operator::I32ShrU, entry, three, Type::I32);
+        let flags = self.load_i32(live, SHAPE_IMMUTABLE_FLAGS_OFFSET);
+        let fs = self.i32c(SHAPE_FIXED_SLOTS_SHIFT);
+        let nf = self.bin(Operator::I32ShrU, flags, fs, Type::I32);
+        let fm = self.i32c(SHAPE_FIXED_SLOTS_MASK_BITS);
+        let nfixed = self.bin(Operator::I32And, nf, fm, Type::I32);
+        let idx_plus = self.bin(Operator::I32Add, idx, nfixed, Type::I32);
+        let abs = self.select(Type::I32, idx_plus, idx, dynamic);
+        self.post_barrier(self.h.post_write_barrier, global, abs, val);
+        self.binding_fuses(slot, val, fused);
+    }
+
+    /// A syntactic global store's bookkeeping, after the slot store: the
+    /// binding's value fuse (`gGlobalVals[bid]`), the bind epoch, and a
+    /// fused literal's fuse.
+    fn binding_fuses(&mut self, bid: u32, val: Value, fused: Option<crate::wasm::translate::FusedGname>) {
+        let one = self.i32c(1);
+        let two = self.i32c(2);
+        // The binding's value fuse (`gGlobalVals[bid]`): an armed cell whose
+        // value changes mirrors a non-GC value in place, and otherwise is
+        // unarmed with the re-arm left to the runtime (bbv's
+        // `emit_blow_binding_value_fuse`).
+        let vals = self.i32c(self.h.global_vals_base + 16 * bid);
+        let fw = self.load_i32(vals, 8);
+        let armed = self.bin(Operator::I32Eq, fw, one, Type::I32);
+        let old = self.load_i64(vals, 0);
+        let changed = self.bin(Operator::I64Ne, old, val, Type::I32);
+        let blow = self.bin(Operator::I32And, armed, changed, Type::I32);
+        let (blow_b, cont) = (self.body.add_block(), self.body.add_block());
+        self.cond_br(blow, Self::to(blow_b), Self::to(cont));
+        self.cur = blow_b;
+        let tag = self.tag_of(val);
+        let st = self.i32c(TAG_STRING as u32);
+        let is_gc = self.bin(Operator::I32GeU, tag, st, Type::I32);
+        let (gc_b, plain_b) = (self.body.add_block(), self.body.add_block());
+        self.cond_br(is_gc, Self::to(gc_b), Self::to(plain_b));
+        self.cur = plain_b;
+        self.store_i64(vals, 0, val);
+        self.terminate(Terminator::Br { target: Self::to(cont) });
+        self.cur = gc_b;
+        let z = self.i32c(0);
+        self.store_i32(vals, 8, z);
+        let b = self.i32c(bid);
+        self.call(self.h.binding_written, &[b], &[]);
+        self.terminate(Terminator::Br { target: Self::to(cont) });
+        self.cur = cont;
+        // The bind epoch.
+        let slot = self.i32c(self.h.strlit_slot + crate::region_shape::STRLIT_BIND_EPOCH_ADDR_OFF);
+        let ep = self.load_i32(slot, 0);
+        let e = self.load_i32(ep, 0);
+        let e1 = self.bin(Operator::I32Add, e, one, Type::I32);
+        self.store_i32(ep, 0, e1);
+        // A fused literal's fuse: the literal arms it, anything else blows
+        // it.
+        if let Some(fg) = fused {
+            let fa = self.i32c(fg.fuse_addr);
+            let f = self.load_i32(fa, 0);
+            let lit = self.i64c(fg.boxed);
+            let neq = self.bin(Operator::I64Ne, val, lit, Type::I32);
+            let z = self.i32c(0);
+            let is_zero = self.bin(Operator::I32Eq, f, z, Type::I32);
+            let armed = self.select(Type::I32, one, f, is_zero);
+            let nf = self.select(Type::I32, two, armed, neq);
+            self.store_i32(fa, 0, nf);
+        }
+    }
+
     fn gname_fast_arms(&mut self, inst: mir::Inst, bid: u32) -> R<()> {
         let vals = self.i32c(self.h.global_vals_base + 16 * bid);
         let fw = self.load_i32(vals, 8);
@@ -3599,53 +3952,7 @@ impl<'a> Lower<'a> {
         let idx_plus = self.bin(Operator::I32Add, idx, nfixed, Type::I32);
         let abs = self.select(Type::I32, idx_plus, idx, dynamic);
         self.post_barrier(self.h.post_write_barrier, global, abs, val);
-        // The binding's value fuse (`gGlobalVals[bid]`): an armed cell whose
-        // value changes mirrors a non-GC value in place, and otherwise is
-        // unarmed with the re-arm left to the runtime (bbv's
-        // `emit_blow_binding_value_fuse`).
-        let vals = self.i32c(self.h.global_vals_base + 16 * bid);
-        let fw = self.load_i32(vals, 8);
-        let armed = self.bin(Operator::I32Eq, fw, one, Type::I32);
-        let old = self.load_i64(vals, 0);
-        let changed = self.bin(Operator::I64Ne, old, val, Type::I32);
-        let blow = self.bin(Operator::I32And, armed, changed, Type::I32);
-        let (blow_b, cont) = (self.body.add_block(), self.body.add_block());
-        self.cond_br(blow, Self::to(blow_b), Self::to(cont));
-        self.cur = blow_b;
-        let tag = self.tag_of(val);
-        let st = self.i32c(TAG_STRING as u32);
-        let is_gc = self.bin(Operator::I32GeU, tag, st, Type::I32);
-        let (gc_b, plain_b) = (self.body.add_block(), self.body.add_block());
-        self.cond_br(is_gc, Self::to(gc_b), Self::to(plain_b));
-        self.cur = plain_b;
-        self.store_i64(vals, 0, val);
-        self.terminate(Terminator::Br { target: Self::to(cont) });
-        self.cur = gc_b;
-        let z = self.i32c(0);
-        self.store_i32(vals, 8, z);
-        let b = self.i32c(bid);
-        self.call(self.h.binding_written, &[b], &[]);
-        self.terminate(Terminator::Br { target: Self::to(cont) });
-        self.cur = cont;
-        // The bind epoch.
-        let slot = self.i32c(self.h.strlit_slot + crate::region_shape::STRLIT_BIND_EPOCH_ADDR_OFF);
-        let ep = self.load_i32(slot, 0);
-        let e = self.load_i32(ep, 0);
-        let e1 = self.bin(Operator::I32Add, e, one, Type::I32);
-        self.store_i32(ep, 0, e1);
-        // A fused literal's fuse: the literal arms it, anything else blows
-        // it.
-        if let Some(fg) = fused {
-            let fa = self.i32c(fg.fuse_addr);
-            let f = self.load_i32(fa, 0);
-            let lit = self.i64c(fg.boxed);
-            let neq = self.bin(Operator::I64Ne, val, lit, Type::I32);
-            let z = self.i32c(0);
-            let is_zero = self.bin(Operator::I32Eq, f, z, Type::I32);
-            let armed = self.select(Type::I32, one, f, is_zero);
-            let nf = self.select(Type::I32, two, armed, neq);
-            self.store_i32(fa, 0, nf);
-        }
+        self.binding_fuses(bid, val, fused);
         let t = self.edge(inst, 0, &[])?;
         self.terminate(Terminator::Br { target: t });
         self.cur = slow;
@@ -6312,10 +6619,44 @@ impl<'a> Lower<'a> {
                 None => None,
             });
         }
-        let fp = frame_parts(&boxed, nargs, nlocals).ok_or("lowering: malformed exit")?;
+        self.write_frame(&boxed, nargs, nlocals)?;
+        let vp = self.vp;
+        let l = self.layout;
+        // The fixed slots MIR does not keep current. The env slot is
+        // written through (scopes), and the arguments-object slot holds the
+        // one `args.object` made, if any (the fresh entry cleared it).
+        self.store_i64(vp, l.new_target(), self.new_target);
+        let w64 = self.un(Operator::I64ExtendI32U, word, Type::I64);
+        let tag = self.i64c(TAG_INT32 << 32);
+        let wv = self.bin(Operator::I64Or, w64, tag, Type::I64);
+        self.store_i64(vp, l.resume(), wv);
+        // Baseline waits this many loop-header visits before it tries an
+        // onramp again, so it makes progress from here.
+        let backoff = self.i64c((TAG_INT32 << 32) | u64::from(ONRAMP_BACKOFF));
+        self.store_i64(vp, l.backoff(), backoff);
+        if self.has_onramps {
+            // Entered by an onramp: the baseline caller resumes itself.
+            let (deopt, call_blk) = (self.body.add_block(), self.body.add_block());
+            self.cond_br(self.onramp_flag, Self::to(deopt), Self::to(call_blk));
+            self.cur = deopt;
+            let d = self.i32c(ERR_DEOPT);
+            self.ret(d);
+            self.cur = call_blk;
+        }
+        let bit = self.i32c(ARGC_RESUME_BIT);
+        let argc = self.bin(Operator::I32Or, self.argc, bit, Type::I32);
+        self.tail_to_baseline(argc);
+        self.cur = saved;
+        Ok(hub)
+    }
+
+    /// Write frame state `boxed` (this, formals, locals, rval, stack; a
+    /// dead operand's slot keeps the frame's valid value) to the baseline
+    /// frame.
+    fn write_frame(&mut self, boxed: &[Option<Value>], nargs: u32, nlocals: u32) -> R<()> {
+        let fp = frame_parts(boxed, nargs, nlocals).ok_or("lowering: malformed exit")?;
         let (sp, vp) = (self.sp, self.vp);
         let l = self.layout;
-        // A dead operand's slot keeps the frame's (valid) value.
         if let Some(v) = *fp.this {
             self.store_i64(sp, FrameLayout::THIS, v);
         }
@@ -6340,32 +6681,58 @@ impl<'a> Lower<'a> {
             };
             self.store_i64(vp, l.operand(u32::try_from(k).unwrap()), v);
         }
-        // The fixed slots MIR does not keep current. The env slot is fixed
-        // for the activation, and the arguments-object slot holds the one
-        // `args.object` made, if any (the fresh entry cleared it).
-        self.store_i64(vp, l.new_target(), self.new_target);
-        let w64 = self.un(Operator::I64ExtendI32U, word, Type::I64);
-        let tag = self.i64c(TAG_INT32 << 32);
-        let wv = self.bin(Operator::I64Or, w64, tag, Type::I64);
-        self.store_i64(vp, l.resume(), wv);
-        // Baseline waits this many loop-header visits before it tries an
-        // onramp again, so it makes progress from here.
-        let backoff = self.i64c((TAG_INT32 << 32) | u64::from(ONRAMP_BACKOFF));
-        self.store_i64(vp, l.backoff(), backoff);
-        if self.has_onramps {
-            // Entered by an onramp: the baseline caller resumes itself.
-            let (deopt, call_blk) = (self.body.add_block(), self.body.add_block());
-            self.cond_br(self.onramp_flag, Self::to(deopt), Self::to(call_blk));
-            self.cur = deopt;
-            let d = self.i32c(ERR_DEOPT);
-            self.ret(d);
-            self.cur = call_blk;
+        Ok(())
+    }
+
+    /// `gen.suspend` (baseline's `suspend`): write the frame, save its
+    /// locals, the operands below the yielded ones and the environment
+    /// into the generator under resume index `index`, and return the
+    /// yielded value (the generator, for `InitialYield`).
+    fn gen_suspend(&mut self, inst: mir::Inst, a: &[Value], index: u32, nargs: u32, nlocals: u32, initial: bool) -> R<()> {
+        let d = self.f.insts[inst].clone();
+        let mut boxed = vec![];
+        for (&v, &mv) in a.iter().zip(&d.args) {
+            let dead = matches!(
+                self.f.values[mv].def,
+                mir::func::ValueDef::Result(i, _) if self.f.insts[i].op == Opcode::ConstVal(ConstVal::Dead)
+            );
+            boxed.push(if dead { None } else { Some(self.boxed(&self.ty(mv), v)?) });
         }
-        let bit = self.i32c(ARGC_RESUME_BIT);
-        let argc = self.bin(Operator::I32Or, self.argc, bit, Type::I32);
-        self.tail_to_baseline(argc);
-        self.cur = saved;
-        Ok(hub)
+        let depth = frame_parts(&boxed, nargs, nlocals).ok_or("lowering: malformed gen.suspend")?.stack.len();
+        let popped = if initial { 1 } else { 2 };
+        let saved = u32::try_from(depth.checked_sub(popped).ok_or("lowering: gen.suspend stack too shallow")?).unwrap();
+        let g = boxed[boxed.len() - 1].ok_or("lowering: gen.suspend without its generator")?;
+        let rv = if initial {
+            g
+        } else {
+            boxed[boxed.len() - 2].ok_or("lowering: gen.suspend without its value")?
+        };
+        // A dead local goes into the generator as undefined, not as the
+        // frame's stale copy: a binding out of scope must not keep its
+        // last value alive while the generator is suspended.
+        let undef = self.i64c(UNDEF);
+        let nlead = 1 + nargs as usize;
+        for (i, b) in boxed.iter_mut().enumerate() {
+            if b.is_none() && i >= nlead && i <= nlead + nlocals as usize {
+                *b = Some(undef);
+            }
+        }
+        self.write_frame(&boxed, nargs, nlocals)?;
+        let l = self.layout;
+        let env = if self.plain_env || self.own_env {
+            self.frame_env()
+        } else {
+            self.i64c(0)
+        };
+        let lp = self.add_off(self.vp, l.local_base());
+        let nl = self.i32c(l.nlocals);
+        let ops = self.add_off(self.vp, l.operand_base());
+        let (kv, dv) = (self.i32c(index), self.i32c(saved));
+        self.call(self.h.gen_suspend, &[self.cx, g, kv, lp, nl, ops, dv, env], &[Type::I32]);
+        self.store_i64(self.retval_out, 0, rv);
+        let z = self.i32c(0);
+        self.ret(z);
+        Ok(())
     }
 
     /// Run this script's baseline body on the frame at `sp` with `argc`

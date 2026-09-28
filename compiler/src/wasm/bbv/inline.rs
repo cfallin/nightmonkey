@@ -329,75 +329,7 @@ impl<'a> Bbv<'a> {
         room: usize,
         entry: Option<Site>,
     ) -> usize {
-        const CALL_COST: usize = 300;
-        const APPLY_FWD_COST: usize = 40;
-        const RESOLVED_COST: usize = 60;
-        const LOOP_WEIGHT: usize = 3;
-        let SourceObject::Script(s) = self.source.object(sid.source()) else {
-            return 0;
-        };
-        // A loop in a spliced callee is the term no size budget can see: its
-        // interior is emitted once per version of the segment, and the
-        // relooper duplicates tails per skipped-header context on top of
-        // that. Measured across the corpus, a loop-bearing closure expands
-        // roughly three times the values per unit of un-weighted cost that a
-        // loop-free one does, and the loops are the whole difference.
-        let nloops = LOOP_WEIGHT * super::translate::scan_loop_intervals(s).len();
-        let mut total = s.bytecode.len() * (1 + nloops);
-        if total > room {
-            return total;
-        }
-        for (cpc, op) in call_site_pcs(s) {
-            if !matches!(op, JSOp::Call | JSOp::CallIgnoresRv | JSOp::New) {
-                continue;
-            }
-            let site = Site::new(sid, Pc::new(cpc));
-            let fwd_target = entry
-                .and_then(|e| self.ctx.facts.apply_targets_in.get(&(e, site)))
-                .or_else(|| self.ctx.facts.apply_targets.get(&site))
-                .copied()
-                .filter(|_| {
-                    op != JSOp::New && self.callee_apply_fwd_pcs(sid, s).contains(&Pc::new(cpc))
-                });
-            let targets: Vec<ScriptId> = match fwd_target {
-                Some(t) => {
-                    total += APPLY_FWD_COST;
-                    vec![t]
-                }
-                None => {
-                    let ts = self.ctx.facts.scripted_targets(site).to_vec();
-                    // A mono-resolved site splices behind one identity
-                    // guard (a construct site adds its shape guards and
-                    // the inline `this` creation); any other site costs
-                    // the classify chain, which a spliced one emits too
-                    // (guard + generic miss arm), on top of the callee
-                    // body.
-                    total += if ts.len() == 1 {
-                        RESOLVED_COST
-                    } else {
-                        CALL_COST
-                    };
-                    ts
-                }
-            };
-            if depth_left > 0 {
-                for t in targets {
-                    total += self.splice_closure_cost(
-                        t,
-                        depth_left - 1,
-                        room.saturating_sub(total),
-                        Some(site),
-                    );
-                    if total > room {
-                        return total;
-                    }
-                }
-            }
-            if total > room {
-                return total;
-            }
-        }
-        total
+        splice_closure_cost(self.ctx, sid, depth_left, room, entry)
     }
 
     /// The callee's apply-forward pc set (empty unless it is a wrapper
@@ -1032,4 +964,89 @@ impl<'a> Bbv<'a> {
         self.inline_sites += 1;
         base
     }
+}
+
+/// Estimated emitted cost of splicing `sid` (see `Bbv::splice_closure_cost`),
+/// shared with the MIR builder's admission.
+pub(crate) fn splice_closure_cost(
+    ctx: &TranslateCtx,
+    sid: ScriptId,
+    depth_left: u32,
+    room: usize,
+    entry: Option<Site>,
+) -> usize {
+    const CALL_COST: usize = 300;
+    const APPLY_FWD_COST: usize = 40;
+    const RESOLVED_COST: usize = 60;
+    const LOOP_WEIGHT: usize = 3;
+    let SourceObject::Script(s) = ctx.source.object(sid.source()) else {
+        return 0;
+    };
+    // A loop in a spliced callee is the term no size budget can see: its
+    // interior is emitted once per version of the segment, and the
+    // relooper duplicates tails per skipped-header context on top of
+    // that. Measured across the corpus, a loop-bearing closure expands
+    // roughly three times the values per unit of un-weighted cost that a
+    // loop-free one does, and the loops are the whole difference.
+    let nloops = LOOP_WEIGHT * super::translate::scan_loop_intervals(s).len();
+    let mut total = s.bytecode.len() * (1 + nloops);
+    if total > room {
+        return total;
+    }
+    for (cpc, op) in call_site_pcs(s) {
+        if !matches!(op, JSOp::Call | JSOp::CallIgnoresRv | JSOp::New) {
+            continue;
+        }
+        let site = Site::new(sid, Pc::new(cpc));
+        let fwd_target = entry
+            .and_then(|e| ctx.facts.apply_targets_in.get(&(e, site)))
+            .or_else(|| ctx.facts.apply_targets.get(&site))
+            .copied()
+            .filter(|_| {
+                op != JSOp::New && callee_apply_fwd_pcs(ctx, sid, s).contains(&Pc::new(cpc))
+            });
+        let targets: Vec<ScriptId> = match fwd_target {
+            Some(t) => {
+                total += APPLY_FWD_COST;
+                vec![t]
+            }
+            None => {
+                let ts = ctx.facts.scripted_targets(site).to_vec();
+                // A mono-resolved site splices behind one identity
+                // guard (a construct site adds its shape guards and
+                // the inline `this` creation); any other site costs
+                // the classify chain, which a spliced one emits too
+                // (guard + generic miss arm), on top of the callee
+                // body.
+                total += if ts.len() == 1 {
+                    RESOLVED_COST
+                } else {
+                    CALL_COST
+                };
+                ts
+            }
+        };
+        if depth_left > 0 {
+            for t in targets {
+                total += splice_closure_cost(
+                    ctx,
+                    t,
+                    depth_left - 1,
+                    room.saturating_sub(total),
+                    Some(site),
+                );
+                if total > room {
+                    return total;
+                }
+            }
+        }
+        if total > room {
+            return total;
+        }
+    }
+    total
+}
+
+fn callee_apply_fwd_pcs(ctx: &TranslateCtx, sid: ScriptId, callee: &Script) -> HashSet<Pc> {
+    super::translate::compute_apply_fwd_pcs(callee, &ctx.facts.apply_sites, sid.get()).unwrap_or_default()
 }

@@ -309,8 +309,10 @@ pub fn mnemonic(op: &Opcode) -> String {
         GuardSingleton(_) => "guard.singleton".into(),
         GuardScript(_) => "guard.script".into(),
         F64ToIntExact => "f64.to_int_exact".into(),
+        IntToI32 => "int.to_i32".into(),
         CheckFuse(_) => "check.fuse".into(),
-        CheckBinding(_) => "check.binding".into(),
+        CheckBinding(_, false) => "check.binding".into(),
+        CheckBinding(_, true) => "check.binding.write".into(),
         CheckNative(_) => "check.native".into(),
         Jump => "jump".into(),
         Br => "br".into(),
@@ -318,6 +320,9 @@ pub fn mnemonic(op: &Opcode) -> String {
         Return => "return".into(),
         Exit { .. } => "exit".into(),
         ExitThrow { .. } => "exit.throw".into(),
+        GenSuspend { index, initial: false, .. } => format!("gen.suspend.{index}"),
+        GenSuspend { index, initial: true, .. } => format!("gen.suspend.initial.{index}"),
+        IsGenClosing => "is_gen_closing".into(),
         ExitInline { throw: false, .. } => "exit.inline".into(),
         ExitInline { throw: true, .. } => "exit.inline.throw".into(),
         InlineEnter => "inline.enter".into(),
@@ -433,6 +438,15 @@ pub fn mnemonic(op: &Opcode) -> String {
             RtOp::NewPrivateName(_) => "js.rt.newprivatename",
             RtOp::DynamicImport => "js.rt.dynamicimport",
             RtOp::SpreadEval(_) => "js.rt.spreadeval",
+            RtOp::CreateGenerator => "js.rt.creategenerator",
+            RtOp::GenFinal => "js.rt.genfinal",
+            RtOp::GenCheckResume => "js.rt.gencheckresume",
+            RtOp::AsyncAwait(0) => "js.rt.asyncawait",
+            RtOp::AsyncAwait(_) => "js.rt.asyncresolve",
+            RtOp::AsyncReject => "js.rt.asyncreject",
+            RtOp::CanSkipAwait => "js.rt.canskipawait",
+            RtOp::MaybeExtractAwait => "js.rt.maybeextractawait",
+            RtOp::Resume => "js.rt.resume",
             RtOp::SetName(_, false) => "js.rt.setname",
             RtOp::SetName(_, true) => "js.rt.setname.strict",
             RtOp::ToString => "js.rt.tostring",
@@ -535,7 +549,7 @@ fn immediates(m: &Module, op: &Opcode) -> Option<String> {
         }
         GuardScript(s) => format!("s{s}"),
         CheckFuse(f) => f.to_string(),
-        CheckBinding(b) | LoadGName(b) | StoreGName(b) => b.to_string(),
+        CheckBinding(b, _) | LoadGName(b) | StoreGName(b) => b.to_string(),
         CheckNative(n) | CallNative(n) => n.to_string(),
         NewObject(k) => format!("L{k}"),
         EnvLoad(s) | EnvStore(s) => s.to_string(),
@@ -662,9 +676,10 @@ pub fn print_module(m: &Module) -> String {
         for (b, d) in m.bindings.iter() {
             writeln!(
                 out,
-                "  binding {b} = {} : {}",
+                "  binding {b} = {} : {} slot={}",
                 atom(Some(m), d.name),
-                type_str_in(Some(m), &d.claim)
+                type_str_in(Some(m), &d.claim),
+                d.slot
             )
             .unwrap();
         }
@@ -712,6 +727,9 @@ pub fn print_func(m: &Module, f: &Func) -> String {
         match r.kind {
             RootKind::Entry => writeln!(out, "  root entry {}", r.block).unwrap(),
             RootKind::Onramp(pc) => writeln!(out, "  root onramp(pc={pc}) {}", r.block).unwrap(),
+            RootKind::Resume { index, pc } => {
+                writeln!(out, "  root resume(index={index}, pc={pc}) {}", r.block).unwrap()
+            }
         }
     }
     for l in &f.loops {

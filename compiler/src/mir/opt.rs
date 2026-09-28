@@ -56,6 +56,7 @@ fn is_guard(op: &Opcode) -> bool {
             | Opcode::GuardSingleton(_)
             | Opcode::GuardScript(_)
             | Opcode::CheckFuse(_)
+            | Opcode::CheckBinding(..)
     )
 }
 
@@ -214,9 +215,13 @@ fn ok_output(f: &Func, ok: &Edge) -> Option<Value> {
 pub fn optimize(m: &Module, f: &mut Func) -> usize {
     let mut total = 0;
     loop {
+        // First: a loop's invariant values reach its body through params
+        // until forwarded, and `hoist_guards` needs them as they are.
+        forward_params(m, f);
         let n = fold_guards(m, f)
             + if CSE_LOADS { cse_loads(m, f) } else { 0 }
-            + if LICM { licm(m, f) } else { 0 };
+            + if LICM { licm(m, f) } else { 0 }
+            + if HOIST_GUARDS { hoist_guards(m, f) } else { 0 };
         forward_params(m, f);
         total += n;
         if n == 0 {
@@ -390,7 +395,7 @@ pub fn fold_guards(m: &Module, f: &mut Func) -> usize {
             // epoch: its check is not kept across such an op, clean edge
             // or not.
             if fx.may_run_js {
-                cur.retain(|(op, _), _| !matches!(op, Opcode::CheckFuse(_)));
+                cur.retain(|(op, _), _| !matches!(op, Opcode::CheckFuse(_) | Opcode::CheckBinding(..)));
             }
             if idx + 1 != insts.len() {
                 continue;
@@ -776,6 +781,229 @@ pub fn licm(m: &Module, f: &mut Func) -> usize {
             inst_block.insert(i, p);
             moved += 1;
         }
+    }
+    moved
+}
+
+/// Hoist guards out of loops (§10.2).
+const HOIST_GUARDS: bool = true;
+
+/// The guards `hoist_guards` moves: a check of an operand (or of global
+/// state, for `check.fuse` and `check.binding`) whose fact only a kill
+/// can end.
+fn hoistable_guard(op: &Opcode) -> bool {
+    matches!(
+        op,
+        Opcode::GuardUnbox(_)
+            | Opcode::GuardTags(_)
+            | Opcode::GuardKind(_)
+            | Opcode::GuardLayout { .. }
+            | Opcode::GuardScript(_)
+            | Opcode::CheckFuse(_)
+            | Opcode::CheckBinding(..)
+    )
+}
+
+/// Guard hoisting (§10.2): a guard in a loop whose operand is defined
+/// before the loop, whose fact nothing in the loop can kill, and which
+/// runs on every iteration (its block dominates the loop's latches) moves
+/// to the preheader, where its failure exits at the loop header with the
+/// state the loop is entered with (the preheader's params, `LoopDecl`'s
+/// `entry`). A `check.fuse` or `check.binding` also needs no JS to run in
+/// the loop: a fuse blows, or the global's shape changes, without a kill
+/// the types record. The guard in the loop becomes a jump carrying the
+/// hoisted guard's outputs. Loops entered other than by their preheader
+/// (an onramp into a nested loop, a generator's resume) are left alone.
+/// Returns how many guards moved.
+pub fn hoist_guards(m: &Module, f: &mut Func) -> usize {
+    let cfg = Cfg::new(f);
+    let mut preds: BTreeMap<Block, Vec<Block>> = BTreeMap::new();
+    for &b in &f.layout {
+        for s in f.succs(b) {
+            preds.entry(s).or_default().push(b);
+        }
+    }
+    let mut inst_block = BTreeMap::new();
+    for &b in &f.layout {
+        for &i in &f.blocks[b].insts {
+            inst_block.insert(i, b);
+        }
+    }
+    let mut moved = 0;
+    for li in 0..f.loops.len() {
+        let l = f.loops[li].clone();
+        let Some(entry) = l.entry.clone() else { continue };
+        let (h, p0) = (l.header, l.preheader);
+        let Some(pt) = f.terminator(p0) else { continue };
+        if f.insts[pt].op != Opcode::Jump || f.succs(p0) != vec![h] || f.inst_frame[pt] != 0 {
+            continue;
+        }
+        let params = if entry.state.is_empty() {
+            f.blocks[p0].params.clone()
+        } else {
+            entry.state.clone()
+        };
+        if entry.slots.iter().filter(|&&x| x).count() != params.len() || f.frame.exit_arity(entry.pc) != Some(entry.slots.len()) {
+            continue;
+        }
+        let mut body: BTreeSet<Block> = BTreeSet::new();
+        body.insert(h);
+        let latches: Vec<Block> = preds
+            .get(&h)
+            .map(|ps| ps.iter().copied().filter(|&q| cfg.dominates(h, q)).collect())
+            .unwrap_or_default();
+        let mut work = latches.clone();
+        while let Some(b) = work.pop() {
+            if body.insert(b) {
+                work.extend(preds.get(&b).into_iter().flatten().copied());
+            }
+        }
+        if latches.is_empty() || body.contains(&p0) || !body.iter().all(|&b| cfg.dominates(p0, b)) {
+            continue;
+        }
+        // Candidates: guards of values from before the loop. Then, as a
+        // greatest fixpoint, judge each on the loop as it would be with
+        // every candidate hoisted (their in-loop copies jumps, so what
+        // only their failures reach is gone): it must still run on every
+        // iteration, and nothing left in the loop may kill its fact.
+        let mut cands: Vec<(Inst, Vec<Type>)> = vec![];
+        for &b in cfg.rpo.iter().filter(|b| body.contains(b)) {
+            let Some(t) = f.terminator(b) else { continue };
+            let d = &f.insts[t];
+            if !hoistable_guard(&d.op) || d.succs.len() != 2 {
+                continue;
+            }
+            if d.args.iter().any(|&a| def_block(f, a, &inst_block).is_none_or(|db| body.contains(&db))) {
+                continue;
+            }
+            let tys: Vec<Type> = d.args.iter().map(|&v| f.values[v].ty).collect();
+            let Ok(sig) = signature(&d.op, &tys, m) else { continue };
+            cands.push((t, sig.outputs));
+        }
+        loop {
+            let set: BTreeSet<Inst> = cands.iter().map(|(t, _)| *t).collect();
+            // The loop's successors with the candidates' failures pruned.
+            let succs = |b: Block| -> Vec<Block> {
+                match f.terminator(b) {
+                    Some(t) if set.contains(&t) => vec![f.insts[t].succs[0].block],
+                    _ => f.succs(b),
+                }
+            };
+            let reach = |skip: Option<Block>| -> BTreeSet<Block> {
+                let mut seen = BTreeSet::new();
+                let mut work = vec![h];
+                while let Some(b) = work.pop() {
+                    if Some(b) == skip || !body.contains(&b) || !seen.insert(b) {
+                        continue;
+                    }
+                    work.extend(succs(b));
+                }
+                seen
+            };
+            let live = reach(None);
+            let mut kills = vec![];
+            let mut runs_js = false;
+            for &b in &live {
+                for &i in &f.blocks[b].insts {
+                    let d = &f.insts[i];
+                    let tys: Vec<Type> = d.args.iter().map(|&v| f.values[v].ty).collect();
+                    let fx = effects(&d.op, &tys, m);
+                    // A kill on an edge that leaves the loop (an exit)
+                    // ends nothing the loop goes on with.
+                    let stays = |roles: &[SuccRole]| {
+                        f.succ_edges(i).any(|(r, e)| roles.contains(&r) && live.contains(&e.block))
+                    };
+                    let kills_here = match d.op.kill_site(&fx) {
+                        KillSite::None => false,
+                        KillSite::Op => true,
+                        KillSite::OkEdge => stays(&[SuccRole::Ok, SuccRole::Err]),
+                        KillSite::DirtyEdge => stays(&[SuccRole::OkDirty, SuccRole::Err]),
+                    };
+                    if kills_here {
+                        kills.push(fx.kill);
+                    }
+                    runs_js |= fx.may_run_js;
+                }
+            }
+            let live_latches: Vec<Block> = latches.iter().copied().filter(|q| live.contains(q)).collect();
+            let keep: Vec<(Inst, Vec<Type>)> = cands
+                .iter()
+                .filter(|(t, outs)| {
+                    let b = inst_block[t];
+                    let d = &f.insts[*t];
+                    if !live.contains(&b) {
+                        return false;
+                    }
+                    // Every iteration passes `b`: without it, no latch.
+                    let without = reach(Some(b));
+                    if live_latches.iter().any(|q| without.contains(q)) {
+                        return false;
+                    }
+                    if matches!(d.op, Opcode::CheckFuse(_) | Opcode::CheckBinding(..)) && runs_js {
+                        return false;
+                    }
+                    !outs.iter().any(|t| kills.iter().any(|k| k.matches(t)))
+                })
+                .cloned()
+                .collect();
+            if keep.len() == cands.len() {
+                break;
+            }
+            cands = keep;
+        }
+        if cands.is_empty() {
+            continue;
+        }
+        // One exit for the lot: the loop's entry state, at its header.
+        let e = f.add_block();
+        let (_, dead) = f.add_inst(e, Opcode::ConstVal(crate::mir::ops::ConstVal::Dead), vec![], &[Type::VAL_TOP], vec![]);
+        let mut ps = params.iter();
+        let ops: Vec<Value> = entry.slots.iter().map(|&x| if x { *ps.next().unwrap() } else { dead[0] }).collect();
+        let exit = Opcode::Exit {
+            pc: entry.pc,
+            nargs: f.frame.formals,
+            nlocals: f.frame.locals,
+        };
+        f.add_inst(e, exit, ops, &[], vec![]);
+        for (t, outs) in cands {
+            let d = f.insts[t].clone();
+            let p = f.loops[li].preheader;
+            let jt = f.terminator(p).unwrap();
+            let jump = f.insts[jt].clone();
+            f.blocks[p].insts.pop();
+            let p2 = f.add_block();
+            let hoisted: Vec<Value> = outs.iter().map(|&ty| f.add_param(p2, ty)).collect();
+            let ok = Edge {
+                block: p2,
+                args: (0..outs.len()).map(|k| EdgeArg::Out(u32::try_from(k).unwrap())).collect(),
+            };
+            let (g, _) = f.add_inst(p, d.op, d.args.clone(), &[], vec![ok, Edge { block: e, args: vec![] }]);
+            f.inst_frame[g] = 0;
+            let (j, _) = f.add_inst(p2, Opcode::Jump, vec![], &[], jump.succs.clone());
+            f.inst_frame[j] = 0;
+            // The guard in the loop: now a jump with the hoisted outputs.
+            let b = inst_block[&t];
+            let okd = d.succs[0].clone();
+            let args = okd
+                .args
+                .iter()
+                .map(|a| match *a {
+                    EdgeArg::Out(k) => EdgeArg::Value(hoisted[k as usize]),
+                    ref a => a.clone(),
+                })
+                .collect();
+            let frame = f.inst_frame[t];
+            f.blocks[b].insts.pop();
+            let (nj, _) = f.add_inst(b, Opcode::Jump, vec![], &[], vec![Edge { block: okd.block, args }]);
+            f.inst_frame[nj] = frame;
+            f.loops[li].preheader = p2;
+            if let Some(e) = f.loops[li].entry.as_mut() {
+                e.state = params.clone();
+            }
+            moved += 1;
+        }
+        // The CFG changed under the loops still to visit.
+        return moved;
     }
     moved
 }

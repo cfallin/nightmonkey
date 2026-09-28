@@ -154,6 +154,7 @@ pub fn translate_script(
             plain_env: baseline::needs_env(script) && baseline::env_is_plain(ctx.source, script),
             own_env: baseline::needs_env(script) && !baseline::env_is_plain(ctx.source, script),
             forward_resume: inline_eligible(ctx, script),
+            is_gen: script.is_generator_or_async,
             mapped_formals: script.has_mapped_args && script.nargs > 0,
         },
         gname_bids,

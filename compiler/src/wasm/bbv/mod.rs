@@ -69,6 +69,7 @@ mod cfg;
 pub use call::build_call_classify_helper;
 pub use element::build_elem_append_helper;
 pub use property::{build_elem_mega_helpers, build_ic_set_cold_helper};
+pub(crate) use inline::splice_closure_cost;
 mod compare;
 mod ctx;
 mod element;

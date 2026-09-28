@@ -34,6 +34,9 @@ pub(crate) struct Callee {
     /// `None`: published, or disagreeing). The caller's next use of the
     /// object guards it back to that state (`guard.ctor`).
     pub this_out: Option<(u32, u32, bool)>,
+    /// The sites it spliced itself, its callees' included (the caller's
+    /// inlining budget counts them, as bbv's walk does).
+    pub sites: u32,
 }
 
 /// The blocks a kill's dirty edge leads to that exit.
@@ -81,6 +84,7 @@ pub(crate) fn fenced(f: &Func, mm: &Module) -> bool {
 struct Maps {
     atoms: BTreeMap<AtomId, AtomId>,
     fuses: BTreeMap<FuseId, FuseId>,
+    bindings: BTreeMap<crate::mir::entity::BindingId, crate::mir::entity::BindingId>,
     natives: BTreeMap<crate::mir::entity::NativeId, crate::mir::entity::NativeId>,
     /// Where the callee's restamp descriptors start in the caller's table.
     restamp_base: u32,
@@ -100,7 +104,7 @@ impl Maps {
             }
             Type::Fact(FactKind::Fuse(f)) => Type::Fact(FactKind::Fuse(self.fuses[&f])),
             Type::Fact(FactKind::NativeIntact(n)) => Type::Fact(FactKind::NativeIntact(self.natives[&n])),
-            Type::Fact(_) => return Err("inline: a binding or native fact".into()),
+            Type::Fact(FactKind::Binding(b)) => Type::Fact(FactKind::Binding(self.bindings[&b])),
             t => t,
         })
     }
@@ -124,11 +128,13 @@ impl Maps {
             StoreField(a) => StoreField(self.atom(a)),
             InitField(a) => InitField(self.atom(a)),
             CheckFuse(f) => CheckFuse(self.fuses[&f]),
+            CheckBinding(b, w) => CheckBinding(self.bindings[&b], w),
+            LoadGName(b) => LoadGName(self.bindings[&b]),
+            StoreGName(b) => StoreGName(self.bindings[&b]),
             CheckNative(n) => CheckNative(self.natives[&n]),
             JsRt(r) => JsRt(r.map_atoms(|a| self.atom(a))),
             Restamp(i) => Restamp(self.restamp_base + i),
-            ConstObj(_) | GuardSingleton(_) | CheckBinding(_) | LoadGName(_)
-            | StoreGName(_) | CallNative(_) => {
+            ConstObj(_) | GuardSingleton(_) | CallNative(_) => {
                 return Err(format!("inline: {} is not remapped", mir::print::mnemonic(&op)))
             }
             op => op,
@@ -143,6 +149,7 @@ fn merge_module(mm: &mut Module, k: &Module) -> Result<Maps, String> {
     let mut maps = Maps {
         atoms: BTreeMap::new(),
         fuses: BTreeMap::new(),
+        bindings: BTreeMap::new(),
         natives: BTreeMap::new(),
         restamp_base: u32::try_from(mm.restamps.len()).unwrap(),
     };
@@ -158,6 +165,18 @@ fn merge_module(mm: &mut Module, k: &Module) -> Result<Maps, String> {
         };
         maps.fuses.insert(fid, id);
     }
+    for (bid, d) in k.bindings.iter() {
+        let found = mm.bindings.iter().find(|(_, x)| x.slot == d.slot).map(|(b, _)| b);
+        let id = match found {
+            Some(b) => b,
+            None => {
+                let mut d = d.clone();
+                d.name = maps.atoms[&d.name];
+                mm.bindings.push(d)
+            }
+        };
+        maps.bindings.insert(bid, id);
+    }
     for (nid, d) in k.natives.iter() {
         let found = mm.natives.iter().find(|(_, x)| x.name == d.name).map(|(n, _)| n);
         let id = match found {
@@ -166,8 +185,8 @@ fn merge_module(mm: &mut Module, k: &Module) -> Result<Maps, String> {
         };
         maps.natives.insert(nid, id);
     }
-    if !k.snap_objs.is_empty() || !k.bindings.is_empty() {
-        return Err("inline: snapshot objects or bindings".into());
+    if !k.snap_objs.is_empty() {
+        return Err("inline: snapshot objects".into());
     }
     for (&key, lay) in &k.layouts {
         let mine = mm.layouts.entry(key).or_default();
@@ -406,6 +425,7 @@ pub(crate) fn splice(
             f.loops.push(LoopDecl {
                 header: h,
                 preheader: p,
+                entry: None,
             });
         }
     }

@@ -1101,10 +1101,12 @@ stores and may-run-JS fences.
 "Declined" means that **a script is compiled by baseline alone when the
 MIR builder meets one of these** (under `pipeline=mir`; BASELINE.md §5):
 
-- generator and async bodies
+- a generator or async body that reads its actuals past its formals (a
+  resume re-enters with none)
 
-(`arguments` and rest, `with`, direct eval and the environment ops were
-on this list; they compile now: M5d, M5i.)
+(Generator and async bodies, `arguments` and rest, `with`, direct eval
+and the environment ops were on this list; they compile now: M5d, M5i,
+M5j.)
 
 Try/catch is supported (§5.3). There is no hidden decline for inlining.
 The MIR builder does not inline anything, so calls in a MIR-compiled
@@ -1741,10 +1743,8 @@ compiles now, lowered onto baseline's helpers:
   (`AddDisposable`, `TakeDisposeCapability`, `CreateSuppressedError`),
   `GetBoundName`, `ObjWithProto`, `NewPrivateName`, `DynamicImport`,
   and spread direct eval (`SpreadEval`).
-- **Generators and async functions** remain declined: a resumed
-  generator enters at a `yield`'s pc, which needs an entry that §5.2's
-  onramps (loop headers and function entry) do not provide. See
-  docs/MIR-KICKOFF-3.md.
+- **Generators and async functions** remained declined here; M5j builds
+  them.
 - An inlined callee's `js.rt` atoms are renamed into the caller's table
   by `RtOp::map_atoms`, an exhaustive match: the splice's old list
   missed the new name ops, so an inlined `GetName` looked up an
@@ -1754,6 +1754,83 @@ compiles now, lowered onto baseline's helpers:
   jit-test joins `jit-test-excludes-mir.txt`: bug1762575-3.js depends on
   a dead local keeping its object alive, as gc/compartment-revived-gc.js
   does.
+
+**M5j. Generators, bbv's inlining limits, typed `length` and globals,
+guard hoisting (2026-09-28).**
+- **Generators and async functions (an extension of §5.2).** A yield
+  (`InitialYield`, `Yield`, `Await`) is `gen.suspend`, a terminator with
+  an exit's operands at its pc: the lowering writes the frame (a dead
+  local as undefined, so an out-of-scope binding does not stay alive in
+  the suspended generator), saves it into the generator with baseline's
+  `gen_suspend`, and returns the yielded value. Each yield's landing is a
+  `Resume { index, pc }` root: the frame there, `Val(⊤)`, guarded up to
+  the types the slots had at the yield (a miss exits at the landing).
+  The body's entry, after the resume and onramp forks, takes a
+  generator's resume (`EnterNightResume`'s generator-closing `this`):
+  it dispatches on the resume index first, restores the frame with
+  `gen_restore`, pushes `[sent value, generator, resume kind]`, and
+  enters the root; an index with no root (a yield in catch code, which
+  is baseline's) goes to baseline's own dispatch, descriptor untouched.
+  Baseline's entry now takes `ARGC_RESUME_BIT` over the magic `this`
+  (an exit from a resumed activation). The rest are `js.rt` ops over
+  baseline's helpers (`CheckResumeKind` raises through the helper with
+  the rval slot left to it; `FinalYieldRval` counts as an rval use).
+  A resume's path re-enters its loop at the header past the preheader:
+  the validator allows that for blocks a `Resume` root reaches, and
+  `licm`/`hoist_guards` leave such loops alone. A `for (…) yield`
+  micro-benchmark runs in MIR with no exits per yield (1222 ms vs
+  legacy's 1547).
+- **Inlining admission is bbv's** (`Bbv::inline_candidates_for`, in its
+  order): depth 8 below a call site in a loop, else 4; 8 spliced
+  segments per function (one per target, nested ones included, counted
+  depth-first: a callee is built with what the budget has left and
+  charges what it used; the budget is checked once per site, as bbv
+  does); per-target bytecode caps
+  (150, 200 in a loop, 500 per target of a poly site); no loop-bearing
+  callee under a loop; a construct's transitive closure cost
+  (`splice_closure_cost`, now shared); no splicing into a function that
+  uses `arguments`, mapped formals or actuals; no call site in a catch
+  or finally range; bbv's splice fuel, at ~4 waffle values per MIR
+  instruction (25000 instructions, 60000 for callees of at most 160
+  bytes). MIR's own callee and per-function instruction budgets are
+  gone. Richards' `Scheduler.schedule` now splices `TaskControlBlock.run`
+  and the task `run`s under it as bbv does.
+- **`length`** (§7): a proven string's `length.string`; a receiver the
+  builder has evidence is an array (a native object its element accesses
+  guarded, or an array layout's value class) is `guard.kind Array`,
+  `length.array` and `int.to_i32` (a new guard: an `int` in int32's
+  range). A summing loop over `a.length` goes from 105 to 61 ms (legacy
+  102).
+- **Globals** (§3): a syntactic global's read is `check.binding` then
+  `load_gname`, its write `check.binding.write` then `store_gname` (the
+  slot store with the barriers, the binding's value fuse, the bind
+  epoch, and a fused literal's fuse, as the inline store did). The
+  module's bindings carry the runtime's row (`slot`). An unresolvable
+  binding exits (a syntactic global is a non-configurable data
+  property: once resolved, the check holds). A read of a binding whose
+  value fuse is armed takes the value table's copy, the check's armed
+  arm going straight to `ok`. `fold_guards` folds repeated checks, not
+  across JS (a global's shape changes with no epoch bump). Inlining
+  merges bindings by row. Cost: in call-heavy code, where no check
+  folds or hoists, a read is the check (one extra fuse-word test and a
+  cold exit) plus the load; earley-boyer is ~2.5% below the generic
+  op's inline arms. Removing that needs the binding fact to carry its
+  armed state at run time.
+- **Guard hoisting (§10.2)**: `opt::hoist_guards`, in the optimizer's
+  fixpoint (which now forwards params first, so a loop's invariant
+  values are visible as such). A guard in a loop whose operand is
+  defined before the loop moves to the preheader when, judged on the
+  loop as it would be with every such guard hoisted (their failure-only
+  paths gone, as a greatest fixpoint), it runs on every iteration and
+  nothing left in the loop kills its fact (a kill on an edge that leaves
+  the loop does not count; `check.fuse`/`check.binding` also need no JS
+  in the loop). A hoisted guard fails to an exit at the loop header with
+  the loop's entry state, which the builder records per loop
+  (`LoopEntry`). The in-loop guard becomes a jump carrying the hoisted
+  outputs. A loop reading two fields of a parameter goes from 49 to 36
+  ms (legacy 37).
+- Night tests: mir-generators.js, mir-length.js, mir-globals.js,
+  mir-hoist-guards.js.
 
 **M6. The rest of §10**: box/unbox cleanup, memory optimizations, and
 numeric optimizations, each with its guard-count and instruction-count

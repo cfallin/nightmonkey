@@ -89,60 +89,19 @@ What landed (see the commit messages for detail):
    extra property) drops TYPES; the hook needs the slot (a change to the
    firefox fork's ExternalCompilerHooks) to keep it there.
 
-### Generators and async functions: a design extension to decide
+### Done since (MIR.md M5j)
 
-They are the one decline left from the jit-test census (476 scripts),
-and the current design cannot take them without an extension:
+- Generators and async functions, as proposed: `gen.suspend`, `Resume`
+  roots at yield landings, the body's own resume dispatch.
+- Inlining admission is bbv's. Correction to the richards note that was
+  here: bbv does splice `TaskControlBlock.run` into `schedule` and three
+  of the four task `run`s under it (`--dump-bbv`: `inline-splice sid#189
+  … depth-seg Some(1)`; the fourth has a loop, refused at that nest). MIR
+  now does the same; richards 9263 → 9846.
+- `length.array`/`length.string`, typed globals (`check.binding`,
+  `load_gname`, `store_gname`), and guard hoisting (`opt::hoist_guards`).
 
-- A resumed generator enters its body at a `yield`'s landing, through
-  baseline's resume dispatch (`EnterNightResume`, `gen_restore`, the
-  landing's `[sent value, generator, resume kind]`). MIR has entries
-  only at the function entry and at loop-header onramps (§5.2).
-- Within the design as written, MIR could compile a generator by making
-  every `InitialYield`/`Yield`/`Await` an exit to its own pc (baseline
-  suspends) and letting baseline onramp back at loop headers. Each
-  iteration of a `for (…) yield x` loop would then pay an exit, a
-  baseline resume and an onramp. The onramp backoff after exits would
-  soon turn the onramp off, so the loop would run in baseline anyway.
-  This buys nothing, and I did not build it.
-- **The extension I would propose:**
-  - (a) `gen.suspend k` in MIR: write the frame through, as an exit's hub
-    does, then baseline's `gen_suspend` over the frame's locals and the
-    operand stack at the yield's depth, then return the yielded value.
-  - (b) Resume landings become onramp roots. Their operands are the
-    frame (restored by `gen_restore`) plus the resume protocol's three
-    stack values, guarded like any onramp's.
-  - (c) The MIR body gets a resume entry, as baseline's: `EnterNightResume`
-    enters the script's table entry, which is the MIR body, and a resume
-    word selects the landing's root.
-
-  (a) and (b) reuse the exit and onramp machinery. (c) is the new part:
-  a generator's MIR body takes the resume fork that baseline's has today.
-- **Decision needed:** whether generator bodies are worth an entry kind
-  beyond §5.2's function entry and loop headers. Octane has none (its
-  async code is in the harness only); the jit-tests have many.
-
-### Richards: where the gap is
-
-A profile of AOT richards under MIR puts 38% in `Scheduler.schedule`
-(sid 218), then the task `run` methods (sids 154, 173, 177, 167). The
-two tiers split the call chain schedule → `TaskControlBlock.run` (sid
-189) → `this.task.run(packet)` (four task scripts) at different places:
-
-- bbv declines `TCB.run` into schedule (its site cap), and compiles
-  `TCB.run` standalone with all four task `run`s spliced in
-  (`--dump-bbv`: `inline-splice sid#189 pc 171 target#154/167/173/177`).
-- MIR inlines `TCB.run` into schedule and then cannot afford the four
-  tasks under its per-function budget (`MAX_INLINE_TOTAL_INSTS`, 6000
-  spliced MIR instructions), so every task run is a call.
-
-Both take one call per schedule iteration; the difference is where. bbv's
-task bodies are spliced under `TCB.run`'s dispatch, with its facts about
-the task. MIR's are separate bodies entered through a four-way script
-guard chain and a real call, with their own entry guards. Pricing
-the budget as bbv does (bytecode bytes per target,
-`MAX_INLINE_POLY_BYTES` for a poly site, transitive closure cost), or
-preferring the inner poly site to the outer mono one, is the parity
-question. It changes §5.5's policy, so it wants a decision. The method
-loads in that loop (`isHeldOrSuspended`, `run`, `link`) are
-`js.getprop`s with their IC inline, each a fence for layout facts.
+Open: int32 accumulators that overflow exit under MIR's int-first
+speculation and re-enter (a summing loop whose total passes 2^31 ran 2.6x
+slower than legacy); typed globals' residual cost in call-heavy code
+(MIR.md M5j).

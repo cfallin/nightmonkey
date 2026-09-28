@@ -116,6 +116,11 @@ pub enum RootKind {
     /// A loop header's onramp entry block `O` (§5.2): the full frame
     /// state at `pc`.
     Onramp(Pc),
+    /// A generator's resume at the landing `pc` of the yield with resume
+    /// index `index`: the full frame state there, as the resume dispatch
+    /// restored it (the landing's stack ends with the sent value, the
+    /// generator and the resume kind).
+    Resume { index: u32, pc: Pc },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -129,10 +134,27 @@ pub struct Root {
 /// hoists to. The loop's body is every block that reaches one of its
 /// latches without passing through the header; that is well-defined even
 /// where onramps make the CFG irreducible (§5.4).
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub struct LoopDecl {
     pub header: Block,
     pub preheader: Block,
+    /// The frame the preheader's params are, for an exit at the header
+    /// (§10.2's hoisted guards): `None` where not known (a loop of an
+    /// inlined callee, or one read from text).
+    pub entry: Option<LoopEntry>,
+}
+
+/// A loop's entry state: the header's pc, and which slots of the frame
+/// there (`this`, formals, locals, rval, then the operand stack) the
+/// preheader has a param for, in order; the others are dead.
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+pub struct LoopEntry {
+    pub pc: Pc,
+    pub slots: Vec<bool>,
+    /// The live slots' values, once guards moved to the preheader made
+    /// it a new block (whose params are theirs); empty until then: the
+    /// preheader's params.
+    pub state: Vec<Value>,
 }
 
 /// A tag set as an attachment's `field_mask` word: the prim bits, then

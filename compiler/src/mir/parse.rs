@@ -804,7 +804,13 @@ impl Parser {
                     let name = self.atom()?;
                     self.expect_punct(":")?;
                     let claim = self.ty()?;
-                    self.m.bindings.push(BindingDef { name, claim });
+                    let slot = if self.eat_word("slot") {
+                        self.expect_punct("=")?;
+                        self.int()?
+                    } else {
+                        0
+                    };
+                    self.m.bindings.push(BindingDef { name, claim, slot });
                 }
                 "native" => {
                     self.decl_id("N", "native", self.m.natives.len())?;
@@ -875,8 +881,19 @@ impl Parser {
                 let pc = Pc::new(self.int()?);
                 self.expect_punct(")")?;
                 RootKind::Onramp(pc)
+            } else if self.eat_word("resume") {
+                self.expect_punct("(")?;
+                self.expect_word("index")?;
+                self.expect_punct("=")?;
+                let index = self.int()?;
+                self.expect_punct(",")?;
+                self.expect_word("pc")?;
+                self.expect_punct("=")?;
+                let pc = Pc::new(self.int()?);
+                self.expect_punct(")")?;
+                RootKind::Resume { index, pc }
             } else {
-                return self.err("expected `entry` or `onramp(pc=N)`");
+                return self.err("expected `entry`, `onramp(pc=N)` or `resume(index=K, pc=N)`");
             };
             let b = st.block(self.prefixed("b", "a block")?);
             st.func.roots.push(Root { kind, block: b });
@@ -886,7 +903,11 @@ impl Parser {
             self.expect_word("preheader")?;
             self.expect_punct("=")?;
             let preheader = st.block(self.prefixed("b", "a block")?);
-            st.func.loops.push(LoopDecl { header, preheader });
+            st.func.loops.push(LoopDecl {
+                header,
+                preheader,
+                entry: None,
+            });
         }
         let mut cur: Option<Block> = None;
         loop {
@@ -1257,7 +1278,7 @@ impl Parser {
             }
             GuardScript(_) => GuardScript(self.script()?),
             CheckFuse(_) => CheckFuse(FuseId::from_u32(self.prefixed("F", "a fuse")?)),
-            CheckBinding(_) => CheckBinding(BindingId::from_u32(self.prefixed("G", "a binding")?)),
+            CheckBinding(_, w) => CheckBinding(BindingId::from_u32(self.prefixed("G", "a binding")?), w),
             LoadGName(_) => LoadGName(BindingId::from_u32(self.prefixed("G", "a binding")?)),
             StoreGName(_) => StoreGName(BindingId::from_u32(self.prefixed("G", "a binding")?)),
             CheckNative(_) => CheckNative(NativeId::from_u32(self.prefixed("N", "a native")?)),
@@ -1494,8 +1515,10 @@ fn template(mn: &str) -> Option<Opcode> {
         GuardSingleton(SnapObj::from_u32(0)),
         GuardScript(ScriptId::new(0)),
         F64ToIntExact,
+        IntToI32,
         CheckFuse(FuseId::from_u32(0)),
-        CheckBinding(BindingId::from_u32(0)),
+        CheckBinding(BindingId::from_u32(0), false),
+        CheckBinding(BindingId::from_u32(0), true),
         CheckNative(NativeId::from_u32(0)),
         Jump,
         Br,
@@ -1586,6 +1609,16 @@ fn template(mn: &str) -> Option<Opcode> {
         JsRt(RtOp::NewPrivateName(placeholder_atom)),
         JsRt(RtOp::DynamicImport),
         JsRt(RtOp::SpreadEval(0)),
+        JsRt(RtOp::CreateGenerator),
+        JsRt(RtOp::GenFinal),
+        JsRt(RtOp::GenCheckResume),
+        JsRt(RtOp::AsyncAwait(0)),
+        JsRt(RtOp::AsyncAwait(1)),
+        JsRt(RtOp::AsyncReject),
+        JsRt(RtOp::CanSkipAwait),
+        JsRt(RtOp::MaybeExtractAwait),
+        JsRt(RtOp::Resume),
+        IsGenClosing,
         ActualArg,
         ActualArgOr(0),
         JsIsBuiltin(0),

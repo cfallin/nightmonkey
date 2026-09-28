@@ -471,6 +471,22 @@ impl<'a> Verifier<'a> {
                 }
             }
         }
+        // What a generator's resume reaches: the rest of a loop iteration
+        // from a yield's landing, re-entering its loop at the header past
+        // the preheader. (`licm` sees the preheader does not dominate the
+        // loop then, and leaves it alone.)
+        let mut resumed: BTreeSet<Block> = BTreeSet::new();
+        let mut work: Vec<Block> = f
+            .roots
+            .iter()
+            .filter(|r| matches!(r.kind, RootKind::Resume { .. }))
+            .map(|r| r.block)
+            .collect();
+        while let Some(b) = work.pop() {
+            if resumed.insert(b) {
+                work.extend(f.succs(b));
+            }
+        }
         for (h, p) in declared {
             if !self.reachable(h) {
                 continue;
@@ -488,7 +504,7 @@ impl<'a> Verifier<'a> {
             // when an onramp side-enters the loop elsewhere.)
             let outside: Vec<String> = self.preds[&h]
                 .iter()
-                .filter(|&&q| q != p && self.reachable(q) && !body.contains(&q))
+                .filter(|&&q| q != p && self.reachable(q) && !body.contains(&q) && !resumed.contains(&q))
                 .map(|q| q.to_string())
                 .collect::<BTreeSet<_>>()
                 .into_iter()
@@ -976,7 +992,7 @@ impl<'a> Verifier<'a> {
                         }
                     }
                 }
-                RootKind::Onramp(pc) => {
+                RootKind::Onramp(pc) | RootKind::Resume { pc, .. } => {
                     match f.frame.exit_arity(pc) {
                         None => self.err(
                             Check::Boundary,

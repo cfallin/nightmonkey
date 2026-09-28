@@ -58,6 +58,8 @@ pub struct FuseDef {
 pub struct BindingDef {
     pub name: AtomId,
     pub claim: Type,
+    /// The runtime's binding row (its syntactic global id, `syn_gnames`).
+    pub slot: u32,
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)]

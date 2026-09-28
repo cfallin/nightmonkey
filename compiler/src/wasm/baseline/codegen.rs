@@ -1014,6 +1014,13 @@ impl<'a> Gen<'a> {
             let thisv = self.load_i64(self.sp, FrameLayout::THIS);
             let magic = self.i64c((TAG_MAGIC << 32) | MAGIC_GENERATOR_CLOSING);
             let is_resume = self.binop(Operator::I64Eq, thisv, magic, Type::I32);
+            // A MIR body's exit from a resumed activation keeps that magic
+            // `this` in the frame, and comes with `ARGC_RESUME_BIT`: it is
+            // the resume word's, not the generator's.
+            let bit = self.i32c(ARGC_RESUME_BIT);
+            let exit = self.binop(Operator::I32And, self.argc_raw, bit, Type::I32);
+            let not_exit = self.unop(Operator::I32Eqz, exit, Type::I32);
+            let is_resume = self.binop(Operator::I32And, is_resume, not_exit, Type::I32);
             let disp = self.body.add_block();
             let fresh = self.body.add_block();
             self.gen_dispatch_blk = Some(disp);

@@ -348,6 +348,25 @@ pub enum RtOp {
     /// A direct eval with spread arguments (`SpreadEval`, its pc):
     /// `callee, this, arr` -> value.
     SpreadEval(u32),
+    /// A generator object for the frame's callee and environment
+    /// (`Generator`) -> object.
+    CreateGenerator,
+    /// Mark generator `g` finished (`FinalYieldRval`): `g`.
+    GenFinal,
+    /// Raise a `throw`/`return` resumption (`CheckResumeKind` with a kind
+    /// other than next; always fails): `v, g, kind`. A return stages `v`
+    /// as the frame's rval.
+    GenCheckResume,
+    /// `AsyncAwait`/`AsyncResolve` (1 for resolve): `v, g` -> value.
+    AsyncAwait(u32),
+    /// `AsyncReject`: `reason, stack, g` -> value.
+    AsyncReject,
+    /// `CanSkipAwait`: `v` -> boolean.
+    CanSkipAwait,
+    /// `MaybeExtractAwaitValue`: `v, can_skip` -> value.
+    MaybeExtractAwait,
+    /// Resume generator `g` with `v` and resume kind `k` (`Resume`) -> value.
+    Resume,
     /// `ToString` of v -> string.
     ToString,
     /// Well-known symbol `code` (`JSOp::Symbol`) -> symbol.
@@ -382,7 +401,9 @@ impl RtOp {
             | SpreadCall(_) | PushEnv(..) | EnterWith(_) | FreshenEnv(_) | BindVar | InitElemGetSet(_)
             | SuperBase | SuperFun | GetElemSuper | SetElemSuper(_) | InitHomeObject | FunWithProto(_)
             | CheckReturn | AddDisposable(_) | TakeDisposeCapability | CreateSuppressedError
-            | ObjWithProto | DynamicImport | SpreadEval(_) | ToString | Symbol(_) | BuiltinObject(_)) => op,
+            | ObjWithProto | DynamicImport | SpreadEval(_) | CreateGenerator | GenFinal | GenCheckResume
+            | AsyncAwait(_) | AsyncReject | CanSkipAwait | MaybeExtractAwait | Resume | ToString | Symbol(_)
+            | BuiltinObject(_)) => op,
         }
     }
 }
@@ -452,8 +473,12 @@ pub enum Opcode {
     GuardScript(ScriptId),
     /// An f64 that is exactly an int32 (not -0) becomes an `I32`.
     F64ToIntExact,
+    /// An `int` known to be int32 (T: fails outside int32's range).
+    IntToI32,
     CheckFuse(FuseId),
-    CheckBinding(BindingId),
+    /// The binding's slot is resolved against the global object's live
+    /// shape (and, with `write`, is a writable data property).
+    CheckBinding(BindingId, bool),
     CheckNative(NativeId),
 
     // Control.
@@ -474,6 +499,22 @@ pub enum Opcode {
         nargs: u32,
         nlocals: u32,
     },
+    /// Suspend the generator at a yield (`InitialYield`, `Yield`, `Await`
+    /// at `pc`, resume index `index`): an exit's operands (the frame at
+    /// `pc`, whose stack ends with the generator, below it the yielded
+    /// value unless `initial`). The lowering writes the frame, saves it
+    /// into the generator (baseline's `gen_suspend`) and returns the
+    /// yielded value (the generator for `initial`). A resume enters the
+    /// function's `Resume` root for `index`.
+    GenSuspend {
+        pc: Pc,
+        index: u32,
+        nargs: u32,
+        nlocals: u32,
+        initial: bool,
+    },
+    /// Whether `v` is the generator-closing magic (`IsGenClosing`) -> bool.
+    IsGenClosing,
     /// An exit from an inlined callee's code (§5.5), with an `exit`'s
     /// operands for the callee's frame: finish the callee in its baseline
     /// body from `pc` (with its exception pending if `throw`), and take
@@ -726,8 +767,9 @@ impl Opcode {
             | GuardSingleton(_)
             | GuardScript(_)
             | F64ToIntExact
+            | IntToI32
             | CheckFuse(_)
-            | CheckBinding(_)
+            | CheckBinding(..)
             | CheckNative(_)
             | I32Ovf(_)
             | LoadElem
@@ -754,7 +796,11 @@ impl Opcode {
     pub fn is_terminator(&self) -> bool {
         matches!(
             self,
-            Opcode::Return | Opcode::Exit { .. } | Opcode::ExitThrow { .. } | Opcode::Unreachable
+            Opcode::Return
+                | Opcode::Exit { .. }
+                | Opcode::ExitThrow { .. }
+                | Opcode::GenSuspend { .. }
+                | Opcode::Unreachable
         ) || !self.roles().is_empty()
     }
 
@@ -762,7 +808,9 @@ impl Opcode {
     /// inline exit.
     pub fn frame_operands(&self) -> Option<(Pc, u32, u32)> {
         match *self {
-            Opcode::ExitInline { pc, nargs, nlocals, .. } => Some((pc, nargs, nlocals)),
+            Opcode::ExitInline { pc, nargs, nlocals, .. } | Opcode::GenSuspend { pc, nargs, nlocals, .. } => {
+                Some((pc, nargs, nlocals))
+            }
             _ => self.exit_shape(),
         }
     }
@@ -1142,6 +1190,13 @@ pub fn signature(op: &Opcode, args: &[Type], m: &Module) -> SigResult {
                 ..o
             }))
         }
+        IntToI32 => {
+            arity(args, 1)?;
+            match args[0] {
+                Type::Int(r) => Sig::output(Type::I32(clamp_range(r.lo.into(), r.hi.into(), I32_MIN, I32_MAX))),
+                _ => return Err("int.to_i32: expected an int".into()),
+            }
+        }
         F64ToIntExact => {
             arity(args, 1)?;
             match args[0] {
@@ -1156,7 +1211,7 @@ pub fn signature(op: &Opcode, args: &[Type], m: &Module) -> SigResult {
             })?;
             Sig::output(Type::Fact(FactKind::Fuse(*f)))
         }
-        CheckBinding(b) => {
+        CheckBinding(b, _) => {
             arity(args, 0)?;
             want(m.bindings.contains(*b), || {
                 format!("check.binding: {b} is not in the module")
@@ -1207,7 +1262,7 @@ pub fn signature(op: &Opcode, args: &[Type], m: &Module) -> SigResult {
             }
             Sig::output(Type::VAL_TOP)
         }
-        Exit { nargs, nlocals, .. } | ExitThrow { nargs, nlocals, .. } => {
+        Exit { nargs, nlocals, .. } | ExitThrow { nargs, nlocals, .. } | GenSuspend { nargs, nlocals, .. } => {
             want(frame_parts(args, *nargs, *nlocals).is_some(), || {
                 "exit: fewer operands than this + args + locals + rval".into()
             })?;
@@ -1404,6 +1459,12 @@ pub fn signature(op: &Opcode, args: &[Type], m: &Module) -> SigResult {
                 RtOp::ObjWithProto => (1, Some(Type::val(TagSet::OBJECT))),
                 RtOp::NewPrivateName(_) => (0, Some(Type::val(TagSet::prims(crate::opsem::PRIM_SYMBOL)))),
                 RtOp::SpreadEval(_) => (3, Some(Type::VAL_TOP)),
+                RtOp::CreateGenerator => (0, Some(Type::val(TagSet::OBJECT))),
+                RtOp::GenFinal => (1, None),
+                RtOp::GenCheckResume => (3, None),
+                RtOp::AsyncAwait(_) | RtOp::MaybeExtractAwait => (2, Some(Type::VAL_TOP)),
+                RtOp::AsyncReject | RtOp::Resume => (3, Some(Type::VAL_TOP)),
+                RtOp::CanSkipAwait => (1, Some(Type::val(TagSet::BOOLEAN))),
                 RtOp::FunWithProto(_) => (1, Some(Type::val(TagSet::OBJECT))),
                 RtOp::SpreadCall(0) => (4, Some(Type::VAL_TOP)),
                 RtOp::SpreadCall(_) => (4, Some(Type::val(TagSet::OBJECT))),
@@ -1445,6 +1506,11 @@ pub fn signature(op: &Opcode, args: &[Type], m: &Module) -> SigResult {
             arity(args, 1)?;
             val(&args[0], "iter.more")?;
             Sig::result(Type::VAL_TOP)
+        }
+        IsGenClosing => {
+            arity(args, 1)?;
+            val(&args[0], "is_gen_closing")?;
+            Sig::result(Type::Bool)
         }
         IterIsDone => {
             arity(args, 1)?;

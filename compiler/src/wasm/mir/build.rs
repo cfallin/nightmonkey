@@ -219,19 +219,6 @@ impl<'a> Shape<'a> {
     /// Whether callee `k` is small enough to inline at `pc` among
     /// `ntargets` targets: bbv's caps, 150 bytes of bytecode for one
     /// target (200 in a loop), 500 each for several.
-    fn fits_site(&self, k: ScriptId, pc: Pc, ntargets: usize) -> bool {
-        let in_loop = self.loops.iter().any(|(&h, &e)| h <= pc && pc < e);
-        let cap = match (ntargets, in_loop) {
-            (1, false) => 150,
-            (1, true) => 200,
-            _ => crate::constants::MAX_INLINE_POLY_BYTES,
-        };
-        matches!(
-            self.ctx.source.object(crate::source::SourceObjectId::new(k.get())),
-            crate::source::SourceObject::Script(ks) if ks.bytecode.len() <= cap
-        )
-    }
-
     /// Layout `cls`'s field `name`: its slot and value claim, from the
     /// layout rows (`this_layouts_in`, as bbv's `layout_fields`).
     fn layout_field(&self, cls: u32, name: crate::ids::NameId) -> Option<(u32, crate::facts::Claim)> {
@@ -276,15 +263,6 @@ impl<'a> Shape<'a> {
         crate::wasm::bbv::typed_alloc_word(self.ctx, mono, site)
     }
 
-    /// Whether script `k` is a class constructor: callable only by `new`
-    /// (a plain call throws), so never inlined at a call.
-    fn is_class_ctor(&self, k: ScriptId) -> bool {
-        matches!(
-            self.ctx.source.object(crate::source::SourceObjectId::new(k.get())),
-            crate::source::SourceObject::Script(ks) if ks.is_class_ctor
-        )
-    }
-
     /// Whether a call of script `k` may go straight to its compiled body
     /// (bbv's `likely_call_target`): not a class constructor, generator or
     /// async function.
@@ -310,35 +288,31 @@ impl<'a> Shape<'a> {
     /// Callee `k` built for inlining here (§5.5), if it may be: an
     /// inline-eligible script that is not this one, not a constructor
     /// that stamps its `this`, and small enough once built.
-    fn callee(&self, k: ScriptId) -> Option<std::rc::Rc<super::inline::Callee>> {
-        self.callee_in(k, &[])
+    fn callee(&self, k: ScriptId, ictx: InlineCtx) -> Option<std::rc::Rc<super::inline::Callee>> {
+        self.callee_ctx(k, &[], None, ictx)
     }
 
     /// `callee`, built knowing which of its formals the call passes a
-    /// known closure in (`Ty::Fn`, by formal; missing ones none): its
-    /// calls of those have exactly that callee.
-    fn callee_in(&self, k: ScriptId, fns: &[Option<ScriptId>]) -> Option<std::rc::Rc<super::inline::Callee>> {
-        self.callee_ctx(k, fns, None)
-    }
-
-    /// `callee_in`, built also for a `this` under construction (`Ty::Ctor`
-    /// of these parts) where the call passes one: context-sensitive in
-    /// the receiver's construction state, as in the closures it passes.
+    /// known closure in (`Ty::Fn`, by formal; missing ones none), and for
+    /// a `this` under construction (`Ty::Ctor` of these parts) where the
+    /// call passes one: context-sensitive in the closures it passes and
+    /// the receiver's construction state, and built where `ictx` says.
     fn callee_ctx(
         &self,
         k: ScriptId,
         fns: &[Option<ScriptId>],
         this_ctor: Option<(u32, u32, bool)>,
+        ictx: InlineCtx,
     ) -> Option<std::rc::Rc<super::inline::Callee>> {
         let mut fns = fns.to_vec();
         while fns.last() == Some(&None) {
             fns.pop();
         }
-        let key = (k, fns, this_ctor);
+        let key = (k, fns, this_ctor, ictx);
         if let Some(c) = self.callees.borrow().get(&key) {
             return c.clone();
         }
-        let c = self.build_callee(k, &key.1, this_ctor).map(std::rc::Rc::new);
+        let c = self.build_callee(k, &key.1, this_ctor, ictx).map(std::rc::Rc::new);
         self.callees.borrow_mut().insert(key, c.clone());
         c
     }
@@ -348,8 +322,9 @@ impl<'a> Shape<'a> {
         k: ScriptId,
         fns: &[Option<ScriptId>],
         this_ctor: Option<(u32, u32, bool)>,
+        ictx: InlineCtx,
     ) -> Option<super::inline::Callee> {
-        if self.inline_depth >= MAX_INLINE_DEPTH || k == self.sid {
+        if k == self.sid {
             return None;
         }
         let names = self.names?;
@@ -363,18 +338,10 @@ impl<'a> Shape<'a> {
         }
         let nargs = usize::from(ks.nargs);
         let fns: Vec<Option<ScriptId>> = fns.iter().copied().take(nargs).collect();
-        let (mut mm, mut f, mut this_out) =
-            build_at(self.ctx, names, k, ks, false, self.inline_depth + 1, &fns, this_ctor).ok()?;
-        // Too big with its own inlining: the callee alone, its calls left
-        // as calls (direct where their callee is known), as bbv's
-        // top-down budget leaves a spliced callee's inner sites once the
-        // splice has spent it.
-        if f.insts.len() > MAX_INLINE_INSTS && LEAN_CALLEES && self.inline_depth + 1 < MAX_INLINE_DEPTH {
-            (mm, f, this_out) = build_at(self.ctx, names, k, ks, false, MAX_INLINE_DEPTH, &fns, this_ctor).ok()?;
-        }
-        if f.insts.len() > MAX_INLINE_INSTS {
-            return None;
-        }
+        let (mut mm, f, this_out, sites) = match build_at(self.ctx, names, k, ks, false, ictx, &fns, this_ctor) {
+            Ok(r) => r,
+            Err(_) => return None,
+        };
         mm.script_addrs.insert(k, ks.addr);
         let max_depth = StackDepths::compute(ks).ok()?.max;
         let fenced = super::inline::fenced(&f, &mm);
@@ -384,6 +351,7 @@ impl<'a> Shape<'a> {
             max_depth,
             fenced,
             this_out,
+            sites,
         })
     }
 }
@@ -452,7 +420,7 @@ pub fn build<'a>(
     script: &'a Script,
     is_global: bool,
 ) -> Result<(mir::Module, mir::Func), String> {
-    build_at(ctx, names, sid, script, is_global, 0, &[], None).map(|(m, f, _)| (m, f))
+    build_at(ctx, names, sid, script, is_global, InlineCtx::ROOT, &[], None).map(|(m, f, _, _)| (m, f))
 }
 
 /// Element accesses the analysis predicts on arrays, with int32 keys, are
@@ -491,8 +459,6 @@ const CALL_KNOWN_FNS: bool = true;
 /// How many likely callees a call not inlined gets direct arms for.
 const MAX_DIRECT_TARGETS: usize = 4;
 
-/// A callee too big to inline with its own inlining is inlined without it.
-const LEAN_CALLEES: bool = true;
 
 /// A generic element op at a polymorphic typed-array site probes the
 /// typed-array kinds (`ta_poly`).
@@ -554,21 +520,35 @@ fn math_fn_name(m: MathFn) -> &'static str {
 /// Generic ops keep proven layouts on their clean edge (`js_keep`).
 const KEEP_ON_CLEAN: bool = true;
 
+/// Syntactic globals read and written as `load_gname`/`store_gname`
+/// behind `check.binding` (§3).
+const TYPED_GNAMES: bool = true;
+
+/// `a.length` of a receiver the builder has array evidence for is
+/// `length.array` behind `guard.kind Array` (§7).
+const LENGTH_ARRAY: bool = true;
+
 /// Guard a method's `this` to its predicted layouts at `FunctionThis`.
 const THIS_ENTRY_GUARD: bool = true;
 
-/// How deep inlining nests: a caller's callees, and theirs.
+// Inlining admission mirrors bbv's (`Bbv::inline_candidates_for`): the
+// same caps in the same order, so both tiers inline the same sites.
+/// How deep inlining nests below a call site in a loop, and below one not
+/// in a loop (the root site's: bbv's `max_depth`).
+const MAX_INLINE_DEPTH_LOOP: u32 = 8;
 const MAX_INLINE_DEPTH: u32 = 4;
-/// The most MIR instructions a callee may have to be inlined.
-const MAX_INLINE_INSTS: usize = 2000;
-/// The most call sites one function inlines into (bbv's per-caller splice
-/// cap: past a few sites the code growth costs more than the calls).
-const MAX_INLINE_SITES: u32 = 8;
-/// The most callee instructions one function splices in, over all its
-/// sites: a body past wasm's function size limit fails the module.
-const MAX_INLINE_TOTAL_INSTS: usize = 6000;
+/// The most sites one function splices, its callees' own included,
+/// counted depth-first (bbv's per-body `MAX_INLINE_SITES`).
+const MAX_INLINE_SITES: u32 = crate::constants::MAX_INLINE_SITES;
 /// The most targets a call site inlines (a guard chain on the script).
-const MAX_INLINE_TARGETS: usize = 4;
+const MAX_INLINE_TARGETS: usize = crate::constants::MAX_INLINE_TARGETS;
+/// Splice fuel (bbv's `SPLICE_FUEL_VALUES`, 100000 waffle values, at the
+/// ~4 values a MIR instruction lowers to): past this many instructions a
+/// function splices nothing more, but callees of at most
+/// `SMALL_SPLICE_BC` bytes, up to the harder line.
+const SPLICE_FUEL_INSTS: usize = 25_000;
+const SMALL_SPLICE_BC: usize = 160;
+const SMALL_SPLICE_FUEL_INSTS: usize = 60_000;
 
 /// `build`, as the callee of an inlining `depth` levels down.
 fn build_at<'a>(
@@ -577,10 +557,10 @@ fn build_at<'a>(
     sid: ScriptId,
     script: &'a Script,
     is_global: bool,
-    depth: u32,
+    ictx: InlineCtx,
     formal_fns: &[Option<ScriptId>],
     this_ctor: Option<(u32, u32, bool)>,
-) -> Result<(mir::Module, mir::Func, Option<(u32, u32, bool)>), String> {
+) -> Result<(mir::Module, mir::Func, Option<(u32, u32, bool)>, u32), String> {
     if is_global {
         return Err("global script".into());
     }
@@ -594,10 +574,12 @@ fn build_at<'a>(
             script.bytecode.len()
         ));
     }
-    if script.is_generator_or_async {
-        return Err("generator or async".into());
-    }
     let fl = FrameLayout::of(script);
+    // A resume re-enters with no actuals (`EnterNightResume`), which a
+    // body reading them past its formals cannot rebase over.
+    if script.is_generator_or_async && fl.rebase_vp {
+        return Err("generator reading its actuals".into());
+    }
     // A mapped arguments object aliases the formals. With no formals there
     // is nothing to alias, and the object (made by the runtime, which maps
     // by the callee) is an unmapped one plus `callee`: scheme runtimes'
@@ -616,7 +598,8 @@ fn build_at<'a>(
     shape.names = Some(names);
     shape.apply_fwd = crate::wasm::translate::compute_apply_fwd_pcs(script, &ctx.facts.apply_sites, sid.get())
         .filter(|s| APPLY_FWD && !s.is_empty());
-    shape.inline_depth = depth;
+    shape.inline_depth = ictx.depth;
+    shape.ictx = ictx;
     shape.formal_fns = formal_fns.to_vec();
     shape.this_ctor = this_ctor;
     for (i, &gc) in script.gcthings.iter().enumerate() {
@@ -633,6 +616,9 @@ fn build_at<'a>(
             }
             if let Some(c) = ctx.facts.gname_types.get(&n) {
                 shape.gname_types.insert(i, *c);
+            }
+            if let Some(&bid) = ctx.syn_gnames.get(&n) {
+                shape.syn_bids.insert(i, bid);
             }
         }
     }
@@ -655,7 +641,8 @@ fn build_at<'a>(
         if !run.widen && new_hoists.is_empty() {
             let mm = std::mem::take(&mut run.mm);
             let this_out = run.this_out.flatten();
-            return Ok((mm, run.finish(), this_out));
+            let sites = run.inline_sites;
+            return Ok((mm, run.finish(), this_out, sites));
         }
         let out = std::mem::take(&mut run.out);
         drop(run);
@@ -705,7 +692,7 @@ fn liveness(script: &Script, nargs: u32, nlocals: u32) -> BTreeMap<Pc, Vec<bool>
             ),
             JSOp::GetArg | JSOp::GetFrameArg => (Some(1 + usize::from(p.next_uint16().unwrap())), None),
             JSOp::SetArg => (None, Some(1 + usize::from(p.next_uint16().unwrap()))),
-            JSOp::GetRval | JSOp::RetRval | JSOp::CheckReturn => (Some(rval), None),
+            JSOp::GetRval | JSOp::RetRval | JSOp::CheckReturn | JSOp::FinalYieldRval => (Some(rval), None),
             JSOp::SetRval => (None, Some(rval)),
             _ => (None, None),
         }
@@ -845,7 +832,27 @@ fn int32_demand(script: &Script, ops: &[Op]) -> std::collections::BTreeSet<Pc> {
 /// What the runs share: the script's decoded shape.
 /// A callee build's context (`callee_in`): the script, the known closures
 /// its formals receive, and the constructing `this` it receives, if any.
-type CalleeKey = (ScriptId, Vec<Option<ScriptId>>, Option<(u32, u32, bool)>);
+type CalleeKey = (ScriptId, Vec<Option<ScriptId>>, Option<(u32, u32, bool)>, InlineCtx);
+
+/// Where a callee is built for inlining (bbv's segment context): its
+/// depth, the sites it may splice itself, whether the root call site is
+/// in a loop (which sets the depth cap), and the loop nest around it.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+struct InlineCtx {
+    depth: u32,
+    budget: u32,
+    root_in_loop: Option<bool>,
+    outer_nest: u32,
+}
+
+impl InlineCtx {
+    const ROOT: InlineCtx = InlineCtx {
+        depth: 0,
+        budget: MAX_INLINE_SITES,
+        root_in_loop: None,
+        outer_nest: 0,
+    };
+}
 
 struct Shape<'a> {
     ctx: &'a TranslateCtx<'a>,
@@ -871,6 +878,9 @@ struct Shape<'a> {
     /// Per gcthing index naming a global: the analysis's likely type
     /// (`gname_types`), guarded at the def.
     gname_types: BTreeMap<u32, crate::facts::Claim>,
+    /// Per gcthing index naming a syntactic global: its binding row
+    /// (`syn_gnames`), for `check.binding`/`load_gname`/`store_gname`.
+    syn_bids: BTreeMap<u32, u32>,
     names: Option<&'a crate::ids::Names>,
     /// The `T.apply(this, arguments)` sites whose arguments object is
     /// never observed (bbv's `compute_apply_fwd_pcs`), if the script has
@@ -878,6 +888,8 @@ struct Shape<'a> {
     apply_fwd: Option<rustc_hash::FxHashSet<Pc>>,
     /// How deep in inlining this build is (0: a script's own).
     inline_depth: u32,
+    /// Where this build is inlined (`InlineCtx::ROOT` for a script's own).
+    ictx: InlineCtx,
     /// Callees built for inlining, by script; `None` if one cannot be.
     callees: std::cell::RefCell<BTreeMap<CalleeKey, Option<std::rc::Rc<super::inline::Callee>>>>,
     /// For a build for inlining at a call passing known closures: the
@@ -936,9 +948,11 @@ impl<'a> Shape<'a> {
             wrap_ok,
             fused: BTreeMap::new(),
             gname_types: BTreeMap::new(),
+            syn_bids: BTreeMap::new(),
             names: None,
             apply_fwd: None,
             inline_depth: 0,
+            ictx: InlineCtx::ROOT,
             callees: Default::default(),
             formal_fns: vec![],
             this_ctor: None,
@@ -1038,7 +1052,8 @@ struct Run<'s, 'a> {
     /// Call sites this run has inlined into (`MAX_INLINE_SITES`), and the
     /// callee instructions they spliced (`MAX_INLINE_TOTAL_INSTS`).
     inline_sites: u32,
-    inline_insts: usize,
+    /// The context the last admitted site's callees were built in.
+    admitted: InlineCtx,
     /// This op's fence renamings of `Obj` values (`fence_params`), for
     /// `repush`.
     renames: Vec<(mir::Value, Slot)>,
@@ -1131,7 +1146,7 @@ impl<'s, 'a> Run<'s, 'a> {
             this_vals: Default::default(),
             this_slots: Default::default(),
             inline_sites: 0,
-            inline_insts: 0,
+            admitted: InlineCtx::ROOT,
         }
     }
 
@@ -1255,6 +1270,64 @@ impl<'s, 'a> Run<'s, 'a> {
 
     /// Push `x`, an operand this op popped, back: as its fence renamed it,
     /// if one did (`fence_params`).
+    /// `recv.length` as a typed op (§7 `length.{string,array}`), pushing
+    /// the int32 it is: a proven string's length word; for a receiver the
+    /// builder has evidence is an array (a native object its element
+    /// accesses guarded, or an array layout's value class), its elements
+    /// header's, guarded to an array and to int32 (a miss exits). False,
+    /// with nothing emitted, for anything else (the generic read, whose
+    /// lowering tests the same cases at run time).
+    fn length_op(&mut self, recv: Slot) -> bool {
+        if let Ty::Val(t) = recv.ty {
+            if t.is_nonempty_subset_of(TagSet::STRING) {
+                let s = self.inst(Opcode::Unbox(UnboxKind::Str), vec![recv.v], Some(MType::STR_TOP));
+                let n = self.inst(Opcode::LengthString, vec![s], Some(MType::i32_range(0, (1 << 30) - 2)));
+                self.push(n, Ty::I32);
+                return true;
+            }
+        }
+        let array_cls = |k: u32| self.mm.array_key_min.is_some_and(|min| k + 1 >= min);
+        let evidence = recv.ty == Ty::Native || self.val_cls.get(&recv.v).is_some_and(|&k| array_cls(k));
+        if !LENGTH_ARRAY || !evidence || !TagSet::OBJECT.subset_of(recv.ty.tags()) {
+            return false;
+        }
+        let o = match recv.ty {
+            Ty::Native | Ty::Obj(..) | Ty::ObjHint(_) | Ty::Ctor(..) => recv.v,
+            Ty::Val(_) => self.guard(Opcode::GuardUnbox(UnboxKind::Obj), vec![recv.v], MType::OBJ_TOP),
+            _ => return false,
+        };
+        let arr = MType::Obj(ObjInfo::kind(ObjKind::Array));
+        let o = self.guard(Opcode::GuardKind(ObjKind::Array), vec![o], arr);
+        let len = self.inst(Opcode::LengthArray, vec![o], Some(MType::int_range(0, u32::MAX.into())));
+        let n = self.guard(Opcode::IntToI32, vec![len], MType::i32_range(0, i64::from(i32::MAX)));
+        self.push(n, Ty::I32);
+        true
+    }
+
+    /// The module's binding for syntactic global `name` (row `slot`),
+    /// declared on first use.
+    fn binding(&mut self, name: mir::entity::AtomId, slot: u32) -> mir::entity::BindingId {
+        if let Some((b, _)) = self.mm.bindings.iter().find(|(_, d)| d.slot == slot) {
+            return b;
+        }
+        self.mm.bindings.push(mir::module::BindingDef {
+            name,
+            claim: MType::VAL_TOP,
+            slot,
+        })
+    }
+
+    /// The constant `v` is, if it is an `i32` constant.
+    fn const_i32_of(&self, v: mir::Value) -> Option<i32> {
+        match self.f.values[v].def {
+            mir::func::ValueDef::Result(i, _) => match self.f.insts[i].op {
+                Opcode::ConstI32(n) => Some(n),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
     fn repush(&mut self, x: Slot) {
         let y = self
             .renames
@@ -1286,16 +1359,116 @@ impl<'s, 'a> Run<'s, 'a> {
         }
     }
 
-    /// Whether this function may inline one more site whose callees add
-    /// `insts` instructions (`MAX_INLINE_SITES`, `MAX_INLINE_TOTAL_INSTS`),
-    /// counting it if so.
-    fn inline_budget(&mut self, insts: usize) -> bool {
-        if self.inline_sites >= MAX_INLINE_SITES || self.inline_insts + insts > MAX_INLINE_TOTAL_INSTS {
-            return false;
+    /// bbv's inlining admission (`Bbv::inline_candidates_for`, with its
+    /// per-target rules): which of `sids` the site at `self.pc` inlines,
+    /// each built by `build` where the site puts it, in order; `None` for
+    /// none. Counts the site, and the sites its callees splice, against
+    /// this function's budget.
+    fn admit(
+        &mut self,
+        sids: &[ScriptId],
+        construct: bool,
+        build: &dyn Fn(&Shape<'a>, ScriptId, InlineCtx) -> Option<std::rc::Rc<super::inline::Callee>>,
+    ) -> Option<Vec<(ScriptId, std::rc::Rc<super::inline::Callee>)>> {
+        use crate::bytecode::TryNoteKind;
+        let s = self.s;
+        let pc = self.pc;
+        let ictx = s.ictx;
+        if sids.is_empty() {
+            return None;
         }
-        self.inline_sites += 1;
-        self.inline_insts += insts;
-        true
+        let local_nest = u32::try_from(s.loops.iter().filter(|(&h, &e)| h <= pc && pc < e).count()).unwrap();
+        let root_in_loop = ictx.root_in_loop.unwrap_or(local_nest > 0);
+        let max_depth = if root_in_loop { MAX_INLINE_DEPTH_LOOP } else { MAX_INLINE_DEPTH };
+        if ictx.depth >= max_depth {
+            return None;
+        }
+        let script = s.script;
+        let needs_args_obj = crate::wasm::translate::uses_arguments(script)
+            || script.has_mapped_args
+            || crate::wasm::translate::uses_actual_args(script);
+        if needs_args_obj || self.inline_sites >= ictx.budget {
+            return None;
+        }
+        let bytes = |k: ScriptId| match s.ctx.source.object(crate::source::SourceObjectId::new(k.get())) {
+            crate::source::SourceObject::Script(ks) => Some(ks),
+            _ => None,
+        };
+        let n = self.f.insts.len();
+        if n >= SPLICE_FUEL_INSTS {
+            let small = sids.iter().all(|&k| bytes(k).is_some_and(|ks| ks.bytecode.len() <= SMALL_SPLICE_BC));
+            if !small || n >= SMALL_SPLICE_FUEL_INSTS {
+                return None;
+            }
+        }
+        if script
+            .try_notes
+            .iter()
+            .any(|t| !matches!(t.kind, TryNoteKind::Loop) && pc >= t.start && pc < t.start + t.length)
+        {
+            return None;
+        }
+        if sids.len() > MAX_INLINE_TARGETS {
+            return None;
+        }
+        let cap = match (sids.len(), root_in_loop) {
+            (1, true) => 200,
+            (1, false) => 150,
+            _ => crate::constants::MAX_INLINE_POLY_BYTES,
+        };
+        let nest = ictx.outer_nest + local_nest;
+        let allow_callee_loops = nest == 0;
+        let picked: Vec<ScriptId> = sids
+            .iter()
+            .copied()
+            .filter(|&k| {
+                let Some(ks) = bytes(k) else { return false };
+                !ks.bytecode.is_empty()
+                    && ks.bytecode.len() <= cap
+                    && !(construct && ks.is_class_ctor)
+                    && !(!construct && ks.is_class_ctor)
+                    && (allow_callee_loops || !ks.try_notes.iter().any(|t| t.kind == TryNoteKind::Loop))
+            })
+            .collect();
+        if picked.is_empty() {
+            return None;
+        }
+        if construct {
+            if picked.len() != 1 {
+                return None;
+            }
+            let room = crate::constants::CONSTRUCT_CLOSURE_CAP;
+            let est = crate::wasm::bbv::splice_closure_cost(s.ctx, picked[0], max_depth - ictx.depth, room, Some(self.site(pc)));
+            if est > room {
+                return None;
+            }
+        }
+        // Depth-first, as bbv's walk: each target is a spliced segment,
+        // and may splice what the budget has left once it and the
+        // segments before it count (bbv checks the budget per site, then
+        // splices every target it picked).
+        let mut used = self.inline_sites;
+        let mut out = vec![];
+        let mut admitted = None;
+        for k in picked {
+            let at = InlineCtx {
+                depth: ictx.depth + 1,
+                budget: ictx.budget.saturating_sub(used + 1),
+                root_in_loop: Some(root_in_loop),
+                outer_nest: nest,
+            };
+            if let Some(c) = build(s, k, at) {
+                used += 1 + c.sites;
+                admitted.get_or_insert(at);
+                out.push((k, c));
+            }
+        }
+        if out.is_empty() {
+            return None;
+        }
+        self.admitted = admitted.unwrap();
+        self.inline_sites = used;
+        Some(out)
     }
 
     /// At a layout constructor's return, the first stamp of its completed
@@ -2941,7 +3114,8 @@ impl<'s, 'a> Run<'s, 'a> {
         let mut callee = callee.clone();
         let mut this_op = this;
         if let Some((key, t)) = self.ctor_of_word(k, word) {
-            if let Some(c) = self.s.callee_ctx(k, &[], Some((key, 0, t))) {
+            if let Some(c) = self.s.callee_ctx(k, &[], Some((key, 0, t)), self.admitted) {
+                self.inline_sites = (self.inline_sites + c.sites).saturating_sub(callee.sites);
                 let o = self.assert_guard(Opcode::GuardUnbox(UnboxKind::Obj), vec![this], MType::OBJ_TOP);
                 let g = Opcode::GuardCtor {
                     key: crate::ids::LayoutKey::new(key),
@@ -3023,16 +3197,10 @@ impl<'s, 'a> Run<'s, 'a> {
             Some(&k) => vec![k],
             None => facts.apply_target_sets.get(&site).cloned().unwrap_or_default(),
         };
-        let targets: Vec<(ScriptId, std::rc::Rc<super::inline::Callee>)> = sids
-            .iter()
-            .take(MAX_INLINE_TARGETS + 1)
-            .filter(|&&k| !self.s.is_class_ctor(k))
-            .filter_map(|&k| Some((k, self.s.callee(k)?)))
-            .collect();
         let helper = (Opcode::ApplyFwd, vec![vals[0], vals[1], vals[2]]);
-        if targets.is_empty() || targets.len() > MAX_INLINE_TARGETS {
+        let Some(targets) = self.admit(&sids, false, &|s, k, ictx| s.callee(k, ictx)) else {
             return self.js(helper.0, helper.1, MType::VAL_TOP);
-        }
+        };
         // Arms with fences meet at `join`: `Obj` slots go in as `ObjHint`.
         // Without one (both arms keep), they keep their facts.
         if targets.iter().any(|(_, c)| c.fenced) || !self.keepable(1) {
@@ -3101,19 +3269,8 @@ impl<'s, 'a> Run<'s, 'a> {
             Some(&k) => vec![k],
             None => facts.apply_target_sets.get(&site).cloned().unwrap_or_default(),
         };
-        let n = sids.len();
-        let targets: Vec<(ScriptId, std::rc::Rc<super::inline::Callee>)> = sids
-            .iter()
-            .take(MAX_INLINE_TARGETS + 1)
-            .filter(|&&k| self.s.fits_site(k, self.pc, n) && !self.s.is_class_ctor(k))
-            .filter_map(|&k| Some((k, self.s.callee_ctx(k, fns, this_ctor.map(|(c, ..)| c))?)))
-            .collect();
-        if targets.is_empty()
-            || targets.len() > MAX_INLINE_TARGETS
-            || !self.inline_budget(targets.iter().map(|(_, c)| c.f.insts.len()).sum())
-        {
-            return None;
-        }
+        let tc = this_ctor.map(|(c, ..)| c);
+        let targets = self.admit(&sids, false, &|s, k, ictx| s.callee_ctx(k, fns, tc, ictx))?;
         let raw = this_ctor.map(|(_, x, boxed)| self.ctor_pass(x, boxed));
         let generic = (Opcode::Call, vals.to_vec());
         // Arms with fences meet at `join`: `Obj` slots go in as `ObjHint`.
@@ -3212,9 +3369,16 @@ impl<'s, 'a> Run<'s, 'a> {
         }
         let p = make(self);
         self.preheaders.insert(pc, p);
+        let depth = u32::try_from(tys.len() - self.frame_len()).unwrap();
+        self.f.frame.depths.entry(pc).or_insert(depth);
         self.f.loops.push(LoopDecl {
             header: h,
             preheader: p,
+            entry: Some(mir::func::LoopEntry {
+                pc,
+                slots: tys.iter().map(|&t| t != Ty::Dead).collect(),
+                state: vec![],
+            }),
         });
         let saved = (self.cur, self.live);
         self.at(p);
@@ -3701,8 +3865,63 @@ impl<'s, 'a> Run<'s, 'a> {
             vec![],
         );
         self.at(o);
+        let args = self.guard_to(&params, &tys, fail).into_iter().map(EdgeArg::Value).collect();
+        self.term(Opcode::Jump, vec![], vec![Edge { block: p, args }]);
+    }
+
+    /// The `Resume` root for resume index `index` at landing `pc`: the
+    /// frame as the resume restored it, all `Val(⊤)`, guarded up to the
+    /// types the slots had at the yield (`before`, whose top `popped`
+    /// values the yield consumed; the landing's three resume values are
+    /// `Val(⊤)`). The walk goes on from there; a miss exits at the landing.
+    fn resume_root(&mut self, index: u32, pc: Pc, before: &[Slot], popped: usize) -> R<()> {
+        let fl = self.frame_len();
+        let depth = self.s.depths.at(pc).ok_or("resume landing without a stack depth")? as usize;
+        let saved = before.len() - fl - popped;
+        if depth != saved + 3 {
+            return Err(format!("BUG: resume landing {pc} at depth {depth}, not {}", saved + 3));
+        }
+        let live = self.s.live.get(&pc).cloned();
+        let mut tys: Vec<Ty> = before[..fl + saved].iter().map(|x| x.ty).collect();
+        for (i, t) in tys.iter_mut().enumerate().take(fl) {
+            if live.as_ref().is_some_and(|l| i < l.len() && !l[i]) {
+                *t = Ty::Dead;
+            }
+        }
+        tys.extend([Ty::Val(TagSet::ALL); 3]);
+        let o = self.new_block();
+        self.f.roots.push(Root {
+            kind: RootKind::Resume { index, pc },
+            block: o,
+        });
+        let params: Vec<mir::Value> = tys.iter().map(|_| self.f.add_param(o, MType::VAL_TOP)).collect();
+        self.f.frame.depths.insert(pc, u32::try_from(depth).unwrap());
+        let fail = self.new_block();
+        self.at(fail);
+        let (nargs, nlocals) = (self.s.nargs, self.s.nlocals);
+        self.term(Opcode::Exit { pc, nargs, nlocals }, params.clone(), vec![]);
+        self.at(o);
+        let mut vals = self.guard_to(&params, &tys, fail).into_iter();
+        self.st = tys
+            .iter()
+            .map(|&ty| match ty {
+                Ty::Dead => Slot::dead(),
+                ty => Slot {
+                    v: vals.next().unwrap(),
+                    ty,
+                },
+            })
+            .collect();
+        self.live = true;
+        Ok(())
+    }
+
+    /// Guard root params `params` (all `Val(⊤)`, the frame) up to slot
+    /// types `tys`, exiting to `fail` on a miss: one value per slot that is
+    /// not dead, with `cur` at the block past the last guard.
+    fn guard_to(&mut self, params: &[mir::Value], tys: &[Ty], fail: mir::Block) -> Vec<mir::Value> {
         let mut args = vec![];
-        for (&v, &t) in params.iter().zip(&tys) {
+        for (&v, &t) in params.iter().zip(tys) {
             let op = match t {
                 Ty::Dead => continue,
                 Ty::I32 => Some(Opcode::GuardUnbox(UnboxKind::I32)),
@@ -3760,12 +3979,12 @@ impl<'s, 'a> Run<'s, 'a> {
                         ],
                     );
                     self.at(b3);
-                    args.push(EdgeArg::Value(bv));
+                    args.push(bv);
                     continue;
                 }
                 Ty::Native | Ty::Ta(_) => {
                     let o = self.guard_narrow(v, t, fail);
-                    args.push(EdgeArg::Value(o));
+                    args.push(o);
                     continue;
                 }
                 Ty::Obj(keys, types) => {
@@ -3798,7 +4017,7 @@ impl<'s, 'a> Run<'s, 'a> {
                         ],
                     );
                     self.at(ok);
-                    args.push(EdgeArg::Value(out));
+                    args.push(out);
                     continue;
                 }
                 Ty::Ctor(key, n, types) => {
@@ -3835,12 +4054,12 @@ impl<'s, 'a> Run<'s, 'a> {
                         ],
                     );
                     self.at(ok);
-                    args.push(EdgeArg::Value(out));
+                    args.push(out);
                     continue;
                 }
             };
             let Some(op) = op else {
-                args.push(EdgeArg::Value(v));
+                args.push(v);
                 continue;
             };
             let ok = self.new_block();
@@ -3857,9 +4076,9 @@ impl<'s, 'a> Run<'s, 'a> {
                 ],
             );
             self.at(ok);
-            args.push(EdgeArg::Value(out));
+            args.push(out);
         }
-        self.term(Opcode::Jump, vec![], vec![Edge { block: p, args }]);
+        args
     }
 
     /// Enter leader `pc`: its entry types are the table's (what back edges
@@ -4674,11 +4893,28 @@ impl<'s, 'a> Run<'s, 'a> {
                 self.push(r, Ty::Val(TagSet::OBJECT));
             }
             SetGName | StrictSetGName => {
-                let a = self.atom(p.next_uint32().unwrap())?;
+                let index = p.next_uint32().unwrap();
+                let a = self.atom(index)?;
                 let v = self.pop();
                 let env = self.pop();
                 let (e, y) = (self.boxed(env), self.boxed(v));
-                self.js_void_keep(Opcode::JsSetName(a, op == StrictSetGName), vec![e, y], v);
+                match self.s.syn_bids.get(&index) {
+                    Some(&slot) if TYPED_GNAMES => {
+                        // §3: `check.binding.write`, then a leaf store of
+                        // the slot; a miss exits here.
+                        let b = self.binding(a, slot);
+                        let fact = self.guard(
+                            Opcode::CheckBinding(b, true),
+                            vec![],
+                            MType::Fact(mir::types::FactKind::Binding(b)),
+                        );
+                        let (t, _) = self.f.add_inst(self.cur, Opcode::StoreGName(b), vec![fact, y], &[], vec![]);
+                        self.f.witnesses[t] = Some(mir::func::Witness {
+                            may_kill: mir::types::KillPattern::of(mir::types::KillSet::FUSE),
+                        });
+                    }
+                    _ => self.js_void_keep(Opcode::JsSetName(a, op == StrictSetGName), vec![e, y], v),
+                }
                 self.repush(v);
             }
             TableSwitch => {
@@ -4879,7 +5115,22 @@ impl<'s, 'a> Run<'s, 'a> {
                         return Ok(());
                     }
                 }
-                let r = self.js(Opcode::JsGetName(a), vec![], MType::VAL_TOP);
+                let r = match self.s.syn_bids.get(&index) {
+                    Some(&slot) if TYPED_GNAMES => {
+                        // §3: `check.binding`, then a leaf load of the
+                        // slot. A syntactic global is a non-configurable
+                        // data property, so the check holds once resolved;
+                        // a miss exits here.
+                        let b = self.binding(a, slot);
+                        let fact = self.guard(
+                            Opcode::CheckBinding(b, false),
+                            vec![],
+                            MType::Fact(mir::types::FactKind::Binding(b)),
+                        );
+                        self.inst(Opcode::LoadGName(b), vec![fact], Some(MType::VAL_TOP))
+                    }
+                    _ => self.js(Opcode::JsGetName(a), vec![], MType::VAL_TOP),
+                };
                 self.gname_vals.insert(r, a);
                 self.push(r, Ty::Val(TagSet::ALL));
                 if let Some(&claim) = self.s.gname_types.get(&index) {
@@ -4896,6 +5147,11 @@ impl<'s, 'a> Run<'s, 'a> {
                         self.push(n, Ty::I32);
                         return Ok(());
                     }
+                }
+                if self.mm.atoms[a].chars() == "length".encode_utf16().collect::<Vec<u16>>().as_slice()
+                    && self.length_op(recv)
+                {
+                    return Ok(());
                 }
                 if self.ctor_get(pc + op.len(), a, recv) {
                     return Ok(());
@@ -5529,13 +5785,14 @@ impl<'s, 'a> Run<'s, 'a> {
                 };
                 let nslots = crate::wasm::bbv::construct_nslots(self.s.ctx, mono, site);
                 let word = self.s.alloc_word(mono, site);
-                let callee = mono
-                    .filter(|&k| self.s.fits_site(k, pc, 1))
-                    .and_then(|k| Some((k, self.s.callee(k)?)));
-                let r = match callee {
-                    Some((k, c)) if INLINE_CONSTRUCT && self.inline_budget(c.f.insts.len()) => {
-                        self.inline_construct(k, &c, &vals, nslots, word)
+                let callee = match mono {
+                    Some(k) if INLINE_CONSTRUCT => {
+                        self.admit(&[k], true, &|s, k, ictx| s.callee(k, ictx)).map(|mut t| t.remove(0))
                     }
+                    _ => None,
+                };
+                let r = match callee {
+                    Some((k, c)) => self.inline_construct(k, &c, &vals, nslots, word),
                     _ => self.js(Opcode::Construct(nslots, word), vals, MType::val(TagSet::OBJECT)),
                 };
                 // The object the site's constructor builds: its layout, as
@@ -5785,6 +6042,130 @@ impl<'s, 'a> Run<'s, 'a> {
                 let r = self.js(Opcode::JsRt(RtOp::SpreadEval(pc.get())), vals, MType::VAL_TOP);
                 self.push(r, Ty::Val(TagSet::ALL));
             }
+            Generator => {
+                let r = self.js(Opcode::JsRt(RtOp::CreateGenerator), vec![], MType::val(TagSet::OBJECT));
+                self.push(r, Ty::Val(TagSet::OBJECT));
+            }
+            InitialYield | Yield | Await => {
+                // Suspend with the frame as an exit writes it; a resume
+                // enters this yield's own root at the landing (§5.2's
+                // onramps, keyed by the resume index).
+                let index = p.next_uint24().unwrap();
+                let initial = op == InitialYield;
+                let before = self.st.clone();
+                let ops = self.exit_operands(pc, &before);
+                let (nargs, nlocals) = (self.s.nargs, self.s.nlocals);
+                self.term(
+                    Opcode::GenSuspend {
+                        pc,
+                        index,
+                        nargs,
+                        nlocals,
+                        initial,
+                    },
+                    ops,
+                    vec![],
+                );
+                let popped = if initial { 1 } else { 2 };
+                self.resume_root(index, pc + op.len(), &before, popped)?;
+            }
+            AfterYield => {
+                p.next_uint24();
+            }
+            FinalYieldRval => {
+                let g = self.pop();
+                let gv = self.boxed(g);
+                self.js_void(Opcode::JsRt(RtOp::GenFinal), vec![gv]);
+                let x = self.st[self.rval_ix()];
+                let v = if x.ty == Ty::Dead {
+                    self.const_val(ConstVal::Undefined)
+                } else {
+                    self.boxed(x)
+                };
+                self.term(Opcode::Return, vec![v], vec![]);
+            }
+            ResumeKind => {
+                let kind = i32::from(p.next_uint8().unwrap());
+                let v = self.const_i32(kind);
+                self.push(v, Ty::I32);
+            }
+            IsGenClosing => {
+                let x = self.top();
+                let v = self.boxed(x);
+                let b = self.inst(Opcode::IsGenClosing, vec![v], Some(MType::Bool));
+                self.push(b, Ty::Bool);
+            }
+            CheckResumeKind => {
+                // [val, gen, kind] -> [val]: next goes on; throw and return
+                // raise through the helper, which always fails.
+                let k = self.pop();
+                let g = self.pop();
+                let next = match k.ty {
+                    Ty::I32 => self.const_i32_of(k.v),
+                    _ => None,
+                };
+                if next != Some(0) {
+                    let ki = if k.ty == Ty::I32 {
+                        k.v
+                    } else {
+                        let kv = self.boxed(k);
+                        self.guard(Opcode::GuardUnbox(UnboxKind::I32), vec![kv], MType::I32_TOP)
+                    };
+                    let zero = self.const_i32(0);
+                    let is_next = self.inst(Opcode::Cmp(NumRepr::I32, Cc::Eq), vec![ki, zero], Some(MType::Bool));
+                    let (cont, raise) = (self.new_block(), self.new_block());
+                    self.term(Opcode::Br, vec![is_next], vec![Self::goto(cont), Self::goto(raise)]);
+                    self.at(raise);
+                    let v = self.top();
+                    let vals = vec![self.boxed(v), self.boxed(g), self.boxed(k)];
+                    // A return stages its value as the frame's rval: the
+                    // throw's exit must leave that slot as the helper wrote
+                    // it.
+                    let ix = self.rval_ix();
+                    self.pre[ix] = Slot::dead();
+                    self.js_void(Opcode::JsRt(RtOp::GenCheckResume), vals);
+                    self.term(Opcode::Unreachable, vec![], vec![]);
+                    self.at(cont);
+                }
+            }
+            AsyncAwait | AsyncResolve => {
+                let g = self.pop();
+                let v = self.pop();
+                let vals = vec![self.boxed(v), self.boxed(g)];
+                let r = self.js(Opcode::JsRt(RtOp::AsyncAwait(u32::from(op == AsyncResolve))), vals, MType::VAL_TOP);
+                self.push(r, Ty::Val(TagSet::ALL));
+            }
+            AsyncReject => {
+                let g = self.pop();
+                let stack = self.pop();
+                let reason = self.pop();
+                let vals = vec![self.boxed(reason), self.boxed(stack), self.boxed(g)];
+                let r = self.js(Opcode::JsRt(RtOp::AsyncReject), vals, MType::VAL_TOP);
+                self.push(r, Ty::Val(TagSet::ALL));
+            }
+            CanSkipAwait => {
+                let x = self.top();
+                let v = self.boxed(x);
+                let r = self.js(Opcode::JsRt(RtOp::CanSkipAwait), vec![v], MType::val(TagSet::BOOLEAN));
+                self.push(r, Ty::Val(TagSet::BOOLEAN));
+            }
+            MaybeExtractAwaitValue => {
+                // [v, can] -> [v', can]
+                let can = self.pop();
+                let x = self.pop();
+                let vals = vec![self.boxed(x), self.boxed(can)];
+                let r = self.js(Opcode::JsRt(RtOp::MaybeExtractAwait), vals, MType::VAL_TOP);
+                self.push(r, Ty::Val(TagSet::ALL));
+                self.repush(can);
+            }
+            Resume => {
+                let k = self.pop();
+                let v = self.pop();
+                let g = self.pop();
+                let vals = vec![self.boxed(g), self.boxed(v), self.boxed(k)];
+                let r = self.js(Opcode::JsRt(RtOp::Resume), vals, MType::VAL_TOP);
+                self.push(r, Ty::Val(TagSet::ALL));
+            }
             CallIter | CallContentIter => {
                 // An iterator method (`obj[Symbol.iterator]()`, a
                 // `return`): the ordinary call, whose uncallable callee
@@ -5898,13 +6279,7 @@ impl<'s, 'a> Run<'s, 'a> {
                 let facts_sids = self.s.ctx.facts.scripted_targets(self.site(pc));
                 let known_sids: Vec<ScriptId> = known.into_iter().collect();
                 let sids: &[ScriptId] = if known.is_some() { &known_sids } else { facts_sids };
-                let n = sids.len();
-                let targets: Vec<(ScriptId, std::rc::Rc<super::inline::Callee>)> = sids
-                    .iter()
-                    .take(MAX_INLINE_TARGETS + 1)
-                    .filter(|&&k| self.s.fits_site(k, pc, n) && !self.s.is_class_ctor(k))
-                    .filter_map(|&k| Some((k, self.s.callee_ctx(k, &fns, recv_ctor.map(|(c, _)| c))?)))
-                    .collect();
+                let sids: Vec<ScriptId> = sids.to_vec();
                 let forward = if argc >= 1 {
                     self.call_forward(&vals, &fns[1..], fwd_ctor.map(|(c, x)| (c, x, vals[2])))
                 } else {
@@ -5914,10 +6289,18 @@ impl<'s, 'a> Run<'s, 'a> {
                     r
                 } else if argc == 2 && self.s.apply_fwd.as_ref().is_some_and(|f| f.contains(&pc)) {
                     self.apply_forward(&vals)
-                } else if targets.is_empty()
-                    || targets.len() > MAX_INLINE_TARGETS
-                    || !self.inline_budget(targets.iter().map(|(_, c)| c.f.insts.len()).sum())
-                {
+                } else if let Some(targets) = {
+                    let rc = recv_ctor.map(|(c, _)| c);
+                    let fns = &fns;
+                    self.admit(&sids, false, &|s, k, ictx| s.callee_ctx(k, fns, rc, ictx))
+                } {
+                    let raw = recv_ctor.map(|(_, x)| self.ctor_pass(x, vals[1]));
+                    let r = self.inline_call_this(&targets, &vals, None, raw);
+                    if raw.is_some() {
+                        self.ctor_after(&targets, vals[1]);
+                    }
+                    r
+                } else {
                     // Not inlined: a known single callee is called
                     // directly while it is the callee.
                     self.likely_targets = if DIRECT_CALLS
@@ -5930,13 +6313,6 @@ impl<'s, 'a> Run<'s, 'a> {
                     };
                     let r = self.js(Opcode::Call, vals, MType::VAL_TOP);
                     self.likely_targets.clear();
-                    r
-                } else {
-                    let raw = recv_ctor.map(|(_, x)| self.ctor_pass(x, vals[1]));
-                    let r = self.inline_call_this(&targets, &vals, None, raw);
-                    if raw.is_some() {
-                        self.ctor_after(&targets, vals[1]);
-                    }
                     r
                 };
                 self.push(r, Ty::Val(TagSet::ALL));
