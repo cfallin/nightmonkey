@@ -654,7 +654,40 @@ impl LayoutPlan {
         plan.add_region_tables(sv);
         plan.add_post_new_rows(sv, facts, deleg);
         plan.emit_this_layouts(sv, facts, &rows);
+        plan.emit_ctor_publish(sv, facts, deleg);
         plan
+    }
+
+    /// `ctor_publish`: for each stamped constructor, the scripts its
+    /// construction of `this` runs through, in program order of its
+    /// `this` events (the ctor, then each `.call`/`.apply` or
+    /// `this.m(...)` delegate, transitively). The construction phase is
+    /// exactly this tree: a call made anywhere in it may see `this` with
+    /// all of the ctor's fields but not yet its stamp.
+    fn emit_ctor_publish(&self, sv: &Solver<'_>, facts: &mut LikelyFacts, deleg: &Delegation) {
+        for f in super::sorted_keys(&facts.ctor_stamps) {
+            let mut seen: HashSet<ScriptId> = HashSet::default();
+            let mut work = vec![(f, 0u32)];
+            while let Some((s, depth)) = work.pop() {
+                if !seen.insert(s) {
+                    continue;
+                }
+                facts.ctor_publish.entry(s).or_default().push(f);
+                if depth >= MAX_DELEG_DEPTH {
+                    continue;
+                }
+                for ev in sv.tables.this_events.get(&s).into_iter().flatten() {
+                    let t = match ev {
+                        TEvent::Write(_) => None,
+                        TEvent::Deleg(pc) => deleg.apply_targets.get(&Site::new(s, *pc)),
+                        TEvent::DelegM(pc) => deleg.single_call_target.get(&Site::new(s, *pc)),
+                    };
+                    if let Some(&t) = t {
+                        work.push((t, depth + 1));
+                    }
+                }
+            }
+        }
     }
 
     /// Caller-side init-after-new: for each allocation site whose result

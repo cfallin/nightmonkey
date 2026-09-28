@@ -46,6 +46,7 @@
 #include "js/Value.h"               // JS::Value
 #include "runtime/Night.h"  // js::night::NightAddPropCheck, the dyncode fuse
 #include "runtime/NightObjectWord.h"
+#include "runtime/NightHooks.h"  // js::night::gNightHooks (the vouched-store mask)
 #include "runtime/NightRegExp.h"
 #include "runtime/NightEntry.h"  // js::night::EnterNightStatus, NightApplyOrCall
 #include "runtime/NightEnv.h"  // js::night::NightEnvDesc, night_runtime_install_env
@@ -2309,16 +2310,63 @@ uint32_t night_runtime_get_prop_ic_miss(JSContext* cx, uint32_t top,
   return kMissOk;
 }
 
+static uint32_t SetPropIcMiss(JSContext* cx, uint32_t top, uint64_t recv,
+                              uint32_t atomId, uint64_t val, uint32_t cacheIdx,
+                              bool strict, bool vouched);
+static void NightCensusTraceSet(uint32_t atomId, uint32_t word,
+                                uint32_t flags);
+
 // Inline SetProp IC miss helper. Reached only when the body's inline
 // shape/generation guards miss (an unseen receiver shape, a stale generation,
 // or a non-cacheable site -- proto/accessor/new property). Does the generic
 // by-id set and, if the property is an own writable data slot, populates a
 // free/victim inline way so subsequent writes hit inline. The value stays on
 // the operand stack (the body re-pushes it, as in the generic set). May GC.
+//
+// `flags`: bit 0 strict; bit 1 (kSetVouchTypes) the compiled caller vouches
+// that `val` is of the field's predicted type for the object's class (its
+// stamp's, or its early key's while constructed), as its inline arms check
+// before they store. Then the helper's own stores that run no JS (the
+// add-transition replays and the mega-set probe: this one store, to this
+// field) keep TYPES, as the inline arms do (`AutoVouchedStore`); the
+// generic set, which may run setters, still drops it.
+static constexpr uint32_t kSetVouchTypes = 2;
 uint32_t night_runtime_set_prop_ic_miss(JSContext* cx, uint32_t top,
                                         uint64_t recv, uint32_t atomId,
                                         uint64_t val, uint32_t cacheIdx,
-                                        uint32_t strict) {
+                                        uint32_t flags) {
+  JS::Value rv = JS::Value::fromRawBits(recv);
+  if (rv.isObject()) {
+    NightCensusTraceSet(atomId, rv.toObject().externalWord(), flags);
+  }
+  return SetPropIcMiss(cx, top, recv, atomId, val, cacheIdx, flags & 1,
+                       flags & kSetVouchTypes);
+}
+
+// While in scope, and `vouched`, the engine's store choke drops RANGES but
+// keeps TYPES: the one store made inside is of a conforming value.
+class MOZ_RAII AutoVouchedStore {
+  bool on_;
+
+ public:
+  explicit AutoVouchedStore(bool vouched) : on_(vouched) {
+    if (on_) {
+      js::night::gNightHooks.storeClearMask = js::night::kWordRanges;
+      js::night::gNightHooks.storeNonNumberClearMask = 0;
+    }
+  }
+  ~AutoVouchedStore() {
+    if (on_) {
+      js::night::gNightHooks.storeClearMask = js::night::kStoreClearMask;
+      js::night::gNightHooks.storeNonNumberClearMask =
+          js::night::kStoreNonNumberClearMask;
+    }
+  }
+};
+
+static uint32_t SetPropIcMiss(JSContext* cx, uint32_t top, uint64_t recv,
+                              uint32_t atomId, uint64_t val, uint32_t cacheIdx,
+                              bool strict, bool vouched) {
   SetNightTop(cx, top);
   JS::HandleId id = AtomIdChecked(atomId);
   // Fused globals: a fused global's write must never be served by the
@@ -2351,6 +2399,7 @@ uint32_t night_runtime_set_prop_ic_miss(JSContext* cx, uint32_t top,
       uint32_t protoShapes[4] = {row[5], row[7], row[9], row[11]};
       uint32_t numProtos = 0;
       while (numProtos < 4 && protoPtrs[numProtos]) numProtos++;
+      AutoVouchedStore v(vouched);
       if (js::night::NightTryAddPropTransition(cx, recv, row[0], row[1], row[3],
                                                protoPtrs, protoShapes,
                                                numProtos, val)) {
@@ -2364,6 +2413,7 @@ uint32_t night_runtime_set_prop_ic_miss(JSContext* cx, uint32_t top,
     uint32_t shapeW =
         js::night::NightObjectShape(&JS::Value::fromRawBits(recv).toObject());
     SetAddRow& trow = SetAddAt(shapeW, atomId);
+    AutoVouchedStore v(vouched);
     if (trow.gen == InlineGen() && trow.oldShape == shapeW &&
         trow.atomId == atomId &&
         js::night::NightTryAddPropTransition(
@@ -2413,6 +2463,7 @@ uint32_t night_runtime_set_prop_ic_miss(JSContext* cx, uint32_t top,
     uint32_t shape = js::night::NightObjectShape(nobj);
     MegaSetEntry& e = *MegaSet(shape, atomId);
     if (e.shape == shape && e.atomId == atomId) {
+      AutoVouchedStore v(vouched);
       nobj->setSlot(e.absSlot, JS::Value::fromRawBits(val));
       noteSetShape(e.shape, e.slotEnc, e.absSlot);
       return kMissClean;
@@ -3650,7 +3701,55 @@ js::night::NightRuntimeData& js::night::NightData() {
 }
 }
 
+// `NIGHT_CENSUS_TRACE=N`: also print the first N MIR exits (kind 90) and
+// epoch bumps (kind 66) in the order they happen, with the epoch: the
+// counts say what is hot, the order says what started it.
+static int64_t gNightCensusTrace = -1;
+// Re-read after wizer resume (`JS::NightActivate`): the program's top level
+// runs while wizening, so a setting latched then would be the snapshot's.
+#ifdef __wasi__
+void __wasilibc_deinitialize_environ(void);
+void __wasilibc_initialize_environ(void);
+#endif
+void NightCensusTraceRearm() {
+#ifdef __wasi__
+  // The environment wasi-libc read while wizening is the snapshot's.
+  __wasilibc_deinitialize_environ();
+  __wasilibc_initialize_environ();
+#endif
+  gNightCensusTrace = -1;
+}
+static void NightCensusTrace(uint32_t kind, uint64_t id);
+// The trace line of a set-helper store to a published object with TYPES:
+// the property, the word, and whether the compiled caller vouched.
+static void NightCensusTraceSet(uint32_t atomId, uint32_t word,
+                                uint32_t flags) {
+  if (gNightCensusTrace > 0 && (word & js::night::kWordTypes) &&
+      !(word & js::night::kWordConstructing)) {
+    fprintf(stderr, "night: trace set %s word %x flags %u\n",
+            std::string(gNames.atoms[atomId].begin(),
+                        gNames.atoms[atomId].end())
+                .c_str(),
+            word, flags);
+  }
+}
+static void NightCensusTrace(uint32_t kind, uint64_t id) {
+  if (gNightCensusTrace < 0) {
+    const char* e = getenv("NIGHT_CENSUS_TRACE");
+    gNightCensusTrace = e ? atoll(e) : 0;
+  }
+  if (gNightCensusTrace > 0) {
+    gNightCensusTrace--;
+    fprintf(stderr, "night: trace kind %u id %llu epoch %llu\n", kind,
+            (unsigned long long)id,
+            (unsigned long long)js::gNightStampEpoch);
+  }
+}
+
 int32_t night_runtime_census(uint32_t kind, uint32_t id) {
+  if (kind == 90) {
+    NightCensusTrace(kind, id);
+  }
   if (!gNightCensus) {
     gNightCensus = new std::map<uint64_t, uint64_t>();
     gNightDepart = new std::vector<NightDepartCells>{
@@ -3719,6 +3818,7 @@ void NightNoteEpochBump(uint32_t site, uint32_t oldWord) {
     return;
   }
   uint64_t id = (static_cast<uint64_t>(site) << 16) | (oldWord & 0xFFFFu);
+  NightCensusTrace(66, id);
   (*gNightCensus)[(66ull << 32) | id] += 1;
 }
 }  // namespace js

@@ -1244,6 +1244,34 @@ impl<'s, 'a> Run<'s, 'a> {
         self.inst(op, vec![t], None);
     }
 
+    /// `publish_layout` at its earliest point (MIR.md §2.3): before a call
+    /// made while `this` may be under construction (`ctor_publish`), the
+    /// stamp of each constructor whose early key it carries, once all of
+    /// that constructor's fields are there. A method it calls on itself
+    /// then finds a published object (its entry guard passes, and its
+    /// stores keep TYPES), where it would otherwise exit to baseline and
+    /// leave the object published without TYPES for good.
+    fn publish_this(&mut self) {
+        let ctx = self.s.ctx;
+        let Some(ctors) = ctx.facts.ctor_publish.get(&self.s.sid) else {
+            return;
+        };
+        let Some(&x) = self.st.first() else { return };
+        if matches!(x.ty, Ty::Dead | Ty::Obj(..) | Ty::ObjHint(..)) {
+            return;
+        }
+        let t = self.boxed(x);
+        for c in ctors {
+            let Some(si) = ctx.stamp_ctors_in.get(c) else { continue };
+            let op = Opcode::CtorPublish(
+                si.layout_id,
+                u32::try_from(si.fields.len()).unwrap(),
+                crate::wasm::bbv::ctor_stamp_keep_bits(si) | self.s.types_bit(si.layout_id),
+            );
+            self.inst(op, vec![t], None);
+        }
+    }
+
     /// At an init delegate's or a fill script's return, the two-phase
     /// restamp of `this` or the named formal (`deleg_restamps_in`,
     /// `arg_restamps_in`); an inlined copy's returns restamp its own.
@@ -4806,6 +4834,7 @@ impl<'s, 'a> Run<'s, 'a> {
             }
             New | NewContent => {
                 // [callee, this, args…, new.target] -> [object]
+                self.publish_this();
                 let argc = usize::from(p.next_uint16().unwrap());
                 let n = self.st.len();
                 let operands: Vec<Slot> = self.st.drain(n - argc - 3..).collect();
@@ -4841,6 +4870,7 @@ impl<'s, 'a> Run<'s, 'a> {
                 if self.math_call(argc) {
                     return Ok(());
                 }
+                self.publish_this();
                 let n = self.st.len();
                 let operands: Vec<Slot> = self.st.drain(n - argc - 2..).collect();
                 // A known closure is the callee (context-sensitive: known

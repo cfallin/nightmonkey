@@ -426,6 +426,7 @@ pub fn mnemonic(op: &Opcode) -> String {
         Restamp(_) => "restamp".into(),
         StampFresh(_) => "stamp.fresh".into(),
         CtorStamp(..) => "ctor.stamp".into(),
+        CtorPublish(..) => "ctor.publish".into(),
         CallNative(_) => "call_native".into(),
     }
 }
@@ -487,7 +488,7 @@ fn immediates(m: &Module, op: &Opcode) -> Option<String> {
         Construct(n, w) | CreateThis(n, w) => format!("{n}, {w}"),
         Restamp(i) => i.to_string(),
         StampFresh(w) => format!("{w:#x}"),
-        CtorStamp(l, n, k) => format!("{l}, {n}, {k}"),
+        CtorStamp(l, n, k) | CtorPublish(l, n, k) => format!("{l}, {n}, {k}"),
         _ => return None,
     })
 }

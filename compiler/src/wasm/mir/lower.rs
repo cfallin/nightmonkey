@@ -65,7 +65,7 @@ use crate::wasm::bbv::abi::{
     STRING_LENGTH_OFFSET, STRING_FLAGS_OFFSET, STRING_CHARS_OFFSET, STRING_LINEAR_BIT,
     STRING_INLINE_CHARS_BIT, STRING_LATIN1_CHARS_BIT, CALL_CELL_ADDR_PLACEHOLDER, CALL_CELL_FUNCIDX,
     CALL_CELL_SCRIPT, EARLY_KEY_MAX, EARLY_KEY_SHIFT, IC_SET_ABSSLOT,
-    IC_SET_RECVSHAPE, IC_SET_SLOTENC, IC_TRANS_ABSSLOT, IC_TRANS_INLINE_HOPS, IC_TRANS_NEWSHAPE,
+    IC_SET_RECVSHAPE, IC_SET_SLOTENC, IC_TRANS_ABSSLOT, IC_TRANS_NEWSHAPE,
     IC_TRANS_OLDSHAPE, IC_TRANS_PROTO0, IC_TRANS_PROTO_HOPS, IC_TRANS_PROTO_ROW_BYTES,
     IC_TRANS_ROW_OFF, IC_TRANS_SLOTOFF, BASESHAPE_PROTO_OFFSET, IOF_CELL_ADDR_PLACEHOLDER,
     IOF_CELL_GEN, IOF_CELL_SLOTENC, CONSTRUCT_CELL_ADDR_PLACEHOLDER, CONSTRUCT_CELL_CTORSHAPE,
@@ -2317,7 +2317,9 @@ impl<'a> Lower<'a> {
                 self.cur = trans;
                 self.set_ic_trans(inst, name, a[0], a[1], way, slow)?;
                 self.cur = slow;
+                let vouch = self.vouch_types(inst, a[0], a[1]);
                 let (c, sv) = (self.i32c(cache), self.i32c(u32::from(strict)));
+                let sv = self.bin(Operator::I32Or, sv, vouch, Type::I32);
                 self.js_call(inst, self.h.set_prop_ic_miss, &[a[0], at, a[1], c, sv], false)?;
             }
             Opcode::JsGetElem => {
@@ -2632,7 +2634,8 @@ impl<'a> Lower<'a> {
                 let v = self.bin(Operator::I32Ne, c, z, Type::I32);
                 self.def(inst, v);
             }
-            Opcode::CtorStamp(layout, nfields, keep) => self.ctor_stamp_inline(a[0], layout, nfields, keep),
+            Opcode::CtorStamp(layout, nfields, keep) => self.ctor_stamp_inline(a[0], layout, nfields, keep, false),
+            Opcode::CtorPublish(layout, nfields, keep) => self.ctor_stamp_inline(a[0], layout, nfields, keep, true),
             Opcode::JsRt(r) => {
                 use crate::mir::ops::RtOp;
                 let h = self.h;
@@ -3980,8 +3983,7 @@ impl<'a> Lower<'a> {
 
     /// A set IC's add-transition row replayed inline (bbv's add arm, in its
     /// sound subset): `recv` an object of the row's pre-add shape, the
-    /// row's prototype hops unchanged (the first two live, deeper ones
-    /// none), and the add unable to falsify the object's class-word bits.
+    /// row's prototype hops unchanged (all four, live), and the add unable to falsify the object's class-word bits.
     /// That holds when it has no SLOTS, or lands where one of the name's
     /// predicted (layout key, offset) pairs says; with no RANGES; and no
     /// TYPES unless the value is a number. Then store the fresh slot, swap
@@ -4008,19 +4010,19 @@ impl<'a> Lower<'a> {
         self.check(m_old, slow);
         let slot_off = self.load_i32(row, IC_TRANS_SLOTOFF);
         self.check(slot_off, slow);
+        // Every recorded hop, live: a class hierarchy built with
+        // prototype objects (`inheritsFrom`) puts three or four protos
+        // under its instances, and a constructor's adds that fell to the
+        // helper would each clear TYPES there.
         for n in 0..IC_TRANS_PROTO_HOPS {
             let p = self.load_i32(row, IC_TRANS_PROTO0 + IC_TRANS_PROTO_ROW_BYTES * n);
             let empty = self.un(Operator::I32Eqz, p, Type::I32);
-            let ok = if n < IC_TRANS_INLINE_HOPS {
-                let want = self.load_i32(row, IC_TRANS_PROTO0 + IC_TRANS_PROTO_ROW_BYTES * n + 4);
-                // An empty hop's load reads the null page's first word:
-                // only its `empty` matters.
-                let live = self.load_i32(p, SHAPE_OFFSET);
-                let same = self.bin(Operator::I32Eq, live, want, Type::I32);
-                self.bin(Operator::I32Or, empty, same, Type::I32)
-            } else {
-                empty
-            };
+            let want = self.load_i32(row, IC_TRANS_PROTO0 + IC_TRANS_PROTO_ROW_BYTES * n + 4);
+            // An empty hop's load reads the null page's first word: only
+            // its `empty` matters.
+            let live = self.load_i32(p, SHAPE_OFFSET);
+            let same = self.bin(Operator::I32Eq, live, want, Type::I32);
+            let ok = self.bin(Operator::I32Or, empty, same, Type::I32);
             self.check(ok, slow);
         }
         // The class word.
@@ -4240,7 +4242,7 @@ impl<'a> Lower<'a> {
     /// gates): an object still under construction whose early key is ours
     /// or none, with a slot span covering the row, gets the layout's idx
     /// plus the validity bits that survived construction.
-    fn ctor_stamp_inline(&mut self, thisv: Value, layout: u32, nfields: u32, keep: u32) {
+    fn ctor_stamp_inline(&mut self, thisv: Value, layout: u32, nfields: u32, keep: u32, exact: bool) {
         let done = self.body.add_block();
         let tag = self.tag_of(thisv);
         let is_obj = self.tag_is(tag, TAG_OBJECT as u32);
@@ -4252,11 +4254,15 @@ impl<'a> Lower<'a> {
         self.check(sent, done);
         let km = self.i32c(EARLY_KEY_MAX << EARLY_KEY_SHIFT);
         let key = self.bin(Operator::I32And, w0, km, Type::I32);
-        let z = self.i32c(0);
-        let none = self.bin(Operator::I32Eq, key, z, Type::I32);
         let mine = self.i32c((layout + 1) << EARLY_KEY_SHIFT);
         let ours = self.bin(Operator::I32Eq, key, mine, Type::I32);
-        let owned = self.bin(Operator::I32Or, none, ours, Type::I32);
+        let owned = if exact {
+            ours
+        } else {
+            let z = self.i32c(0);
+            let none = self.bin(Operator::I32Eq, key, z, Type::I32);
+            self.bin(Operator::I32Or, none, ours, Type::I32)
+        };
         self.check(owned, done);
         let shape = self.load_i32(obj, SHAPE_OFFSET);
         let imm = self.load_i32(shape, SHAPE_IMMUTABLE_FLAGS_OFFSET);
@@ -4395,6 +4401,73 @@ impl<'a> Lower<'a> {
         self.drop_types(obj, w, slow);
         self.terminate(Terminator::Br { target: Self::to(join) });
         self.cur = join;
+    }
+
+    /// The set helper's vouch bit (`night_runtime_set_prop_ic_miss`'s
+    /// flag 2) for a store of `val` through `recv`: 2 when `recv` is an
+    /// object whose class types the field and `val` is of that type, or,
+    /// the site's list complete, a class typing no such field; else 0.
+    /// The helper's own stores (replays, the mega-set probe) then keep
+    /// TYPES, as the inline arms do: a polymorphic site's other classes
+    /// miss its one inline way, and must not be demoted for it.
+    fn vouch_types(&mut self, inst: mir::Inst, recv: Value, val: Value) -> Value {
+        let Some(a) = self.f.insts[inst].attach.filter(|&a| {
+            let at = &self.f.attachments[a];
+            at.field_types_complete || !at.field_types.is_empty()
+        }) else {
+            return self.i32c(0);
+        };
+        let at = &self.f.attachments[a];
+        let classes: Vec<(u32, TagSet)> =
+            at.field_types.iter().map(|&(k, m)| (k, mir::func::decode_tags(m))).collect();
+        let complete = at.field_types_complete;
+        let vt = match self.ty(self.f.insts[inst].args[1]) {
+            MType::Val(s) => s.tags,
+            _ => TagSet::ALL,
+        };
+        // A non-object's word is read off the null page, then ignored.
+        let tag = self.tag_of(recv);
+        let is_obj = self.tag_is(tag, TAG_OBJECT as u32);
+        let o = self.un(Operator::I32WrapI64, recv, Type::I32);
+        let z = self.i32c(0);
+        let obj = self.select(Type::I32, o, z, is_obj);
+        let w = self.load_i32(obj, OBJ_CLASS_IDX_OFFSET);
+        // Its class: the stamp's identity, or while it is constructed its
+        // early key.
+        let m16 = self.i32c(0xFFFF);
+        let idx = self.bin(Operator::I32And, w, m16, Type::I32);
+        let ksh = self.i32c(EARLY_KEY_SHIFT);
+        let kraw = self.bin(Operator::I32ShrU, w, ksh, Type::I32);
+        let km = self.i32c(EARLY_KEY_MAX);
+        let early = self.bin(Operator::I32And, kraw, km, Type::I32);
+        let sb = self.i32c(CLASS_WORD_SENTINEL);
+        let sent = self.bin(Operator::I32And, w, sb, Type::I32);
+        let id = self.select(Type::I32, early, idx, sent);
+        let mut ok = self.i32c(0);
+        let mut listed = self.i32c(0);
+        for (k, t) in classes {
+            let kv = self.i32c(k);
+            let is = self.bin(Operator::I32Eq, id, kv, Type::I32);
+            listed = self.bin(Operator::I32Or, listed, is, Type::I32);
+            let conf = if vt.is_nonempty_subset_of(t) {
+                self.i32c(1)
+            } else if vt.intersect(t).is_empty() {
+                self.i32c(0)
+            } else {
+                self.has_tags(val, t)
+            };
+            let hit = self.bin(Operator::I32And, is, conf, Type::I32);
+            ok = self.bin(Operator::I32Or, ok, hit, Type::I32);
+        }
+        if complete {
+            let unlisted = self.un(Operator::I32Eqz, listed, Type::I32);
+            let keyed = self.bin(Operator::I32Ne, id, z, Type::I32);
+            let other = self.bin(Operator::I32And, unlisted, keyed, Type::I32);
+            ok = self.bin(Operator::I32Or, ok, other, Type::I32);
+        }
+        let ok = self.bin(Operator::I32And, ok, is_obj, Type::I32);
+        let one = self.i32c(1);
+        self.bin(Operator::I32Shl, ok, one, Type::I32)
     }
 
     /// A store that falsifies TYPES: on an object under construction (no

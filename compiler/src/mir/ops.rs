@@ -472,6 +472,11 @@ pub enum Opcode {
     /// (layout, field count, kept bits): a no-op unless `this` is an
     /// object of this constructor still under construction.
     CtorStamp(u32, u32, u32),
+    /// `publish_layout` at its earliest point (MIR.md §2.3): the same
+    /// stamp before a call made while `this` may still be under
+    /// construction (`ctor_publish`), only for an object carrying this
+    /// constructor's own early key (an unkeyed one waits for the return).
+    CtorPublish(u32, u32, u32),
     CallNative(NativeId),
 }
 
@@ -1307,7 +1312,7 @@ pub fn signature(op: &Opcode, args: &[Type], m: &Module) -> SigResult {
             val(&args[0], "stamp.fresh")?;
             Sig::none()
         }
-        CtorStamp(..) => {
+        CtorStamp(..) | CtorPublish(..) => {
             arity(args, 1)?;
             val(&args[0], "ctor.stamp")?;
             Sig::none()
@@ -1770,7 +1775,7 @@ pub fn effects(op: &Opcode, args: &[Type], m: &Module) -> Effects {
         // `.prototype` of the callee: generic, reported.
         CreateThis(..) => return Effects::generic(FlagsEffect::Dynamic),
         // Writes the class word of an object no guard can have proven.
-        CtorStamp(..) => {
+        CtorStamp(..) | CtorPublish(..) => {
             fx.writes = vec![Region::Unknown];
             fx.flags = FlagsEffect::Bits(FlagBits::MUT_THIS);
         }

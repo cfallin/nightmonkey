@@ -85,7 +85,7 @@ NIGHT_RUNTIME_EXPORT(night_runtime_set_prop_ic_miss)
 uint32_t night_runtime_set_prop_ic_miss(JSContext* cx, uint32_t top,
                                         uint64_t recv, uint32_t atomId,
                                         uint64_t val, uint32_t cacheIdx,
-                                        uint32_t strict);
+                                        uint32_t flags);
 
 // Static fixed-slot store post-write (generational) barrier slow path. The
 // driver inlines the raw `store_i64` and the is-GC-thing/is-nursery check, and

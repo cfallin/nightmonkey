@@ -294,7 +294,10 @@ JS_PUBLIC_API bool JS::NightRegisterRoot(JSContext* cx,
 // environment from the tool-written region table, apply the fuse policy,
 // and enable dispatch. The tool already set each compiled script's
 // nightFuncIndex_ in the image.
+extern "C" void NightCensusTraceRearm();
+
 JS_PUBLIC_API bool JS::NightActivate(JSContext* cx) {
+  NightCensusTraceRearm();
   if (gNightActivated) {
     return true;
   }

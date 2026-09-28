@@ -482,6 +482,14 @@ pub struct LikelyFacts {
     /// Ctor-return stamp sites: constructor script -> its own ctor-class
     /// key (contiguous within the predictor group).
     pub ctor_stamps: HashMap<ScriptId, LayoutKey>,
+    /// Early publication (MIR.md §2.3 `publish_layout`): every script that
+    /// runs as part of a layout constructor's construction of `this` (the
+    /// ctor itself and the `.call`/`.apply`/`this.m(...)` delegates its
+    /// `this` events reach) -> the ctors whose objects it may be building.
+    /// Before a call there, `this` is stamped with the ctor's key as soon
+    /// as it carries that ctor's early key and all of its fields, so
+    /// methods it calls on itself find a published object.
+    pub ctor_publish: HashMap<ScriptId, Vec<ScriptId>>,
     /// Object-literal stamp sites: the `NewInit`/`NewObject` site -> its
     /// lit-row layout key. The rows always existed in the key space (and
     /// so in the runtime layout tables and the per-site claims); this is

@@ -1224,12 +1224,17 @@ impl Parser {
                 self.expect_punct(",")?;
                 CreateThis(n, self.int()?)
             }
-            CtorStamp(..) => {
+            CtorStamp(..) | CtorPublish(..) => {
                 let l = self.int()?;
                 self.expect_punct(",")?;
                 let n = self.int()?;
                 self.expect_punct(",")?;
-                CtorStamp(l, n, self.int()?)
+                let k = self.int()?;
+                if matches!(t, CtorStamp(..)) {
+                    CtorStamp(l, n, k)
+                } else {
+                    CtorPublish(l, n, k)
+                }
             }
             Construct(..) => {
                 let n = self.int()?;
@@ -1536,6 +1541,7 @@ fn template(mn: &str) -> Option<Opcode> {
         Restamp(0),
         StampFresh(0),
         CtorStamp(0, 0, 0),
+        CtorPublish(0, 0, 0),
         CallNative(NativeId::from_u32(0)),
     ];
     for k in UnboxKind::ALL {

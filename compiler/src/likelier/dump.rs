@@ -186,6 +186,10 @@ pub fn dump_facts(facts: &LikelyFacts, path: &str) {
     for (&s, &key) in &facts.ctor_stamps {
         lines.push(format!("ctor_stamps {s} = {key}"));
     }
+    for (&s, ctors) in &facts.ctor_publish {
+        let v: Vec<String> = ctors.iter().map(|c| c.to_string()).collect();
+        lines.push(format!("ctor_publish {s} = {}", v.join(",")));
+    }
     for (&s, &n) in &facts.ctor_nslots {
         lines.push(format!("ctor_nslots {s} = {n}"));
     }
