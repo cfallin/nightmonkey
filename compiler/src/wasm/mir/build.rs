@@ -227,6 +227,24 @@ impl<'a> Shape<'a> {
         )
     }
 
+    /// Layout `cls`'s field `name`: its slot and value claim, from the
+    /// layout rows (`this_layouts_in`, as bbv's `layout_fields`).
+    fn layout_field(&self, cls: u32, name: crate::ids::NameId) -> Option<(u32, crate::facts::Claim)> {
+        let mut cache = self.layout_fields.borrow_mut();
+        let m = cache.get_or_insert_with(|| {
+            let mut m: BTreeMap<u32, BTreeMap<crate::ids::NameId, (u32, crate::facts::Claim)>> = BTreeMap::new();
+            for li in self.ctx.this_layouts_in.values() {
+                let e = m.entry(li.layout_id).or_default();
+                for (i, &n) in li.fields.iter().enumerate() {
+                    let claim = li.masks.get(i).copied().unwrap_or(crate::facts::Claim::NONE);
+                    e.entry(n).or_insert((u32::try_from(i).unwrap(), claim));
+                }
+            }
+            m
+        });
+        m.get(&cls)?.get(&name).copied()
+    }
+
     /// Whether a call of script `k` may go straight to its compiled body
     /// (bbv's `likely_call_target`): not a class constructor, generator or
     /// async function.
@@ -402,6 +420,10 @@ const TA_POLY: bool = true;
 
 /// A typed array's `.length` is its length slot (`length.ta`).
 const LENGTH_TA: bool = true;
+
+/// Receivers the analysis hints one class for get typed sites
+/// (`hinted_site`).
+const CLS_HINTS: bool = true;
 
 /// `Math.<fn>(...)` calls are typed ops behind a native check (`math_call`).
 const MATH_CALLS: bool = true;
@@ -769,6 +791,10 @@ struct Shape<'a> {
     /// For a build for inlining at a call passing known closures: the
     /// formals holding one (`Ty::Fn`), by formal.
     formal_fns: Vec<Option<ScriptId>>,
+    /// The layout rows' fields, by layout (`layout_field`), made on first
+    /// use.
+    #[allow(clippy::type_complexity)]
+    layout_fields: std::cell::RefCell<Option<BTreeMap<u32, BTreeMap<crate::ids::NameId, (u32, crate::facts::Claim)>>>>,
 }
 
 impl<'a> Shape<'a> {
@@ -816,6 +842,7 @@ impl<'a> Shape<'a> {
             inline_depth: 0,
             callees: Default::default(),
             formal_fns: vec![],
+            layout_fields: Default::default(),
         })
     }
 
@@ -924,6 +951,10 @@ struct Run<'s, 'a> {
     math_fns: BTreeMap<mir::Value, MathFn>,
     /// The element op being built is at an `elem_poly_sites` site.
     ta_poly_site: bool,
+    /// Advisory classes (`hinted_site`): of values, and of the frame
+    /// slots whose writes carry them.
+    val_cls: BTreeMap<mir::Value, u32>,
+    slot_cls: BTreeMap<usize, u32>,
 }
 
 impl<'s, 'a> Run<'s, 'a> {
@@ -967,6 +998,8 @@ impl<'s, 'a> Run<'s, 'a> {
             gname_vals: BTreeMap::new(),
             math_fns: BTreeMap::new(),
             ta_poly_site: false,
+            val_cls: BTreeMap::new(),
+            slot_cls: BTreeMap::new(),
             inline_sites: 0,
             inline_insts: 0,
         }
@@ -1871,30 +1904,57 @@ impl<'s, 'a> Run<'s, 'a> {
     /// `None` without one, or when it disagrees with another site's
     /// description of the same slot.
     fn typed_site(&mut self, pc: Pc, name: mir::entity::AtomId) -> Option<TypedSite> {
-        let ps = self
+        let ps = *self
             .s
             .ctx
             .prop_sites_in
             .get(&crate::ids::Site::new(self.s.sid, pc))?;
-        let prims = ps.claim.prims();
+        self.site_for(ps.layout_id, ps.hi_layout_id, ps.slot, ps.claim, ps.shallow_possible, name)
+    }
+
+    /// A property access with no site row, through a receiver the analysis
+    /// hints one class for (`val_cls`: bbv's advisory tier, from
+    /// `arg_cls` and `field_cls_sites`): that class's field, from its
+    /// layout row (`this_layouts_in`). The hint is unchecked; the typed
+    /// access guards it, reading through the IC on a miss.
+    fn hinted_site(&mut self, recv: mir::Value, name: mir::entity::AtomId) -> Option<TypedSite> {
+        if !CLS_HINTS {
+            return None;
+        }
+        let cls = *self.val_cls.get(&recv)?;
+        let n = self.s.names?.lookup(self.mm.atoms[name].chars())?;
+        let (slot, claim) = self.s.layout_field(cls, n)?;
+        self.site_for(cls, cls, slot, claim, true, name)
+    }
+
+    fn site_for(
+        &mut self,
+        lo: u32,
+        hi: u32,
+        slot: u32,
+        claim_in: crate::facts::Claim,
+        shallow_possible: bool,
+        name: mir::entity::AtomId,
+    ) -> Option<TypedSite> {
+        let prims = claim_in.prims();
         // TYPES maintains only numberness today (§4.6): a claim is a
         // number claim, and only where the receivers can carry the bit.
         // Outside bbv every store goes through the engine, which drops the
         // bit on any non-number store to any field, so it survives only on
         // layouts whose fields are all numbers.
-        let types = !ps.claim.is_none()
-            && ps.shallow_possible
+        let types = !claim_in.is_none()
+            && shallow_possible
             && !prims.is_empty()
             && prims.subset_of(crate::opsem::NUM)
-            && (ps.layout_id..=ps.hi_layout_id).all(|k| numeric_layout(self.s.ctx, k));
+            && (lo..=hi).all(|k| numeric_layout(self.s.ctx, k));
         let site = TypedSite {
-            lo: ps.layout_id,
-            hi: ps.hi_layout_id,
+            lo,
+            hi,
             types,
-            claim: ps.claim,
+            claim: claim_in,
         };
         let claim = site.claim_ty();
-        let slot = usize::try_from(ps.slot).unwrap();
+        let slot = usize::try_from(slot).unwrap();
         for k in site.lo..=site.hi {
             let l = self
                 .mm
@@ -2827,6 +2887,10 @@ impl<'s, 'a> Run<'s, 'a> {
 
     /// Assign frame slot `ix`, writing it through to the frame.
     fn set_frame_slot(&mut self, ix: usize, x: Slot) {
+        match self.val_cls.get(&x.v) {
+            Some(&c) => self.slot_cls.insert(ix, c),
+            None => self.slot_cls.remove(&ix),
+        };
         if self.args_placeholder == Some(x.v) {
             self.args_local = Some(ix);
         }
@@ -2891,6 +2955,16 @@ impl<'s, 'a> Run<'s, 'a> {
                 self.op(op)?;
                 if self.live {
                     self.local_restamp(pc);
+                    // A property read's value class, hinted (bbv's
+                    // `attach_likely_cls`).
+                    if matches!(op, JSOp::GetProp | JSOp::GetElem) {
+                        if let Some(&(lo, hi)) = self.s.ctx.facts.field_cls_sites.get(&self.site(pc)) {
+                            if lo == hi {
+                                let v = self.top().v;
+                                self.val_cls.insert(v, lo.get());
+                            }
+                        }
+                    }
                 }
             }
             i += 1;
@@ -3197,6 +3271,14 @@ impl<'s, 'a> Run<'s, 'a> {
             };
             let v = self.f.add_param(b0, ty.mir());
             self.st.push(Slot { v, ty });
+            // The formal's advisory class (bbv's lazy tier: unguarded
+            // until a typed access checks it).
+            let key = (self.s.sid, ArgIndex::new(i + 1));
+            if let Some(&(lo, hi)) = self.s.ctx.facts.arg_cls.get(&key) {
+                if lo == hi && !self.s.script.has_mapped_args {
+                    self.slot_cls.insert(self.st.len() - 1, lo.get());
+                }
+            }
         }
         let undef = self.const_val(ConstVal::Undefined);
         let uty = Ty::Val(TagSet::prims(PRIM_UNDEFINED));
@@ -3285,7 +3367,11 @@ impl<'s, 'a> Run<'s, 'a> {
             // --- frame ---
             GetLocal => {
                 let n = p.next_uint24().unwrap();
-                let x = self.st[self.local_ix(n)];
+                let ix = self.local_ix(n);
+                let x = self.st[ix];
+                if let Some(&c) = self.slot_cls.get(&ix) {
+                    self.val_cls.insert(x.v, c);
+                }
                 self.st.push(x);
             }
             SetLocal | InitLexical => {
@@ -3305,7 +3391,11 @@ impl<'s, 'a> Run<'s, 'a> {
             }
             GetArg | GetFrameArg => {
                 let n = u32::from(p.next_uint16().unwrap());
-                let x = self.st[self.arg_ix(n)];
+                let ix = self.arg_ix(n);
+                let x = self.st[ix];
+                if let Some(&c) = self.slot_cls.get(&ix) {
+                    self.val_cls.insert(x.v, c);
+                }
                 self.st.push(x);
             }
             ToString if RT_OPS => {
@@ -4070,7 +4160,7 @@ impl<'s, 'a> Run<'s, 'a> {
                         return Ok(());
                     }
                 }
-                let site = self.typed_site(pc, a);
+                let site = self.typed_site(pc, a).or_else(|| self.hinted_site(recv.v, a));
                 if let Some((o, site)) = site.and_then(|site| self.proven_recv(recv, &site)) {
                     let r = self
                         .js_dirty_exits(Opcode::LoadField(a), vec![o], Some(site.claim_ty()), pc + op.len(), None)
@@ -4144,7 +4234,7 @@ impl<'s, 'a> Run<'s, 'a> {
                 // conformance check, and a number over a number needs no
                 // barriers); without a TYPES claim, any value, and the
                 // store's own check keeps the object's bits.
-                let site = self.typed_site(pc, a).filter(|s| num || !s.types);
+                let site = self.typed_site(pc, a).or_else(|| self.hinted_site(recv.v, a)).filter(|s| num || !s.types);
                 let proven = site.and_then(|site| self.proven_recv(recv, &site));
                 // The IC arm of an unproven typed store keeps facts, a kill
                 // exiting; where it cannot, it is a fence the two arms meet
