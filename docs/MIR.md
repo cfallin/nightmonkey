@@ -1733,6 +1733,11 @@ compiles now, lowered onto baseline's helpers:
   computed-key accessors, `debugger` (a no-op, as baseline's), `ThrowMsg`,
   and a `CheckLexical` whose value is surely uninitialized, which exits
   (baseline throws).
+- **A second census** after these left only generators and a short tail,
+  now also `js.rt` ops over baseline's helpers: `using` declarations
+  (`AddDisposable`, `TakeDisposeCapability`, `CreateSuppressedError`),
+  `GetBoundName`, `ObjWithProto`, `NewPrivateName`, `DynamicImport`,
+  and spread direct eval (`SpreadEval`).
 - **Generators and async functions** remain declined: a resumed
   generator enters at a `yield`'s pc, which needs an entry that §5.2's
   onramps (loop headers and function entry) do not provide. See
@@ -1741,7 +1746,8 @@ compiles now, lowered onto baseline's helpers:
   by `RtOp::map_atoms`, an exhaustive match: the splice's old list
   missed the new name ops, so an inlined `GetName` looked up an
   unrelated string (four jit-tests caught it).
-- Night tests: mir-iter-spread.js, mir-scopes.js, mir-misc-ops.js. One
+- Night tests: mir-iter-spread.js, mir-scopes.js, mir-misc-ops.js,
+  mir-rare-ops.js. One
   jit-test joins `jit-test-excludes-mir.txt`: bug1762575-3.js depends on
   a dead local keeping its object alive, as gc/compartment-revived-gc.js
   does.

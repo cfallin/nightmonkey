@@ -5731,6 +5731,60 @@ impl<'s, 'a> Run<'s, 'a> {
                 let r = self.js(Opcode::JsRt(RtOp::CheckReturn), vec![x, y], MType::VAL_TOP);
                 self.push(r, Ty::Val(TagSet::ALL));
             }
+            AddDisposable => {
+                let hint = u32::from(p.next_uint8().unwrap());
+                let nc = self.pop();
+                let m = self.pop();
+                let v = self.pop();
+                let vals = vec![self.boxed(v), self.boxed(m), self.boxed(nc)];
+                self.js_void(Opcode::JsRt(RtOp::AddDisposable(hint)), vals);
+            }
+            TakeDisposeCapability => {
+                let r = self.js(Opcode::JsRt(RtOp::TakeDisposeCapability), vec![], MType::VAL_TOP);
+                self.push(r, Ty::Val(TagSet::ALL));
+            }
+            CreateSuppressedError => {
+                let sup = self.pop();
+                let e = self.pop();
+                let vals = vec![self.boxed(e), self.boxed(sup)];
+                let r = self.js(Opcode::JsRt(RtOp::CreateSuppressedError), vals, MType::val(TagSet::OBJECT));
+                self.push(r, Ty::Val(TagSet::OBJECT));
+            }
+            GetBoundName => {
+                let a = self.atom(p.next_uint32().unwrap())?;
+                let x = self.pop();
+                let v = self.boxed(x);
+                let r = self.js(Opcode::JsRt(RtOp::GetBoundName(a)), vec![v], MType::VAL_TOP);
+                self.push(r, Ty::Val(TagSet::ALL));
+            }
+            ObjWithProto => {
+                let x = self.pop();
+                let v = self.boxed(x);
+                let r = self.js(Opcode::JsRt(RtOp::ObjWithProto), vec![v], MType::val(TagSet::OBJECT));
+                self.push(r, Ty::Val(TagSet::OBJECT));
+            }
+            NewPrivateName => {
+                let a = self.atom(p.next_uint32().unwrap())?;
+                let t = TagSet::prims(crate::opsem::PRIM_SYMBOL);
+                let r = self.js(Opcode::JsRt(RtOp::NewPrivateName(a)), vec![], MType::val(t));
+                self.push(r, Ty::Val(t));
+            }
+            DynamicImport => {
+                let o = self.pop();
+                let s = self.pop();
+                let vals = vec![self.boxed(s), self.boxed(o)];
+                let r = self.js(Opcode::JsRt(RtOp::DynamicImport), vals, MType::val(TagSet::OBJECT));
+                self.push(r, Ty::Val(TagSet::OBJECT));
+            }
+            SpreadEval | StrictSpreadEval => {
+                self.publish_this();
+                let arr = self.pop();
+                let thisv = self.pop();
+                let callee = self.pop();
+                let vals = vec![self.boxed(callee), self.boxed(thisv), self.boxed(arr)];
+                let r = self.js(Opcode::JsRt(RtOp::SpreadEval(pc.get())), vals, MType::VAL_TOP);
+                self.push(r, Ty::Val(TagSet::ALL));
+            }
             CallIter | CallContentIter => {
                 // An iterator method (`obj[Symbol.iterator]()`, a
                 // `return`): the ordinary call, whose uncallable callee

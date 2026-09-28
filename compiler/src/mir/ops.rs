@@ -328,6 +328,26 @@ pub enum RtOp {
     /// value (throws for a non-object, non-undefined rval or an
     /// uninitialized `this`).
     CheckReturn,
+    /// Register a `using` resource with the frame's environment
+    /// (`AddDisposable`, the hint): `v, method, needs_closure`.
+    AddDisposable(u32),
+    /// The frame's environment's disposal list, taken
+    /// (`TakeDisposeCapability`) -> value.
+    TakeDisposeCapability,
+    /// `SuppressedError(e, suppressed)` (`CreateSuppressedError`) -> object.
+    CreateSuppressedError,
+    /// `name` read from environment `env` a `BindName` found
+    /// (`GetBoundName`): `env` -> value.
+    GetBoundName(AtomId),
+    /// An object with prototype `proto` (`ObjWithProto`) -> object.
+    ObjWithProto,
+    /// A fresh private name (`NewPrivateName`) -> symbol.
+    NewPrivateName(AtomId),
+    /// `import(spec, opts)` (`DynamicImport`) -> object.
+    DynamicImport,
+    /// A direct eval with spread arguments (`SpreadEval`, its pc):
+    /// `callee, this, arr` -> value.
+    SpreadEval(u32),
     /// `ToString` of v -> string.
     ToString,
     /// Well-known symbol `code` (`JSOp::Symbol`) -> symbol.
@@ -354,12 +374,15 @@ impl RtOp {
             SetName(a, s) => SetName(f(a), s),
             GetPropSuper(a) => GetPropSuper(f(a)),
             SetPropSuper(a, s) => SetPropSuper(f(a), s),
+            GetBoundName(a) => GetBoundName(f(a)),
+            NewPrivateName(a) => NewPrivateName(f(a)),
             op @ (Instanceof | In | HasOwn | DelElem(_) | NewObject | NewArray(_) | InitElem(..)
             | ToPropertyKey | RegExp(_) | Iter | Check(_) | SetFunName(_) | GlobalThis | BigInt(_)
             | MutateProto | CheckPrivateField(..) | CheckIsObj(_) | CloseIter(_) | OptimizeSpreadCall
             | SpreadCall(_) | PushEnv(..) | EnterWith(_) | FreshenEnv(_) | BindVar | InitElemGetSet(_)
             | SuperBase | SuperFun | GetElemSuper | SetElemSuper(_) | InitHomeObject | FunWithProto(_)
-            | CheckReturn | ToString | Symbol(_) | BuiltinObject(_)) => op,
+            | CheckReturn | AddDisposable(_) | TakeDisposeCapability | CreateSuppressedError
+            | ObjWithProto | DynamicImport | SpreadEval(_) | ToString | Symbol(_) | BuiltinObject(_)) => op,
         }
     }
 }
@@ -1374,6 +1397,13 @@ pub fn signature(op: &Opcode, args: &[Type], m: &Module) -> SigResult {
                 RtOp::GetElemSuper | RtOp::SetPropSuper(..) => (3, Some(Type::VAL_TOP)),
                 RtOp::SetElemSuper(_) => (4, Some(Type::VAL_TOP)),
                 RtOp::InitHomeObject => (2, None),
+                RtOp::AddDisposable(_) => (3, None),
+                RtOp::TakeDisposeCapability => (0, Some(Type::VAL_TOP)),
+                RtOp::CreateSuppressedError | RtOp::DynamicImport => (2, Some(Type::val(TagSet::OBJECT))),
+                RtOp::GetBoundName(_) => (1, Some(Type::VAL_TOP)),
+                RtOp::ObjWithProto => (1, Some(Type::val(TagSet::OBJECT))),
+                RtOp::NewPrivateName(_) => (0, Some(Type::val(TagSet::prims(crate::opsem::PRIM_SYMBOL)))),
+                RtOp::SpreadEval(_) => (3, Some(Type::VAL_TOP)),
                 RtOp::FunWithProto(_) => (1, Some(Type::val(TagSet::OBJECT))),
                 RtOp::SpreadCall(0) => (4, Some(Type::VAL_TOP)),
                 RtOp::SpreadCall(_) => (4, Some(Type::val(TagSet::OBJECT))),

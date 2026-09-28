@@ -2868,6 +2868,26 @@ impl<'a> Lower<'a> {
                         (h.fun_with_proto, vec![env, a[0], script, iv])
                     }
                     RtOp::CheckReturn => (h.check_return, vec![a[0], a[1]]),
+                    RtOp::AddDisposable(hint) => {
+                        let env = self.frame_env();
+                        let hv = self.i32c(hint);
+                        (h.add_disposable, vec![env, a[0], a[1], a[2], hv])
+                    }
+                    RtOp::TakeDisposeCapability => (h.take_dispose_capability, vec![self.frame_env()]),
+                    RtOp::CreateSuppressedError => (h.create_suppressed_error, vec![a[0], a[1]]),
+                    RtOp::GetBoundName(name) => (h.get_bound_name, vec![a[0], self.atom(name)]),
+                    RtOp::ObjWithProto => (h.obj_with_proto, vec![a[0]]),
+                    RtOp::NewPrivateName(name) => (h.new_private_name, vec![self.atom(name)]),
+                    RtOp::DynamicImport => {
+                        let script = self.script_ptr();
+                        (h.dynamic_import, vec![script, a[0], a[1]])
+                    }
+                    RtOp::SpreadEval(pc) => {
+                        let env = self.frame_env();
+                        let script = self.script_ptr();
+                        let pcv = self.i32c(pc);
+                        (h.spread_eval, vec![a[0], a[1], a[2], env, script, pcv])
+                    }
                     RtOp::InitElemGetSet(kind) => {
                         let kv = self.i32c(kind);
                         (h.init_elem_getset, vec![a[0], a[1], a[2], kv])

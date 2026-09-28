@@ -425,6 +425,14 @@ pub fn mnemonic(op: &Opcode) -> String {
             RtOp::InitHomeObject => "js.rt.inithomeobject",
             RtOp::FunWithProto(_) => "js.rt.funwithproto",
             RtOp::CheckReturn => "js.rt.checkreturn",
+            RtOp::AddDisposable(_) => "js.rt.adddisposable",
+            RtOp::TakeDisposeCapability => "js.rt.takedisposecapability",
+            RtOp::CreateSuppressedError => "js.rt.createsuppressederror",
+            RtOp::GetBoundName(_) => "js.rt.getboundname",
+            RtOp::ObjWithProto => "js.rt.objwithproto",
+            RtOp::NewPrivateName(_) => "js.rt.newprivatename",
+            RtOp::DynamicImport => "js.rt.dynamicimport",
+            RtOp::SpreadEval(_) => "js.rt.spreadeval",
             RtOp::SetName(_, false) => "js.rt.setname",
             RtOp::SetName(_, true) => "js.rt.setname.strict",
             RtOp::ToString => "js.rt.tostring",
@@ -537,7 +545,8 @@ fn immediates(m: &Module, op: &Opcode) -> Option<String> {
         JsRt(RtOp::DelProp(a, _)) | JsRt(RtOp::Intrinsic(a)) | JsRt(RtOp::GetNameTypeof(a)) => atom(Some(m), *a),
         JsRt(RtOp::CheckPrivateField(c, k)) | JsRt(RtOp::PushEnv(c, k)) => format!("{c}, {k}"),
         JsRt(RtOp::GetName(a, k)) | JsRt(RtOp::BindName(a, k)) => format!("{}, {k}", atom(Some(m), *a)),
-        JsRt(RtOp::DelName(a)) | JsRt(RtOp::SetName(a, _)) | JsRt(RtOp::GetPropSuper(a)) | JsRt(RtOp::SetPropSuper(a, _)) => {
+        JsRt(RtOp::DelName(a)) | JsRt(RtOp::SetName(a, _)) | JsRt(RtOp::GetPropSuper(a)) | JsRt(RtOp::SetPropSuper(a, _))
+        | JsRt(RtOp::GetBoundName(a)) | JsRt(RtOp::NewPrivateName(a)) => {
             atom(Some(m), *a)
         }
         JsRt(RtOp::NewArray(n))
@@ -555,6 +564,8 @@ fn immediates(m: &Module, op: &Opcode) -> Option<String> {
         | ObjectLit(n)
         | JsRt(RtOp::InitElemGetSet(n))
         | JsRt(RtOp::FunWithProto(n))
+        | JsRt(RtOp::AddDisposable(n))
+        | JsRt(RtOp::SpreadEval(n))
         | JsRt(RtOp::EnterWith(n))
         | JsRt(RtOp::FreshenEnv(n)) => {
             n.to_string()
