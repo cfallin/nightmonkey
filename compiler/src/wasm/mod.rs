@@ -1056,6 +1056,7 @@ pub struct EnvLayout {
     pub prop_sites_tx: HashMap<Site, translate::PropSiteIn>,
     /// Stamped class idx (`layout_id + 1`) -> field name -> value mask.
     pub layout_field_masks_tx: HashMap<StampKey, HashMap<NameId, Claim>>,
+    pub layout_field_types_tx: HashMap<StampKey, HashMap<NameId, Claim>>,
     /// Same keying, the range claims (absent name = no claim).
     pub layout_field_ranges_tx: HashMap<StampKey, HashMap<NameId, ValueRange>>,
     /// Array alloc site -> the stamp word to write at allocation.
@@ -1542,6 +1543,18 @@ pub fn layout_env(
             )
         })
         .collect();
+    // The full-type parallel (MIR's TYPES): each field's predicted type,
+    // any type.
+    let layout_field_types_tx: HashMap<StampKey, HashMap<NameId, Claim>> = layout_ctors
+        .iter()
+        .map(|&key| {
+            let fields = &facts.classes[&LayoutKey::new(key.get())].fields;
+            (
+                LayoutKey::new(ctor_layout_id[&key]).stamp(),
+                fields.iter().map(|f| (f.name, f.types)).collect(),
+            )
+        })
+        .collect();
     // The range parallel, same keying: "does field N of this layout carry
     // a range claim, and which?" -- what the store choke needs to decide
     // between proving a store, checking it, and dropping the claim.
@@ -1841,6 +1854,7 @@ pub fn layout_env(
         this_layouts_tx,
         prop_sites_tx,
         layout_field_masks_tx,
+        layout_field_types_tx,
         layout_field_ranges_tx,
         array_stamp_tx,
         array_elem_tx,
@@ -2040,6 +2054,7 @@ pub fn translate_all(
         lit_stamps_in: &env.lit_stamps_tx,
         prop_sites_in: &env.prop_sites_tx,
         layout_field_masks_in: &env.layout_field_masks_tx,
+        layout_field_types_in: &env.layout_field_types_tx,
         layout_field_ranges_in: &env.layout_field_ranges_tx,
         array_stamp_in: &env.array_stamp_tx,
         array_elem_in: &env.array_elem_tx,

@@ -2728,6 +2728,11 @@ impl Solver<'_> {
                 .iter()
                 .enumerate()
                 .map(|(i, n)| ClassFieldFacts {
+                    types: plan
+                        .key_class
+                        .get(&k)
+                        .and_then(|&c| self.class_view_types(c, *n))
+                        .unwrap_or(Claim::NONE),
                     name: *n,
                     prims: prims.get(i).copied().unwrap_or(Prims::EMPTY),
                     range: ranges.get(i).copied().flatten(),
@@ -2855,6 +2860,25 @@ impl Solver<'_> {
     /// The claim is per-object ("SHALLOW set => claimed fields are
     /// numbers"), the store fence clears SHALLOW on any non-conforming
     /// store, and a wrong prediction costs the degrade path, never a deopt.
+    /// The full predicted type of a class's view cell (`ClassFieldFacts::
+    /// types`): its primitive classes, and the object bit where objects or
+    /// functions flow in; none where an unknown value may.
+    fn class_view_types(&self, c: ClassId, name: NameId) -> Option<Claim> {
+        let cell = self
+            .engine
+            .lookup(super::engine::CellKey::ClassView { class: c, name })?;
+        let ts = self.engine.ts(cell);
+        if ts.unknown {
+            return None;
+        }
+        let objects = !matches!(ts.obj, ObjType::Empty) || !ts.fns.is_empty();
+        if ts.prims.is_empty() && !objects {
+            return None;
+        }
+        let obj_bit = if objects { Claim::OBJECT.bits() } else { 0 };
+        Some(Claim::from_bits(ts.prims.bits() | obj_bit))
+    }
+
     fn class_view_prims(&self, c: ClassId, name: NameId) -> Option<Prims> {
         let cell = self
             .engine

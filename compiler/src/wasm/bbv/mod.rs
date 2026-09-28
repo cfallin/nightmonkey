@@ -187,7 +187,7 @@ pub(crate) fn construct_alloc_word(ctx: &TranslateCtx<'_>, mono: Option<ScriptId
     let word_of = |si: &StampCtorIn| {
         early_stamp_word(
             si.layout_id + 1,
-            si.masks.iter().any(|m| m.prims() != Prims::EMPTY),
+            si.masks.iter().any(|m| !m.is_none()),
             si.ranges.iter().any(Option::is_some),
         )
     };
@@ -212,7 +212,7 @@ pub(crate) fn construct_alloc_word(ctx: &TranslateCtx<'_>, mono: Option<ScriptId
 /// claims (see `emit_class_idx_stamp_impl`).
 pub(crate) fn ctor_stamp_keep_bits(si: &StampCtorIn) -> u32 {
     CLASS_WORD_SLOTS
-        | if si.masks.iter().any(|m| m.prims() != Prims::EMPTY) { CLASS_WORD_SHALLOW } else { 0 }
+        | if si.masks.iter().any(|m| !m.is_none()) { CLASS_WORD_SHALLOW } else { 0 }
         | if si.ranges.iter().any(Option::is_some) { CLASS_WORD_RANGES } else { 0 }
 }
 

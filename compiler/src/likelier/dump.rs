@@ -129,6 +129,8 @@ pub fn dump_facts(facts: &LikelyFacts, path: &str) {
             .map(|f| format!("{:#x}", f.prims.bits()))
             .collect();
         lines.push(format!("class_layout_masks {ctor} = {}", m.join(",")));
+        let t: Vec<String> = class.fields.iter().map(|f| format!("{:#x}", f.types.bits())).collect();
+        lines.push(format!("class_layout_types {ctor} = {}", t.join(",")));
         if class.fields.iter().any(|f| f.typed_prims != f.prims) {
             let m: Vec<String> = class
                 .fields

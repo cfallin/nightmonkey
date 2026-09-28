@@ -68,13 +68,14 @@ static constexpr uint32_t kWordRanges = 0x40000000u;
 static constexpr uint32_t kWordConstructing = 0x80000000u;
 
 // The engine-path store policy (JS::ExternalCompilerHooks store masks).
-// TYPES asserts per-field NUMBERNESS and nothing finer: a number store
-// through ANY path violates no class's claim and keeps the bit; the finer
-// per-field mask survives only because every consumer unboxes through the
-// number-tag dispatch, i.e. re-checks the mask at the load. RANGES is
-// consumed CHECKLESSLY, so every store through the engine drops it (owner
-// ruling 2026-08-16).
-static constexpr uint32_t kStoreClearMask = kWordRanges;
+// TYPES asserts that every field holds a value of its predicted type (any
+// type), and a read under a set bit on a valid stamp trusts it. The engine
+// cannot tell which field a store writes (and should not look it up), so
+// every store through it drops TYPES; compiled stores to a known field
+// keep it for a value of the field's predicted type (owner ruling
+// 2026-09-27). RANGES is consumed CHECKLESSLY, so every store through the
+// engine drops it (owner ruling 2026-08-16).
+static constexpr uint32_t kStoreClearMask = kWordRanges | kWordTypes;
 static constexpr uint32_t kStoreNonNumberClearMask = kWordTypes;
 
 // Epoch discipline: a demotion bumps the epoch only for a NON-sentinel word.

@@ -1296,7 +1296,7 @@ impl<'a> Bbv<'a> {
         // keeping a vacuous bit would still cost a demote-and-bump on
         // every engine-path non-number store, even though no consumer
         // tests a vacuous bit for this idx.
-        let keep_shallow = si.masks.iter().any(|m| m.prims() != Prims::EMPTY);
+        let keep_shallow = si.masks.iter().any(|m| !m.is_none());
         let keep_ranges = si.ranges.iter().any(Option::is_some);
         let bits_m = self.i32_const(
             CLASS_WORD_SLOTS

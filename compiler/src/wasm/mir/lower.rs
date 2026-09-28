@@ -2365,7 +2365,7 @@ impl<'a> Lower<'a> {
                 self.check(good, slow);
                 if duty {
                     let w = self.load_i32(obj, OBJ_CLASS_IDX_OFFSET);
-                    self.clear_bits(obj, w, CLASS_WORD_RANGES);
+                    self.clear_bits(obj, w, CLASS_WORD_RANGES | CLASS_WORD_SHALLOW);
                 }
                 if !num {
                     self.pre_barrier(addr, 0);
@@ -2535,7 +2535,7 @@ impl<'a> Lower<'a> {
                 self.check(thawed, fail);
                 if duty {
                     let w = self.load_i32(a[0], OBJ_CLASS_IDX_OFFSET);
-                    self.clear_bits(a[0], w, CLASS_WORD_RANGES);
+                    self.clear_bits(a[0], w, CLASS_WORD_RANGES | CLASS_WORD_SHALLOW);
                 }
                 if !num {
                     self.pre_barrier(addr, 0);
@@ -3745,43 +3745,27 @@ impl<'a> Lower<'a> {
         let num = val.is_some()
             && matches!(self.ty(self.f.insts[inst].args[1]), MType::Val(s) if s.tags.subset_of(TagSet::NUMBER));
         let w = self.load_i32(obj, OBJ_CLASS_IDX_OFFSET);
-        if slots_proven && (val.is_none() || num) {
-            // No test: a load, or a number store (TYPES survives it).
-            let outs = match val {
-                None => vec![self.load_i64(obj, off)],
-                Some(v) => {
-                    self.clear_bits(obj, w, CLASS_WORD_RANGES);
-                    self.store_i64(obj, off, v);
-                    vec![]
-                }
-            };
-            let t = self.edge(inst, 0, &outs)?;
+        if slots_proven && val.is_none() {
+            // A load under the claim: no test.
+            let r = self.load_i64(obj, off);
+            let t = self.edge(inst, 0, &[r])?;
             self.terminate(Terminator::Br { target: t });
             return Ok(());
         }
-        let fast_ok = if val.is_none() {
-            let bit = self.i32c(CLASS_WORD_SLOTS);
-            self.bin(Operator::I32And, w, bit, Type::I32)
-        } else {
-            // A store keeps the object's validity bits true only if it
-            // cannot break them: TYPES survives a number store only (a
-            // MIR claim may rest on it; the engine maintains it), and
-            // RANGES, consumed checklessly but by no MIR claim, is dropped
-            // on the way (`drop_ranges`).
-            let mask = CLASS_WORD_SLOTS | if num { 0 } else { CLASS_WORD_SHALLOW };
-            let m = self.i32c(mask);
-            let bits = self.bin(Operator::I32And, w, m, Type::I32);
-            let want = self.i32c(CLASS_WORD_SLOTS);
-            self.bin(Operator::I32Eq, bits, want, Type::I32)
-        };
         let (fast, slow) = (self.body.add_block(), self.body.add_block());
-        self.cond_br(fast_ok, Self::to(fast), Self::to(slow));
-
+        if slots_proven {
+            self.terminate(Terminator::Br { target: Self::to(fast) });
+        } else {
+            let bit = self.i32c(CLASS_WORD_SLOTS);
+            let has = self.bin(Operator::I32And, w, bit, Type::I32);
+            self.cond_br(has, Self::to(fast), Self::to(slow));
+        }
         self.cur = fast;
         let outs = match val {
             None => vec![self.load_i64(obj, off)],
             Some(v) => {
-                self.clear_bits(obj, w, CLASS_WORD_RANGES);
+                // TYPES survives only a value of the field's predicted type.
+                self.store_types(inst, obj, w, v, slow);
                 if !num {
                     self.pre_barrier(obj, off);
                 }
@@ -3934,7 +3918,7 @@ impl<'a> Lower<'a> {
         let hit = self.bin(Operator::I32Eq, shape, cached, Type::I32);
         self.check(hit, slow);
         let w = self.load_i32(obj, OBJ_CLASS_IDX_OFFSET);
-        self.check_store_bits(obj, w, num, slow);
+        self.check_store_bits(inst, obj, w, val, num, slow);
         // The slot: `enc & 1` selects the dynamic slots over the object,
         // `enc & !1` is the byte offset from that base.
         let enc = self.load_i32(way, IC_SET_SLOTENC);
@@ -4041,7 +4025,7 @@ impl<'a> Lower<'a> {
         }
         // The class word.
         let w = self.load_i32(obj, OBJ_CLASS_IDX_OFFSET);
-        self.check_store_bits(obj, w, num, slow);
+        self.check_store_bits(inst, obj, w, val, num, slow);
         let sb = self.i32c(CLASS_WORD_SLOTS);
         let slots = self.bin(Operator::I32And, w, sb, Type::I32);
         let (keyed, go) = (self.body.add_block(), self.body.add_block());
@@ -4330,17 +4314,66 @@ impl<'a> Lower<'a> {
     /// construction (the CONSTRUCTING sentinel: no guard can have proven
     /// it, so no claim rests on it); on a published one it goes to
     /// `slow`, where the engine keeps the bit.
-    fn check_store_bits(&mut self, obj: Value, w: Value, num: bool, slow: Block) {
-        if !num {
-            let m = self.i32c(CLASS_WORD_SHALLOW | CLASS_WORD_SENTINEL);
-            let bits = self.bin(Operator::I32And, w, m, Type::I32);
-            let pub_shallow = self.i32c(CLASS_WORD_SHALLOW);
-            let bad = self.bin(Operator::I32Eq, bits, pub_shallow, Type::I32);
-            let ok = self.un(Operator::I32Eqz, bad, Type::I32);
-            self.check(ok, slow);
+    fn check_store_bits(&mut self, inst: mir::Inst, obj: Value, w: Value, val: Value, _num: bool, slow: Block) {
+        self.store_types(inst, obj, w, val, slow);
+    }
+
+    /// A store's duty to the object's word `w` (§4.6): TYPES survives
+    /// only a value of the stored field's predicted type (`store_mask`);
+    /// any other store drops it (`drop_types`). RANGES, which no MIR claim
+    /// reads, is dropped either way.
+    fn store_types(&mut self, inst: mir::Inst, obj: Value, w: Value, val: Value, slow: Block) {
+        match self.store_mask(inst) {
+            Some(m) => self.keep_types_by_mask(inst, obj, w, val, m, slow),
+            None => self.drop_types(obj, w, slow),
         }
-        let mask = CLASS_WORD_RANGES | if num { 0 } else { CLASS_WORD_SHALLOW };
-        self.clear_bits(obj, w, mask);
+    }
+
+    /// A store that falsifies TYPES: on an object under construction (no
+    /// fact covers its word) the bit is cleared here; on a published one
+    /// the store goes to `slow`, the engine's, which clears it and bumps
+    /// the epoch (so the op reports dirt, and facts leave with it).
+    fn drop_types(&mut self, obj: Value, w: Value, slow: Block) {
+        let m = self.i32c(CLASS_WORD_SHALLOW | CLASS_WORD_SENTINEL);
+        let bits = self.bin(Operator::I32And, w, m, Type::I32);
+        let pub_shallow = self.i32c(CLASS_WORD_SHALLOW);
+        let bad = self.bin(Operator::I32Eq, bits, pub_shallow, Type::I32);
+        let ok = self.un(Operator::I32Eqz, bad, Type::I32);
+        self.check(ok, slow);
+        self.clear_bits(obj, w, CLASS_WORD_RANGES | CLASS_WORD_SHALLOW);
+    }
+
+    /// The predicted type of the field a store writes, from its
+    /// `field_mask` attachment (a likelier claim's bits).
+    fn store_mask(&self, inst: mir::Inst) -> Option<TagSet> {
+        let w = self.f.insts[inst].attach.and_then(|a| self.f.attachments[a].field_mask)?;
+        Some(mir::func::decode_tags(w))
+    }
+
+    /// A store of `val` to a field predicted `mask` keeps TYPES iff the
+    /// value is of that type (decided statically where its type says,
+    /// else by its tag); RANGES, which no MIR claim reads, is dropped.
+    fn keep_types_by_mask(&mut self, inst: mir::Inst, obj: Value, w: Value, val: Value, mask: TagSet, slow: Block) {
+        let vt = match self.ty(self.f.insts[inst].args[1]) {
+            MType::Val(s) => s.tags,
+            _ => TagSet::ALL,
+        };
+        if vt.is_nonempty_subset_of(mask) {
+            self.clear_bits(obj, w, CLASS_WORD_RANGES);
+        } else if vt.intersect(mask).is_empty() {
+            self.drop_types(obj, w, slow);
+        } else {
+            let conf = self.has_tags(val, mask);
+            let (keep, drop, join) = (self.body.add_block(), self.body.add_block(), self.body.add_block());
+            self.cond_br(conf, Self::to(keep), Self::to(drop));
+            self.cur = keep;
+            self.clear_bits(obj, w, CLASS_WORD_RANGES);
+            self.terminate(Terminator::Br { target: Self::to(join) });
+            self.cur = drop;
+            self.drop_types(obj, w, slow);
+            self.terminate(Terminator::Br { target: Self::to(join) });
+            self.cur = join;
+        }
     }
 
     /// Clear `mask`'s bits of `obj`'s class word `w`, if any is set.
@@ -4661,7 +4694,7 @@ impl<'a> Lower<'a> {
         let row = self.un(Operator::I32WrapI64, row, Type::I32);
         if duty {
             let w = self.load_i32(obj, OBJ_CLASS_IDX_OFFSET);
-            self.clear_bits(obj, w, CLASS_WORD_RANGES);
+            self.clear_bits(obj, w, CLASS_WORD_RANGES | CLASS_WORD_SHALLOW);
         }
         // A hole or the space past the initialized length holds no GC
         // thing: no pre-barrier.
@@ -5128,7 +5161,7 @@ impl<'a> Lower<'a> {
         self.check(all, slow);
         if duty {
             let word = self.load_i32(obj, OBJ_CLASS_IDX_OFFSET);
-            self.clear_bits(obj, word, CLASS_WORD_RANGES);
+            self.clear_bits(obj, word, CLASS_WORD_RANGES | CLASS_WORD_SHALLOW);
         }
         self.store_i64(elems, index * 8, val);
         let nl = self.i32c(index + 1);
@@ -5200,6 +5233,10 @@ impl<'a> Lower<'a> {
         let three = self.i32c(3);
         let off = self.bin(Operator::I32Shl, initlen, three, Type::I32);
         let addr = self.bin(Operator::I32Add, elements, off, Type::I32);
+        // A stamped array's element claims (RANGES, TYPES) hold for a value
+        // no site proves here: dropped (the array stamp's store duty).
+        let w = self.load_i32(obj, OBJ_CLASS_IDX_OFFSET);
+        self.clear_bits(obj, w, CLASS_WORD_RANGES | CLASS_WORD_SHALLOW);
         self.store_i64(addr, 0, arg);
         let one = self.i32c(1);
         let newlen = self.bin(Operator::I32Add, initlen, one, Type::I32);

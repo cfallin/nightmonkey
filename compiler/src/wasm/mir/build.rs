@@ -191,25 +191,6 @@ fn num_claim_ty(claim: crate::facts::Claim, int_first: bool) -> Option<Ty> {
     }
 }
 
-/// Whether every field of layout `k` has a number claim (so its objects
-/// keep the TYPES bit through engine-path stores); false for a layout no
-/// constructor describes.
-fn numeric_layout(ctx: &crate::wasm::translate::TranslateCtx<'_>, k: u32) -> bool {
-    let mut rows = ctx
-        .stamp_ctors_in
-        .values()
-        .chain(ctx.construct_sites_in.values())
-        .filter(|si| si.layout_id == k)
-        .peekable();
-    rows.peek().is_some()
-        && rows.all(|si| {
-            si.masks.iter().all(|m| {
-                let p = m.prims();
-                !p.is_empty() && p.subset_of(crate::opsem::NUM)
-            })
-        })
-}
-
 impl<'a> Shape<'a> {
     /// Whether callee `k` is small enough to inline at `pc` among
     /// `ntargets` targets: bbv's caps, 150 bytes of bytecode for one
@@ -243,6 +224,35 @@ impl<'a> Shape<'a> {
             m
         });
         m.get(&cls)?.get(&name).copied()
+    }
+
+    /// TYPES (the SHALLOW bit) where layout `k` predicts a type for any
+    /// field (`layout_field_types_in`): what MIR's allocations seed and
+    /// its stamps keep, beside bbv's numeric-mask rule.
+    fn types_bit(&self, k: u32) -> u32 {
+        let typed = self
+            .ctx
+            .layout_field_types_in
+            .get(&crate::ids::LayoutKey::new(k).stamp())
+            .is_some_and(|m| m.values().any(|c| !c.is_none()));
+        if typed {
+            crate::wasm::bbv::CLASS_WORD_SHALLOW
+        } else {
+            0
+        }
+    }
+
+    /// A construct site's allocation word (`construct_alloc_word`), seeding
+    /// TYPES for a layout that predicts field types.
+    fn alloc_word(&self, mono: Option<ScriptId>, site: crate::ids::Site) -> u32 {
+        let w = crate::wasm::bbv::construct_alloc_word(self.ctx, mono, site);
+        let si = mono
+            .and_then(|f| self.ctx.stamp_ctors_in.get(&f))
+            .or_else(|| self.ctx.construct_sites_in.get(&site));
+        match si {
+            Some(si) if w & crate::wasm::bbv::CLASS_WORD_SENTINEL != 0 => w | self.types_bit(si.layout_id),
+            _ => w,
+        }
     }
 
     /// Whether a call of script `k` may go straight to its compiled body
@@ -325,8 +335,10 @@ impl<'a> Shape<'a> {
 }
 
 /// A property access the analysis predicts: the receiver's layouts
-/// `[lo, hi]`, and whether the field's claim is backed by the stamp's
-/// TYPES bit (a number).
+/// `[lo, hi]`, and whether the field's predicted type is backed by the
+/// stamp's TYPES bit: with it set on a valid stamp, every field holds a
+/// value of its layout's predicted type (any type), so a read is of that
+/// type unchecked.
 #[derive(Clone, Copy, Debug)]
 struct TypedSite {
     lo: u32,
@@ -335,15 +347,29 @@ struct TypedSite {
     /// The analysis's value claim, to guard at the def when the stamp
     /// does not back it (`!types`).
     claim: crate::facts::Claim,
+    /// The field's predicted type over the layouts: what a read is (their
+    /// union), and what a store must be to keep TYPES on every one of
+    /// them (their intersection).
+    load_tags: TagSet,
+    store_tags: TagSet,
 }
 
 impl TypedSite {
     fn claim_ty(&self) -> MType {
         if self.types {
-            MType::val(TagSet::NUMBER)
+            MType::val(self.load_tags)
         } else {
             MType::VAL_TOP
         }
+    }
+}
+
+/// The tags a likelier claim admits.
+fn claim_tags(c: crate::facts::Claim) -> TagSet {
+    TagSet {
+        prims: c.prims(),
+        object: c.bits() & crate::facts::Claim::OBJECT.bits() != 0,
+        magic: false,
     }
 }
 
@@ -420,6 +446,10 @@ const TA_POLY: bool = true;
 
 /// A typed array's `.length` is its length slot (`length.ta`).
 const LENGTH_TA: bool = true;
+
+/// Property stores keep TYPES for a value of the field's predicted type
+/// (`field_claim`), and reads under TYPES are of that type.
+const FIELD_MASKS: bool = true;
 
 /// Receivers the analysis hints one class for get typed sites
 /// (`hinted_site`).
@@ -951,6 +981,9 @@ struct Run<'s, 'a> {
     math_fns: BTreeMap<mir::Value, MathFn>,
     /// The element op being built is at an `elem_poly_sites` site.
     ta_poly_site: bool,
+    /// The predicted type of the field the property store being built
+    /// writes, for its TYPES maintenance (`field_mask` attachments).
+    store_mask: Option<TagSet>,
     /// Advisory classes (`hinted_site`): of values, and of the frame
     /// slots whose writes carry them.
     val_cls: BTreeMap<mir::Value, u32>,
@@ -998,6 +1031,7 @@ impl<'s, 'a> Run<'s, 'a> {
             gname_vals: BTreeMap::new(),
             math_fns: BTreeMap::new(),
             ta_poly_site: false,
+            store_mask: None,
             val_cls: BTreeMap::new(),
             slot_cls: BTreeMap::new(),
             inline_sites: 0,
@@ -1043,6 +1077,17 @@ impl<'s, 'a> Run<'s, 'a> {
     /// Give a generic `call` the site's likely callees (`likely_targets`),
     /// for its lowering's direct arms.
     fn attach_targets(&mut self, inst: mir::Inst) {
+        if let Some(mask) = self.store_mask {
+            if matches!(self.f.insts[inst].op, Opcode::StoreField(_) | Opcode::JsSetProp(..)) {
+                let a = self.f.attachments.push(mir::func::Attachment {
+                    site: Some(self.site(self.pc)),
+                    field_mask: Some(mir::func::encode_tags(mask)),
+                    ..Default::default()
+                });
+                self.f.insts[inst].attach = Some(a);
+                return;
+            }
+        }
         if self.ta_poly_site && matches!(self.f.insts[inst].op, Opcode::JsGetElem | Opcode::JsSetElem(..)) {
             let a = self.f.attachments.push(mir::func::Attachment {
                 site: Some(self.site(self.pc)),
@@ -1156,7 +1201,7 @@ impl<'s, 'a> Run<'s, 'a> {
         let op = Opcode::CtorStamp(
             si.layout_id,
             u32::try_from(si.fields.len()).unwrap(),
-            crate::wasm::bbv::ctor_stamp_keep_bits(si),
+            crate::wasm::bbv::ctor_stamp_keep_bits(si) | self.s.types_bit(si.layout_id),
         );
         let t = self.boxed(self.st[0]);
         self.inst(op, vec![t], None);
@@ -1212,19 +1257,20 @@ impl<'s, 'a> Run<'s, 'a> {
     }
 
     fn restamp(&mut self, si: &StampCtorIn, v: mir::Value) {
-        let Some(r) = crate::wasm::bbv::restamp_args(si) else {
+        let Some(mut r) = crate::wasm::bbv::restamp_args(si) else {
             return;
         };
+        r[2] |= self.s.types_bit(si.layout_id);
         let i = u32::try_from(self.mm.restamps.len()).unwrap();
         self.mm.restamps.push(r);
         self.inst(Opcode::Restamp(i), vec![v], None);
     }
 
     /// Whether an element store at `pc` of `v` owes the array stamp's
-    /// RANGES claim a clear (bbv's `emit_elem_store_duty`): the site's
-    /// claim, or the intersection of every claim for a receiver the
-    /// analysis did not place, unless `v` is proven inside it. No claim,
-    /// no duty.
+    /// RANGES and TYPES claims a clear (bbv's `emit_elem_store_duty`): the
+    /// site's claim, or the intersection of every claim for a receiver
+    /// the analysis did not place, unless `v` is proven an int32 inside it
+    /// (an element claim is an int32 range). No claim, no duty.
     fn ranges_duty(&self, pc: Pc, v: Slot) -> bool {
         let ctx = self.s.ctx;
         let claim = ctx.array_elem_in.get(&self.site(pc)).map(|a| a.range).or(ctx.array_any_claim);
@@ -1232,8 +1278,8 @@ impl<'s, 'a> Run<'s, 'a> {
         let inside = |lo: i64, hi: i64| lo >= r.lo && hi <= r.hi;
         let proven = match self.f.ty(v.v) {
             MType::I32(ir) | MType::Int(ir) => inside(ir.lo, ir.hi),
-            MType::Val(s) if s.tags.is_nonempty_subset_of(TagSet::NUMBER) => {
-                s.num.integral && !s.num.may_nan && s.num.range.is_some_and(|x| inside(x.lo, x.hi))
+            MType::Val(s) if s.tags.is_nonempty_subset_of(TagSet::INT32) => {
+                s.num.range.is_some_and(|x| inside(x.lo, x.hi))
             }
             _ => false,
         };
@@ -1912,6 +1958,37 @@ impl<'s, 'a> Run<'s, 'a> {
         self.site_for(ps.layout_id, ps.hi_layout_id, ps.slot, ps.claim, ps.shallow_possible, name)
     }
 
+    /// The predicted type of field `name` a store at `pc` through `recv`
+    /// must be to keep TYPES (`FIELD_MASKS`): the layouts' masks for it
+    /// (all of them, intersected), the layouts from the site row, the
+    /// hinted class, or, through `this`, the script's own layout row.
+    fn field_claim(&mut self, pc: Pc, name: mir::entity::AtomId, recv: Slot) -> Option<TagSet> {
+        if !FIELD_MASKS {
+            return None;
+        }
+        let site = crate::ids::Site::new(self.s.sid, pc);
+        let (lo, hi) = if let Some(ps) = self.s.ctx.prop_sites_in.get(&site) {
+            (ps.layout_id, ps.hi_layout_id)
+        } else if let Some(&cls) = self.val_cls.get(&recv.v) {
+            (cls, cls)
+        } else if recv.v == self.st.first().map(|x| x.v)? {
+            let li = self.s.ctx.this_layouts_in.get(&self.s.sid)?;
+            (li.layout_id, li.hi_layout_id)
+        } else {
+            return None;
+        };
+        let n = self.s.names?.lookup(self.mm.atoms[name].chars())?;
+        let mut t = TagSet::ALL;
+        for k in lo..=hi {
+            let c = *self.s.ctx.layout_field_types_in.get(&crate::ids::LayoutKey::new(k).stamp())?.get(&n)?;
+            if c.is_none() {
+                return None;
+            }
+            t = t.intersect(claim_tags(c));
+        }
+        Some(t)
+    }
+
     /// A property access with no site row, through a receiver the analysis
     /// hints one class for (`val_cls`: bbv's advisory tier, from
     /// `arg_cls` and `field_cls_sites`): that class's field, from its
@@ -1936,26 +2013,29 @@ impl<'s, 'a> Run<'s, 'a> {
         shallow_possible: bool,
         name: mir::entity::AtomId,
     ) -> Option<TypedSite> {
-        let prims = claim_in.prims();
-        // TYPES maintains only numberness today (§4.6): a claim is a
-        // number claim, and only where the receivers can carry the bit.
-        // Outside bbv every store goes through the engine, which drops the
-        // bit on any non-number store to any field, so it survives only on
-        // layouts whose fields are all numbers.
-        let types = !claim_in.is_none()
-            && shallow_possible
-            && !prims.is_empty()
-            && prims.subset_of(crate::opsem::NUM)
-            && (lo..=hi).all(|k| numeric_layout(self.s.ctx, k));
+        // TYPES (§4.6): each layout's predicted type for the field, where
+        // the receivers can carry the bit and every layout predicts one.
+        let n = self.s.names.and_then(|ns| ns.lookup(self.mm.atoms[name].chars()));
+        let masks: Vec<TagSet> = (lo..=hi)
+            .filter_map(|k| {
+                let c = *self.s.ctx.layout_field_types_in.get(&crate::ids::LayoutKey::new(k).stamp())?.get(&n?)?;
+                (!c.is_none()).then(|| claim_tags(c))
+            })
+            .collect();
+        let types = shallow_possible && masks.len() == (hi - lo + 1) as usize;
+        let load_tags = masks.iter().fold(TagSet::NONE, |a, &m| a.union(m));
+        let store_tags = masks.iter().fold(TagSet::ALL, |a, &m| a.intersect(m));
         let site = TypedSite {
             lo,
             hi,
             types,
             claim: claim_in,
+            load_tags,
+            store_tags,
         };
-        let claim = site.claim_ty();
         let slot = usize::try_from(slot).unwrap();
-        for k in site.lo..=site.hi {
+        for (i, k) in (site.lo..=site.hi).enumerate() {
+            let claim = if types { MType::val(masks[i]) } else { MType::VAL_TOP };
             let l = self
                 .mm
                 .layouts
@@ -2087,7 +2167,8 @@ impl<'s, 'a> Run<'s, 'a> {
         let err = self.exit_block(true);
         // Not `term`: the clean edge is no fence.
         self.retain_locals(&op);
-        self.f.add_inst(self.cur, op, args, &[], vec![clean, dirty, Self::goto(err)]);
+        let (inst, _) = self.f.add_inst(self.cur, op, args, &[], vec![clean, dirty, Self::goto(err)]);
+        self.attach_targets(inst);
         self.live = false;
         self.at(ok);
         p
@@ -3313,6 +3394,7 @@ impl<'s, 'a> Run<'s, 'a> {
         let pc = self.pc;
         self.next_pc = Some(pc + op.len());
         self.ta_poly_site = false;
+        self.store_mask = None;
         let mut p = self.s.imms(pc);
         let int_ty = Ty::I32;
         match op {
@@ -4228,13 +4310,16 @@ impl<'s, 'a> Run<'s, 'a> {
                 let a = self.atom(p.next_uint32().unwrap())?;
                 let v = self.pop();
                 let recv = self.pop();
-                let num = v.ty.num().is_some();
-                // A field of the predicted layout: a number into a field
-                // the stamp's TYPES claims as one keeps the claim (no
-                // conformance check, and a number over a number needs no
-                // barriers); without a TYPES claim, any value, and the
-                // store's own check keeps the object's bits.
-                let site = self.typed_site(pc, a).or_else(|| self.hinted_site(recv.v, a)).filter(|s| num || !s.types);
+                self.store_mask = self.field_claim(pc, a, recv);
+                // A field of the predicted layout: a value of its predicted
+                // type (statically) keeps TYPES as a typed store; another
+                // goes through the IC, whose store keeps the bit by the
+                // value's tag or leaves it to the engine, which clears it.
+                let vtags = v.ty.tags();
+                let site = self
+                    .typed_site(pc, a)
+                    .or_else(|| self.hinted_site(recv.v, a))
+                    .filter(|s| !s.types || vtags.is_nonempty_subset_of(s.store_tags));
                 let proven = site.and_then(|site| self.proven_recv(recv, &site));
                 // The IC arm of an unproven typed store keeps facts, a kill
                 // exiting; where it cannot, it is a fence the two arms meet
@@ -4251,7 +4336,7 @@ impl<'s, 'a> Run<'s, 'a> {
                         let (o, site) = proven.unwrap();
                         let mut x = self.boxed(v);
                         if site.types {
-                            x = self.weaken(x, MType::val(TagSet::NUMBER));
+                            x = self.weaken(x, MType::val(site.store_tags));
                         }
                         self.js_dirty_exits(Opcode::StoreField(a), vec![o, x], None, pc + op.len(), Some(v));
                     }
@@ -4264,7 +4349,7 @@ impl<'s, 'a> Run<'s, 'a> {
                         let o = self.guard_layout_or(r, &site, generic);
                         let mut x = self.boxed(v);
                         if site.types {
-                            x = self.weaken(x, MType::val(TagSet::NUMBER));
+                            x = self.weaken(x, MType::val(site.store_tags));
                         }
                         self.js_dirty_exits(Opcode::StoreField(a), vec![o, x], None, pc + op.len(), Some(v));
                         self.term(Opcode::Jump, vec![], vec![Self::goto(join)]);
@@ -4657,7 +4742,7 @@ impl<'s, 'a> Run<'s, 'a> {
                     _ => None,
                 };
                 let nslots = crate::wasm::bbv::construct_nslots(self.s.ctx, mono, site);
-                let word = crate::wasm::bbv::construct_alloc_word(self.s.ctx, mono, site);
+                let word = self.s.alloc_word(mono, site);
                 let callee = mono
                     .filter(|&k| self.s.fits_site(k, pc, 1))
                     .and_then(|k| Some((k, self.s.callee(k)?)));

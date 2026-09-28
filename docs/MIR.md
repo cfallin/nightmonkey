@@ -393,6 +393,29 @@ They are the only prediction data MIR retains.
 
 ### 4.6 Field type claims: what `TYPES` can guarantee
 
+**Status (2026-09-27): M5b built for MIR, as below.**
+
+- **Emission:** each field carries its full predicted type
+  (`ClassFieldFacts::types`: every prim class plus the object bit; none
+  where an unknown value may flow in), served as
+  `layout_field_types_in`. Legacy keeps its numeric masks.
+- **Maintenance:**
+  - The engine store mask clears `TYPES` on every store
+    (`kStoreClearMask = RANGES | TYPES`; `SLOTS` is left out).
+  - MIR's stores to a known field carry its type (`field_mask`) and keep
+    `TYPES` iff the value conforms, statically or by its tag. A
+    nonconforming value on a published object goes to the engine, which
+    clears the bit, and the op reports dirty; under construction the bit
+    is cleared inline. A store without a known field drops `TYPES`.
+- **Consumption:** a typed site's reads trust the layout's type for the
+  field, any type (`load_field -> val{null,object}` etc.), under a
+  `guard.layout {types}`.
+- **Stamps:** MIR's allocations seed `TYPES` and its ctor stamps and
+  restamps keep it for any layout with a typed field.
+- **Not yet:** the object component (kind, script, singleton).
+
+The rest of this section is the design as written before M5b.
+
 **Today (answering "gap in emission, or in the analysis?"): it is
 emission plus runtime maintenance. The fixpoint analysis tracks
 everything.**

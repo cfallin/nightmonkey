@@ -135,6 +135,20 @@ pub struct LoopDecl {
     pub preheader: Block,
 }
 
+/// A tag set as an attachment's `field_mask` word: the prim bits, then
+/// the object and magic bits (16, 17).
+pub fn encode_tags(t: crate::mir::types::TagSet) -> u32 {
+    u32::from(t.prims.bits()) | u32::from(t.object) << 16 | u32::from(t.magic) << 17
+}
+
+pub fn decode_tags(w: u32) -> crate::mir::types::TagSet {
+    crate::mir::types::TagSet {
+        prims: crate::opsem::Prims::from_bits((w & 0xFFFF) as u16),
+        object: w & (1 << 16) != 0,
+        magic: w & (1 << 17) != 0,
+    }
+}
+
 /// What the lowering needs from the analysis and the translator's site
 /// tables that is neither an operand nor derivable from operand types.
 #[derive(Clone, PartialEq, Eq, Debug, Default)]
@@ -144,7 +158,8 @@ pub struct Attachment {
     pub ic_cell: Option<u32>,
     pub call_cell: Option<u32>,
     pub slot: Option<SlotIndex>,
-    /// The typed-site field mask.
+    /// A property store's field's predicted type, which the value must
+    /// have for the object to keep TYPES (`encode_tags`).
     pub field_mask: Option<u32>,
     /// Candidate call targets, for later inlining.
     pub targets: Vec<ScriptId>,

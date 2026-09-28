@@ -168,6 +168,11 @@ pub struct ClassFieldFacts {
     /// value's magnitude and `prims` is its tag, and no consumer wants one
     /// without the other.
     pub range: Option<ValueRange>,
+    /// The field's predicted type in full (every primitive class it may
+    /// hold, and whether objects: `Claim::OBJECT`'s bit beside the prims),
+    /// or none where an unknown value may flow in. What MIR's TYPES bit
+    /// asserts: under it every field holds a value of this type.
+    pub types: Claim,
     /// The effective claim in fullword/dims mode: `prims` where the write
     /// tier claimed one, otherwise the name-keyed claim filled in from the
     /// typed tier. Equal to `prims` when the typed tier adds nothing.
