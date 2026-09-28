@@ -352,6 +352,7 @@ impl<'a> Shape<'a> {
             fenced,
             this_out,
             sites,
+            reads_actuals: layout::reads_actuals(ks),
         })
     }
 }
@@ -843,6 +844,11 @@ struct InlineCtx {
     budget: u32,
     root_in_loop: Option<bool>,
     outer_nest: u32,
+    /// The call site entering a callee whose forward sites the analysis
+    /// resolves per entry (`apply_targets_in`: a shared wrapper's
+    /// `this.initialize.apply(this, arguments)`), for them; else `None`,
+    /// so other callees are built once whatever the site.
+    entry: Option<crate::ids::Site>,
 }
 
 impl InlineCtx {
@@ -851,6 +857,7 @@ impl InlineCtx {
         budget: MAX_INLINE_SITES,
         root_in_loop: None,
         outer_nest: 0,
+        entry: None,
     };
 }
 
@@ -1384,8 +1391,12 @@ impl<'s, 'a> Run<'s, 'a> {
             return None;
         }
         let script = s.script;
-        let needs_args_obj = crate::wasm::translate::uses_arguments(script)
-            || script.has_mapped_args
+        // bbv's rule (no splicing into a function that uses `arguments`,
+        // mapped formals or actuals), except where `arguments` only feeds
+        // `T.apply(this, arguments)` forwards (`apply_fwd`, never made):
+        // the frame's actuals are read in place, whatever is spliced.
+        let needs_args_obj = (crate::wasm::translate::uses_arguments(script) && s.apply_fwd.is_none())
+            || (script.has_mapped_args && script.nargs > 0)
             || crate::wasm::translate::uses_actual_args(script);
         if needs_args_obj || self.inline_sites >= ictx.budget {
             return None;
@@ -1451,11 +1462,15 @@ impl<'s, 'a> Run<'s, 'a> {
         let mut out = vec![];
         let mut admitted = None;
         for k in picked {
+            let site = self.site(pc);
+            let per_entry = bytes(k).is_some_and(layout::reads_actuals)
+                && s.ctx.facts.apply_targets_in.keys().any(|&(e, a)| e == site && a.script == k);
             let at = InlineCtx {
                 depth: ictx.depth + 1,
                 budget: ictx.budget.saturating_sub(used + 1),
                 root_in_loop: Some(root_in_loop),
                 outer_nest: nest,
+                entry: per_entry.then_some(site),
             };
             if let Some(c) = build(s, k, at) {
                 used += 1 + c.sites;
@@ -1821,7 +1836,10 @@ impl<'s, 'a> Run<'s, 'a> {
             let ok = self.new_block();
             let obj = self.f.add_param(ok, MType::val(TagSet::OBJECT));
             let err = self.new_block();
+            // Retained as the exit has them (a dirty exit's are weakened).
+            let live = std::mem::replace(&mut self.st, st.clone());
             self.retain_locals(&Opcode::ArgsObject);
+            self.st = live;
             let (t, _) = self.f.add_inst(
                 self.cur,
                 Opcode::ArgsObject,
@@ -1998,7 +2016,14 @@ impl<'s, 'a> Run<'s, 'a> {
 
     fn make_ctor_layout(&mut self, key: u32) -> Option<Vec<(mir::entity::AtomId, MType)>> {
         let ctx = self.s.ctx;
-        let si = ctx.stamp_ctors_in.values().find(|si| si.layout_id == key)?;
+        // A constructor's row, or, for a construct through a shared
+        // wrapper (`Class.create`'s), the site's or its init delegate's.
+        let si = ctx
+            .stamp_ctors_in
+            .values()
+            .chain(ctx.construct_sites_in.values())
+            .chain(ctx.deleg_restamps_in.values())
+            .find(|si| si.layout_id == key)?;
         let names = self.s.names?;
         let claims = ctx.layout_field_types_in.get(&crate::ids::LayoutKey::new(key).stamp());
         let out: Vec<(mir::entity::AtomId, MType)> = si
@@ -2035,8 +2060,14 @@ impl<'s, 'a> Run<'s, 'a> {
         if !CTOR_TYPES || word & crate::wasm::bbv::CLASS_WORD_SENTINEL == 0 {
             return None;
         }
-        let key = self.s.ctx.stamp_ctors_in.get(&k)?.layout_id;
-        if (word >> crate::wasm::bbv::abi::EARLY_KEY_SHIFT) & 0xFFF != key + 1 {
+        let early = (word >> crate::wasm::bbv::abi::EARLY_KEY_SHIFT) & 0xFFF;
+        // A shared wrapper constructor has no row of its own: the site's
+        // (`construct_sites_in`) put its key in the word.
+        let key = match self.s.ctx.stamp_ctors_in.get(&k) {
+            Some(si) => si.layout_id,
+            None => early.checked_sub(1)?,
+        };
+        if early != key + 1 {
             return None;
         }
         self.ctor_layout(key)?;
@@ -2938,18 +2969,9 @@ impl<'s, 'a> Run<'s, 'a> {
     /// A call whose predicted targets are inlined (§5.5): the callee
     /// guarded to each target's script in turn, each target's MIR spliced
     /// in on its hit; the ordinary call when none matches. Returns the
-    /// result, at the continuation.
-    fn inline_call(
-        &mut self,
-        targets: &[(ScriptId, std::rc::Rc<super::inline::Callee>)],
-        vals: &[mir::Value],
-        fallback: Option<(Opcode, Vec<mir::Value>)>,
-    ) -> mir::Value {
-        self.inline_call_this(targets, vals, fallback, None)
-    }
-
-    /// `inline_call`, the callees receiving `this_raw` (an object under
-    /// construction, `ctor_pass`) as their `this`, built for it.
+    /// result, at the continuation. With `this_raw` (an object under
+    /// construction, `ctor_pass`), the callees receive it as their `this`,
+    /// built for it.
     fn inline_call_this(
         &mut self,
         targets: &[(ScriptId, std::rc::Rc<super::inline::Callee>)],
@@ -3008,13 +3030,16 @@ impl<'s, 'a> Run<'s, 'a> {
             let nformals = callee.f.frame.formals as usize;
             let mut operands = vec![kobj, this_raw.unwrap_or(vals[1])];
             let undef = self.const_val(ConstVal::Undefined);
-            for i in 0..nformals {
+            // A callee reading its actuals gets them all.
+            let argc = callee.reads_actuals.then(|| u32::try_from(vals.len() - 2).unwrap());
+            let n = nformals.max(argc.map_or(0, |a| a as usize));
+            for i in 0..n {
                 operands.push(vals.get(2 + i).copied().unwrap_or(undef));
             }
             let saved_mm = self.mm.clone();
             let saved_frames = self.f.inline_frames.len();
             self.retain_all();
-            match super::inline::splice(&mut self.mm, &mut self.f, callee, 0, hit, &operands, None, join, dirty.clone(), err) {
+            match super::inline::splice(&mut self.mm, &mut self.f, callee, 0, hit, &operands, None, argc, join, dirty.clone(), err) {
                 Ok(()) => {
                     self.mm.script_addrs.insert(*k, callee.mm.script_addrs[k]);
                 }
@@ -3130,7 +3155,9 @@ impl<'s, 'a> Run<'s, 'a> {
         let nargs = vals.len() - 3;
         let mut operands = vec![kobj, this_op];
         let undef = self.const_val(ConstVal::Undefined);
-        for i in 0..nformals {
+        // A constructor reading its actuals gets them all.
+        let argc = callee.reads_actuals.then(|| u32::try_from(nargs).unwrap());
+        for i in 0..nformals.max(argc.map_or(0, |a| a as usize)) {
             operands.push(if i < nargs { vals[2 + i] } else { undef });
         }
         // The body's value, then the construct's result rule.
@@ -3140,7 +3167,7 @@ impl<'s, 'a> Run<'s, 'a> {
         let saved_frames = self.f.inline_frames.len();
         let here = self.cur;
         self.retain_all();
-        match super::inline::splice(&mut self.mm, &mut self.f, &callee, 0, here, &operands, Some(nt), ret, None, err) {
+        match super::inline::splice(&mut self.mm, &mut self.f, &callee, 0, here, &operands, Some(nt), argc, ret, None, err) {
             Ok(()) => {
                 self.mm.script_addrs.insert(k, callee.mm.script_addrs[&k]);
                 self.live = false;
@@ -3190,17 +3217,26 @@ impl<'s, 'a> Run<'s, 'a> {
     /// With the `.apply` the pristine builtin, the site's known targets
     /// are inlined, their formals read from this frame's actuals; any other
     /// target, or another `.apply`, forwards through the runtime.
-    fn apply_forward(&mut self, vals: &[mir::Value]) -> mir::Value {
+    fn apply_forward(&mut self, vals: &[mir::Value], this_ctor: Option<((u32, u32, bool), Slot)>) -> mir::Value {
         let site = self.site(self.pc);
         let facts = &self.s.ctx.facts;
-        let sids: Vec<ScriptId> = match facts.apply_targets.get(&site) {
+        // Resolved for the site that entered this copy where the analysis
+        // has it per entry (bbv's `seg_entry_site`).
+        let per_entry = self.s.ictx.entry.and_then(|e| facts.apply_targets_in.get(&(e, site)));
+        let sids: Vec<ScriptId> = match per_entry.or_else(|| facts.apply_targets.get(&site)) {
             Some(&k) => vec![k],
             None => facts.apply_target_sets.get(&site).cloned().unwrap_or_default(),
         };
         let helper = (Opcode::ApplyFwd, vec![vals[0], vals[1], vals[2]]);
-        let Some(targets) = self.admit(&sids, false, &|s, k, ictx| s.callee(k, ictx)) else {
+        // A target reading its actuals would need this frame's count. A
+        // `this` under construction (a wrapper constructor's forward to its
+        // `initialize`): targets built for it, as `call_forward`'s.
+        let tc = this_ctor.map(|(c, _)| c);
+        let build = |s: &Shape<'a>, k, ictx| s.callee_ctx(k, &[], tc, ictx).filter(|c| !c.reads_actuals);
+        let Some(targets) = self.admit(&sids, false, &build) else {
             return self.js(helper.0, helper.1, MType::VAL_TOP);
         };
+        let raw = this_ctor.map(|(_, x)| self.ctor_pass(x, vals[2]));
         // Arms with fences meet at `join`: `Obj` slots go in as `ObjHint`.
         // Without one (both arms keep), they keep their facts.
         if targets.iter().any(|(_, c)| c.fenced) || !self.keepable(1) {
@@ -3221,7 +3257,10 @@ impl<'s, 'a> Run<'s, 'a> {
         for k in 0..n {
             call.push(self.inst(Opcode::ActualArgOr(k), vec![], Some(MType::VAL_TOP)));
         }
-        let r = self.inline_call(&targets, &call, Some(helper.clone()));
+        let r = self.inline_call_this(&targets, &call, Some(helper.clone()), raw);
+        if raw.is_some() {
+            self.ctor_after(&targets, vals[2]);
+        }
         self.term(
             Opcode::Jump,
             vec![],
@@ -6242,9 +6281,10 @@ impl<'s, 'a> Run<'s, 'a> {
                     let site = self.site(pc);
                     let facts = &self.s.ctx.facts;
                     let direct = !facts.scripted_targets(site).is_empty();
-                    let fwd = argc >= 1
+                    let fwd = (argc >= 1
                         && facts.apply_sites.get(&site) == Some(&crate::facts::CallForm::Call)
-                        && (facts.apply_targets.contains_key(&site) || facts.apply_target_sets.contains_key(&site));
+                        && (facts.apply_targets.contains_key(&site) || facts.apply_target_sets.contains_key(&site)))
+                        || (argc == 2 && self.s.apply_fwd.as_ref().is_some_and(|f| f.contains(&pc)));
                     for (i, want) in [(1, direct), (2, fwd)] {
                         if want {
                             if let Some(s) = self.ctor_reguard(operands[i]) {
@@ -6288,7 +6328,7 @@ impl<'s, 'a> Run<'s, 'a> {
                 let r = if let Some(r) = forward {
                     r
                 } else if argc == 2 && self.s.apply_fwd.as_ref().is_some_and(|f| f.contains(&pc)) {
-                    self.apply_forward(&vals)
+                    self.apply_forward(&vals, fwd_ctor)
                 } else if let Some(targets) = {
                     let rc = recv_ctor.map(|(c, _)| c);
                     let fns = &fns;

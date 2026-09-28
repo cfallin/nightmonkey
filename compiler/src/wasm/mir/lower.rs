@@ -180,6 +180,19 @@ pub fn resume_words(f: &mir::Func) -> Vec<ResumeWord> {
     out.into_iter().collect()
 }
 
+/// The tags a value of MIR type `t` may have, boxed.
+fn value_tags(t: &MType) -> TagSet {
+    match t {
+        MType::Val(v) => v.tags,
+        MType::Obj(_) => TagSet::OBJECT,
+        MType::Str(_) => TagSet::prims(PRIM_STRING),
+        MType::Bool => TagSet::BOOLEAN,
+        MType::I32(_) => TagSet::INT32,
+        MType::F64(_) | MType::Int(_) => TagSet::NUMBER,
+        _ => TagSet::ALL,
+    }
+}
+
 /// The resume words of the exits and throws reachable from `root`: where
 /// an activation entered there can resume baseline.
 pub fn resume_words_from(f: &mir::Func, root: mir::Block) -> Vec<ResumeWord> {
@@ -309,10 +322,20 @@ struct Lower<'a> {
     /// With inlined callees (§5.5): per frame id its base and end offsets
     /// from `sp` and its layout. Frame 0 is the function's, ending past
     /// the rooting area; each inline frame sits at its parent's end. A
-    /// may-GC call's scan limit is its frame's end.
+    /// may-GC call's scan limit is its frame's top: the end of frame 0,
+    /// or an inline frame's fixed slots (its operand stack is baseline's,
+    /// written only by the frame's exits, so nothing in MIR reads it or
+    /// lets the GC see it). A nested inline frame starts at its parent's
+    /// top; an exit's baseline body runs on the frame up to its end.
     inline: bool,
     frame_off: Vec<u32>,
+    /// Per frame: where its variable region (locals, fixed slots,
+    /// operands) starts, from `vp`: its `frame_off`, past the actuals
+    /// beyond its formals for a callee reading its actuals (baseline's
+    /// `vp` rebase).
+    frame_voff: Vec<u32>,
     frame_end: Vec<u32>,
+    frame_top: Vec<u32>,
     frame_layouts: Vec<FrameLayout>,
     /// The frame of the instruction being lowered.
     cur_frame: u32,
@@ -323,6 +346,10 @@ struct Lower<'a> {
     /// the guard census's miss reason.
     guard_word: Option<(Value, Value, mir::types::KeyRange)>,
     guard_obj: Option<Value>,
+    /// A `guard.script` chain's function test, for the next guard on the
+    /// same callee, keyed by the block that guard is in (the first's
+    /// `fail`, its only way in).
+    script_memo: BTreeMap<mir::Block, (mir::Value, Value)>,
     /// Whether the function has onramp roots, and (if so) the entry's
     /// test of `ARGC_ONRAMP_BIT`, which says how this activation began.
     has_onramps: bool,
@@ -480,12 +507,15 @@ pub fn lower<'a>(
         crossed_out: BTreeMap::new(),
         inline: !f.inline_frames.is_empty(),
         frame_off: vec![0],
+        frame_voff: vec![0],
         frame_end: vec![root_base],
+        frame_top: vec![root_base],
         frame_layouts: vec![layout],
         cur_frame: 0,
         baseline_calls: vec![],
         stress: o.stress,
         guard_word: None,
+        script_memo: BTreeMap::new(),
         guard_obj: None,
         has_onramps: f.roots.iter().any(|r| r.kind != RootKind::Entry),
         onramp_flag: argc,
@@ -923,6 +953,7 @@ impl<'a> Lower<'a> {
         }
         self.homes(&reach, &order);
         self.frame_end[0] = self.root_base + 8 * self.nslots;
+        self.frame_top[0] = self.frame_end[0];
         if self.inline {
             self.inline_layout();
         }
@@ -1003,6 +1034,27 @@ impl<'a> Lower<'a> {
         }
         waffle::passes::empty_blocks::run(&mut self.body);
         Ok(())
+    }
+
+    /// Whether an instruction in the loop through header `h` (back-edge
+    /// sources `later`) may GC.
+    fn loop_may_gc(&self, h: mir::Block, later: &[mir::Block]) -> bool {
+        let f = self.f;
+        let mut fwd: BTreeSet<mir::Block> = BTreeSet::new();
+        let mut work = vec![h];
+        while let Some(b) = work.pop() {
+            if fwd.insert(b) {
+                work.extend(f.succs(b));
+            }
+        }
+        let mut body: BTreeSet<mir::Block> = BTreeSet::new();
+        let mut work: Vec<mir::Block> = later.to_vec();
+        while let Some(b) = work.pop() {
+            if fwd.contains(&b) && body.insert(b) && b != h {
+                work.extend(self.preds.get(&b).cloned().unwrap_or_default());
+            }
+        }
+        body.iter().any(|&b| f.blocks[b].insts.iter().any(|&i| self.may_gc(i)))
     }
 
     /// The frame stores in the loop through header `h` (the blocks between
@@ -1210,7 +1262,26 @@ impl<'a> Lower<'a> {
             }
         }
         self.plans.insert(b, plan.clone());
-        let dirty: BTreeSet<u32> = pend.iter().flat_map(|p| p.dirty.iter().copied()).collect();
+        // What may hold a dead value on entry: as the hot edges have it (a
+        // helper's slow path clears its own extra on its edge, `conform`,
+        // so a hot GC point after the join need not).
+        let hot_dirty = pend.iter().any(|p| !p.cold);
+        let mut dirty: BTreeSet<u32> = pend
+            .iter()
+            .filter(|p| !hot_dirty || !p.cold)
+            .flat_map(|p| p.dirty.iter().copied())
+            .collect();
+        // A loop that may GC starts clean: its entry edges clear what they
+        // may leave dead (`conform`), so its GC points do not clear them
+        // on every iteration.
+        if !later.is_empty() && !dirty.is_empty() && self.loop_may_gc(b, &later) {
+            let kept: BTreeSet<u32> = plan
+                .iter()
+                .filter(|&&(_, loc, es)| loc == Loc::Slot || es)
+                .filter_map(|(v, _, _)| self.home.get(v).copied())
+                .collect();
+            dirty.retain(|s| kept.contains(s));
+        }
         // What the frame holds on every edge. Where back edges are still
         // to come, only slots the loop never stores a different value into
         // (nor enters their inline frame), which the back edges then agree
@@ -1475,7 +1546,15 @@ impl<'a> Lower<'a> {
         let zero = self.i64c(TAG_INT32 << 32);
         self.store_i64(vp, l.resume(), zero);
         self.store_i64(vp, l.backoff(), zero);
-        self.init_root_area();
+        if self.own_env || self.is_gen {
+            self.init_root_area();
+        } else {
+            // Not written here: every slot may hold a dead frame's value,
+            // which the first may-GC call on each path clears (`root`'s
+            // stale slots), as a loop's entry edges do where the loop may
+            // GC (`enter_block`).
+            self.dirty = (0..self.nslots).collect();
+        }
         if self.own_env {
             // Every slot is valid: the GC may run. Failing, the throw has
             // no handler (baseline's prologue: pc 0, depth 0).
@@ -1728,7 +1807,7 @@ impl<'a> Lower<'a> {
     /// enclosing inline frame. (`live` no longer matters: kept for the
     /// callers' shape.)
     fn top_off(&self, _live: usize) -> u32 {
-        self.frame_end[self.cur_frame as usize]
+        self.frame_top[self.cur_frame as usize]
     }
 
     /// Lay out the inline frames (§5.5): each at its parent's end, the
@@ -1740,9 +1819,12 @@ impl<'a> Lower<'a> {
                 nlocals: fr.shape.locals,
                 rebase_vp: false,
             };
-            let off = self.frame_end[fr.parent as usize];
+            let off = self.frame_top[fr.parent as usize];
+            let voff = off + 8 * fr.argc.map_or(0, |n| n.saturating_sub(fr.shape.formals));
             self.frame_off.push(off);
-            self.frame_end.push(off + lay.top(fr.max_depth + 3));
+            self.frame_voff.push(voff);
+            self.frame_end.push(voff + lay.top(fr.max_depth + 3));
+            self.frame_top.push(voff + lay.operand_base());
             self.frame_layouts.push(lay);
         }
     }
@@ -1813,13 +1895,12 @@ impl<'a> Lower<'a> {
             let f = fid as usize;
             let l = self.frame_layouts[f];
             let (nargs, nlocals) = (l.nargs, l.nlocals);
-            let off = self.frame_off[f]
-                + match k {
-                    0 => FrameLayout::THIS,
-                    k if k <= nargs => l.arg(k - 1),
-                    k if k <= nargs + nlocals => l.local(k - 1 - nargs),
-                    _ => l.rval(),
-                };
+            let off = match k {
+                0 => self.frame_off[f] + FrameLayout::THIS,
+                k if k <= nargs => self.frame_off[f] + l.arg(k - 1),
+                k if k <= nargs + nlocals => self.frame_voff[f] + l.local(k - 1 - nargs),
+                _ => self.frame_voff[f] + l.rval(),
+            };
             let w = self.value_here(v)?;
             let t = self.ty(v);
             let b = self.boxed(&t, w)?;
@@ -2115,15 +2196,7 @@ impl<'a> Lower<'a> {
                 let wv = self.i32c(w);
                 self.store_i32(obj, OBJ_CLASS_IDX_OFFSET, wv);
             }
-            Opcode::Restamp(i) => {
-                // A leaf: the runtime's two-phase restamp gates.
-                let r = self.mm.restamps[i as usize];
-                let mut args = vec![a[0]];
-                for x in r {
-                    args.push(self.i32c(x));
-                }
-                self.call(self.h.ctor_restamp, &args, &[]);
-            }
+            Opcode::Restamp(i) => self.restamp(a[0], self.mm.restamps[i as usize]),
             Opcode::Return => {
                 self.store_i64(self.retval_out, 0, a[0]);
                 let z = self.i32c(0);
@@ -2268,6 +2341,9 @@ impl<'a> Lower<'a> {
             | Opcode::JsCompare(_)
             | Opcode::JsToNumeric => {
                 self.numeric_fast_arms(inst, &d.op, &a)?;
+                if d.op == Opcode::JsAdd {
+                    self.concat_arm(inst, &d, &a)?;
+                }
                 self.js_op(inst, &d.op, &a)?
             }
             Opcode::ArgsMapped(n) | Opcode::ArgsMappedSet(n) => {
@@ -2350,13 +2426,12 @@ impl<'a> Lower<'a> {
                 let fid = self.cur_frame as usize;
                 let l = self.frame_layouts[fid];
                 let (nargs, nlocals) = (l.nargs, l.nlocals);
-                let off = self.frame_off[fid]
-                    + match k {
-                        0 => FrameLayout::THIS,
-                        k if k <= nargs => l.arg(k - 1),
-                        k if k <= nargs + nlocals => l.local(k - 1 - nargs),
-                        _ => l.rval(),
-                    };
+                let off = match k {
+                    0 => self.frame_off[fid] + FrameLayout::THIS,
+                    k if k <= nargs => self.frame_off[fid] + l.arg(k - 1),
+                    k if k <= nargs + nlocals => self.frame_voff[fid] + l.local(k - 1 - nargs),
+                    _ => self.frame_voff[fid] + l.rval(),
+                };
                 // The Value it is. A double goes in as a double (NaN made
                 // canonical, as any boxed double must be), not re-tagged
                 // as an int32: `box_number` is not needed for validity.
@@ -2488,6 +2563,36 @@ impl<'a> Lower<'a> {
                 let t = self.edge(inst, 0, &[v])?;
                 self.terminate(Terminator::Br { target: t });
                 self.cur = slow;
+                // bbv's other pure arms, where the operands' types admit
+                // them: a string's char, and a string key's megamorphic
+                // probe (`obj[name]`).
+                let (rt, kt) = (value_tags(&self.ty(d.args[0])), value_tags(&self.ty(d.args[1])));
+                if !rt.intersect(TagSet::prims(PRIM_STRING)).is_empty() && !kt.intersect(TagSet::INT32).is_empty() {
+                    let other = self.body.add_block();
+                    let c = self.string_char(a[0], a[1], other);
+                    let t = self.edge(inst, 0, &[c])?;
+                    self.terminate(Terminator::Br { target: t });
+                    self.cur = other;
+                }
+                if !rt.intersect(TagSet::OBJECT).is_empty() && !kt.intersect(TagSet::prims(PRIM_STRING)).is_empty() {
+                    let other = self.body.add_block();
+                    let tag = self.tag_of(a[0]);
+                    let is_obj = self.tag_is(tag, TAG_OBJECT as u32);
+                    let ktag = self.tag_of(a[1]);
+                    let is_str = self.tag_is(ktag, TAG_STRING as u32);
+                    let both = self.bin(Operator::I32And, is_obj, is_str, Type::I32);
+                    self.check(both, other);
+                    let obj = self.un(Operator::I32WrapI64, a[0], Type::I32);
+                    let r = self.call1(self.h.elem_mega_get, &[obj, a[1]], Type::I64);
+                    let rtag = self.tag_of(r);
+                    let miss = self.tag_is(rtag, TAG_MAGIC as u32);
+                    let hit = self.body.add_block();
+                    self.cond_br(miss, Self::to(other), Self::to(hit));
+                    self.cur = hit;
+                    let t = self.edge(inst, 0, &[r])?;
+                    self.terminate(Terminator::Br { target: t });
+                    self.cur = other;
+                }
                 if self.ta_poly(inst) {
                     // A typed array of any kind (bbv's poly-TA arm): the
                     // probe's value, or the magic tag on a miss.
@@ -2743,43 +2848,7 @@ impl<'a> Lower<'a> {
             Opcode::Call => self.js_call_op(inst, &a, false)?,
             Opcode::CallIter => self.js_call_op(inst, &a, true)?,
             Opcode::CallEval(pc) => self.js_eval_op(inst, &a, pc)?,
-            Opcode::GuardScript(sid) => {
-                // The callee is a function of `sid`'s script, which is
-                // compiled (§5.5): its class is a function class, its
-                // script slot is that script (a native's slot never is),
-                // and the script has a table index.
-                let addr = *self
-                    .mm
-                    .script_addrs
-                    .get(&sid)
-                    .ok_or("lowering: guard.script without the script's address")?;
-                let shape = self.load_i32(a[0], SHAPE_OFFSET);
-                let base = self.load_i32(shape, SHAPE_BASESHAPE_OFFSET);
-                let clasp = self.load_i32(base, BASESHAPE_CLASP_OFFSET);
-                let slot = self.i32c(self.h.fn_class_slot);
-                let fn_class = self.load_i32(slot, 0);
-                let ext_class = self.load_i32(slot, 4);
-                let is_fn = self.bin(Operator::I32Eq, clasp, fn_class, Type::I32);
-                let is_ext = self.bin(Operator::I32Eq, clasp, ext_class, Type::I32);
-                let is_function = self.bin(Operator::I32Or, is_fn, is_ext, Type::I32);
-                let (fun_b, fail_b) = (self.body.add_block(), self.body.add_block());
-                self.cond_br(is_function, Self::to(fun_b), Self::to(fail_b));
-                self.cur = fun_b;
-                let script = self.load_i32(a[0], FUNC_SCRIPT_SLOT_OFFSET);
-                let want = self.i32c(addr);
-                let same = self.bin(Operator::I32Eq, script, want, Type::I32);
-                let idx_addr = self.i32c(addr);
-                let idx = self.load_i32(idx_addr, BASESCRIPT_NIGHTFUNCINDEX_OFFSET);
-                let z = self.i32c(0);
-                let compiled = self.bin(Operator::I32Ne, idx, z, Type::I32);
-                let ok = self.bin(Operator::I32And, same, compiled, Type::I32);
-                let t = self.edge(inst, 0, &[a[0]])?;
-                let e = self.edge(inst, 1, &[])?;
-                self.cond_br(ok, t, e);
-                self.cur = fail_b;
-                let e = self.edge(inst, 1, &[])?;
-                self.terminate(Terminator::Br { target: e });
-            }
+            Opcode::GuardScript(sid) => self.guard_script(inst, &d, &a, sid)?,
             Opcode::InlineEnter => self.inline_enter(&d, &a)?,
             Opcode::CreateThis(nslots, word) => {
                 // May GC: root what is live across it.
@@ -3038,7 +3107,7 @@ impl<'a> Lower<'a> {
                     RtOp::GenFinal => (h.gen_final, vec![a[0]]),
                     RtOp::GenCheckResume => {
                         let k = self.un(Operator::I32WrapI64, a[2], Type::I32);
-                        let rval = self.add_off(self.vp, self.frame_off[self.cur_frame as usize] + self.layout.rval());
+                        let rval = self.add_off(self.vp, self.frame_voff[self.cur_frame as usize] + self.layout.rval());
                         (h.gen_check_resume, vec![a[1], a[0], k, rval])
                     }
                     RtOp::AsyncAwait(resolve) => {
@@ -3112,8 +3181,11 @@ impl<'a> Lower<'a> {
             Opcode::ArgsObject => {
                 // The frame caches it, as baseline does, so both tiers
                 // (and repeated reads) see one object.
-                let l = self.layout;
-                let cached = self.load_i64(self.vp, l.args_obj());
+                let fid = self.cur_frame as usize;
+                let l = self.frame_layouts[fid];
+                let slot = self.frame_voff[fid] + l.args_obj();
+                let (asp, argc) = self.actuals();
+                let cached = self.load_i64(self.vp, slot);
                 let tag = self.tag_of(cached);
                 let undef = self.tag_is(tag, TAG_UNDEFINED as u32);
                 let (build, have) = (self.body.add_block(), self.body.add_block());
@@ -3126,28 +3198,33 @@ impl<'a> Lower<'a> {
                 // With an environment, the runtime is given it, as
                 // baseline's prologue does: a mapped object in a function
                 // with a call object records it (`MaybeForwardToCallObject`).
-                let (ok, r) = if self.plain_env || self.own_env {
+                // (An inlined callee's object is unmapped: no env.)
+                let (ok, r) = if fid == 0 && (self.plain_env || self.own_env) {
                     let env = self.load_i64(self.vp, l.env());
-                    self.gc_call(self.h.arguments_env, &[self.sp, self.argc, env], &live)?
+                    self.gc_call(self.h.arguments_env, &[asp, argc, env], &live)?
                 } else {
-                    self.gc_call(self.h.arguments_, &[self.sp, self.argc], &live)?
+                    self.gc_call(self.h.arguments_, &[asp, argc], &live)?
                 };
                 let (store, e) = (self.body.add_block(), self.edge(inst, 1, &[])?);
                 self.cond_br(ok, Self::to(store), e);
                 self.cur = store;
-                self.store_i64(self.vp, l.args_obj(), r);
+                self.store_i64(self.vp, slot, r);
                 let t = self.edge(inst, 0, &[r])?;
                 self.terminate(Terminator::Br { target: t });
             }
             Opcode::RestArray(n) => {
                 let live = self.live_across(inst);
                 let nv = self.i32c(n);
-                let (ok, r) = self.gc_call(self.h.rest, &[self.sp, self.argc, nv], &live)?;
+                let (asp, argc) = self.actuals();
+                let (ok, r) = self.gc_call(self.h.rest, &[asp, argc, nv], &live)?;
                 let t = self.edge(inst, 0, &[r])?;
                 let e = self.edge(inst, 1, &[])?;
                 self.cond_br(ok, t, e);
             }
-            Opcode::ArgsLength => self.def(inst, self.argc),
+            Opcode::ArgsLength => {
+                let (_, argc) = self.actuals();
+                self.def(inst, argc);
+            }
             Opcode::IterMore => {
                 let r = self.call1(self.h.more_iter, &[self.cx, a[0]], Type::I64);
                 self.def(inst, r);
@@ -3175,14 +3252,15 @@ impl<'a> Lower<'a> {
             }
             Opcode::FrameNewTarget => {
                 let fid = self.cur_frame as usize;
-                let off = self.frame_off[fid] + self.frame_layouts[fid].new_target();
+                let off = self.frame_voff[fid] + self.frame_layouts[fid].new_target();
                 let v = self.load_i64(self.vp, off);
                 self.def(inst, v);
             }
             Opcode::ActualArgOr(k) => {
-                let v = self.load_i64(self.sp, FrameLayout::ARGS + 8 * k);
+                let (asp, argc) = self.actuals();
+                let v = self.load_i64(asp, FrameLayout::ARGS + 8 * k);
                 let kv = self.i32c(k);
-                let have = self.bin(Operator::I32LtU, kv, self.argc, Type::I32);
+                let have = self.bin(Operator::I32LtU, kv, argc, Type::I32);
                 let undef = self.i64c(UNDEF);
                 let r = self.select(Type::I64, v, undef, have);
                 self.def(inst, r);
@@ -3194,12 +3272,14 @@ impl<'a> Lower<'a> {
                 self.def(inst, r);
             }
             Opcode::ApplyFwd => {
-                self.js_call(inst, self.h.apply_fwd, &[a[0], a[1], a[2], self.sp, self.argc], false)?;
+                let (asp, argc) = self.actuals();
+                self.js_call(inst, self.h.apply_fwd, &[a[0], a[1], a[2], asp, argc], false)?;
             }
             Opcode::ActualArg => {
                 let eight = self.i32c(8);
                 let off = self.bin(Operator::I32Mul, a[0], eight, Type::I32);
-                let addr = self.bin(Operator::I32Add, self.sp, off, Type::I32);
+                let (asp, _) = self.actuals();
+                let addr = self.bin(Operator::I32Add, asp, off, Type::I32);
                 let v = self.load_i64(addr, FrameLayout::ARGS);
                 self.def(inst, v);
             }
@@ -3354,21 +3434,21 @@ impl<'a> Lower<'a> {
                 let w = self.load_i32(a[0], OBJ_CLASS_IDX_OFFSET);
                 let m = self.i32c(0xFFFF);
                 let id = self.bin(Operator::I32And, w, m, Type::I32);
-                let lo = self.i32c(keys.lo.get() + 1);
-                let mut ok = if keys.lo == keys.hi {
-                    self.bin(Operator::I32Eq, id, lo, Type::I32)
+                let want = if GUARD_SLOTS { CLASS_WORD_SLOTS } else { 0 } | if types { CLASS_WORD_SHALLOW } else { 0 };
+                // One masked compare, as bbv's class guard: identity and
+                // the bits at once. Over a range, the masked word less the
+                // lowest wanted word is at most the span only with every
+                // bit there (a missing bit, at 1 << 16 or above, wraps it).
+                let mask = self.i32c(0xFFFF | want);
+                let wm = self.bin(Operator::I32And, w, mask, Type::I32);
+                let exp = self.i32c((keys.lo.get() + 1) | want);
+                let ok = if keys.lo == keys.hi {
+                    self.bin(Operator::I32Eq, wm, exp, Type::I32)
                 } else {
-                    let rel = self.bin(Operator::I32Sub, id, lo, Type::I32);
+                    let rel = self.bin(Operator::I32Sub, wm, exp, Type::I32);
                     let span = self.i32c(keys.hi.get() - keys.lo.get());
                     self.bin(Operator::I32LeU, rel, span, Type::I32)
                 };
-                if types || GUARD_SLOTS {
-                    let want = if GUARD_SLOTS { CLASS_WORD_SLOTS } else { 0 } | if types { CLASS_WORD_SHALLOW } else { 0 };
-                    let bits = self.i32c(want);
-                    let t = self.bin(Operator::I32And, w, bits, Type::I32);
-                    let t = self.bin(Operator::I32Eq, t, bits, Type::I32);
-                    ok = self.bin(Operator::I32And, ok, t, Type::I32);
-                }
                 self.guard_word = Some((w, id, keys));
                 self.guard_obj = Some(a[0]);
                 self.guard(inst, ok, &[a[0]])?;
@@ -3608,6 +3688,36 @@ impl<'a> Lower<'a> {
             tys.join(", ")
         );
         id
+    }
+
+    /// `a + b` of two strings: the quiet concat helper (bbv's arm: it runs
+    /// no user code and touches no stamp, so it takes `ok_clean`), where
+    /// both operands' types admit a string.
+    fn concat_arm(&mut self, inst: mir::Inst, d: &mir::func::InstData, a: &[Value]) -> R<()> {
+        let s = TagSet::prims(PRIM_STRING);
+        if value_tags(&self.ty(d.args[0])).intersect(s).is_empty() || value_tags(&self.ty(d.args[1])).intersect(s).is_empty() {
+            return Ok(());
+        }
+        let (x, y) = (a[0], a[1]);
+        let tx = self.tag_of(x);
+        let sx = self.tag_is(tx, TAG_STRING as u32);
+        let ty = self.tag_of(y);
+        let sy = self.tag_is(ty, TAG_STRING as u32);
+        let both = self.bin(Operator::I32And, sx, sy, Type::I32);
+        let (cat, other) = (self.body.add_block(), self.body.add_block());
+        self.cond_br(both, Self::to(cat), Self::to(other));
+        self.cur = cat;
+        // The helper's reload rebinds the live values on its path only.
+        let saved = (self.vmap.clone(), self.slotted.clone(), self.dirty.clone(), self.framed.clone(), self.cold);
+        let live = self.live_across(inst);
+        let (ok, r) = self.gc_call(self.h.concat, &[x, y], &live)?;
+        let t = self.edge(inst, 0, &[r])?;
+        let e = self.edge(inst, 2, &[])?;
+        self.cond_br(ok, t, e);
+        (self.vmap, self.slotted, self.dirty, self.framed, self.cold) = saved;
+        self.epoch_same = None;
+        self.cur = other;
+        Ok(())
     }
 
     /// A generic JS op through its helper (`ok_clean`, `ok_dirty`, `err`).
@@ -5517,6 +5627,43 @@ impl<'a> Lower<'a> {
     /// `key` an int32, and the element an initialized, non-hole dense one;
     /// else branches to `fail`. Pure reads: a typed array's dense
     /// initializedLength is 0, and a proxy fails the native check first.
+    /// `s[i]` of a linear latin1 string (boxed) and an in-bounds int32
+    /// index (boxed): the unit string from the static strings table
+    /// (bbv's `emit_string_elem_arm`); anything else branches to `fail`.
+    fn string_char(&mut self, recv: Value, key: Value, fail: Block) -> Value {
+        let tag = self.tag_of(recv);
+        let is_str = self.tag_is(tag, TAG_STRING as u32);
+        let ktag = self.tag_of(key);
+        let is_int = self.tag_is(ktag, TAG_INT32 as u32);
+        let both = self.bin(Operator::I32And, is_str, is_int, Type::I32);
+        self.check(both, fail);
+        let s = self.un(Operator::I32WrapI64, recv, Type::I32);
+        let flags = self.load_i32(s, STRING_FLAGS_OFFSET);
+        let want = self.i32c(STRING_LINEAR_BIT | STRING_LATIN1_CHARS_BIT);
+        let masked = self.bin(Operator::I32And, flags, want, Type::I32);
+        let lin = self.bin(Operator::I32Eq, masked, want, Type::I32);
+        let len = self.load_i32(s, STRING_LENGTH_OFFSET);
+        let idx = self.un(Operator::I32WrapI64, key, Type::I32);
+        let inb = self.bin(Operator::I32LtU, idx, len, Type::I32);
+        let ok = self.bin(Operator::I32And, lin, inb, Type::I32);
+        self.check(ok, fail);
+        let ib = self.i32c(STRING_INLINE_CHARS_BIT);
+        let inline = self.bin(Operator::I32And, flags, ib, Type::I32);
+        let heap = self.load_i32(s, STRING_CHARS_OFFSET);
+        let here = self.add_off(s, STRING_CHARS_OFFSET);
+        let chars = self.select(Type::I32, here, heap, inline);
+        let at = self.bin(Operator::I32Add, chars, idx, Type::I32);
+        let m = self.mem(0, 0);
+        let c = self.un(Operator::I32Load8U { memory: m }, at, Type::I32);
+        let tslot = self.i32c(self.h.static_strings_slot);
+        let tbl = self.load_i32(tslot, 0);
+        let two = self.i32c(2);
+        let off = self.bin(Operator::I32Shl, c, two, Type::I32);
+        let ea = self.bin(Operator::I32Add, tbl, off, Type::I32);
+        let atom = self.load_i32(ea, 0);
+        self.box_tagged(TAG_STRING, atom)
+    }
+
     fn dense_element(&mut self, recv: Value, key: Value, fail: Block) -> Value {
         self.dense_slot(recv, key, fail).4
     }
@@ -5667,10 +5814,24 @@ impl<'a> Lower<'a> {
     /// baseline's calls do: JS call depth is then bounded by the
     /// NightStack, not the native stack), else the generic helper. The
     /// result is at the frame's top. Success takes `ok_dirty`.
+    /// The op's frame's actuals: where its callee, `this` and actuals
+    /// start, and its actual count. An inlined callee's are its inline
+    /// frame's, its count the call's (`InlineFrame::argc`).
+    fn actuals(&mut self) -> (Value, Value) {
+        let fid = self.cur_frame as usize;
+        if fid == 0 {
+            return (self.sp, self.argc);
+        }
+        let fr = &self.f.inline_frames[fid - 1];
+        let n = fr.argc.unwrap_or(fr.shape.formals);
+        let base = self.add_off(self.vp, self.frame_off[fid]);
+        (base, self.i32c(n))
+    }
+
     /// The op's frame's env slot offset from `vp`.
     fn frame_env_off(&self) -> u32 {
         let fid = self.cur_frame as usize;
-        self.frame_off[fid] + self.frame_layouts[fid].env()
+        self.frame_voff[fid] + self.frame_layouts[fid].env()
     }
 
     /// The op's frame's current environment (boxed), from its env slot.
@@ -6290,6 +6451,194 @@ impl<'a> Lower<'a> {
         Ok(())
     }
 
+    /// `restamp` (bbv's inline `emit_class_idx_stamp_impl` restamp): the
+    /// runtime's two-phase gates (`night_runtime_ctor_restamp`), with its
+    /// two common outcomes inline: a word already of the layout stays,
+    /// and a native object under construction for it (its early key none,
+    /// the layout's or a prefix's) with every field's slot is stamped.
+    /// Anything else (a prefix-stamped word advancing, a short or capped
+    /// slot span, not an object) is the helper's.
+    fn restamp(&mut self, this: Value, r: [u32; 7]) {
+        let [layout, nfields, keep, prefixes @ ..] = r;
+        let done = self.body.add_block();
+        let (obj_b, slow) = (self.body.add_block(), self.body.add_block());
+        let tag = self.tag_of(this);
+        let is_obj = self.tag_is(tag, TAG_OBJECT as u32);
+        self.cond_br(is_obj, Self::to(obj_b), Self::to(done));
+        self.cur = obj_b;
+        let obj = self.un(Operator::I32WrapI64, this, Type::I32);
+        let w0 = self.load_i32(obj, OBJ_CLASS_IDX_OFFSET);
+        let m16 = self.i32c(0xFFFF);
+        let idx = self.bin(Operator::I32And, w0, m16, Type::I32);
+        let want = self.i32c(layout + 1);
+        let already = self.bin(Operator::I32Eq, idx, want, Type::I32);
+        let work = self.body.add_block();
+        self.cond_br(already, Self::to(done), Self::to(work));
+        self.cur = work;
+        // The sentinel with an early key it owns.
+        let sentb = self.i32c(CLASS_WORD_SENTINEL);
+        let sent = self.bin(Operator::I32And, w0, sentb, Type::I32);
+        let z = self.i32c(0);
+        let s_nz = self.bin(Operator::I32Ne, sent, z, Type::I32);
+        let km = self.i32c(EARLY_KEY_MAX << EARLY_KEY_SHIFT);
+        let key = self.bin(Operator::I32And, w0, km, Type::I32);
+        let mut k_ok = self.bin(Operator::I32Eq, key, z, Type::I32);
+        for k in std::iter::once(layout + 1).chain(prefixes.iter().copied().filter(|&p| p != 0)) {
+            let kv = self.i32c(k << EARLY_KEY_SHIFT);
+            let e = self.bin(Operator::I32Eq, key, kv, Type::I32);
+            k_ok = self.bin(Operator::I32Or, k_ok, e, Type::I32);
+        }
+        let ok = self.bin(Operator::I32And, s_nz, k_ok, Type::I32);
+        // A native object with every field's slot.
+        let shape = self.load_i32(obj, SHAPE_OFFSET);
+        let imm = self.load_i32(shape, SHAPE_IMMUTABLE_FLAGS_OFFSET);
+        let nb = self.i32c(SHAPE_IS_NATIVE_BIT);
+        let native = self.bin(Operator::I32And, imm, nb, Type::I32);
+        let native = self.bin(Operator::I32Ne, native, z, Type::I32);
+        let sh = self.i32c(SHAPE_SMALL_SLOTSPAN_SHIFT);
+        let span = self.bin(Operator::I32ShrU, imm, sh, Type::I32);
+        let sm = self.i32c(SHAPE_SMALL_SLOTSPAN_MASK_BITS);
+        let span = self.bin(Operator::I32And, span, sm, Type::I32);
+        let n = self.i32c(nfields);
+        let full = self.bin(Operator::I32GeU, span, n, Type::I32);
+        let ok = self.bin(Operator::I32And, ok, native, Type::I32);
+        let ok = self.bin(Operator::I32And, ok, full, Type::I32);
+        let stamp = self.body.add_block();
+        self.cond_br(ok, Self::to(stamp), Self::to(slow));
+        self.cur = stamp;
+        let kb = self.i32c(keep);
+        let bits = self.bin(Operator::I32And, w0, kb, Type::I32);
+        let nw = self.bin(Operator::I32Or, want, bits, Type::I32);
+        self.store_i32(obj, OBJ_CLASS_IDX_OFFSET, nw);
+        self.terminate(Terminator::Br { target: Self::to(done) });
+        self.cur = slow;
+        let mut args = vec![this];
+        for x in r {
+            args.push(self.i32c(x));
+        }
+        self.call(self.h.ctor_restamp, &args, &[]);
+        self.terminate(Terminator::Br { target: Self::to(done) });
+        self.cur = done;
+    }
+
+    /// `guard.script`: the callee is a function of `sid`'s script, which
+    /// is compiled (§5.5): its class is a function class, its script slot
+    /// is that script (a native's slot never is), and the script has a
+    /// table index. A lone guard (one likely callee) first probes a value
+    /// cell of its own, as bbv's inline guard: a hit is one compare of the
+    /// callee against the row, with no load through it. The full test fills
+    /// the row as `night_call_classify` does (tenured callees only; a
+    /// second callee poisons it). In a chain over several targets the
+    /// function test is made once, by the first guard.
+    fn guard_script(&mut self, inst: mir::Inst, d: &mir::func::InstData, a: &[Value], sid: crate::ids::ScriptId) -> R<()> {
+        let addr = *self
+            .mm
+            .script_addrs
+            .get(&sid)
+            .ok_or("lowering: guard.script without the script's address")?;
+        let callee = d.args[0];
+        let fail_m = d.succs[1].block;
+        let chains = self.f.terminator(fail_m).is_some_and(|t| {
+            matches!(self.f.insts[t].op, Opcode::GuardScript(_)) && self.f.insts[t].args[0] == callee
+        });
+        let memo = self
+            .script_memo
+            .get(&self.cur_mblock)
+            .filter(|(v, _)| *v == callee)
+            .map(|&(_, f)| f);
+        let cell = (memo.is_none() && !chains).then(|| {
+            let cell = self.i32c(CALL_CELL_ADDR_PLACEHOLDER);
+            let idx = self.atoms.next_call_cell();
+            self.call_cell_patches.push((cell, idx + 1));
+            let boxed = self.box_tagged(TAG_OBJECT, a[0]);
+            let cached = self.load_i64(cell, 0);
+            let f = self.load_i32(cell, CALL_CELL_FUNCIDX);
+            let sc = self.load_i32(cell, CALL_CELL_SCRIPT);
+            let hit = self.bin(Operator::I64Eq, boxed, cached, Type::I32);
+            let want = self.i32c(addr);
+            let same = self.bin(Operator::I32Eq, sc, want, Type::I32);
+            let z = self.i32c(0);
+            let compiled = self.bin(Operator::I32Ne, f, z, Type::I32);
+            let ok = self.bin(Operator::I32And, hit, same, Type::I32);
+            let ok = self.bin(Operator::I32And, ok, compiled, Type::I32);
+            let slow = self.body.add_block();
+            let t = self.edge(inst, 0, &[a[0]])?;
+            self.cond_br(ok, t, Self::to(slow));
+            self.cur = slow;
+            Ok::<_, String>((cell, boxed))
+        });
+        let cell = cell.transpose()?;
+        let is_function = match memo {
+            Some(f) => f,
+            None => {
+                let shape = self.load_i32(a[0], SHAPE_OFFSET);
+                let base = self.load_i32(shape, SHAPE_BASESHAPE_OFFSET);
+                let clasp = self.load_i32(base, BASESHAPE_CLASP_OFFSET);
+                let slot = self.i32c(self.h.fn_class_slot);
+                let fn_class = self.load_i32(slot, 0);
+                let ext_class = self.load_i32(slot, 4);
+                let is_fn = self.bin(Operator::I32Eq, clasp, fn_class, Type::I32);
+                let is_ext = self.bin(Operator::I32Eq, clasp, ext_class, Type::I32);
+                self.bin(Operator::I32Or, is_fn, is_ext, Type::I32)
+            }
+        };
+        if chains && self.preds.get(&fail_m).is_some_and(|p| p.len() == 1) {
+            self.script_memo.insert(fail_m, (callee, is_function));
+        }
+        let (fun_b, fail_b) = (self.body.add_block(), self.body.add_block());
+        self.cond_br(is_function, Self::to(fun_b), Self::to(fail_b));
+        self.cur = fun_b;
+        let script = self.load_i32(a[0], FUNC_SCRIPT_SLOT_OFFSET);
+        let want = self.i32c(addr);
+        let same = self.bin(Operator::I32Eq, script, want, Type::I32);
+        let idx_addr = self.i32c(addr);
+        let idx = self.load_i32(idx_addr, BASESCRIPT_NIGHTFUNCINDEX_OFFSET);
+        let z = self.i32c(0);
+        let compiled = self.bin(Operator::I32Ne, idx, z, Type::I32);
+        let ok = self.bin(Operator::I32And, same, compiled, Type::I32);
+        let e = self.edge(inst, 1, &[])?;
+        match cell {
+            None => {
+                let t = self.edge(inst, 0, &[a[0]])?;
+                self.cond_br(ok, t, e);
+            }
+            Some((cell, boxed)) => {
+                // The row's fill (`night_call_classify`'s): an empty row
+                // learns this callee (a nursery one's store goes to the
+                // trash row), a populated one is poisoned.
+                let fill = self.body.add_block();
+                self.cond_br(ok, Self::to(fill), e);
+                self.cur = fill;
+                let trash = self.i32c(CALL_CELL_ADDR_PLACEHOLDER);
+                self.call_cell_patches.push((trash, 0));
+                let cached = self.load_i64(cell, 0);
+                let z64 = self.i64c(0);
+                let empty = self.bin(Operator::I64Eq, cached, z64, Type::I32);
+                let mask = self.i32c(NOT_CHUNK_MASK);
+                let chunk = self.bin(Operator::I32And, a[0], mask, Type::I32);
+                let sb = self.load_i32(chunk, CHUNK_STORE_BUFFER_OFFSET);
+                let dst = self.select(Type::I32, trash, cell, sb);
+                let (learn, poison) = (self.body.add_block(), self.body.add_block());
+                self.cond_br(empty, Self::to(learn), Self::to(poison));
+                self.cur = learn;
+                self.store_i64(dst, 0, boxed);
+                self.store_i32(dst, CALL_CELL_FUNCIDX, idx);
+                self.store_i32(dst, CALL_CELL_SCRIPT, script);
+                let t = self.edge(inst, 0, &[a[0]])?;
+                self.terminate(Terminator::Br { target: t });
+                self.cur = poison;
+                let one = self.i64c(1);
+                self.store_i64(cell, 0, one);
+                let t = self.edge(inst, 0, &[a[0]])?;
+                self.terminate(Terminator::Br { target: t });
+            }
+        }
+        self.cur = fail_b;
+        let e = self.edge(inst, 1, &[])?;
+        self.terminate(Terminator::Br { target: e });
+        Ok(())
+    }
+
     /// `night_call_classify` of boxed `callee`: its funcref-table index (0
     /// when not compiled or not a scripted function) and its `JSScript*`.
     fn classify(&mut self, callee: Value) -> (Value, Value) {
@@ -6354,17 +6703,18 @@ impl<'a> Lower<'a> {
     }
 
     /// `inline.enter` (§5.5): the inlined callee's frame, as its
-    /// prologue would write it, from `callee, this, formals`. Every slot
-    /// up to the frame's end is made a valid Value: helpers' GC scan limit
-    /// inside the callee is that end.
+    /// prologue would write it, from `callee, this, formals`. Every fixed
+    /// slot is made a valid Value: helpers' GC scan limit inside the callee
+    /// is the frame's top (`frame_top`), past them.
     fn inline_enter(&mut self, d: &mir::func::InstData, a: &[Value]) -> R<()> {
         let fid = self.cur_frame as usize;
         self.framed.retain(|&(f, _), _| f as usize != fid);
-        let (base, l) = (self.frame_off[fid], self.frame_layouts[fid]);
-        let max_depth = self.f.inline_frames[fid - 1].max_depth;
+        let (base, vbase, l) = (self.frame_off[fid], self.frame_voff[fid], self.frame_layouts[fid]);
+        // Every actual for a callee reading them, else every formal.
+        let nact = self.f.inline_frames[fid - 1].argc.map_or(l.nargs, |n| n.max(l.nargs));
         // A construct also passes its new.target.
-        let construct = a.len() == 3 + l.nargs as usize;
-        if a.len() != 2 + l.nargs as usize && !construct {
+        let construct = a.len() == 3 + nact as usize;
+        if a.len() != 2 + nact as usize && !construct {
             return Err("lowering: inline.enter needs callee, this and every formal".into());
         }
         let mut boxed = vec![];
@@ -6376,29 +6726,28 @@ impl<'a> Lower<'a> {
         let sp = self.vp;
         self.store_i64(sp, base + FrameLayout::CALLEE, boxed[0]);
         self.store_i64(sp, base + FrameLayout::THIS, boxed[1]);
-        for i in 0..l.nargs {
+        for i in 0..nact {
             self.store_i64(sp, base + l.arg(i), boxed[2 + i as usize]);
         }
         let undef = self.i64c(UNDEF);
         for j in 0..l.nlocals {
-            self.store_i64(sp, base + l.local(j), undef);
+            self.store_i64(sp, vbase + l.local(j), undef);
         }
         // The callee's own environment: what its prologue loads, for a
         // script whose activation has none of its own (the only kind
         // inlined).
         let fun = self.un(Operator::I32WrapI64, boxed[0], Type::I32);
         let env = self.load_i64(fun, FUNC_ENV_SLOT_OFFSET);
-        self.store_i64(sp, base + l.env(), env);
-        self.store_i64(sp, base + l.args_obj(), undef);
+        self.store_i64(sp, vbase + l.env(), env);
+        self.store_i64(sp, vbase + l.args_obj(), undef);
         let nt = if construct { boxed[boxed.len() - 1] } else { undef };
-        self.store_i64(sp, base + l.new_target(), nt);
-        self.store_i64(sp, base + l.rval(), undef);
+        self.store_i64(sp, vbase + l.new_target(), nt);
+        self.store_i64(sp, vbase + l.rval(), undef);
         let zero = self.i64c(TAG_INT32 << 32);
-        self.store_i64(sp, base + l.resume(), zero);
-        self.store_i64(sp, base + l.backoff(), zero);
-        for k in 0..max_depth + 3 {
-            self.store_i64(sp, base + l.operand(k), undef);
-        }
+        self.store_i64(sp, vbase + l.resume(), zero);
+        self.store_i64(sp, vbase + l.backoff(), zero);
+        // The operand stack is past the frame's GC scan limit
+        // (`frame_top`): its exits write it.
         Ok(())
     }
 
@@ -6518,7 +6867,7 @@ impl<'a> Lower<'a> {
         self.cur = hub;
         let fp = frame_parts(&ops, nargs, nlocals).ok_or("lowering: malformed exit.inline")?;
         let f = fid as usize;
-        let (base, end, l) = (self.frame_off[f], self.frame_end[f], self.frame_layouts[f]);
+        let (base, vbase, end, l) = (self.frame_off[f], self.frame_voff[f], self.frame_end[f], self.frame_layouts[f]);
         // Inline frames are placed from `vp`.
         let sp = self.vp;
         if let Some(v) = *fp.this {
@@ -6531,23 +6880,23 @@ impl<'a> Lower<'a> {
         }
         for (j, v) in fp.locals.iter().enumerate() {
             if let Some(v) = *v {
-                self.store_i64(sp, base + l.local(u32::try_from(j).unwrap()), v);
+                self.store_i64(sp, vbase + l.local(u32::try_from(j).unwrap()), v);
             }
         }
         if let Some(v) = *fp.rval {
-            self.store_i64(sp, base + l.rval(), v);
+            self.store_i64(sp, vbase + l.rval(), v);
         }
         for (k, v) in fp.stack.iter().enumerate() {
             if let Some(v) = *v {
-                self.store_i64(sp, base + l.operand(u32::try_from(k).unwrap()), v);
+                self.store_i64(sp, vbase + l.operand(u32::try_from(k).unwrap()), v);
             }
         }
         let w64 = self.un(Operator::I64ExtendI32U, word, Type::I64);
         let tag = self.i64c(TAG_INT32 << 32);
         let wv = self.bin(Operator::I64Or, w64, tag, Type::I64);
-        self.store_i64(sp, base + l.resume(), wv);
+        self.store_i64(sp, vbase + l.resume(), wv);
         let backoff = self.i64c((TAG_INT32 << 32) | u64::from(ONRAMP_BACKOFF));
-        self.store_i64(sp, base + l.backoff(), backoff);
+        self.store_i64(sp, vbase + l.backoff(), backoff);
         let callee = self.load_i64(sp, base + FrameLayout::CALLEE);
         let (funcidx, script) = self.classify(callee);
         let off = self.i32c(u32::MAX);
@@ -6555,7 +6904,10 @@ impl<'a> Lower<'a> {
         let body_idx = self.bin(Operator::I32Sub, funcidx, off, Type::I32);
         let frame = self.add_off(sp, base);
         let top = self.add_off(sp, end);
-        let argc = self.i32c(nargs | ARGC_RESUME_BIT);
+        // The call's actual count, for a callee reading its actuals: its
+        // `vp` rebase is the frame's.
+        let n = self.f.inline_frames[f - 1].argc.unwrap_or(nargs);
+        let argc = self.i32c(n | ARGC_RESUME_BIT);
         let undef = self.i64c(UNDEF);
         let args = self
             .body

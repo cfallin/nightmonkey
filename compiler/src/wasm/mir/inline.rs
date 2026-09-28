@@ -37,6 +37,9 @@ pub(crate) struct Callee {
     /// The sites it spliced itself, its callees' included (the caller's
     /// inlining budget counts them, as bbv's walk does).
     pub sites: u32,
+    /// Whether it reads its actuals (`layout::reads_actuals`): a splice
+    /// then passes every actual, and needs the call's count.
+    pub reads_actuals: bool,
 }
 
 /// The blocks a kill's dirty edge leads to that exit.
@@ -219,7 +222,8 @@ fn merge_module(mm: &mut Module, k: &Module) -> Result<Maps, String> {
 /// Splice callee `k` into `f` (of module `mm`) at the end of block
 /// `enter`, which is not yet terminated, called from frame `parent` with
 /// `operands`: callee (an object of `k`'s script), `this`, and one value
-/// per formal. Its returns go to `join` (one `Val` param), its exceptions
+/// per formal, or, for a callee that reads its actuals (`argc` given, the
+/// call's count), every actual, padded to the formals. Its returns go to `join` (one `Val` param), its exceptions
 /// to `err` (no params).
 pub(crate) fn splice(
     mm: &mut Module,
@@ -229,6 +233,7 @@ pub(crate) fn splice(
     enter: Block,
     operands: &[Value],
     new_target: Option<Value>,
+    argc: Option<u32>,
     join: Block,
     dirty: Option<Edge>,
     err: Block,
@@ -245,7 +250,10 @@ pub(crate) fn splice(
         .into_iter()
         .filter_map(|b| kf.blocks[b].insts.last().copied())
         .collect();
-    if operands.len() != 2 + kf.frame.formals as usize {
+    // A callee reading its actuals gets every actual in its frame (at
+    // least one per formal); another, one per formal.
+    let nformals = kf.frame.formals as usize;
+    if operands.len() < 2 + nformals || (argc.is_none() && operands.len() != 2 + nformals) {
         return Err("inline: operands are not callee, this and the formals".into());
     }
     let maps = merge_module(mm, &k.mm)?;
@@ -271,6 +279,7 @@ pub(crate) fn splice(
         shape: kf.frame.clone(),
         parent,
         max_depth: k.max_depth,
+        argc,
     });
     for fr in &kf.inline_frames {
         f.inline_frames.push(InlineFrame {
@@ -443,7 +452,7 @@ pub(crate) fn splice(
         &[],
         vec![Edge {
             block: bmap[&entry],
-            args: operands.iter().map(|&v| EdgeArg::Value(v)).collect(),
+            args: operands[..2 + nformals].iter().map(|&v| EdgeArg::Value(v)).collect(),
         }],
     );
     f.inst_frame[jump] = parent;

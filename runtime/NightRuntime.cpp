@@ -2106,9 +2106,18 @@ static bool PlainStore(JSObject* obj, JS::HandleId id) {
   }
   for (JSObject* p = nobj->staticPrototype(); p; p = p->staticPrototype()) {
     if (!p->is<js::NativeObject>() || p->getClass()->getResolve() ||
-        p->getClass()->getAddProperty() ||
-        p->as<js::NativeObject>().lookupPure(id).isSome()) {
+        p->getClass()->getAddProperty()) {
       return false;
+    }
+    // The first holder on the chain decides: a writable data property is
+    // shadowed by a plain add (a prototype's defaults, `x: 0.0`); a setter
+    // or a read-only one is not a plain store.
+    mozilla::Maybe<js::PropertyInfo> pp = p->as<js::NativeObject>().lookupPure(id);
+    if (pp.isSome()) {
+      if (!pp->isDataProperty() || !pp->writable()) {
+        return false;
+      }
+      break;
     }
   }
   return !nobj->getClass()->getAddProperty();

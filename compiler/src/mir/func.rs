@@ -49,6 +49,12 @@ pub struct InlineFrame {
     pub parent: u32,
     /// The callee's deepest operand stack (its baseline frame's size).
     pub max_depth: u32,
+    /// For a callee that reads its actuals (`layout::reads_actuals`): the
+    /// call's actual count. Its frame holds every actual (at least its
+    /// formals), with the variable region past them, as baseline's `vp`
+    /// rebase has it, and an exit enters its baseline body with this
+    /// `argc`.
+    pub argc: Option<u32>,
 }
 
 impl Func {

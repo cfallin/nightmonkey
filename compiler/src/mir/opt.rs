@@ -223,11 +223,216 @@ pub fn optimize(m: &Module, f: &mut Func) -> usize {
             + if LICM { licm(m, f) } else { 0 }
             + if HOIST_GUARDS { hoist_guards(m, f) } else { 0 };
         forward_params(m, f);
+        let threaded = if THREAD_JUMPS { thread_jumps(f) } else { 0 };
         total += n;
-        if n == 0 {
+        if n == 0 && threaded == 0 {
             return total;
         }
     }
+}
+
+/// Whether `thread_jumps` runs.
+const THREAD_JUMPS: bool = true;
+
+/// Jump threading: an edge into a block that computes nothing but
+/// constants and weakenings and ends in a `jump`, or in a `br` whose
+/// condition that edge makes a constant, goes straight to where that
+/// block would send it, the block's own instructions copied along. The
+/// builder's boolean diamonds (`x != null`, `!c`, a tag test's merge) then
+/// branch where they test instead of materializing a bool for a later
+/// branch, as bbv's compare-and-branch does. An edge is never threaded
+/// into a loop header, a loop's preheader or a root, so loops keep their
+/// shape. Returns how many edges moved.
+pub fn thread_jumps(f: &mut Func) -> usize {
+    let mut fixed: BTreeSet<Block> = f.roots.iter().map(|r| r.block).collect();
+    for l in &f.loops {
+        fixed.insert(l.header);
+        fixed.insert(l.preheader);
+    }
+    let copyable = |op: &Opcode| {
+        matches!(
+            op,
+            Opcode::ConstVal(_)
+                | Opcode::ConstI32(_)
+                | Opcode::ConstF64(_)
+                | Opcode::ConstBool(_)
+                | Opcode::Weaken
+        )
+    };
+    let const_bool = |f: &Func, v: Value| match f.values[v].def {
+        ValueDef::Result(i, 0) => match f.insts[i].op {
+            Opcode::ConstBool(c) => Some(c),
+            _ => None,
+        },
+        _ => None,
+    };
+    // A block is skipped only where nothing it defines is used past it:
+    // the edges that bypass it would leave such a use undominated.
+    let mut inst_block = BTreeMap::new();
+    for &b in &f.layout {
+        for &i in &f.blocks[b].insts {
+            inst_block.insert(i, b);
+        }
+    }
+    let mut escapes: BTreeSet<Block> = BTreeSet::new();
+    for &b in &f.layout {
+        for &i in &f.blocks[b].insts {
+            let d = &f.insts[i];
+            let edge_vals = d.succs.iter().flat_map(|e| {
+                e.args.iter().filter_map(|a| match a {
+                    EdgeArg::Value(v) => Some(*v),
+                    EdgeArg::Out(_) => None,
+                })
+            });
+            for v in d.args.iter().copied().chain(edge_vals) {
+                if let Some(db) = def_block(f, v, &inst_block) {
+                    if db != b {
+                        escapes.insert(db);
+                    }
+                }
+            }
+        }
+    }
+    let mut moved = 0;
+    for p in f.layout.clone() {
+        let Some(t) = f.terminator(p) else { continue };
+        for k in 0..f.insts[t].succs.len() {
+            for _ in 0..16 {
+                let e = f.insts[t].succs[k].clone();
+                let b = e.block;
+                if b == p || fixed.contains(&b) || escapes.contains(&b) {
+                    break;
+                }
+                let insts = f.blocks[b].insts.clone();
+                let Some((&bt, body)) = insts.split_last() else { break };
+                if !body.iter().all(|&i| copyable(&f.insts[i].op)) {
+                    break;
+                }
+                // What each of `b`'s params and results is on this edge.
+                let mut map: BTreeMap<Value, EdgeArg> = BTreeMap::new();
+                for (&q, &a) in f.blocks[b].params.iter().zip(&e.args) {
+                    map.insert(q, a);
+                }
+                let bd = f.insts[bt].clone();
+                let next = match bd.op {
+                    Opcode::Jump => bd.succs[0].clone(),
+                    Opcode::Br => {
+                        let c = match map.get(&bd.args[0]) {
+                            Some(EdgeArg::Value(v)) => const_bool(f, *v),
+                            Some(EdgeArg::Out(_)) => None,
+                            None => const_bool(f, bd.args[0]),
+                        };
+                        match c {
+                            Some(true) => bd.succs[0].clone(),
+                            Some(false) => bd.succs[1].clone(),
+                            None => break,
+                        }
+                    }
+                    _ => break,
+                };
+                if next.block == b || fixed.contains(&next.block) {
+                    break;
+                }
+                // Keep every output the edge carries (a guard's proof is
+                // what later folding finds it by).
+                let outs_in: BTreeSet<u32> = e
+                    .args
+                    .iter()
+                    .filter_map(|a| match a {
+                        EdgeArg::Out(n) => Some(*n),
+                        EdgeArg::Value(_) => None,
+                    })
+                    .collect();
+                let outs_on: BTreeSet<u32> = next
+                    .args
+                    .iter()
+                    .filter_map(|a| match a {
+                        EdgeArg::Value(v) => match map.get(v) {
+                            Some(EdgeArg::Out(n)) => Some(*n),
+                            _ => None,
+                        },
+                        EdgeArg::Out(_) => None,
+                    })
+                    .collect();
+                if outs_in != outs_on {
+                    break;
+                }
+                // Copy the block's instructions the new edge needs into
+                // `p`, before its terminator, in order.
+                let mut need: BTreeSet<Value> = BTreeSet::new();
+                for a in &next.args {
+                    if let EdgeArg::Value(v) = a {
+                        need.insert(*v);
+                    }
+                }
+                let mut ok = true;
+                let mut copies: Vec<(Inst, Value)> = vec![];
+                for &i in body.iter().rev() {
+                    let r = f.insts[i].results[0];
+                    if !need.contains(&r) {
+                        continue;
+                    }
+                    for &a in &f.insts[i].args {
+                        match map.get(&a) {
+                            Some(EdgeArg::Out(_)) => ok = false,
+                            _ => {
+                                need.insert(a);
+                            }
+                        }
+                    }
+                    copies.push((i, r));
+                }
+                // A weakening copied before a fence would be live across
+                // it: only before a terminator that kills nothing.
+                let quiet = matches!(f.insts[t].op, Opcode::Jump | Opcode::Br) || is_guard(&f.insts[t].op);
+                if !ok || (!quiet && copies.iter().any(|&(i, _)| f.insts[i].op == Opcode::Weaken)) {
+                    break;
+                }
+                copies.reverse();
+                for (i, r) in copies {
+                    let d = f.insts[i].clone();
+                    let args: Vec<Value> = d
+                        .args
+                        .iter()
+                        .map(|a| match map.get(a) {
+                            Some(EdgeArg::Value(v)) => *v,
+                            _ => *a,
+                        })
+                        .collect();
+                    let ty = f.values[r].ty;
+                    let n = f.insts.push(crate::mir::func::InstData {
+                        op: d.op.clone(),
+                        args,
+                        results: vec![],
+                        succs: vec![],
+                        attach: None,
+                    });
+                    let nv = f.values.push(crate::mir::func::ValueData {
+                        def: ValueDef::Result(n, 0),
+                        ty,
+                    });
+                    f.insts[n].results = vec![nv];
+                    let at = f.blocks[p].insts.len() - 1;
+                    f.blocks[p].insts.insert(at, n);
+                    map.insert(r, EdgeArg::Value(nv));
+                }
+                let args = next
+                    .args
+                    .iter()
+                    .map(|a| match a {
+                        EdgeArg::Value(v) => map.get(v).copied().unwrap_or(*a),
+                        EdgeArg::Out(_) => unreachable!("a jump or br has no outputs"),
+                    })
+                    .collect();
+                f.insts[t].succs[k] = Edge {
+                    block: next.block,
+                    args,
+                };
+                moved += 1;
+            }
+        }
+    }
+    moved
 }
 
 /// Replace each param of a (non-root) block that every incoming edge

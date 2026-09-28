@@ -36,23 +36,15 @@ pub(crate) fn inline_eligible(ctx: &TranslateCtx, script: &Script) -> bool {
         && script.bytecode.len() <= INLINE_MAX_BYTECODE
         && !script.is_generator_or_async
         && !script.is_class_ctor
-        && !script.has_mapped_args
-        && !baseline::layout::FrameLayout::of(script).rebase_vp
+        // Mapped formals (write-through, aliasing): none with no formals.
+        && !(script.has_mapped_args && script.nargs > 0)
         // No handler or close: `inline::splice` sends every throw straight
         // to the call site.
         && script.try_notes.iter().all(|t| t.kind == TryNoteKind::Loop)
-        // The actuals ops read the frame they run in, which for an inlined
-        // copy is not the callee's (`ArgumentsLength` is not in
-        // `reads_actuals`).
-        && !script.parser().opcodes().any(|op| {
-            matches!(
-                op,
-                crate::bytecode::JSOp::ArgumentsLength
-                    | crate::bytecode::JSOp::GetActualArg
-                    | crate::bytecode::JSOp::Arguments
-                    | crate::bytecode::JSOp::Rest
-            )
-        })
+        // A callee reading its actuals gets them all in its inline frame
+        // (`InlineFrame::argc`), which its actuals ops read.
+        && !(script.parser().opcodes().any(|op| op == crate::bytecode::JSOp::ArgumentsLength)
+            && !baseline::layout::reads_actuals(script))
         && (!baseline::needs_env(script) || baseline::env_is_plain(ctx.source, script))
 }
 
