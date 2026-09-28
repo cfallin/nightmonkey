@@ -1181,6 +1181,7 @@ impl Parser {
             JsGetName(_) => JsGetName(self.atom()?),
             JsRt(RtOp::DelProp(_, strict)) => JsRt(RtOp::DelProp(self.atom()?, strict)),
             JsRt(RtOp::Intrinsic(_)) => JsRt(RtOp::Intrinsic(self.atom()?)),
+            JsRt(RtOp::GetNameTypeof(_)) => JsRt(RtOp::GetNameTypeof(self.atom()?)),
             JsRt(RtOp::Symbol(_)) => JsRt(RtOp::Symbol(self.int()?)),
             Restamp(_) => Restamp(self.int()?),
             StampFresh(_) => StampFresh(self.int()?),
@@ -1203,6 +1204,13 @@ impl Parser {
                 let keys = self.keys()?;
                 let types = self.eat_word("types");
                 GuardLayout { keys, types }
+            }
+            GuardCtor { .. } => {
+                let key = self.layout_key()?;
+                self.expect_punct(",")?;
+                let n = self.int()?;
+                let types = self.eat_word("types");
+                GuardCtor { key, n, types }
             }
             GuardScript(_) => GuardScript(self.script()?),
             CheckFuse(_) => CheckFuse(FuseId::from_u32(self.prefixed("F", "a fuse")?)),
@@ -1435,6 +1443,11 @@ fn template(mn: &str) -> Option<Opcode> {
             keys: KeyRange::one(LayoutKey::new(0)),
             types: false,
         },
+        GuardCtor {
+            key: LayoutKey::new(0),
+            n: 0,
+            types: false,
+        },
         GuardSingleton(SnapObj::from_u32(0)),
         GuardScript(ScriptId::new(0)),
         F64ToIntExact,
@@ -1484,6 +1497,11 @@ fn template(mn: &str) -> Option<Opcode> {
         ArgsObject,
         RestArray(0),
         ArgsLength,
+        FrameNewTarget,
+        IterMore,
+        IterIsDone,
+        IterEnd,
+        JsRt(RtOp::Iter),
         ActualArg,
         ActualArgOr(0),
         JsIsBuiltin(0),
@@ -1504,6 +1522,7 @@ fn template(mn: &str) -> Option<Opcode> {
         JsRt(RtOp::RegExp(0)),
         JsRt(RtOp::InitPropGetSet(placeholder_atom, 0)),
         JsRt(RtOp::Intrinsic(placeholder_atom)),
+        JsRt(RtOp::GetNameTypeof(placeholder_atom)),
         JsRt(RtOp::ToString),
         JsRt(RtOp::Symbol(0)),
         JsRt(RtOp::BuiltinObject(0)),

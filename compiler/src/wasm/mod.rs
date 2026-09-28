@@ -1030,6 +1030,7 @@ pub fn resolve_helpers(
         mir_stress: resolve(m, "night_runtime_mir_stress")?,
         ctor_stamp: resolve(m, "night_runtime_ctor_stamp")?,
         ctor_restamp: resolve(m, "night_runtime_ctor_restamp")?,
+        init_field: resolve(m, "night_runtime_init_field")?,
     })
 }
 

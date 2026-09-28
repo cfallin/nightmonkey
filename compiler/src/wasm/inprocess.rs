@@ -694,6 +694,7 @@ mod tests {
         "night_runtime_mir_stress",
         "night_runtime_ctor_stamp",
         "night_runtime_ctor_restamp",
+        "night_runtime_init_field",
         "night_runtime_bigint",
         "night_runtime_non_syntactic_global_this",
         "night_runtime_set_intrinsic",

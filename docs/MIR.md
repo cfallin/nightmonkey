@@ -151,6 +151,42 @@ LayoutClaim := { keys: [lo,hi], types: bool, constructing: Option<…> }   (§2.
 
 ### 2.3 Constructors
 
+**Status (2026-09-28): built for inlined constructs.**
+
+- **Producer.** An inlined `new` whose allocation word carries the
+  constructor's own early key restates `create_this`'s result as
+  `guard.ctor K, 0` (an assertion: `create_this` wrote that word; its
+  fail edge is unreachable), and splices a callee built for a `this` of
+  type `Obj{K constructing(0)}` (`Ty::Ctor` in the builder). A
+  constructing `this` is part of a callee build's context, like the
+  closures it receives (`callee_ctx`), so the body has no entry guard.
+- **In the body.** The add of K's next field is `init_field` (the value
+  guarded to the field's claim, exiting on a miss); a field already
+  added is a typed `load_field`/`store_field`; once every field is
+  there, `publish_layout` stamps K and `this` is a published `Obj{K}`
+  (its prediction witness: `constructing`). A builder run's only
+  constructing object is its own `this`, so an add replaces every slot
+  of K's constructing type (a join may have made a second value of it).
+- **Methods.** A method called on the constructing `this` is spliced
+  built for it (receiver or a `.call`'s `thisArg`), with no entry guard,
+  reading the fields added so far typed. The caller continues with a
+  boxed copy, hinted (`ctor_hint`) with the state the callee's returns
+  leave `this` in (`Callee::this_out`) where they agree; its next add or
+  method call guards that state back (`guard.ctor K, n`: sentinel, early
+  key, SLOTS/TYPES, exactly `n` slots), exiting on a miss.
+- **Fences.** A fence demotes a `Ctor` to a boxed, hinted object (a
+  published-layout `ObjHint` would be wrong); the next use re-guards.
+- **`init_field`'s slow path** is `night_runtime_init_field`: the plain
+  add (`PlainStore`: runs no JS), vouched (TYPES kept), filling the
+  site's add-transition row; `fail` (exit) unless the object is then
+  `constructing(n+1)`. Cold sites therefore stay in MIR.
+- **Everywhere else** (a non-inlined constructor body, a delegate reached
+  without a constructing `this`), `this` is an untyped object, and the
+  dynamic early publish of `ctor_publish` stamps it before calls once all
+  its fields are there.
+
+The design as written:
+
 Constructors are in scope for v1. `this` in a constructor is `Obj{layout: {keys: K, constructing: n}}`.
 The object carries the CONSTRUCTING sentinel and has had the first `n`
 predicted fields added. A compiled stamp guard would fail on it, so this
@@ -407,11 +443,28 @@ They are the only prediction data MIR retains.
     nonconforming value on a published object goes to the engine, which
     clears the bit, and the op reports dirty; under construction the bit
     is cleared inline. A store without a known field drops `TYPES`.
+  - (2026-09-28) Stores that reach a set helper keep `TYPES` too when the
+    value conforms: the compiled store vouches (MIR's by `field_types`,
+    baseline's by `field_classes`), and the helper also checks the
+    field's claim for the object's class itself (the layout table carries
+    each field's claim; `NightStoreConforms`, under the any-type flag of
+    the MIR and baseline pipelines). A vouched store keeps the bit where
+    it runs no JS: add replays, the set-add table, the mega-set probe, a
+    plain slot write or plain add (`PlainStore`). The engine's store
+    choke itself still drops it (it knows no field; `defineProperty`'s
+    accessor slots, say, demote an object whose layout they are not in).
+  - Element stores owe the array stamp's claims only on arrays: a plain
+    object's `TYPES` claims its fields (`array_key_min`).
 - **Consumption:** a typed site's reads trust the layout's type for the
   field, any type (`load_field -> val{null,object}` etc.), under a
   `guard.layout {types}`.
-- **Stamps:** MIR's allocations seed `TYPES` and its ctor stamps and
-  restamps keep it for any layout with a typed field.
+- **Stamps:** MIR's and baseline's allocations seed `TYPES` and their
+  ctor stamps and restamps keep it for any layout with a typed field
+  (`layout_types_bit`, shared). Snapshot objects are stamped with any row
+  of their constructor's clump they match exactly, with `TYPES` iff
+  every field's value in the image conforms. Before a call made during
+  construction, `this` is stamped once all of its fields are there
+  (`ctor_publish`: §2.3's `publish_layout`, dynamically).
 - **Not yet:** the object component (kind, script, singleton).
 
 The rest of this section is the design as written before M5b.

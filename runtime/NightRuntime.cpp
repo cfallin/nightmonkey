@@ -2669,6 +2669,47 @@ static uint32_t SetPropIcMiss(JSContext* cx, uint32_t top, uint64_t recv,
              : kMissOk;
 }
 
+// MIR's `init_field` slow path (MIR.md §2.3): add field `atomId` (the next
+// one its layout predicts) to `recv`, an object under construction, when
+// the add is a plain one (`PlainStore`: runs no JS), keeping TYPES (the
+// value is of the field's type by the caller's type) and filling the
+// site's add-transition row so the inline replay hits next time. The
+// object (a GC may have moved it) goes to the out-slot. Returns 1 iff the
+// object is still under construction with the caller's early key, with
+// `wantBits` (SLOTS, TYPES) set and exactly `expectSpan` slots: the
+// constructing type the caller continues with. 0 leaves the rest of the
+// constructor to baseline (an add not done is done there; one done
+// becomes an overwrite). May GC.
+uint32_t night_runtime_init_field(JSContext* cx, uint32_t top, uint64_t recv,
+                                  uint32_t atomId, uint64_t val,
+                                  uint32_t cacheIdx, uint32_t expectSpan,
+                                  uint32_t wantBits) {
+  SetNightTop(cx, top);
+  WriteNightOut(top, recv);
+  JS::Value rv = JS::Value::fromRawBits(recv);
+  if (!rv.isObject() || !rv.toObject().is<js::NativeObject>()) {
+    return 0;
+  }
+  JS::RootedObject obj(cx, &rv.toObject());
+  JS::HandleId id = AtomIdChecked(atomId);
+  uint32_t key = obj->externalWord() & (js::night::kWordConstructing | 0x3FFC0000u);
+  if (!PlainStore(obj, id) || obj->as<js::NativeObject>().lookupPure(id).isSome()) {
+    return 0;
+  }
+  uint32_t r = SetPropIcMiss(cx, top, recv, atomId, val, cacheIdx, false, true);
+  WriteNightOut(top, JS::ObjectValue(*obj).asRawBits());
+  if (r == kMissErr) {
+    cx->clearPendingException();
+    return 0;
+  }
+  uint32_t w = obj->externalWord();
+  return (w & (js::night::kWordConstructing | 0x3FFC0000u)) == key &&
+                 (w & wantBits) == wantBits &&
+                 obj->as<js::NativeObject>().slotSpan() == expectSpan
+             ? 1
+             : 0;
+}
+
 // Major-GC callback: bump the inline-IC generation counter and zero every
 // linear-memory cache region that holds raw shape/function/value words, so a
 // cached (possibly moved or freed-and-reused) pointer can never false-hit

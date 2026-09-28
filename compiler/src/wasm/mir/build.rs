@@ -61,6 +61,14 @@ enum Ty {
     /// field access through it guards the layout again, exiting on a miss
     /// (identity rarely changes), and refines the slot back to `Obj`.
     ObjHint(KeyRange),
+    /// An object under construction for layout `key` with its first `n`
+    /// fields added, TYPES held if the flag says so (MIR.md §2.3,
+    /// `obj{Lkey constructing(n)}`, raw): made by an inlined `new`'s
+    /// allocation, advanced by `init_field`, published by `publish_layout`
+    /// once every field is there. Its field accesses below `n` are typed;
+    /// a fence (anything that may reach the object) demotes it to a boxed
+    /// object, which the rest of the constructor treats generically.
+    Ctor(u32, u32, bool),
     /// A native object (`obj{Native}`, raw): its elements are addressable
     /// (`load_elem`, `store_elem`). Immutable, so no fence kills it.
     Native,
@@ -102,6 +110,14 @@ impl Ty {
                 ..ObjInfo::TOP
             }),
             Ty::ObjHint(_) => MType::OBJ_TOP,
+            Ty::Ctor(key, n, types) => MType::Obj(ObjInfo {
+                layout: Some(LayoutClaim {
+                    keys: KeyRange::one(crate::ids::LayoutKey::new(key)),
+                    types,
+                    state: LayoutState::Constructing(n),
+                }),
+                ..ObjInfo::TOP
+            }),
             Ty::Native => MType::Obj(ObjInfo::kind(ObjKind::Native)),
             Ty::Ta(k) => MType::Obj(ObjInfo::kind(ObjKind::TypedArray(k))),
             Ty::Dead => unreachable!("a dead slot has no type"),
@@ -114,7 +130,7 @@ impl Ty {
             Ty::F64 => TagSet::NUMBER,
             Ty::Bool => TagSet::BOOLEAN,
             Ty::Val(t) => t,
-            Ty::Obj(..) | Ty::ObjHint(_) | Ty::Native | Ty::Ta(_) | Ty::Fn(_) => TagSet::OBJECT,
+            Ty::Obj(..) | Ty::ObjHint(_) | Ty::Ctor(..) | Ty::Native | Ty::Ta(_) | Ty::Fn(_) => TagSet::OBJECT,
             Ty::Dead => TagSet::NONE,
         }
     }
@@ -125,6 +141,7 @@ impl Ty {
             (Ty::Dead, x) | (x, Ty::Dead) => x,
             (Ty::I32, Ty::F64) | (Ty::F64, Ty::I32) => Ty::F64,
             (Ty::Obj(k1, t1), Ty::Obj(k2, t2)) => Ty::Obj(k1.hull(&k2), t1 && t2),
+            (Ty::Ctor(k1, n1, t1), Ty::Ctor(k2, n2, t2)) if k1 == k2 && n1 == n2 => Ty::Ctor(k1, n1, t1 && t2),
             (Ty::Obj(k1, _) | Ty::ObjHint(k1), Ty::Obj(k2, _) | Ty::ObjHint(k2)) => {
                 Ty::ObjHint(k1.hull(&k2))
             }
@@ -171,6 +188,10 @@ const APPLY_FWD: bool = true;
 
 /// Whether `T.call(thisArg, args…)` inlines its resolved targets.
 const CALL_FWD: bool = true;
+
+/// Whether an inlined `new` builds its constructor for a `this` of the
+/// constructing type (MIR.md §2.3, `Ty::Ctor`).
+const CTOR_TYPES: bool = true;
 
 /// Whether scripts that read their actuals are built.
 const ACTUALS: bool = true;
@@ -288,20 +309,37 @@ impl<'a> Shape<'a> {
     /// known closure in (`Ty::Fn`, by formal; missing ones none): its
     /// calls of those have exactly that callee.
     fn callee_in(&self, k: ScriptId, fns: &[Option<ScriptId>]) -> Option<std::rc::Rc<super::inline::Callee>> {
+        self.callee_ctx(k, fns, None)
+    }
+
+    /// `callee_in`, built also for a `this` under construction (`Ty::Ctor`
+    /// of these parts) where the call passes one: context-sensitive in
+    /// the receiver's construction state, as in the closures it passes.
+    fn callee_ctx(
+        &self,
+        k: ScriptId,
+        fns: &[Option<ScriptId>],
+        this_ctor: Option<(u32, u32, bool)>,
+    ) -> Option<std::rc::Rc<super::inline::Callee>> {
         let mut fns = fns.to_vec();
         while fns.last() == Some(&None) {
             fns.pop();
         }
-        let key = (k, fns);
+        let key = (k, fns, this_ctor);
         if let Some(c) = self.callees.borrow().get(&key) {
             return c.clone();
         }
-        let c = self.build_callee(k, &key.1).map(std::rc::Rc::new);
+        let c = self.build_callee(k, &key.1, this_ctor).map(std::rc::Rc::new);
         self.callees.borrow_mut().insert(key, c.clone());
         c
     }
 
-    fn build_callee(&self, k: ScriptId, fns: &[Option<ScriptId>]) -> Option<super::inline::Callee> {
+    fn build_callee(
+        &self,
+        k: ScriptId,
+        fns: &[Option<ScriptId>],
+        this_ctor: Option<(u32, u32, bool)>,
+    ) -> Option<super::inline::Callee> {
         if self.inline_depth >= MAX_INLINE_DEPTH || k == self.sid {
             return None;
         }
@@ -316,13 +354,14 @@ impl<'a> Shape<'a> {
         }
         let nargs = usize::from(ks.nargs);
         let fns: Vec<Option<ScriptId>> = fns.iter().copied().take(nargs).collect();
-        let (mut mm, mut f) = build_at(self.ctx, names, k, ks, false, self.inline_depth + 1, &fns).ok()?;
+        let (mut mm, mut f, mut this_out) =
+            build_at(self.ctx, names, k, ks, false, self.inline_depth + 1, &fns, this_ctor).ok()?;
         // Too big with its own inlining: the callee alone, its calls left
         // as calls (direct where their callee is known), as bbv's
         // top-down budget leaves a spliced callee's inner sites once the
         // splice has spent it.
         if f.insts.len() > MAX_INLINE_INSTS && LEAN_CALLEES && self.inline_depth + 1 < MAX_INLINE_DEPTH {
-            (mm, f) = build_at(self.ctx, names, k, ks, false, MAX_INLINE_DEPTH, &fns).ok()?;
+            (mm, f, this_out) = build_at(self.ctx, names, k, ks, false, MAX_INLINE_DEPTH, &fns, this_ctor).ok()?;
         }
         if f.insts.len() > MAX_INLINE_INSTS {
             return None;
@@ -330,7 +369,13 @@ impl<'a> Shape<'a> {
         mm.script_addrs.insert(k, ks.addr);
         let max_depth = StackDepths::compute(ks).ok()?.max;
         let fenced = super::inline::fenced(&f, &mm);
-        Some(super::inline::Callee { mm, f, max_depth, fenced })
+        Some(super::inline::Callee {
+            mm,
+            f,
+            max_depth,
+            fenced,
+            this_out,
+        })
     }
 }
 
@@ -398,7 +443,7 @@ pub fn build<'a>(
     script: &'a Script,
     is_global: bool,
 ) -> Result<(mir::Module, mir::Func), String> {
-    build_at(ctx, names, sid, script, is_global, 0, &[])
+    build_at(ctx, names, sid, script, is_global, 0, &[], None).map(|(m, f, _)| (m, f))
 }
 
 /// Element accesses the analysis predicts on arrays, with int32 keys, are
@@ -525,7 +570,8 @@ fn build_at<'a>(
     is_global: bool,
     depth: u32,
     formal_fns: &[Option<ScriptId>],
-) -> Result<(mir::Module, mir::Func), String> {
+    this_ctor: Option<(u32, u32, bool)>,
+) -> Result<(mir::Module, mir::Func, Option<(u32, u32, bool)>), String> {
     if is_global {
         return Err("global script".into());
     }
@@ -566,6 +612,7 @@ fn build_at<'a>(
         .filter(|s| APPLY_FWD && !s.is_empty());
     shape.inline_depth = depth;
     shape.formal_fns = formal_fns.to_vec();
+    shape.this_ctor = this_ctor;
     for (i, &gc) in script.gcthings.iter().enumerate() {
         if gc.is_other() {
             continue;
@@ -601,7 +648,8 @@ fn build_at<'a>(
             .collect();
         if !run.widen && new_hoists.is_empty() {
             let mm = std::mem::take(&mut run.mm);
-            return Ok((mm, run.finish()));
+            let this_out = run.this_out.flatten();
+            return Ok((mm, run.finish(), this_out));
         }
         let out = std::mem::take(&mut run.out);
         drop(run);
@@ -789,6 +837,10 @@ fn int32_demand(script: &Script, ops: &[Op]) -> std::collections::BTreeSet<Pc> {
 }
 
 /// What the runs share: the script's decoded shape.
+/// A callee build's context (`callee_in`): the script, the known closures
+/// its formals receive, and the constructing `this` it receives, if any.
+type CalleeKey = (ScriptId, Vec<Option<ScriptId>>, Option<(u32, u32, bool)>);
+
 struct Shape<'a> {
     ctx: &'a TranslateCtx<'a>,
     sid: ScriptId,
@@ -821,10 +873,14 @@ struct Shape<'a> {
     /// How deep in inlining this build is (0: a script's own).
     inline_depth: u32,
     /// Callees built for inlining, by script; `None` if one cannot be.
-    callees: std::cell::RefCell<BTreeMap<(ScriptId, Vec<Option<ScriptId>>), Option<std::rc::Rc<super::inline::Callee>>>>,
+    callees: std::cell::RefCell<BTreeMap<CalleeKey, Option<std::rc::Rc<super::inline::Callee>>>>,
     /// For a build for inlining at a call passing known closures: the
     /// formals holding one (`Ty::Fn`), by formal.
     formal_fns: Vec<Option<ScriptId>>,
+    /// The object under construction the inlining call passes as `this`
+    /// (`Ty::Ctor`: layout key, fields added, TYPES): the body is built
+    /// for it, with no entry guard, as a context-sensitive callee build.
+    this_ctor: Option<(u32, u32, bool)>,
     /// `name_classes`, by name, made on first use.
     #[allow(clippy::type_complexity)]
     name_classes: std::cell::RefCell<BTreeMap<crate::ids::NameId, std::rc::Rc<Vec<(u32, TagSet)>>>>,
@@ -879,6 +935,7 @@ impl<'a> Shape<'a> {
             inline_depth: 0,
             callees: Default::default(),
             formal_fns: vec![],
+            this_ctor: None,
             name_classes: Default::default(),
             layout_fields: Default::default(),
         })
@@ -995,6 +1052,19 @@ struct Run<'s, 'a> {
     /// Advisory classes (`hinted_site`): of values, and of the frame
     /// slots whose writes carry them.
     val_cls: BTreeMap<mir::Value, u32>,
+    /// Boxed objects known to have been under construction for a layout
+    /// (key, fields added, TYPES) when a fence demoted them from `Ctor`
+    /// (§2.3), or as an inlined callee left them: a field add or a method
+    /// call through one guards the construction state again
+    /// (`guard.ctor`), and continues typed.
+    ctor_hint: BTreeMap<mir::Value, (u32, u32, bool)>,
+    /// Each constructed layout's fields and claims, registered in the
+    /// module (`ctor_layout`); `None` where the table cannot hold them.
+    ctor_layouts: BTreeMap<u32, Option<std::rc::Rc<Vec<(mir::entity::AtomId, MType)>>>>,
+    /// The state `this` (a `Ctor`) is in at every return seen so far
+    /// (`Callee::this_out`): `None` before the first, `Some(None)` once
+    /// two disagree or one is anything else.
+    this_out: Option<Option<(u32, u32, bool)>>,
     slot_cls: BTreeMap<usize, u32>,
     /// Values that are the frame's `this` (`FunctionThis`'s results),
     /// and the frame slots a write carries that to (`.this`).
@@ -1048,6 +1118,9 @@ impl<'s, 'a> Run<'s, 'a> {
             ta_poly_site: false,
             store_mask: None,
             val_cls: BTreeMap::new(),
+            ctor_hint: BTreeMap::new(),
+            ctor_layouts: BTreeMap::new(),
+            this_out: None,
             slot_cls: BTreeMap::new(),
             this_vals: Default::default(),
             this_slots: Default::default(),
@@ -1151,14 +1224,13 @@ impl<'s, 'a> Run<'s, 'a> {
         let mut done: Vec<(mir::Value, Slot)> = vec![];
         let olds: Vec<Slot> = self.st.iter().chain(&self.pre).copied().collect();
         for x in olds {
-            let Ty::Obj(k, _) = x.ty else { continue };
-            if !fx.kill.matches(&x.ty.mir()) || done.iter().any(|&(v, _)| v == x.v) {
+            if !matches!(x.ty, Ty::Obj(..) | Ty::Ctor(..))
+                || !fx.kill.matches(&x.ty.mir())
+                || done.iter().any(|&(v, _)| v == x.v)
+            {
                 continue;
             }
-            let y = Slot {
-                v: self.weaken(x.v, MType::OBJ_TOP),
-                ty: Ty::ObjHint(k),
-            };
+            let y = self.demote(x);
             done.push((x.v, y));
         }
         if done.is_empty() {
@@ -1187,13 +1259,23 @@ impl<'s, 'a> Run<'s, 'a> {
         self.st.push(y);
     }
 
-    /// `x`, as `ObjHint` if it is an `Obj`.
+    /// `x`, as `ObjHint` if it is an `Obj`; boxed if it is a `Ctor` (an
+    /// object under construction that a fence may have reached: its state
+    /// is unknown, and a published-layout hint would be wrong).
     fn demote(&mut self, x: Slot) -> Slot {
         match x.ty {
             Ty::Obj(k, _) => Slot {
                 v: self.weaken(x.v, MType::OBJ_TOP),
                 ty: Ty::ObjHint(k),
             },
+            Ty::Ctor(k, n, t) => {
+                let v = self.boxed(x);
+                self.ctor_hint.insert(v, (k, n, t));
+                Slot {
+                    v,
+                    ty: Ty::Val(TagSet::OBJECT),
+                }
+            }
             _ => x,
         }
     }
@@ -1239,7 +1321,7 @@ impl<'s, 'a> Run<'s, 'a> {
             return;
         };
         let Some(&x) = self.st.first() else { return };
-        if matches!(x.ty, Ty::Dead | Ty::Obj(..) | Ty::ObjHint(..)) {
+        if matches!(x.ty, Ty::Dead | Ty::Obj(..) | Ty::ObjHint(..) | Ty::Ctor(..)) {
             return;
         }
         let t = self.boxed(x);
@@ -1392,14 +1474,10 @@ impl<'s, 'a> Run<'s, 'a> {
         let mut done: Vec<(mir::Value, Slot)> = vec![];
         let olds: Vec<Slot> = self.st.iter().chain(&self.pre).copied().collect();
         for x in olds {
-            let Ty::Obj(k, _) = x.ty else { continue };
-            if done.iter().any(|&(v, _)| v == x.v) {
+            if !matches!(x.ty, Ty::Obj(..) | Ty::Ctor(..)) || done.iter().any(|&(v, _)| v == x.v) {
                 continue;
             }
-            let y = Slot {
-                v: self.weaken(x.v, MType::OBJ_TOP),
-                ty: Ty::ObjHint(k),
-            };
+            let y = self.demote(x);
             done.push((x.v, y));
         }
         if done.is_empty() {
@@ -1452,7 +1530,10 @@ impl<'s, 'a> Run<'s, 'a> {
     fn retain_all(&mut self) {
         for ix in 1..self.frame_len().min(self.st.len()) {
             let x = self.st[ix];
-            let managed = matches!(x.ty, Ty::Val(_) | Ty::Fn(_) | Ty::Obj(..) | Ty::ObjHint(_) | Ty::Native | Ty::Ta(_));
+            let managed = matches!(
+                x.ty,
+                Ty::Val(_) | Ty::Fn(_) | Ty::Obj(..) | Ty::ObjHint(_) | Ty::Ctor(..) | Ty::Native | Ty::Ta(_)
+            );
             if !managed {
                 continue;
             }
@@ -1499,9 +1580,9 @@ impl<'s, 'a> Run<'s, 'a> {
         match (x.ty, to) {
             (a, b) if a == b => x.v,
             (Ty::I32, Ty::F64) => self.inst(Opcode::I32ToF64, vec![x.v], Some(MType::F64_TOP)),
-            (Ty::Obj(..), Ty::Obj(..) | Ty::ObjHint(_)) | (Ty::ObjHint(_), Ty::ObjHint(_)) => {
-                self.weaken(x.v, to.mir())
-            }
+            (Ty::Obj(..), Ty::Obj(..) | Ty::ObjHint(_))
+            | (Ty::ObjHint(_), Ty::ObjHint(_))
+            | (Ty::Ctor(..), Ty::Ctor(..)) => self.weaken(x.v, to.mir()),
             (_, Ty::Val(t)) => {
                 let v = self.boxed(x);
                 self.weaken(v, MType::val(t))
@@ -1722,6 +1803,291 @@ impl<'s, 'a> Run<'s, 'a> {
 
     /// A fallible check: continue on success with its output (of type
     /// `out`), exit at the op's pc on failure.
+    /// Layout `key`'s fields in slot order, each with its claim (MIR.md
+    /// §2.3: the row a constructor builds, `stamp_ctors_in`), registered
+    /// in the module's layout table for `init_field` and `publish_layout`.
+    /// `None` if no constructor builds it, or the table already describes
+    /// one of its slots otherwise.
+    fn ctor_layout(&mut self, key: u32) -> Option<std::rc::Rc<Vec<(mir::entity::AtomId, MType)>>> {
+        if let Some(l) = self.ctor_layouts.get(&key) {
+            return l.clone();
+        }
+        let l = self.make_ctor_layout(key).map(std::rc::Rc::new);
+        self.ctor_layouts.insert(key, l.clone());
+        l
+    }
+
+    fn make_ctor_layout(&mut self, key: u32) -> Option<Vec<(mir::entity::AtomId, MType)>> {
+        let ctx = self.s.ctx;
+        let si = ctx.stamp_ctors_in.values().find(|si| si.layout_id == key)?;
+        let names = self.s.names?;
+        let claims = ctx.layout_field_types_in.get(&crate::ids::LayoutKey::new(key).stamp());
+        let out: Vec<(mir::entity::AtomId, MType)> = si
+            .fields
+            .iter()
+            .map(|&n| {
+                let a = self.mm.intern_atom(names.get(n).chars());
+                let claim = match claims.and_then(|m| m.get(&n)).filter(|c| !c.is_none()) {
+                    Some(&c) => MType::val(claim_tags(c)),
+                    None => MType::VAL_TOP,
+                };
+                (a, claim)
+            })
+            .collect();
+        let l = self.mm.layouts.entry(crate::ids::LayoutKey::new(key)).or_default();
+        if l.fields.len() > out.len() {
+            return None;
+        }
+        l.fields.resize(out.len(), None);
+        for (i, &(a, claim)) in out.iter().enumerate() {
+            match &l.fields[i] {
+                None => l.fields[i] = Some(mir::module::FieldDef { name: a, claim }),
+                Some(f) if f.name == a && f.claim == claim => {}
+                Some(_) => return None,
+            }
+        }
+        Some(out)
+    }
+
+    /// The layout a constructor `k`'s `this` is under construction for,
+    /// and its TYPES, when a construct allocates it with `word`: the
+    /// sentinel with `k`'s own early key (`CTOR_TYPES`).
+    fn ctor_of_word(&mut self, k: ScriptId, word: u32) -> Option<(u32, bool)> {
+        if !CTOR_TYPES || word & crate::wasm::bbv::CLASS_WORD_SENTINEL == 0 {
+            return None;
+        }
+        let key = self.s.ctx.stamp_ctors_in.get(&k)?.layout_id;
+        if (word >> crate::wasm::bbv::abi::EARLY_KEY_SHIFT) & 0xFFF != key + 1 {
+            return None;
+        }
+        self.ctor_layout(key)?;
+        Some((key, word & crate::wasm::bbv::CLASS_WORD_SHALLOW != 0))
+    }
+
+    /// `recv.f` for an object under construction (§2.3) whose field `f`
+    /// is already added: the field, typed by its claim where TYPES holds.
+    /// `false` (nothing built) for any other access.
+    fn ctor_get(&mut self, next: Pc, a: mir::entity::AtomId, recv: Slot) -> bool {
+        let Ty::Ctor(key, n, t) = recv.ty else { return false };
+        let Some(fields) = self.ctor_layout(key) else { return false };
+        let Some(i) = fields.iter().position(|&(f, _)| f == a) else {
+            return false;
+        };
+        if i >= n as usize {
+            return false;
+        }
+        let claim = if t { fields[i].1 } else { MType::VAL_TOP };
+        let r = self
+            .js_dirty_exits(Opcode::LoadField(a), vec![recv.v], Some(claim), next, None)
+            .unwrap();
+        let tags = match claim {
+            MType::Val(s) => s.tags,
+            _ => TagSet::ALL,
+        };
+        let r = self.weaken(r, MType::val(tags));
+        self.push(r, Ty::Val(tags));
+        true
+    }
+
+    /// `recv.f = v` for an object under construction (§2.3): the add of
+    /// the next field its layout predicts is an `init_field` (its value
+    /// guarded to the field's claim, exiting here on a miss), advancing
+    /// `recv` and every copy of it, and publishing the layout
+    /// (`publish_layout`) once every field is there; a store to a field
+    /// already added is a typed `store_field`. A boxed object a fence
+    /// demoted from under construction (`ctor_hint`) is guarded back to
+    /// the state the add expects (`guard.ctor`) first. `false` (nothing
+    /// built) for any other store.
+    fn ctor_set(&mut self, next: Pc, a: mir::entity::AtomId, recv: Slot, v: Slot) -> bool {
+        let (key, t, hinted) = match recv.ty {
+            Ty::Ctor(key, _, t) => (key, t, false),
+            Ty::Val(_) => match self.ctor_hint.get(&recv.v) {
+                Some(&(key, _, t)) => (key, t, true),
+                None => return false,
+            },
+            _ => return false,
+        };
+        let Some(fields) = self.ctor_layout(key) else { return false };
+        let Some(i) = fields.iter().position(|&(f, _)| f == a) else {
+            return false;
+        };
+        let recv = if hinted {
+            // The add of field `i` expects exactly `i` fields.
+            let o = self.guard(Opcode::GuardUnbox(UnboxKind::Obj), vec![recv.v], MType::OBJ_TOP);
+            let g = Opcode::GuardCtor {
+                key: crate::ids::LayoutKey::new(key),
+                n: u32::try_from(i).unwrap(),
+                types: t,
+            };
+            let ty = Ty::Ctor(key, u32::try_from(i).unwrap(), t);
+            let c = self.guard(g, vec![o], ty.mir());
+            let s = Slot { v: c, ty };
+            self.replace_slot(recv.v, s);
+            s
+        } else {
+            recv
+        };
+        let Ty::Ctor(_, n, _) = recv.ty else { unreachable!() };
+        let n = n as usize;
+        if i > n {
+            return false;
+        }
+        // The value, of the field's claim: statically, or guarded here.
+        let claim = fields[i].1;
+        let ctags = match claim {
+            MType::Val(s) => s.tags,
+            _ => TagSet::ALL,
+        };
+        let x = self.boxed(v);
+        let x = if v.ty.tags().is_nonempty_subset_of(ctags) {
+            self.weaken(x, claim)
+        } else {
+            self.guard(Opcode::GuardTags(ctags), vec![x], claim)
+        };
+        if i < n {
+            let x = if t { x } else { self.weaken(x, MType::VAL_TOP) };
+            self.store_mask = Some((vec![(key + 1, ctags)], false));
+            self.js_dirty_exits(Opcode::StoreField(a), vec![recv.v, x], None, next, Some(v));
+            return true;
+        }
+        let ty = Ty::Ctor(key, u32::try_from(n + 1).unwrap(), t);
+        let o = self.guard(Opcode::InitField(a), vec![recv.v, x], ty.mir());
+        let s = Slot { v: o, ty };
+        self.replace_slot(recv.v, s);
+        if n + 1 == fields.len() {
+            // Every field is there: the stamp. It ends construction, so it
+            // kills the claims on the object under construction, as its
+            // prediction witness says (§4.5); every copy of it is
+            // replaced by the published one.
+            let pty = Ty::Obj(KeyRange::one(crate::ids::LayoutKey::new(key)), t);
+            let (inst, rs) = self.f.add_inst(self.cur, Opcode::PublishLayout, vec![o], &[pty.mir()], vec![]);
+            self.f.witnesses[inst] = Some(mir::func::Witness {
+                may_kill: mir::types::KillPattern::of(mir::types::KillSet::CONSTRUCTING),
+            });
+            self.replace_slot(o, Slot { v: rs[0], ty: pty });
+        }
+        true
+    }
+
+    /// An object under construction `x` passed as a callee's `this`
+    /// (`inline_call_this`): the callee, built for it, gets `x` itself;
+    /// this frame continues with `boxed` (its boxed copy), hinted
+    /// (`ctor_hint`), since the callee may add fields or publish it.
+    fn ctor_pass(&mut self, x: Slot, boxed: mir::Value) -> mir::Value {
+        let Ty::Ctor(k, n, t) = x.ty else { unreachable!("ctor_pass of {:?}", x.ty) };
+        self.ctor_hint.insert(boxed, (k, n, t));
+        let y = Slot {
+            v: boxed,
+            ty: Ty::Val(TagSet::OBJECT),
+        };
+        for s in self.st.iter_mut().chain(self.pre.iter_mut()).filter(|s| s.v == x.v) {
+            *s = y;
+        }
+        self.renames.push((x.v, y));
+        x.v
+    }
+
+    /// At a return, the construction state `this` is left in
+    /// (`this_out`).
+    fn note_this_out(&mut self) {
+        let now = match self.st.first().map(|x| x.ty) {
+            Some(Ty::Ctor(k, n, t)) => Some((k, n, t)),
+            _ => None,
+        };
+        self.this_out = Some(match self.this_out {
+            None => now,
+            Some(prev) if prev == now => now,
+            Some(_) => None,
+        });
+    }
+
+    /// The state of an object under construction `boxed`, passed to
+    /// inlined `targets` as `this`, after them: every callee's `this_out`,
+    /// where they agree, is its next use's guard (`ctor_hint`).
+    fn ctor_after(&mut self, targets: &[(ScriptId, std::rc::Rc<super::inline::Callee>)], boxed: mir::Value) {
+        let outs: Vec<Option<(u32, u32, bool)>> = targets.iter().map(|(_, c)| c.this_out).collect();
+        match outs.first() {
+            Some(&Some(o)) if outs.iter().all(|&x| x == Some(o)) => {
+                self.ctor_hint.insert(boxed, o);
+            }
+            _ => {
+                self.ctor_hint.remove(&boxed);
+            }
+        }
+    }
+
+    /// A boxed receiver `x` a fence demoted from under construction
+    /// (`ctor_hint`), guarded back to the state it was left in, for a call
+    /// whose callees are built for it; exiting here on a miss.
+    fn ctor_reguard(&mut self, x: Slot) -> Option<Slot> {
+        let &(k, n, t) = self.ctor_hint.get(&x.v)?;
+        if !matches!(x.ty, Ty::Val(_)) {
+            return None;
+        }
+        let o = self.guard(Opcode::GuardUnbox(UnboxKind::Obj), vec![x.v], MType::OBJ_TOP);
+        let g = Opcode::GuardCtor {
+            key: crate::ids::LayoutKey::new(k),
+            n,
+            types: t,
+        };
+        let ty = Ty::Ctor(k, n, t);
+        let c = self.guard(g, vec![o], ty.mir());
+        let s = Slot { v: c, ty };
+        self.replace_slot(x.v, s);
+        Some(s)
+    }
+
+    /// Replace every copy of `old` in the state with `new` (the receiver
+    /// of an `init_field`, advanced; published). For an object under
+    /// construction, every slot of its layout's constructing type is it:
+    /// a builder run's only such object is its own `this` (another's, an
+    /// inlined `new`'s, lives in that callee's run, and leaves it boxed),
+    /// though a join may have given it a second value (an operand copy
+    /// made a block param), whose claim the add has made stale.
+    fn replace_slot(&mut self, old: mir::Value, new: Slot) {
+        let key = match new.ty {
+            Ty::Ctor(k, ..) => Some(k),
+            Ty::Obj(keys, _) if keys.lo == keys.hi => Some(keys.lo.get()),
+            _ => None,
+        };
+        let mut olds = vec![old];
+        for x in self.st.iter_mut() {
+            let same = x.v == old || matches!(x.ty, Ty::Ctor(k, ..) if Some(k) == key);
+            if same && x.v != new.v {
+                if !olds.contains(&x.v) {
+                    olds.push(x.v);
+                }
+                *x = new;
+            }
+        }
+        for o in olds {
+            self.renames.push((o, new));
+        }
+    }
+
+    /// A guard whose failure cannot happen (it restates what the op before
+    /// it made so): its fail edge is unreachable.
+    fn assert_guard(&mut self, op: Opcode, args: Vec<mir::Value>, out: MType) -> mir::Value {
+        let ok = self.new_block();
+        let p = self.f.add_param(ok, out);
+        let never = self.new_block();
+        self.term(
+            op,
+            args,
+            vec![
+                Edge {
+                    block: ok,
+                    args: vec![EdgeArg::Out(0)],
+                },
+                Self::goto(never),
+            ],
+        );
+        self.at(never);
+        self.term(Opcode::Unreachable, vec![], vec![]);
+        self.at(ok);
+        p
+    }
+
     fn guard(&mut self, op: Opcode, args: Vec<mir::Value>, out: MType) -> mir::Value {
         let ok = self.new_block();
         let p = self.f.add_param(ok, out);
@@ -1755,8 +2121,10 @@ impl<'s, 'a> Run<'s, 'a> {
         let Some(&(lo, hi)) = ctx.facts.this_layouts.get(&sid) else {
             return;
         };
-        // A constructor's `this` is still being built.
-        if ctx.stamp_ctors_in.contains_key(&sid)
+        // A constructor's `this` is still being built: known so where the
+        // inlining `new` passed it (`Ctor`), else left unguarded.
+        if matches!(self.top().ty, Ty::Ctor(..))
+            || ctx.stamp_ctors_in.contains_key(&sid)
             || ctx.deleg_restamps_in.contains_key(&sid)
             || ctx.this_layouts_in.get(&sid).is_some_and(|l| l.init_home)
         {
@@ -2325,7 +2693,7 @@ impl<'s, 'a> Run<'s, 'a> {
         let mut copies: Vec<(mir::Value, mir::Value)> = vec![];
         if weakened {
             for x in &olds {
-                if matches!(x.ty, Ty::Obj(..)) && !copies.iter().any(|&(v, _)| v == x.v) {
+                if matches!(x.ty, Ty::Obj(..) | Ty::Ctor(..)) && !copies.iter().any(|&(v, _)| v == x.v) {
                     let w = self.weaken(x.v, MType::OBJ_TOP);
                     copies.push((x.v, w));
                 }
@@ -2336,7 +2704,7 @@ impl<'s, 'a> Run<'s, 'a> {
         let dp = out.map(|t| self.f.add_param(b, t));
         let mut objs: Vec<(mir::Value, mir::Value)> = vec![];
         for x in &olds {
-            if matches!(x.ty, Ty::Obj(..)) && !objs.iter().any(|&(v, _)| v == x.v) {
+            if matches!(x.ty, Ty::Obj(..) | Ty::Ctor(..)) && !objs.iter().any(|&(v, _)| v == x.v) {
                 let p = match copies.iter().find(|&&(v, _)| v == x.v) {
                     Some(&(_, w)) => w,
                     None => self.f.add_param(b, MType::OBJ_TOP),
@@ -2349,6 +2717,11 @@ impl<'s, 'a> Run<'s, 'a> {
             (Ty::Obj(k, _), Some(&(_, p))) => Slot {
                 v: p,
                 ty: Ty::ObjHint(k),
+            },
+            // The block only exits, which boxes it.
+            (Ty::Ctor(k, ..), Some(&(_, p))) => Slot {
+                v: p,
+                ty: Ty::ObjHint(KeyRange::one(crate::ids::LayoutKey::new(k))),
             },
             _ => x,
         };
@@ -2392,6 +2765,18 @@ impl<'s, 'a> Run<'s, 'a> {
         targets: &[(ScriptId, std::rc::Rc<super::inline::Callee>)],
         vals: &[mir::Value],
         fallback: Option<(Opcode, Vec<mir::Value>)>,
+    ) -> mir::Value {
+        self.inline_call_this(targets, vals, fallback, None)
+    }
+
+    /// `inline_call`, the callees receiving `this_raw` (an object under
+    /// construction, `ctor_pass`) as their `this`, built for it.
+    fn inline_call_this(
+        &mut self,
+        targets: &[(ScriptId, std::rc::Rc<super::inline::Callee>)],
+        vals: &[mir::Value],
+        fallback: Option<(Opcode, Vec<mir::Value>)>,
+        this_raw: Option<mir::Value>,
     ) -> mir::Value {
         // Facts are fixed: with every kill in the callees exiting (none
         // fenced), a kill leaves for baseline at the call's next pc, and
@@ -2442,7 +2827,7 @@ impl<'s, 'a> Run<'s, 'a> {
             );
             self.at(hit);
             let nformals = callee.f.frame.formals as usize;
-            let mut operands = vec![kobj, vals[1]];
+            let mut operands = vec![kobj, this_raw.unwrap_or(vals[1])];
             let undef = self.const_val(ConstVal::Undefined);
             for i in 0..nformals {
                 operands.push(vals.get(2 + i).copied().unwrap_or(undef));
@@ -2455,8 +2840,10 @@ impl<'s, 'a> Run<'s, 'a> {
                     self.mm.script_addrs.insert(*k, callee.mm.script_addrs[k]);
                 }
                 Err(_) => {
-                    // Not this one after all: the hit takes the ordinary call.
+                    // Not this one after all: the hit takes the ordinary call
+                    // (the guard stays, so its script's address does too).
                     self.mm = saved_mm;
+                    self.mm.script_addrs.insert(*k, callee.mm.script_addrs[k]);
                     self.f.inline_frames.truncate(saved_frames);
                     self.term(Opcode::Jump, vec![], vec![Self::goto(generic)]);
                 }
@@ -2541,9 +2928,27 @@ impl<'s, 'a> Run<'s, 'a> {
         // A fence: the next pc's value is the construct's, not `this`, so
         // a kill here has nowhere to exit to.
         let this = self.js_fence(Opcode::CreateThis(nslots, word), vec![vals[0], nt], MType::val(TagSet::OBJECT));
+        // The object `create_this` made carries `word` (§2.3): under
+        // construction for the constructor's own layout, with no field
+        // yet. The body is built for that `this`, whose adds are then
+        // `init_field`s and whose methods see its construction state.
+        let mut callee = callee.clone();
+        let mut this_op = this;
+        if let Some((key, t)) = self.ctor_of_word(k, word) {
+            if let Some(c) = self.s.callee_ctx(k, &[], Some((key, 0, t))) {
+                let o = self.assert_guard(Opcode::GuardUnbox(UnboxKind::Obj), vec![this], MType::OBJ_TOP);
+                let g = Opcode::GuardCtor {
+                    key: crate::ids::LayoutKey::new(key),
+                    n: 0,
+                    types: t,
+                };
+                this_op = self.assert_guard(g, vec![o], Ty::Ctor(key, 0, t).mir());
+                callee = c;
+            }
+        }
         let nformals = callee.f.frame.formals as usize;
         let nargs = vals.len() - 3;
-        let mut operands = vec![kobj, this];
+        let mut operands = vec![kobj, this_op];
         let undef = self.const_val(ConstVal::Undefined);
         for i in 0..nformals {
             operands.push(if i < nargs { vals[2 + i] } else { undef });
@@ -2555,7 +2960,7 @@ impl<'s, 'a> Run<'s, 'a> {
         let saved_frames = self.f.inline_frames.len();
         let here = self.cur;
         self.retain_all();
-        match super::inline::splice(&mut self.mm, &mut self.f, callee, 0, here, &operands, Some(nt), ret, None, err) {
+        match super::inline::splice(&mut self.mm, &mut self.f, &callee, 0, here, &operands, Some(nt), ret, None, err) {
             Ok(()) => {
                 self.mm.script_addrs.insert(k, callee.mm.script_addrs[&k]);
                 self.live = false;
@@ -2584,6 +2989,7 @@ impl<'s, 'a> Run<'s, 'a> {
             }
             Err(_) => {
                 self.mm = saved_mm;
+                self.mm.script_addrs.insert(k, callee.mm.script_addrs[&k]);
                 self.f.inline_frames.truncate(saved_frames);
                 self.term(Opcode::Jump, vec![], vec![Self::goto(generic)]);
             }
@@ -2670,7 +3076,12 @@ impl<'s, 'a> Run<'s, 'a> {
     /// constructor's `Super.call(this, …)`), built knowing the closures
     /// `fns` the call passes; any other target, or another `.call`, calls
     /// generically. `None` where nothing can be inlined.
-    fn call_forward(&mut self, vals: &[mir::Value], fns: &[Option<ScriptId>]) -> Option<mir::Value> {
+    fn call_forward(
+        &mut self,
+        vals: &[mir::Value],
+        fns: &[Option<ScriptId>],
+        this_ctor: Option<((u32, u32, bool), Slot, mir::Value)>,
+    ) -> Option<mir::Value> {
         if !CALL_FWD {
             return None;
         }
@@ -2688,7 +3099,7 @@ impl<'s, 'a> Run<'s, 'a> {
             .iter()
             .take(MAX_INLINE_TARGETS + 1)
             .filter(|&&k| self.s.fits_site(k, self.pc, n))
-            .filter_map(|&k| Some((k, self.s.callee_in(k, fns)?)))
+            .filter_map(|&k| Some((k, self.s.callee_ctx(k, fns, this_ctor.map(|(c, ..)| c))?)))
             .collect();
         if targets.is_empty()
             || targets.len() > MAX_INLINE_TARGETS
@@ -2696,6 +3107,7 @@ impl<'s, 'a> Run<'s, 'a> {
         {
             return None;
         }
+        let raw = this_ctor.map(|(_, x, boxed)| self.ctor_pass(x, boxed));
         let generic = (Opcode::Call, vals.to_vec());
         // Arms with fences meet at `join`: `Obj` slots go in as `ObjHint`.
         if targets.iter().any(|(_, c)| c.fenced) || !self.keepable(1) {
@@ -2711,7 +3123,10 @@ impl<'s, 'a> Run<'s, 'a> {
         );
         self.term(Opcode::Br, vec![is_call], vec![Self::goto(fast), Self::goto(slow)]);
         self.at(fast);
-        let r = self.inline_call(&targets, &vals[1..], Some(generic.clone()));
+        let r = self.inline_call_this(&targets, &vals[1..], Some(generic.clone()), raw);
+        if raw.is_some() {
+            self.ctor_after(&targets, vals[2]);
+        }
         self.term(
             Opcode::Jump,
             vec![],
@@ -2813,6 +3228,24 @@ impl<'s, 'a> Run<'s, 'a> {
     ///   types. `None` when they are narrower than the frame's: the run is
     ///   then not the last (`widen`), and the edge is left out.
     fn edge_to(&mut self, to: Pc, from: Option<Pc>) -> Option<Edge> {
+        // A formal a mapped `arguments` aliases is written through the
+        // frame (`ArgsMappedSet`), which leaves its slot dead on this path;
+        // where the target takes a value for it, the current one, read
+        // back (else the target's entry types never settle).
+        if self.mapped() {
+            if let Some(want) = self.entry_types.get(&to).cloned() {
+                for n in 0..self.s.nargs {
+                    let ix = self.arg_ix(n);
+                    if self.st.get(ix).is_some_and(|x| x.ty == Ty::Dead) && want.get(ix).is_some_and(|&t| t != Ty::Dead) {
+                        let v = self.inst(Opcode::ArgsMapped(n), vec![], Some(MType::VAL_TOP));
+                        self.st[ix] = Slot {
+                            v,
+                            ty: Ty::Val(TagSet::ALL),
+                        };
+                    }
+                }
+            }
+        }
         let tys: Vec<Ty> = self.st.iter().map(|x| x.ty).collect();
         match self.out.get_mut(&to) {
             Some(o) => {
@@ -2950,7 +3383,7 @@ impl<'s, 'a> Run<'s, 'a> {
             Ty::Dead => unreachable!("a dead slot is never read"),
             Ty::Bool => x.v,
             // A closure never emulates `undefined`.
-            Ty::Obj(..) | Ty::ObjHint(_) | Ty::Native | Ty::Ta(_) | Ty::Fn(_) => {
+            Ty::Obj(..) | Ty::ObjHint(_) | Ty::Ctor(..) | Ty::Native | Ty::Ta(_) | Ty::Fn(_) => {
                 self.inst(Opcode::ConstBool(true), vec![], Some(MType::Bool))
             }
             Ty::I32 => {
@@ -3302,6 +3735,12 @@ impl<'s, 'a> Run<'s, 'a> {
                     );
                     self.at(b2);
                     self.f.add_param(b3, MType::Obj(ObjInfo::kind(ObjKind::Function(Some(k)))));
+                    // The guard compares against the script's address.
+                    if let crate::source::SourceObject::Script(ks) =
+                        self.s.ctx.source.object(crate::source::SourceObjectId::new(k.get()))
+                    {
+                        self.mm.script_addrs.insert(k, ks.addr);
+                    }
                     self.term(
                         Opcode::GuardScript(k),
                         vec![o],
@@ -3342,6 +3781,43 @@ impl<'s, 'a> Run<'s, 'a> {
                     let out = self.f.add_param(ok, t.mir());
                     self.term(
                         Opcode::GuardLayout { keys, types },
+                        vec![o],
+                        vec![
+                            Edge {
+                                block: ok,
+                                args: vec![EdgeArg::Out(0)],
+                            },
+                            Self::goto(fail),
+                        ],
+                    );
+                    self.at(ok);
+                    args.push(EdgeArg::Value(out));
+                    continue;
+                }
+                Ty::Ctor(key, n, types) => {
+                    // Unbox, then the construction state (§2.3).
+                    let ok = self.new_block();
+                    let o = self.f.add_param(ok, MType::OBJ_TOP);
+                    self.term(
+                        Opcode::GuardUnbox(UnboxKind::Obj),
+                        vec![v],
+                        vec![
+                            Edge {
+                                block: ok,
+                                args: vec![EdgeArg::Out(0)],
+                            },
+                            Self::goto(fail),
+                        ],
+                    );
+                    self.at(ok);
+                    let ok = self.new_block();
+                    let out = self.f.add_param(ok, t.mir());
+                    self.term(
+                        Opcode::GuardCtor {
+                            key: crate::ids::LayoutKey::new(key),
+                            n,
+                            types,
+                        },
                         vec![o],
                         vec![
                             Edge {
@@ -3487,9 +3963,14 @@ impl<'s, 'a> Run<'s, 'a> {
         });
         let callee = MType::Obj(ObjInfo::kind(ObjKind::Function(Some(self.s.sid))));
         self.f.add_param(b0, callee);
-        let this = self.f.add_param(b0, MType::VAL_TOP);
         let all = Ty::Val(TagSet::ALL);
-        self.st.push(Slot { v: this, ty: all });
+        // An object under construction the inlining `new` or call passes.
+        let this_ty = match self.s.this_ctor {
+            Some((k, n, t)) => Ty::Ctor(k, n, t),
+            None => all,
+        };
+        let this = self.f.add_param(b0, this_ty.mir());
+        self.st.push(Slot { v: this, ty: this_ty });
         for i in 0..self.s.nargs {
             // A closure the inlining call passes (`formal_fns`).
             let ty = match self.s.formal_fns.get(i as usize) {
@@ -3552,6 +4033,14 @@ impl<'s, 'a> Run<'s, 'a> {
             // (`exit.throw`) and baseline takes the pc's handler. The catch
             // code, entered only by a throw, is never reached here.
             Try | TryDestructuring => {}
+            // A finally block's start: a marker. MIR runs only its normal
+            // entry (a throw exits, and baseline's unwind enters it
+            // throwing), whose rethrow arm is therefore baseline's too.
+            Finally => {}
+            ThrowWithStack => {
+                let b = self.exit_block(false);
+                self.term(Opcode::Jump, vec![], vec![Self::goto(b)]);
+            }
 
             Undefined => {
                 let v = self.const_val(ConstVal::Undefined);
@@ -4088,6 +4577,7 @@ impl<'s, 'a> Run<'s, 'a> {
             Return => {
                 let x = self.pop();
                 let v = self.boxed(x);
+                self.note_this_out();
                 self.ctor_stamp();
                 self.return_restamps();
                 self.term(Opcode::Return, vec![v], vec![]);
@@ -4095,6 +4585,7 @@ impl<'s, 'a> Run<'s, 'a> {
             RetRval => {
                 let x = self.st[self.rval_ix()];
                 let v = self.boxed(x);
+                self.note_this_out();
                 self.ctor_stamp();
                 self.return_restamps();
                 self.term(Opcode::Return, vec![v], vec![]);
@@ -4254,7 +4745,7 @@ impl<'s, 'a> Run<'s, 'a> {
                         self.at(d);
                         o
                     }
-                    Ty::Bool | Ty::Obj(..) | Ty::ObjHint(_) | Ty::Native | Ty::Ta(_) => {
+                    Ty::Bool | Ty::Obj(..) | Ty::ObjHint(_) | Ty::Ctor(..) | Ty::Native | Ty::Ta(_) => {
                         self.jump_to(default, Some(pc));
                         return Ok(());
                     }
@@ -4363,10 +4854,14 @@ impl<'s, 'a> Run<'s, 'a> {
 
             // --- generic names, properties, elements and calls ---
             GetGName => {
-                if self.s.next_is_typeof(pc, op) {
-                    return Err("GetGName for typeof".into());
-                }
                 let index = p.next_uint32().unwrap();
+                if self.s.next_is_typeof(pc, op) {
+                    // `typeof name`: an unbound global reads as undefined.
+                    let a = self.atom(index)?;
+                    let r = self.js(Opcode::JsRt(RtOp::GetNameTypeof(a)), vec![], MType::VAL_TOP);
+                    self.push(r, Ty::Val(TagSet::ALL));
+                    return Ok(());
+                }
                 let a = self.atom(index)?;
                 if let Some(&fg) = self.s.fused.get(&index) {
                     if self.fused_gname(a, fg) {
@@ -4390,6 +4885,9 @@ impl<'s, 'a> Run<'s, 'a> {
                         self.push(n, Ty::I32);
                         return Ok(());
                     }
+                }
+                if self.ctor_get(pc + op.len(), a, recv) {
+                    return Ok(());
                 }
                 let site = self.typed_site(pc, a).or_else(|| self.hinted_site(recv.v, a));
                 if let Some((o, site)) = site.and_then(|site| self.proven_recv(recv, &site)) {
@@ -4459,6 +4957,10 @@ impl<'s, 'a> Run<'s, 'a> {
                 let a = self.atom(p.next_uint32().unwrap())?;
                 let v = self.pop();
                 let recv = self.pop();
+                if self.ctor_set(pc + op.len(), a, recv, v) {
+                    self.repush(v);
+                    return Ok(());
+                }
                 self.store_mask = self.field_claim(pc, a, recv);
                 // A field of the predicted layout: a value of its predicted
                 // type (statically) keeps TYPES as a typed store; another
@@ -4889,6 +5391,38 @@ impl<'s, 'a> Run<'s, 'a> {
                 let v = self.inst(Opcode::ActualArg, vec![i.v], Some(MType::VAL_TOP));
                 self.push(v, Ty::Val(TagSet::ALL));
             }
+            Iter => {
+                // For-in (baseline's helpers): the property iterator; the
+                // loop's names from it; its close. A throw inside exits,
+                // and baseline's unwind closes it.
+                let x = self.pop();
+                let v = self.boxed(x);
+                let r = self.js(Opcode::JsRt(RtOp::Iter), vec![v], MType::val(TagSet::OBJECT));
+                self.push(r, Ty::Val(TagSet::OBJECT));
+            }
+            MoreIter => {
+                let it = self.top();
+                let v = self.boxed(it);
+                let r = self.inst(Opcode::IterMore, vec![v], Some(MType::VAL_TOP));
+                self.push(r, Ty::Val(TagSet::ALL));
+            }
+            IsNoIter => {
+                let x = self.top();
+                let v = self.boxed(x);
+                let b = self.inst(Opcode::IterIsDone, vec![v], Some(MType::Bool));
+                self.push(b, Ty::Bool);
+            }
+            EndIter => {
+                self.pop();
+                let it = self.pop();
+                let v = self.boxed(it);
+                self.inst(Opcode::IterEnd, vec![v], None);
+            }
+            NewTarget => {
+                // The frame's new.target (undefined unless constructed).
+                let v = self.inst(Opcode::FrameNewTarget, vec![], Some(MType::VAL_TOP));
+                self.push(v, Ty::Val(TagSet::ALL));
+            }
             IsConstructing => {
                 let v = self.const_val(ConstVal::IsConstructing);
                 self.push(v, Ty::Val(TagSet::MAGIC));
@@ -4933,7 +5467,25 @@ impl<'s, 'a> Run<'s, 'a> {
                 }
                 self.publish_this();
                 let n = self.st.len();
-                let operands: Vec<Slot> = self.st.drain(n - argc - 2..).collect();
+                let mut operands: Vec<Slot> = self.st.drain(n - argc - 2..).collect();
+                // A receiver (or a `.call`'s `this`) a fence demoted from
+                // under construction, for callees to inline: back to its
+                // construction state (§2.3).
+                {
+                    let site = self.site(pc);
+                    let facts = &self.s.ctx.facts;
+                    let direct = !facts.scripted_targets(site).is_empty();
+                    let fwd = argc >= 1
+                        && facts.apply_sites.get(&site) == Some(&crate::facts::CallForm::Call)
+                        && (facts.apply_targets.contains_key(&site) || facts.apply_target_sets.contains_key(&site));
+                    for (i, want) in [(1, direct), (2, fwd)] {
+                        if want {
+                            if let Some(s) = self.ctor_reguard(operands[i]) {
+                                operands[i] = s;
+                            }
+                        }
+                    }
+                }
                 // A known closure is the callee (context-sensitive: known
                 // here, maybe not where the analysis looked); the closures
                 // the call passes go to the callee's build.
@@ -4948,6 +5500,14 @@ impl<'s, 'a> Run<'s, 'a> {
                         _ => None,
                     })
                     .collect();
+                // An object under construction as the receiver, or as a
+                // `.call`'s `this`: callees built for it (§2.3).
+                let this_ctor = |x: Option<&Slot>| match x.map(|x| x.ty) {
+                    Some(Ty::Ctor(k, n, t)) => Some((k, n, t)),
+                    _ => None,
+                };
+                let recv_ctor = this_ctor(operands.get(1)).map(|c| (c, operands[1]));
+                let fwd_ctor = this_ctor(operands.get(2)).map(|c| (c, operands[2]));
                 let vals: Vec<mir::Value> = operands.into_iter().map(|x| self.boxed(x)).collect();
                 let facts_sids = self.s.ctx.facts.scripted_targets(self.site(pc));
                 let known_sids: Vec<ScriptId> = known.into_iter().collect();
@@ -4957,9 +5517,13 @@ impl<'s, 'a> Run<'s, 'a> {
                     .iter()
                     .take(MAX_INLINE_TARGETS + 1)
                     .filter(|&&k| self.s.fits_site(k, pc, n))
-                    .filter_map(|&k| Some((k, self.s.callee_in(k, &fns)?)))
+                    .filter_map(|&k| Some((k, self.s.callee_ctx(k, &fns, recv_ctor.map(|(c, _)| c))?)))
                     .collect();
-                let forward = if argc >= 1 { self.call_forward(&vals, &fns[1..]) } else { None };
+                let forward = if argc >= 1 {
+                    self.call_forward(&vals, &fns[1..], fwd_ctor.map(|(c, x)| (c, x, vals[2])))
+                } else {
+                    None
+                };
                 let r = if let Some(r) = forward {
                     r
                 } else if argc == 2 && self.s.apply_fwd.as_ref().is_some_and(|f| f.contains(&pc)) {
@@ -4982,7 +5546,12 @@ impl<'s, 'a> Run<'s, 'a> {
                     self.likely_targets.clear();
                     r
                 } else {
-                    self.inline_call(&targets, &vals, None)
+                    let raw = recv_ctor.map(|(_, x)| self.ctor_pass(x, vals[1]));
+                    let r = self.inline_call_this(&targets, &vals, None, raw);
+                    if raw.is_some() {
+                        self.ctor_after(&targets, vals[1]);
+                    }
+                    r
                 };
                 self.push(r, Ty::Val(TagSet::ALL));
                 let claim = self.s.ctx.facts.call_types.get(&self.site(pc)).copied();

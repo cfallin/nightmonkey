@@ -236,6 +236,11 @@ pub enum RtOp {
     InitPropGetSet(AtomId, u32),
     /// Self-hosted intrinsic `name` (`GetIntrinsic`) -> value.
     Intrinsic(AtomId),
+    /// Global `name` for `typeof` (`GetGName` before `Typeof`): an unbound
+    /// name is undefined, not a ReferenceError -> value.
+    GetNameTypeof(AtomId),
+    /// For-in's property iterator over `v` (`Iter`) -> object.
+    Iter,
     /// `ToString` of v -> string.
     ToString,
     /// Well-known symbol `code` (`JSOp::Symbol`) -> symbol.
@@ -294,6 +299,15 @@ pub enum Opcode {
     GuardKind(ObjKind),
     GuardLayout {
         keys: KeyRange,
+        types: bool,
+    },
+    /// An object under construction for layout `key` (MIR.md §2.3): its
+    /// word carries the CONSTRUCTING sentinel with `key`'s early key, and
+    /// SLOTS (and TYPES if `types`), and it has exactly `n` slots, so
+    /// `key`'s first `n` fields (`constructing(n)`).
+    GuardCtor {
+        key: LayoutKey,
+        n: u32,
         types: bool,
     },
     GuardSingleton(SnapObj),
@@ -394,6 +408,16 @@ pub enum Opcode {
     RestArray(u32),
     /// The actual argument count, an i32.
     ArgsLength,
+    /// The frame's `new.target` (the op's frame: an inlined construct's
+    /// frame holds its own) -> value.
+    FrameNewTarget,
+    /// For-in: the iterator's next property name, or the NO_ITER magic
+    /// when it is exhausted (`MoreIter`; advances the iterator).
+    IterMore,
+    /// Whether a value is the NO_ITER magic (`IsNoIter`) -> bool.
+    IterIsDone,
+    /// For-in: close the iterator (`EndIter`).
+    IterEnd,
     /// Actual argument `args[0]` (an i32 index below the count).
     ActualArg,
     /// Actual argument `k`, or undefined if there are not that many.
@@ -537,6 +561,7 @@ impl Opcode {
             | GuardTags(_)
             | GuardKind(_)
             | GuardLayout { .. }
+            | GuardCtor { .. }
             | GuardSingleton(_)
             | GuardScript(_)
             | F64ToIntExact
@@ -919,6 +944,18 @@ pub fn signature(op: &Opcode, args: &[Type], m: &Module) -> SigResult {
                 ..o
             }))
         }
+        GuardCtor { key, n, types } => {
+            arity(args, 1)?;
+            let o = obj(&args[0], "guard.ctor")?;
+            Sig::output(Type::Obj(ObjInfo {
+                layout: Some(LayoutClaim {
+                    keys: KeyRange::one(*key),
+                    types: *types,
+                    state: LayoutState::Constructing(*n),
+                }),
+                ..o
+            }))
+        }
         GuardSingleton(s) => {
             arity(args, 1)?;
             let o = obj(&args[0], "guard.singleton")?;
@@ -1177,7 +1214,8 @@ pub fn signature(op: &Opcode, args: &[Type], m: &Module) -> SigResult {
                 RtOp::ToPropertyKey => (1, Some(Type::VAL_TOP)),
                 RtOp::RegExp(_) => (0, Some(Type::val(TagSet::OBJECT))),
                 RtOp::InitPropGetSet(..) => (2, None),
-                RtOp::Intrinsic(_) => (0, Some(Type::VAL_TOP)),
+                RtOp::Intrinsic(_) | RtOp::GetNameTypeof(_) => (0, Some(Type::VAL_TOP)),
+                RtOp::Iter => (1, Some(Type::val(TagSet::OBJECT))),
                 RtOp::ToString => (1, Some(Type::val(TagSet::STRING))),
                 RtOp::Symbol(_) => (0, Some(Type::val(TagSet::prims(crate::opsem::PRIM_SYMBOL)))),
                 RtOp::BuiltinObject(_) => (0, Some(Type::val(TagSet::OBJECT))),
@@ -1203,6 +1241,25 @@ pub fn signature(op: &Opcode, args: &[Type], m: &Module) -> SigResult {
         ArgsLength => {
             arity(args, 0)?;
             Sig::result(Type::I32(IRange::new(0, i64::from(i32::MAX))))
+        }
+        FrameNewTarget => {
+            arity(args, 0)?;
+            Sig::result(Type::VAL_TOP)
+        }
+        IterMore => {
+            arity(args, 1)?;
+            val(&args[0], "iter.more")?;
+            Sig::result(Type::VAL_TOP)
+        }
+        IterIsDone => {
+            arity(args, 1)?;
+            val(&args[0], "iter.done")?;
+            Sig::result(Type::Bool)
+        }
+        IterEnd => {
+            arity(args, 1)?;
+            val(&args[0], "iter.end")?;
+            Sig::none()
         }
         ActualArg => {
             arity(args, 1)?;
@@ -1844,6 +1901,11 @@ pub fn effects(op: &Opcode, args: &[Type], m: &Module) -> Effects {
             }
         }
         LengthArray => fx.reads = vec![Region::ArrayLength(elements_root(recv, m))],
+        // The iterator's own state, which nothing else reads.
+        IterMore | IterEnd => {
+            fx.reads = vec![Region::Unknown];
+            fx.writes = vec![Region::Unknown];
+        }
         LengthTa => fx.reads = vec![Region::TypedArrayLength],
         ElementsPtr => fx.reads = vec![Region::Elements(elements_root(recv, m))],
         // Reading a rope's chars flattens it, which allocates.

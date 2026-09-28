@@ -704,6 +704,10 @@ pub struct Helpers {
     /// `night_runtime_ctor_restamp(this i64, layout, nfields, keep, p0..p3)`
     /// (leaf): the baseline and MIR tiers' init-delegate restamp.
     pub ctor_restamp: Func,
+    /// `night_runtime_init_field(cx, top, recv i64, atomId, val i64,
+    /// cacheIdx, expectSpan, wantBits) -> ok`: MIR's `init_field` slow
+    /// path (the object to the out-slot). May GC.
+    pub init_field: Func,
     /// `night_runtime_set_fun_name(cx, top, fun i64, name i64, prefixKind i32) -> ok`:
     /// `JSOp::SetFunName` -- set the inferred name on an anonymous function.
     /// Leaves `fun` on the stack (no out-slot).
@@ -3655,6 +3659,20 @@ mod tests {
             returns: vec![],
         });
         let ctor_restamp = stub(&mut m, crs_sig, false, "night_runtime_ctor_restamp");
+        let initf_sig = m.signatures.push(SignatureData {
+            params: vec![
+                Type::I32,
+                Type::I32,
+                Type::I64,
+                Type::I32,
+                Type::I64,
+                Type::I32,
+                Type::I32,
+                Type::I32,
+            ],
+            returns: vec![Type::I32],
+        });
+        let init_field = stub(&mut m, initf_sig, true, "night_runtime_init_field");
         // math_unary: (kind i32, x f64) -> f64; math_pow: (x f64, y f64) -> f64.
         let mu_sig = m.signatures.push(SignatureData {
             params: vec![Type::I32, Type::F64],
@@ -3974,6 +3992,7 @@ mod tests {
                 mir_stress,
                 ctor_stamp,
                 ctor_restamp,
+                init_field,
             },
         )
     }

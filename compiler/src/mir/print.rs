@@ -305,6 +305,7 @@ pub fn mnemonic(op: &Opcode) -> String {
         GuardTags(_) => "guard.tags".into(),
         GuardKind(_) => "guard.kind".into(),
         GuardLayout { .. } => "guard.layout".into(),
+        GuardCtor { .. } => "guard.ctor".into(),
         GuardSingleton(_) => "guard.singleton".into(),
         GuardScript(_) => "guard.script".into(),
         F64ToIntExact => "f64.to_int_exact".into(),
@@ -366,6 +367,10 @@ pub fn mnemonic(op: &Opcode) -> String {
         ArgsObject => "args.object".into(),
         RestArray(_) => "args.rest".into(),
         ArgsLength => "args.length".into(),
+        FrameNewTarget => "frame.new_target".into(),
+        IterMore => "iter.more".into(),
+        IterIsDone => "iter.done".into(),
+        IterEnd => "iter.end".into(),
         ActualArg => "args.actual".into(),
         ActualArgOr(_) => "args.actual_or".into(),
         JsIsBuiltin(_) => "js.is_builtin".into(),
@@ -387,6 +392,8 @@ pub fn mnemonic(op: &Opcode) -> String {
             RtOp::RegExp(_) => "js.rt.regexp",
             RtOp::InitPropGetSet(..) => "js.rt.initgetset",
             RtOp::Intrinsic(_) => "js.rt.intrinsic",
+            RtOp::GetNameTypeof(_) => "js.rt.getname.typeof",
+            RtOp::Iter => "js.rt.iter",
             RtOp::ToString => "js.rt.tostring",
             RtOp::Symbol(_) => "js.rt.symbol",
             RtOp::BuiltinObject(_) => "js.rt.builtinobject",
@@ -471,6 +478,13 @@ fn immediates(m: &Module, op: &Opcode) -> Option<String> {
             }
             s
         }
+        GuardCtor { key, n, types } => {
+            let mut s = format!("L{key}, {n}");
+            if *types {
+                s.push_str(" types");
+            }
+            s
+        }
         GuardScript(s) => format!("s{s}"),
         CheckFuse(f) => f.to_string(),
         CheckBinding(b) | LoadGName(b) | StoreGName(b) => b.to_string(),
@@ -480,7 +494,7 @@ fn immediates(m: &Module, op: &Opcode) -> Option<String> {
         JsLambda(k) | FrameStore(k) | RestArray(k) | ActualArgOr(k) | JsIsBuiltin(k) => {
             k.to_string()
         }
-        JsRt(RtOp::DelProp(a, _)) | JsRt(RtOp::Intrinsic(a)) => atom(Some(m), *a),
+        JsRt(RtOp::DelProp(a, _)) | JsRt(RtOp::Intrinsic(a)) | JsRt(RtOp::GetNameTypeof(a)) => atom(Some(m), *a),
         JsRt(RtOp::NewArray(n)) | JsRt(RtOp::InitElem(n, _)) | JsRt(RtOp::Symbol(n)) | JsRt(RtOp::BuiltinObject(n)) => {
             n.to_string()
         }

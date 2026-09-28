@@ -81,6 +81,11 @@ struct Verifier<'a> {
     inst_pos: BTreeMap<Inst, (Block, usize)>,
     sigs: EntityMap<Inst, Option<Sig>>,
     live_in: BTreeMap<Block, BTreeSet<Value>>,
+    /// `live_in` for the fence checks: uses in throw blocks do not count
+    /// (`is_throw_block`: nothing in one relies on a killable component),
+    /// wherever the throw block is, behind an `exit.inline`'s `err` edge
+    /// too.
+    live_in_fence: BTreeMap<Block, BTreeSet<Value>>,
 }
 
 impl<'a> Verifier<'a> {
@@ -662,6 +667,43 @@ impl<'a> Verifier<'a> {
         out
     }
 
+    /// `live_in_fence`, by the same dataflow as `liveness` with every throw
+    /// block's live-in empty.
+    fn fence_liveness(&mut self) {
+        let f = self.f;
+        let throw: BTreeSet<Block> = self.rpo.iter().copied().filter(|&b| self.is_throw_block(b)).collect();
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for &b in self.rpo.iter().rev() {
+                if throw.contains(&b) {
+                    continue;
+                }
+                let mut live = self.live_out_fence(b);
+                for &inst in f.blocks[b].insts.iter().rev() {
+                    self.step_back(inst, &mut live);
+                }
+                for p in &f.blocks[b].params {
+                    live.remove(p);
+                }
+                if self.live_in_fence.get(&b) != Some(&live) {
+                    self.live_in_fence.insert(b, live);
+                    changed = true;
+                }
+            }
+        }
+    }
+
+    fn live_out_fence(&self, b: Block) -> BTreeSet<Value> {
+        let mut out = BTreeSet::new();
+        for s in self.f.succs(b) {
+            if let Some(l) = self.live_in_fence.get(&s) {
+                out.extend(l.iter().copied());
+            }
+        }
+        out
+    }
+
     /// Move `live` from after `inst` to before it.
     fn step_back(&self, inst: Inst, live: &mut BTreeSet<Value>) {
         let d = &self.f.insts[inst];
@@ -703,8 +745,12 @@ impl<'a> Verifier<'a> {
 
     fn fences(&mut self) {
         let f = self.f;
+        self.fence_liveness();
         for &b in &self.rpo.clone() {
+            // Walk both: the full live set for the GC check, the fence set
+            // (throw blocks' uses left out) for the kill checks.
             let mut live = self.live_out(b);
+            let mut flive = self.live_out_fence(b);
             // Walk backward so `live` is the set live after each inst.
             for &inst in f.blocks[b].insts.iter().rev() {
                 let d = &f.insts[inst];
@@ -715,6 +761,7 @@ impl<'a> Verifier<'a> {
                     // Neither a fence nor a GC point: nothing to check
                     // (and no need to build the live set's copy).
                     self.step_back(inst, &mut live);
+                    self.step_back(inst, &mut flive);
                     continue;
                 }
                 let name = mnemonic(&d.op);
@@ -723,8 +770,13 @@ impl<'a> Verifier<'a> {
                     .copied()
                     .filter(|v| !d.results.contains(v))
                     .collect();
+                let fence_across: Vec<Value> = flive
+                    .iter()
+                    .copied()
+                    .filter(|v| !d.results.contains(v))
+                    .collect();
                 if site == KillSite::Op {
-                    for &v in &across {
+                    for &v in &fence_across {
                         if fx.kill.matches(&self.ty(v)) {
                             let msg = format!(
                                 "{} is live across {name}, which kills {{{}}}",
@@ -758,6 +810,7 @@ impl<'a> Verifier<'a> {
                     self.raw_across_gc(b, inst, &fx, &across);
                 }
                 self.step_back(inst, &mut live);
+                self.step_back(inst, &mut flive);
             }
         }
     }
@@ -776,7 +829,7 @@ impl<'a> Verifier<'a> {
             if !is_fence {
                 continue;
             }
-            let live_in = self.live_in.get(&e.block).cloned().unwrap_or_default();
+            let live_in = self.live_in_fence.get(&e.block).cloned().unwrap_or_default();
             for v in live_in {
                 if fx.kill.matches(&self.ty(v)) {
                     let msg = format!(
@@ -970,6 +1023,7 @@ pub fn verify(m: &Module, f: &Func) -> Result<(), Vec<VerifyError>> {
         inst_pos: BTreeMap::new(),
         sigs: EntityMap::new(),
         live_in: BTreeMap::new(),
+        live_in_fence: BTreeMap::new(),
     };
     v.structure();
     if v.errors.is_empty() {

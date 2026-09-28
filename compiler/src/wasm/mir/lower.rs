@@ -1036,7 +1036,9 @@ impl<'a> Lower<'a> {
     fn may_gc(&self, inst: mir::Inst) -> bool {
         use mir::ops::SuccRole;
         let op = &self.f.insts[inst].op;
-        op.roles().iter().any(|r| matches!(r, SuccRole::Err | SuccRole::OkDirty))
+        // `init_field` (ok, fail) calls the runtime's plain add on its
+        // slow path.
+        matches!(op, Opcode::InitField(_)) || op.roles().iter().any(|r| matches!(r, SuccRole::Err | SuccRole::OkDirty))
     }
 
     /// Home slots: every managed value live across a may-GC instruction
@@ -2755,6 +2757,12 @@ impl<'a> Lower<'a> {
                         let (at, kv) = (self.atom(name), self.i32c(kind));
                         (h.init_prop_getset, vec![a[0], at, a[1], kv])
                     }
+                    RtOp::Iter => (h.iter_, vec![a[0]]),
+                    RtOp::GetNameTypeof(name) => {
+                        // `get_gname`'s typeof form: unbound is undefined.
+                        let (at, one) = (self.atom(name), self.i32c(1));
+                        (h.get_gname, vec![at, one])
+                    }
                 };
                 self.js_call(inst, f, &args, false)?;
             }
@@ -2810,6 +2818,24 @@ impl<'a> Lower<'a> {
                 self.cond_br(ok, t, e);
             }
             Opcode::ArgsLength => self.def(inst, self.argc),
+            Opcode::IterMore => {
+                let r = self.call1(self.h.more_iter, &[self.cx, a[0]], Type::I64);
+                self.def(inst, r);
+            }
+            Opcode::IterEnd => {
+                self.call(self.h.end_iter, &[self.cx, a[0]], &[]);
+            }
+            Opcode::IterIsDone => {
+                let m = self.i64c((TAG_MAGIC << 32) | crate::wasm::translate::MAGIC_NO_ITER_VALUE);
+                let r = self.bin(Operator::I64Eq, a[0], m, Type::I32);
+                self.def(inst, r);
+            }
+            Opcode::FrameNewTarget => {
+                let fid = self.cur_frame as usize;
+                let off = self.frame_off[fid] + self.frame_layouts[fid].new_target();
+                let v = self.load_i64(self.vp, off);
+                self.def(inst, v);
+            }
             Opcode::ActualArgOr(k) => {
                 let v = self.load_i64(self.sp, FrameLayout::ARGS + 8 * k);
                 let kv = self.i32c(k);
@@ -3005,6 +3031,40 @@ impl<'a> Lower<'a> {
                 self.guard(inst, ok, &[a[0]])?;
                 self.guard_word = None;
                 self.guard_obj = None;
+            }
+            Opcode::GuardCtor { key, n, types } => {
+                // Under construction for `key` (§2.3): the sentinel with
+                // its early key, SLOTS (and TYPES), and exactly `n` slots.
+                let w = self.load_i32(a[0], OBJ_CLASS_IDX_OFFSET);
+                let bits = CLASS_WORD_SLOTS | if types { CLASS_WORD_SHALLOW } else { 0 };
+                let m = self.i32c(CLASS_WORD_SENTINEL | (EARLY_KEY_MAX << EARLY_KEY_SHIFT) | bits);
+                let want = self.i32c(CLASS_WORD_SENTINEL | ((key.get() + 1) << EARLY_KEY_SHIFT) | bits);
+                let wm = self.bin(Operator::I32And, w, m, Type::I32);
+                let ok = self.bin(Operator::I32Eq, wm, want, Type::I32);
+                let span = self.slot_span(a[0]);
+                let nv = self.i32c(n);
+                let s_ok = self.bin(Operator::I32Eq, span, nv, Type::I32);
+                let ok = self.bin(Operator::I32And, ok, s_ok, Type::I32);
+                self.guard(inst, ok, &[a[0]])?;
+            }
+            Opcode::InitField(name) => self.init_field(inst, name, a[0], a[1])?,
+            Opcode::PublishLayout => {
+                // The stamp of a completed `constructing(n)` object (its
+                // type proves the sentinel, the key and every field): its
+                // identity, keeping SLOTS and, where claimed, TYPES.
+                let c = self
+                    .ty(d.args[0])
+                    .obj_info()
+                    .and_then(|o| o.layout)
+                    .ok_or("lowering: publish_layout without a layout claim")?;
+                let w = self.load_i32(a[0], OBJ_CLASS_IDX_OFFSET);
+                let keep = CLASS_WORD_SLOTS | if c.types { CLASS_WORD_SHALLOW } else { 0 };
+                let kb = self.i32c(keep);
+                let bits = self.bin(Operator::I32And, w, kb, Type::I32);
+                let idx = self.i32c(c.keys.lo.get() + 1);
+                let nw = self.bin(Operator::I32Or, idx, bits, Type::I32);
+                self.store_i32(a[0], OBJ_CLASS_IDX_OFFSET, nw);
+                self.def(inst, a[0]);
             }
             Opcode::CheckFuse(fuse) => {
                 let addr = self.mm.fuses[fuse].addr;
@@ -4629,6 +4689,85 @@ impl<'a> Lower<'a> {
             self.terminate(Terminator::Br { target: Self::to(join) });
             self.cur = join;
         }
+    }
+
+    /// The number of slots native object `obj`'s shape spans.
+    fn slot_span(&mut self, obj: Value) -> Value {
+        let shape = self.load_i32(obj, SHAPE_OFFSET);
+        let imm = self.load_i32(shape, SHAPE_IMMUTABLE_FLAGS_OFFSET);
+        let sh = self.i32c(SHAPE_SMALL_SLOTSPAN_SHIFT);
+        let span = self.bin(Operator::I32ShrU, imm, sh, Type::I32);
+        let sm = self.i32c(SHAPE_SMALL_SLOTSPAN_MASK_BITS);
+        self.bin(Operator::I32And, span, sm, Type::I32)
+    }
+
+    /// `init_field` (§2.3): add field `n` of the receiver's
+    /// `constructing(n)` layout, of a value of its type. The site's
+    /// add-transition row replayed inline where it adds exactly that
+    /// field at its fixed slot (every recorded prototype hop live, as
+    /// `set_ic_trans`); else the runtime's plain add, which also fills the
+    /// row, continuing iff the object is then `constructing(n + 1)`, and
+    /// leaving the rest of the constructor to baseline (`fail`) if not.
+    /// TYPES holds by the value's type; RANGES, which no MIR claim reads,
+    /// is dropped.
+    fn init_field(&mut self, inst: mir::Inst, name: mir::entity::AtomId, obj: Value, val: Value) -> R<()> {
+        let d = &self.f.insts[inst];
+        let c = self
+            .ty(d.args[0])
+            .obj_info()
+            .and_then(|o| o.layout)
+            .ok_or("lowering: init_field without a layout claim")?;
+        let mir::types::LayoutState::Constructing(n) = c.state else {
+            return Err("lowering: init_field on a published object".into());
+        };
+        let num = matches!(self.ty(d.args[1]), MType::Val(s) if s.tags.subset_of(TagSet::NUMBER));
+        let at = self.atom(name);
+        let cache = self.atoms.next_prop_cache();
+        let way = self.i32c(IC_WAY_ADDR_PLACEHOLDER);
+        self.prop_ic_patches.push((way, cache * INLINE_IC_STRIDE));
+        let slow = self.body.add_block();
+        let row = self.add_off(way, IC_TRANS_ROW_OFF);
+        let shape = self.load_i32(obj, SHAPE_OFFSET);
+        let old = self.load_i32(row, IC_TRANS_OLDSHAPE);
+        let m_old = self.bin(Operator::I32Eq, old, shape, Type::I32);
+        self.check(m_old, slow);
+        let off = FIXED_SLOTS_BASE + 8 * n;
+        let slot_off = self.load_i32(row, IC_TRANS_SLOTOFF);
+        let want = self.i32c(off);
+        let at_slot = self.bin(Operator::I32Eq, slot_off, want, Type::I32);
+        self.check(at_slot, slow);
+        for h in 0..IC_TRANS_PROTO_HOPS {
+            let p = self.load_i32(row, IC_TRANS_PROTO0 + IC_TRANS_PROTO_ROW_BYTES * h);
+            let empty = self.un(Operator::I32Eqz, p, Type::I32);
+            let wv = self.load_i32(row, IC_TRANS_PROTO0 + IC_TRANS_PROTO_ROW_BYTES * h + 4);
+            let live = self.load_i32(p, SHAPE_OFFSET);
+            let same = self.bin(Operator::I32Eq, live, wv, Type::I32);
+            let ok = self.bin(Operator::I32Or, empty, same, Type::I32);
+            self.check(ok, slow);
+        }
+        self.store_i64(obj, off, val);
+        let new_s = self.load_i32(row, IC_TRANS_NEWSHAPE);
+        self.store_i32(obj, SHAPE_OFFSET, new_s);
+        if !num {
+            let abs = self.load_i32(row, IC_TRANS_ABSSLOT);
+            self.post_barrier(self.h.post_write_barrier, obj, abs, val);
+        }
+        let w = self.load_i32(obj, OBJ_CLASS_IDX_OFFSET);
+        self.clear_bits(obj, w, CLASS_WORD_RANGES);
+        let t = self.edge(inst, 0, &[obj])?;
+        self.terminate(Terminator::Br { target: t });
+        self.cur = slow;
+        let live = self.live_across(inst);
+        let recv = self.box_tagged(TAG_OBJECT, obj);
+        let bits = CLASS_WORD_SLOTS | if c.types { CLASS_WORD_SHALLOW } else { 0 };
+        let (cv, sv, bv) = (self.i32c(cache), self.i32c(n + 1), self.i32c(bits));
+        let (ok, out) = self.gc_call(self.h.init_field, &[recv, at, val, cv, sv, bv], &live)?;
+        self.epoch_same = None;
+        let o2 = self.un(Operator::I32WrapI64, out, Type::I32);
+        let t = self.edge(inst, 0, &[o2])?;
+        let f = self.edge(inst, 1, &[])?;
+        self.cond_br(ok, t, f);
+        Ok(())
     }
 
     /// An element store's duty to the array stamp's claims on `obj`'s

@@ -55,11 +55,16 @@ answer).
    entirely, although `I32Ovf`/`IntArith` signatures already compute
    ranges.
 6. **Whole-script declines.** Any unsupported op declines the whole
-   script to baseline: `typeof globalName`, class constructors,
-   generators/async, for-of/iterators, `??`, spread (call and array),
-   `super`, `new.target`, `Hole`, `InitElemInc`, singleton `Object`,
-   getter/setter element inits, lexical environments
-   (`PushLexicalEnv`...), non-global `GetName`/`SetName`, eval.
+   script to baseline: class constructors, generators/async, for-of and
+   iterator protocols, spread (call and array), `super`, `Hole`,
+   `InitElemInc`, singleton `Object`, getter/setter element inits,
+   lexical environments (`PushLexicalEnv`...), non-global
+   `GetName`/`SetName`, eval. Built since the audit (2026-09-28):
+   `typeof globalName` (`js.rt.getname.typeof`), `new.target`
+   (`frame.new_target`), for-in (`js.rt.iter`, `iter.more`, `iter.done`,
+   `iter.end`), try/finally (`Finally` a marker; its rethrow exits).
+   Octane after them: pdfjs 1001 MIR scripts to 3 baseline (the global
+   script, a 32K-bytecode script, one eval user); earley-boyer 463 to 2.
 7. **Unused IR.** `LoadGName`, `StoreGName`, `CheckBinding`,
    `NewObject(_)`, `NewArray`, `InitField`, `PublishLayout`,
    `CallDirect`, `CallNative`, `GuardSingleton`,

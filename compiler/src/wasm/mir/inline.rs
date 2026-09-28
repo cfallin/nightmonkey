@@ -29,6 +29,11 @@ pub(crate) struct Callee {
     /// kill exits (its dirty edge leaves for baseline, and an exit's
     /// rest, run there, reports whether it demoted anything).
     pub fenced: bool,
+    /// Built for a `this` under construction (`Ty::Ctor`): the state every
+    /// normal return leaves it in, where they agree (fields added, or
+    /// `None`: published, or disagreeing). The caller's next use of the
+    /// object guards it back to that state (`guard.ctor`).
+    pub this_out: Option<(u32, u32, bool)>,
 }
 
 /// The blocks a kill's dirty edge leads to that exit.
@@ -126,6 +131,7 @@ impl Maps {
                 JsRt(mir::ops::RtOp::InitPropGetSet(self.atom(a), k))
             }
             JsRt(mir::ops::RtOp::Intrinsic(a)) => JsRt(mir::ops::RtOp::Intrinsic(self.atom(a))),
+            JsRt(mir::ops::RtOp::GetNameTypeof(a)) => JsRt(mir::ops::RtOp::GetNameTypeof(self.atom(a))),
             Restamp(i) => Restamp(self.restamp_base + i),
             ConstObj(_) | GuardSingleton(_) | CheckBinding(_) | LoadGName(_)
             | StoreGName(_) | CallNative(_) => {
