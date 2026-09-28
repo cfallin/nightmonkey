@@ -45,6 +45,32 @@ if [ "${NIGHT_INPROCESS_OFF:-0}" != 1 ]; then
   esac
 fi
 
+# jit_test.py does not count a `|jit-test| error:` test whose uncaught error
+# is the wrong one (check_output returns a bare False, not FAILED): it prints
+# TEST-UNEXPECTED-FAIL in the automation format and nothing at all in the
+# default one, and its summary says "Failed: 0". So the lane runs in the
+# automation format (unless the caller picks one) and counts those lines.
+fmt=()
+case " $* " in
+  *" --format"*) ;;
+  *) fmt=(--format=automation) ;;
+esac
+log=$(mktemp)
+# The automation format's structured log goes to $MOZ_UPLOAD_DIR, else the
+# current directory.
+upload=$(mktemp -d)
+trap 'rm -rf "$combined" "$log" "$upload"' EXIT
+export MOZ_UPLOAD_DIR=${MOZ_UPLOAD_DIR:-$upload}
+set +e
 python3 "$firefox/js/src/jit-test/jit_test.py" \
-  --exclude-from "$combined" \
-  "$build/bin/inproc-shell.sh" "$@"
+  --exclude-from "$combined" "${fmt[@]}" \
+  "$build/bin/inproc-shell.sh" "$@" | tee "$log"
+rc=${PIPESTATUS[0]}
+set -e
+unexpected=$(grep -c '^TEST-UNEXPECTED-FAIL' "$log" || true)
+if [ "$unexpected" -ne 0 ]; then
+  echo "run-jit-tests.sh: $unexpected TEST-UNEXPECTED-FAIL line(s), counted or not by jit_test.py:"
+  grep '^TEST-UNEXPECTED-FAIL' "$log"
+  [ "$rc" -ne 0 ] || rc=1
+fi
+exit "$rc"

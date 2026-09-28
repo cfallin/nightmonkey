@@ -43,6 +43,7 @@ dataview/resizable-dataview-bytelength-with-sab.js
 dataview/resizable-dataview-byteoffset-sab.js
 dataview/resizable-dataview-get-elem-with-sab.js
 dataview/resizable-dataview-set-elem-with-sab.js
+debug/bug-1995637.js
 fuses/species-fuse-sharedarraybuffer-1.js
 fuses/species-fuse-sharedarraybuffer-2.js
 ion/bug1877709.js

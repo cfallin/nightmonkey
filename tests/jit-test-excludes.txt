@@ -18,10 +18,12 @@ auto-regress/bug1448582-3.js
 auto-regress/bug1448582-4.js
 auto-regress/bug1448582-5.js
 auto-regress/bug1448582-6.js
+auto-regress/bug765483.js
 baseline/bug836742.js
 baseline/metadata-hook-on-stack.js
 basic/bug-1649234-2.js
 basic/bug1015339.js
+basic/bug1100623.js
 basic/bug1122581.js
 basic/bug1293575.js
 basic/bug1731540.js
@@ -65,6 +67,7 @@ debug/Environment-setVariable-16.js
 debug/Environment-setVariable-17.js
 debug/Environment-setVariable-18.js
 debug/Frame-eval-25.js
+debug/Frame-eval-32.js
 debug/Frame-eval-33.js
 debug/Frame-eval-stack.js
 debug/Frame-identity-01.js
@@ -101,6 +104,7 @@ debug/prologueFailure-02.js
 debug/prologueFailure-03.js
 debug/resumption-03.js
 debug/resumption-05.js
+debug/uncaughtExceptionHook-03.js
 errors/bug1961019.js
 errors/capture-stack-jit.js
 errors/capture-stack.js
@@ -153,8 +157,10 @@ jaeger/loops/hoist-05.js
 latin1/decompiler.js
 modules/bug-1245518.js
 modules/bug-1498980.js
+modules/bug-1502669.js
 modules/bug-1782496.js
 modules/failure-on-resume.js
+parser/bug-1263355-27.js
 # AOT-executed scripts never baseline-compile, so no profiler script sources register.
 profiler/bug2002982.js
 profiler/interpreter-stacks.js
