@@ -226,6 +226,27 @@ impl<'a> Shape<'a> {
         m.get(&cls)?.get(&name).copied()
     }
 
+    /// Every class whose layout types field `name` (a class word's
+    /// identity, layout key + 1), with its type for it; made on first use.
+    fn name_classes(&self, name: crate::ids::NameId) -> std::rc::Rc<Vec<(u32, TagSet)>> {
+        if let Some(v) = self.name_classes.borrow().get(&name) {
+            return v.clone();
+        }
+        let mut v: Vec<(u32, TagSet)> = self
+            .ctx
+            .layout_field_types_in
+            .iter()
+            .filter_map(|(k, row)| {
+                let c = row.get(&name).filter(|c| !c.is_none())?;
+                Some((k.get(), claim_tags(*c)))
+            })
+            .collect();
+        v.sort_by_key(|e| e.0);
+        let v = std::rc::Rc::new(v);
+        self.name_classes.borrow_mut().insert(name, v.clone());
+        v
+    }
+
     /// TYPES (the SHALLOW bit) where layout `k` predicts a type for any
     /// field (`layout_field_types_in`): what MIR's allocations seed and
     /// its stamps keep, beside bbv's numeric-mask rule.
@@ -450,6 +471,10 @@ const LENGTH_TA: bool = true;
 /// Property stores keep TYPES for a value of the field's predicted type
 /// (`field_claim`), and reads under TYPES are of that type.
 const FIELD_MASKS: bool = true;
+
+/// How many classes a store lists (`field_claim`) before it names only
+/// the receiver's predicted ones.
+const MAX_STORE_CLASSES: usize = 8;
 
 /// Receivers the analysis hints one class for get typed sites
 /// (`hinted_site`).
@@ -821,6 +846,9 @@ struct Shape<'a> {
     /// For a build for inlining at a call passing known closures: the
     /// formals holding one (`Ty::Fn`), by formal.
     formal_fns: Vec<Option<ScriptId>>,
+    /// `name_classes`, by name, made on first use.
+    #[allow(clippy::type_complexity)]
+    name_classes: std::cell::RefCell<BTreeMap<crate::ids::NameId, std::rc::Rc<Vec<(u32, TagSet)>>>>,
     /// The layout rows' fields, by layout (`layout_field`), made on first
     /// use.
     #[allow(clippy::type_complexity)]
@@ -872,6 +900,7 @@ impl<'a> Shape<'a> {
             inline_depth: 0,
             callees: Default::default(),
             formal_fns: vec![],
+            name_classes: Default::default(),
             layout_fields: Default::default(),
         })
     }
@@ -983,11 +1012,15 @@ struct Run<'s, 'a> {
     ta_poly_site: bool,
     /// The predicted type of the field the property store being built
     /// writes, for its TYPES maintenance (`field_mask` attachments).
-    store_mask: Option<TagSet>,
+    store_mask: Option<(Vec<(u32, TagSet)>, bool)>,
     /// Advisory classes (`hinted_site`): of values, and of the frame
     /// slots whose writes carry them.
     val_cls: BTreeMap<mir::Value, u32>,
     slot_cls: BTreeMap<usize, u32>,
+    /// Values that are the frame's `this` (`FunctionThis`'s results),
+    /// and the frame slots a write carries that to (`.this`).
+    this_vals: std::collections::BTreeSet<mir::Value>,
+    this_slots: std::collections::BTreeSet<usize>,
 }
 
 impl<'s, 'a> Run<'s, 'a> {
@@ -1034,6 +1067,8 @@ impl<'s, 'a> Run<'s, 'a> {
             store_mask: None,
             val_cls: BTreeMap::new(),
             slot_cls: BTreeMap::new(),
+            this_vals: Default::default(),
+            this_slots: Default::default(),
             inline_sites: 0,
             inline_insts: 0,
         }
@@ -1077,11 +1112,12 @@ impl<'s, 'a> Run<'s, 'a> {
     /// Give a generic `call` the site's likely callees (`likely_targets`),
     /// for its lowering's direct arms.
     fn attach_targets(&mut self, inst: mir::Inst) {
-        if let Some(mask) = self.store_mask {
+        if let Some((classes, complete)) = self.store_mask.clone() {
             if matches!(self.f.insts[inst].op, Opcode::StoreField(_) | Opcode::JsSetProp(..)) {
                 let a = self.f.attachments.push(mir::func::Attachment {
                     site: Some(self.site(self.pc)),
-                    field_mask: Some(mir::func::encode_tags(mask)),
+                    field_types: classes.iter().map(|&(k, t)| (k, mir::func::encode_tags(t))).collect(),
+                    field_types_complete: complete,
                     ..Default::default()
                 });
                 self.f.insts[inst].attach = Some(a);
@@ -1106,7 +1142,8 @@ impl<'s, 'a> Run<'s, 'a> {
             ic_cell: None,
             call_cell: None,
             slot: None,
-            field_mask: None,
+            field_types: vec![],
+            field_types_complete: false,
             targets,
             ta_poly: false,
         });
@@ -1720,8 +1757,12 @@ impl<'s, 'a> Run<'s, 'a> {
         let v = self.boxed(x);
         let o = self.guard(Opcode::GuardUnbox(UnboxKind::Obj), vec![v], MType::OBJ_TOP);
         let keys = KeyRange { lo, hi };
-        let ty = Ty::Obj(keys, false);
-        let g = self.guard(Opcode::GuardLayout { keys, types: false }, vec![o], ty.mir());
+        // Identity and TYPES are what OPT means (§4.3): where the layouts
+        // type their fields, the guard proves TYPES too, and `this`'s
+        // field reads are of their predicted types unchecked.
+        let types = (lo.get()..=hi.get()).all(|k| self.s.types_bit(k) != 0);
+        let ty = Ty::Obj(keys, types);
+        let g = self.guard(Opcode::GuardLayout { keys, types }, vec![o], ty.mir());
         self.st.pop();
         self.push(g, ty);
     }
@@ -1958,35 +1999,42 @@ impl<'s, 'a> Run<'s, 'a> {
         self.site_for(ps.layout_id, ps.hi_layout_id, ps.slot, ps.claim, ps.shallow_possible, name)
     }
 
-    /// The predicted type of field `name` a store at `pc` through `recv`
-    /// must be to keep TYPES (`FIELD_MASKS`): the layouts' masks for it
-    /// (all of them, intersected), the layouts from the site row, the
-    /// hinted class, or, through `this`, the script's own layout row.
-    fn field_claim(&mut self, pc: Pc, name: mir::entity::AtomId, recv: Slot) -> Option<TagSet> {
+    /// The classes a store of field `name` at `pc` through `recv` checks
+    /// its value against (`FIELD_MASKS`), each with its own predicted type
+    /// for the field, as an IC validating the object's class before it
+    /// stores: every class typing the field (complete) where they are few,
+    /// else those the receiver is predicted of (the site row's, the hinted
+    /// class, or, through `this`, the script's own row or the layout its
+    /// constructor builds).
+    fn field_claim(&mut self, pc: Pc, name: mir::entity::AtomId, recv: Slot) -> Option<(Vec<(u32, TagSet)>, bool)> {
         if !FIELD_MASKS {
             return None;
+        }
+        let n = self.s.names?.lookup(self.mm.atoms[name].chars())?;
+        let all = self.s.name_classes(n);
+        if all.len() <= MAX_STORE_CLASSES {
+            return Some((all.to_vec(), true));
         }
         let site = crate::ids::Site::new(self.s.sid, pc);
         let (lo, hi) = if let Some(ps) = self.s.ctx.prop_sites_in.get(&site) {
             (ps.layout_id, ps.hi_layout_id)
         } else if let Some(&cls) = self.val_cls.get(&recv.v) {
             (cls, cls)
-        } else if recv.v == self.st.first().map(|x| x.v)? {
-            let li = self.s.ctx.this_layouts_in.get(&self.s.sid)?;
-            (li.layout_id, li.hi_layout_id)
+        } else if recv.v == self.st.first().map(|x| x.v)? || self.this_vals.contains(&recv.v) {
+            let ctx = self.s.ctx;
+            let sid = self.s.sid;
+            if let Some(li) = ctx.this_layouts_in.get(&sid) {
+                (li.layout_id, li.hi_layout_id)
+            } else if let Some(si) = ctx.stamp_ctors_in.get(&sid).or_else(|| ctx.deleg_restamps_in.get(&sid)) {
+                (si.layout_id, si.layout_id)
+            } else {
+                return None;
+            }
         } else {
             return None;
         };
-        let n = self.s.names?.lookup(self.mm.atoms[name].chars())?;
-        let mut t = TagSet::ALL;
-        for k in lo..=hi {
-            let c = *self.s.ctx.layout_field_types_in.get(&crate::ids::LayoutKey::new(k).stamp())?.get(&n)?;
-            if c.is_none() {
-                return None;
-            }
-            t = t.intersect(claim_tags(c));
-        }
-        Some(t)
+        let some: Vec<(u32, TagSet)> = all.iter().copied().filter(|&(k, _)| k > lo && k <= hi + 1).collect();
+        Some((some, false))
     }
 
     /// A property access with no site row, through a receiver the analysis
@@ -2968,6 +3016,11 @@ impl<'s, 'a> Run<'s, 'a> {
 
     /// Assign frame slot `ix`, writing it through to the frame.
     fn set_frame_slot(&mut self, ix: usize, x: Slot) {
+        if self.this_vals.contains(&x.v) {
+            self.this_slots.insert(ix);
+        } else {
+            self.this_slots.remove(&ix);
+        }
         match self.val_cls.get(&x.v) {
             Some(&c) => self.slot_cls.insert(ix, c),
             None => self.slot_cls.remove(&ix),
@@ -3036,6 +3089,10 @@ impl<'s, 'a> Run<'s, 'a> {
                 self.op(op)?;
                 if self.live {
                     self.local_restamp(pc);
+                    if op == JSOp::FunctionThis {
+                        let v = self.top().v;
+                        self.this_vals.insert(v);
+                    }
                     // A property read's value class, hinted (bbv's
                     // `attach_likely_cls`).
                     if matches!(op, JSOp::GetProp | JSOp::GetElem) {
@@ -3453,6 +3510,9 @@ impl<'s, 'a> Run<'s, 'a> {
                 let x = self.st[ix];
                 if let Some(&c) = self.slot_cls.get(&ix) {
                     self.val_cls.insert(x.v, c);
+                }
+                if self.this_slots.contains(&ix) {
+                    self.this_vals.insert(x.v);
                 }
                 self.st.push(x);
             }
@@ -4315,11 +4375,15 @@ impl<'s, 'a> Run<'s, 'a> {
                 // type (statically) keeps TYPES as a typed store; another
                 // goes through the IC, whose store keeps the bit by the
                 // value's tag or leaves it to the engine, which clears it.
+                // A value not statically of the field's type still stores
+                // to the slot, as a store without the TYPES claim: its
+                // lowering keeps the bit by the value's tag, or leaves the
+                // store to the engine, which clears it.
                 let vtags = v.ty.tags();
-                let site = self
-                    .typed_site(pc, a)
-                    .or_else(|| self.hinted_site(recv.v, a))
-                    .filter(|s| !s.types || vtags.is_nonempty_subset_of(s.store_tags));
+                let site = self.typed_site(pc, a).or_else(|| self.hinted_site(recv.v, a)).map(|mut s| {
+                    s.types &= vtags.is_nonempty_subset_of(s.store_tags);
+                    s
+                });
                 let proven = site.and_then(|site| self.proven_recv(recv, &site));
                 // The IC arm of an unproven typed store keeps facts, a kill
                 // exiting; where it cannot, it is a fence the two arms meet
@@ -4333,7 +4397,16 @@ impl<'s, 'a> Run<'s, 'a> {
                 };
                 match site {
                     Some(_) if proven.is_some() => {
-                        let (o, site) = proven.unwrap();
+                        let (mut o, site) = proven.unwrap();
+                        if !site.types {
+                            // Its TYPES claim is not the store's to keep.
+                            if let MType::Obj(mut info) = self.f.ty(o) {
+                                if let Some(c) = info.layout.as_mut() {
+                                    c.types = false;
+                                }
+                                o = self.weaken(o, MType::Obj(info));
+                            }
+                        }
                         let mut x = self.boxed(v);
                         if site.types {
                             x = self.weaken(x, MType::val(site.store_tags));
@@ -4612,6 +4685,7 @@ impl<'s, 'a> Run<'s, 'a> {
                 if let Some(&lid) = self.s.ctx.lit_stamps_in.get(&self.site(self.pc)) {
                     let w = (lid + 1) | crate::wasm::bbv::abi::CLASS_WORD_SLOTS;
                     self.inst(Opcode::StampFresh(w), vec![v], None);
+                    self.val_cls.insert(v, lid);
                 }
                 self.push(v, Ty::Val(TagSet::OBJECT));
             }
@@ -4752,6 +4826,14 @@ impl<'s, 'a> Run<'s, 'a> {
                     }
                     _ => self.js(Opcode::Construct(nslots, word), vals, MType::val(TagSet::OBJECT)),
                 };
+                // The object the site's constructor builds: its layout, as
+                // an advisory class (checked at use).
+                let built = mono
+                    .and_then(|f| self.s.ctx.stamp_ctors_in.get(&f))
+                    .or_else(|| self.s.ctx.construct_sites_in.get(&site));
+                if let Some(si) = built {
+                    self.val_cls.insert(r, si.layout_id);
+                }
                 self.push(r, Ty::Val(TagSet::OBJECT));
             }
             Call | CallIgnoresRv | CallContent => {

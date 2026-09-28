@@ -158,9 +158,15 @@ pub struct Attachment {
     pub ic_cell: Option<u32>,
     pub call_cell: Option<u32>,
     pub slot: Option<SlotIndex>,
-    /// A property store's field's predicted type, which the value must
-    /// have for the object to keep TYPES (`encode_tags`).
-    pub field_mask: Option<u32>,
+    /// A property store's expected classes (a class word's identity:
+    /// layout key + 1) with each one's predicted type for the field
+    /// (`encode_tags`): the store keeps TYPES iff the value is of its
+    /// object's own class's type (`types=[k:mask, ...]`).
+    pub field_types: Vec<(u32, u32)>,
+    /// Whether `field_types` names every class that types the field (then
+    /// an object of any other class keeps TYPES: its layout claims no
+    /// such field) (`complete=1`).
+    pub field_types_complete: bool,
     /// Candidate call targets, for later inlining.
     pub targets: Vec<ScriptId>,
     /// An element site whose receivers are typed arrays of several kinds

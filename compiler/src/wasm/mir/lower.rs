@@ -4319,14 +4319,82 @@ impl<'a> Lower<'a> {
     }
 
     /// A store's duty to the object's word `w` (§4.6): TYPES survives
-    /// only a value of the stored field's predicted type (`store_mask`);
-    /// any other store drops it (`drop_types`). RANGES, which no MIR claim
-    /// reads, is dropped either way.
+    /// only a value of the stored field's predicted type for the object's
+    /// own class (`field_types`: the classes the site expects, as an IC
+    /// validating the object's class before it stores); any other store
+    /// drops it (`drop_types`). RANGES, which no MIR claim reads, is
+    /// dropped either way.
     fn store_types(&mut self, inst: mir::Inst, obj: Value, w: Value, val: Value, slow: Block) {
-        match self.store_mask(inst) {
-            Some(m) => self.keep_types_by_mask(inst, obj, w, val, m, slow),
-            None => self.drop_types(obj, w, slow),
+        let Some(a) = self.f.insts[inst].attach.filter(|&a| {
+            let at = &self.f.attachments[a];
+            at.field_types_complete || !at.field_types.is_empty()
+        }) else {
+            self.drop_types(obj, w, slow);
+            return;
+        };
+        let at = &self.f.attachments[a];
+        let mut classes: Vec<(u32, TagSet)> =
+            at.field_types.iter().map(|&(k, m)| (k, mir::func::decode_tags(m))).collect();
+        let complete = at.field_types_complete;
+        // A receiver proven of some layouts is of no other class.
+        let proven = self
+            .ty(self.f.insts[inst].args[0])
+            .obj_info()
+            .and_then(|o| o.layout)
+            .filter(|c| c.state == mir::types::LayoutState::Published)
+            .map(|c| (c.keys.lo.get() + 1, c.keys.hi.get() + 1));
+        if let Some((lo, hi)) = proven {
+            if complete {
+                classes.retain(|&(k, _)| k >= lo && k <= hi);
+                let n = (hi - lo + 1) as usize;
+                let first = classes.first().map(|c| c.1);
+                if classes.is_empty() {
+                    self.clear_bits(obj, w, CLASS_WORD_RANGES);
+                    return;
+                }
+                if classes.len() == n && classes.iter().all(|c| Some(c.1) == first) {
+                    self.keep_types_known(inst, obj, w, val, first.unwrap(), slow);
+                    return;
+                }
+            }
         }
+        // By the object's class: its stamp's identity, or while it is
+        // constructed its early key (none: no class, no claim to check).
+        let m16 = self.i32c(0xFFFF);
+        let idx = self.bin(Operator::I32And, w, m16, Type::I32);
+        let ksh = self.i32c(EARLY_KEY_SHIFT);
+        let kraw = self.bin(Operator::I32ShrU, w, ksh, Type::I32);
+        let km = self.i32c(EARLY_KEY_MAX);
+        let early = self.bin(Operator::I32And, kraw, km, Type::I32);
+        let sb = self.i32c(CLASS_WORD_SENTINEL);
+        let sent = self.bin(Operator::I32And, w, sb, Type::I32);
+        let id = self.select(Type::I32, early, idx, sent);
+        let join = self.body.add_block();
+        for (k, t) in classes {
+            let kv = self.i32c(k);
+            let is = self.bin(Operator::I32Eq, id, kv, Type::I32);
+            let (this_b, next) = (self.body.add_block(), self.body.add_block());
+            self.cond_br(is, Self::to(this_b), Self::to(next));
+            self.cur = this_b;
+            self.keep_types_known(inst, obj, w, val, t, slow);
+            self.terminate(Terminator::Br { target: Self::to(join) });
+            self.cur = next;
+        }
+        // Another class: with the list complete its layout types no such
+        // field (the store touches no claim), unless it has no class.
+        if complete {
+            let z = self.i32c(0);
+            let none = self.bin(Operator::I32Eq, id, z, Type::I32);
+            let (drop_b, keep_b) = (self.body.add_block(), self.body.add_block());
+            self.cond_br(none, Self::to(drop_b), Self::to(keep_b));
+            self.cur = keep_b;
+            self.clear_bits(obj, w, CLASS_WORD_RANGES);
+            self.terminate(Terminator::Br { target: Self::to(join) });
+            self.cur = drop_b;
+        }
+        self.drop_types(obj, w, slow);
+        self.terminate(Terminator::Br { target: Self::to(join) });
+        self.cur = join;
     }
 
     /// A store that falsifies TYPES: on an object under construction (no
@@ -4343,17 +4411,9 @@ impl<'a> Lower<'a> {
         self.clear_bits(obj, w, CLASS_WORD_RANGES | CLASS_WORD_SHALLOW);
     }
 
-    /// The predicted type of the field a store writes, from its
-    /// `field_mask` attachment (a likelier claim's bits).
-    fn store_mask(&self, inst: mir::Inst) -> Option<TagSet> {
-        let w = self.f.insts[inst].attach.and_then(|a| self.f.attachments[a].field_mask)?;
-        Some(mir::func::decode_tags(w))
-    }
-
-    /// A store of `val` to a field predicted `mask` keeps TYPES iff the
-    /// value is of that type (decided statically where its type says,
-    /// else by its tag); RANGES, which no MIR claim reads, is dropped.
-    fn keep_types_by_mask(&mut self, inst: mir::Inst, obj: Value, w: Value, val: Value, mask: TagSet, slow: Block) {
+    /// A store of `val` to an object whose class types the field `mask`:
+    /// TYPES survives iff the value is of it.
+    fn keep_types_known(&mut self, inst: mir::Inst, obj: Value, w: Value, val: Value, mask: TagSet, slow: Block) {
         let vt = match self.ty(self.f.insts[inst].args[1]) {
             MType::Val(s) => s.tags,
             _ => TagSet::ALL,

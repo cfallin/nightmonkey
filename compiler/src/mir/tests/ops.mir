@@ -70,7 +70,7 @@ b4(v41: obj{L3 types}):
 b5(v42: val{object} obj{Plain}):
   v44 = unbox.obj v42
   v45 = const.val int32 7
-  store_field v41, v45 x @{slot=0, mask=0x1} -> ok_clean b6, ok_dirty b90, err b92
+  store_field v41, v45 x @{slot=0, types=[1:0x1]} -> ok_clean b6, ok_dirty b90, err b92
 b6:
   guard.tags v3 {int32,double} -> ok b7(v46: val{int32,double}), fail b90
 b7(v46: val{int32,double}):

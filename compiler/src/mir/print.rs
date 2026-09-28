@@ -754,8 +754,12 @@ pub fn print_func(m: &Module, f: &Func) -> String {
                 if let Some(s) = at.slot {
                     items.push(format!("slot={s}"));
                 }
-                if let Some(k) = at.field_mask {
-                    items.push(format!("mask={k:#x}"));
+                if !at.field_types.is_empty() {
+                    let ts: Vec<_> = at.field_types.iter().map(|(k, m)| format!("{k}:{m:#x}")).collect();
+                    items.push(format!("types=[{}]", ts.join(", ")));
+                }
+                if at.field_types_complete {
+                    items.push("complete=1".to_string());
                 }
                 if !at.targets.is_empty() {
                     let ts: Vec<_> = at.targets.iter().map(|s| format!("s{s}")).collect();

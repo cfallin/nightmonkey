@@ -35,3 +35,33 @@ for (var round = 0; round < 100; round++) {
     assertEq(l.next.total(), "17e");
   }
 }
+
+// Delegating constructors (the object's early key is the outer class's)
+// and one store site reaching two classes whose same-named field has
+// different predicted types: each store is checked against its object's
+// own class.
+function Base(s) { this.strength = s; }
+function Mid(a, s) { Base.call(this, s); this.a = a; this.dir = 0; }
+function Leaf(a, s) { Mid.call(this, a, s); }
+Leaf.prototype = Mid.prototype;
+Mid.prototype.sum = function () { return this.a.v + this.strength.v + this.dir; };
+function A() { this.tag = "a"; this.n = 1; }
+function B() { this.tag = 7; this.n = 2; }
+function setTag(o, t) { o.tag = t; return o; }
+function tagOf(o) { return o.tag; }
+for (var round = 0; round < 200; round++) {
+  var l = new Leaf({ v: round }, { v: 2 });
+  assertEq(l.sum(), round + 2);
+  var x = setTag(new A(), "s" + round);
+  var y = setTag(new B(), round);
+  assertEq(tagOf(x), "s" + round);
+  assertEq(tagOf(y), round);
+  if (round % 50 == 49) {
+    setTag(x, round);
+    assertEq(tagOf(x) + 1, round + 1);
+    setTag(y, "t");
+    assertEq(tagOf(y), "t");
+    l.dir = "d";
+    assertEq(l.sum(), round + 2 + "d");
+  }
+}

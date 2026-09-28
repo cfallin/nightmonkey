@@ -1256,7 +1256,16 @@ impl Parser {
                 "ic" => a.ic_cell = Some(self.int()?),
                 "call" => a.call_cell = Some(self.int()?),
                 "slot" => a.slot = Some(SlotIndex::new(self.int()?)),
-                "mask" => a.field_mask = Some(self.int()?),
+                "types" => {
+                    self.expect_punct("[")?;
+                    while !self.eat_punct("]") {
+                        let k = self.int()?;
+                        self.expect_punct(":")?;
+                        a.field_types.push((k, self.int()?));
+                        self.eat_punct(",");
+                    }
+                }
+                "complete" => a.field_types_complete = self.int::<u32>()? != 0,
                 "ta" => a.ta_poly = self.int::<u32>()? != 0,
                 "targets" => {
                     self.expect_punct("[")?;
