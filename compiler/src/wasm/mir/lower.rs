@@ -260,7 +260,6 @@ struct Lower<'a> {
     /// `argc` without its flag bits.
     argc: Value,
     retval_out: Value,
-    script_param: Value,
     new_target: Value,
     blocks: BTreeMap<mir::Block, Block>,
     live_in: BTreeMap<mir::Block, BTreeSet<mir::Value>>,
@@ -427,7 +426,7 @@ pub fn lower<'a>(
     let body = FunctionBody::new(m, h.night_abi_sig2);
     let entry = body.entry;
     let p = |i: usize| body.blocks[entry].params[i].1;
-    let (cx, sp, argc, retval_out, script_param, new_target) = (p(0), p(1), p(2), p(3), p(4), p(5));
+    let (cx, sp, argc, retval_out, new_target) = (p(0), p(1), p(2), p(3), p(5));
     // Rooting slots and callee frames go above baseline's fixed frame and
     // locals, which therefore always hold valid Values (a fresh entry
     // initializes them): an exit can leave a dead one as it is. They
@@ -447,7 +446,6 @@ pub fn lower<'a>(
         vp: sp,
         argc,
         retval_out,
-        script_param,
         new_target,
         blocks: BTreeMap::new(),
         live_in: BTreeMap::new(),
@@ -5716,6 +5714,13 @@ impl<'a> Lower<'a> {
     /// Run this script's baseline body on the frame at `sp` with `argc`
     /// (resume and onramp bits included), and return its result.
     fn tail_to_baseline(&mut self, argc: Value) {
+        // The script from the frame's callee, not the `script` param: a
+        // param used anywhere is copied at entry, and that i32 stack
+        // argument read as a 64-bit slot defeats store forwarding from the
+        // caller's store on every call.
+        let callee = self.load_i64(self.sp, FrameLayout::CALLEE);
+        let fp = self.un(Operator::I32WrapI64, callee, Type::I32);
+        let script = self.load_i32(fp, FUNC_SCRIPT_SLOT_OFFSET);
         let call = self.call(
             Func::invalid(),
             &[
@@ -5723,7 +5728,7 @@ impl<'a> Lower<'a> {
                 self.sp,
                 argc,
                 self.retval_out,
-                self.script_param,
+                script,
                 self.new_target,
             ],
             &[Type::I32, Type::I32],
