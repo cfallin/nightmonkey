@@ -63,9 +63,9 @@ run();
 stress = true;
 run();
 stress = false;
-gczeal(7, 3);
+if (typeof gczeal == "function") gczeal(7, 3);
 run();
-gczeal(0);
+if (typeof gczeal == "function") gczeal(0);
 
 // Retention matches baseline's frame: a local's value stays alive until
 // the local is overwritten, even where it is dead, and no longer after;

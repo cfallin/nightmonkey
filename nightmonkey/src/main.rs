@@ -498,18 +498,26 @@ fn main() -> Result<()> {
                 continue;
             }
             let by_proto = od.proto.and_then(|p| row_of_proto.get(&p.id())).copied();
+            let row_chars = |lid: u32| -> Vec<Vec<u16>> {
+                env.likely_class_layouts[&env.layout_ctors[lid as usize]]
+                    .iter()
+                    .map(|&n| names.get(n).chars().to_vec())
+                    .collect()
+            };
             let lid = match by_proto {
                 Some(lid) => {
-                    // The constructor's row, if the object has exactly it.
-                    let key = env.layout_ctors[lid as usize];
-                    let row: Vec<Vec<u16>> = env.likely_class_layouts[&key]
-                        .iter()
-                        .map(|&n| names.get(n).chars().to_vec())
-                        .collect();
-                    if row != chars {
-                        continue;
+                    // The constructor's row, if the object has exactly it;
+                    // else the one row of its clump (a row extending the
+                    // constructor's: a two-phase or filled object) it has.
+                    if row_chars(lid) != chars {
+                        let base = row_chars(lid);
+                        match row_of.get(&chars) {
+                            Some(&ext) if ext != u32::MAX && chars.starts_with(&base) => ext,
+                            _ => continue,
+                        }
+                    } else {
+                        lid
                     }
-                    lid
                 }
                 None => match row_of.get(&chars) {
                     Some(&lid) if lid != u32::MAX => lid,
@@ -533,7 +541,22 @@ fn main() -> Result<()> {
             if (nfixed as usize) < ext_len[lid as usize] {
                 snapshot_stamps_short += 1;
             }
-            out.push((addr, (lid + 1) | night_compiler::wasm::stamp::SLOTS));
+            // TYPES (MIR.md §4.6, the any-type meaning of the MIR and
+            // baseline tiers; legacy reads the bit by its numeric masks):
+            // the image holds every field's value, so the stamp can check
+            // each against its layout's predicted type exactly, as a
+            // conforming store would keep the bit.
+            let key = env.layout_ctors[lid as usize];
+            let types = opts.pipeline != night_compiler::options::Pipeline::Legacy
+                && env.layout_field_types_tx.get(&key.stamp()).is_some_and(|claims| {
+                    let fields = &env.likely_class_layouts[&key];
+                    claims.values().any(|c| !c.is_none())
+                        && od.properties.iter().zip(fields).all(|(&(_, vid), n)| {
+                            claims.get(n).is_none_or(|&c| c.is_none() || value_conforms(&source, vid, c))
+                        })
+                });
+            let types = if types { night_compiler::wasm::stamp::TYPES } else { 0 };
+            out.push((addr, (lid + 1) | night_compiler::wasm::stamp::SLOTS | types));
         }
         out
     };
@@ -680,7 +703,11 @@ fn main() -> Result<()> {
         eprintln!(
             "nightmonkey: {n_sized} ctor-nslots entries, {patched} scripts armed, \
              {stamped} snapshot objects stamped ({snapshot_stamps_short} with fewer fixed \
-             slots than their clump's longest row)"
+             slots than their clump's longest row, {} with TYPES)",
+            snapshot_stamps
+                .iter()
+                .filter(|&&(_, w)| w & night_compiler::wasm::stamp::TYPES != 0)
+                .count()
         );
     }
 
@@ -753,4 +780,36 @@ fn main() -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// Whether snapshot value `vid` is of claimed type `c` (its tag; an
+/// object of a typed-array claim must be a typed array of that kind).
+fn value_conforms(
+    source: &night_compiler::source::Source,
+    vid: night_compiler::source::SourceObjectId,
+    c: night_compiler::facts::Claim,
+) -> bool {
+    use night_compiler::opsem::*;
+    use night_compiler::source::{ObjectKind, Primitive, SourceObject};
+    if vid.is_other() {
+        return false;
+    }
+    let prim = |p: Prims| p.subset_of(c.prims());
+    match source.object(vid) {
+        SourceObject::Primitive(Primitive::Undefined) => prim(PRIM_UNDEFINED),
+        SourceObject::Primitive(Primitive::Null) => prim(PRIM_NULL),
+        SourceObject::Primitive(Primitive::Boolean(_)) => prim(PRIM_BOOLEAN),
+        SourceObject::Primitive(Primitive::Int32(_)) => prim(PRIM_INT32),
+        SourceObject::Primitive(Primitive::Double(_)) => prim(PRIM_DOUBLE),
+        SourceObject::String(_) => prim(PRIM_STRING),
+        SourceObject::Symbol => prim(PRIM_SYMBOL),
+        SourceObject::Object(od) => {
+            c.bits() & night_compiler::facts::Claim::OBJECT.bits() != 0
+                && match c.ta_kind() {
+                    None => true,
+                    Some(k) => od.kind == ObjectKind::TypedArray(k.code()),
+                }
+        }
+        SourceObject::Script(_) | SourceObject::Scope(_) => false,
+    }
 }

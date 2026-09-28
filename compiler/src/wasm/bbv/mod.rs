@@ -207,6 +207,71 @@ pub(crate) fn construct_alloc_word(ctx: &TranslateCtx<'_>, mono: Option<ScriptId
     CLASS_WORD_SENTINEL | CLASS_WORD_SHALLOW | CLASS_WORD_SLOTS | CLASS_WORD_RANGES
 }
 
+/// TYPES (the SHALLOW bit) where layout `k` predicts a type for any field
+/// (`layout_field_types_in`, docs/MIR.md §4.6): what the MIR and baseline
+/// tiers' allocations seed and their stamps keep, beside bbv's numeric-mask
+/// rule. One rule for both tiers: an object built, stamped or restamped
+/// in baseline (after an exit, say) must carry the bit as MIR's would.
+pub(crate) fn layout_types_bit(ctx: &TranslateCtx<'_>, k: u32) -> u32 {
+    let typed = ctx
+        .layout_field_types_in
+        .get(&crate::ids::LayoutKey::new(k).stamp())
+        .is_some_and(|m| m.values().any(|c| !c.is_none()));
+    if typed {
+        CLASS_WORD_SHALLOW
+    } else {
+        0
+    }
+}
+
+/// Every class whose layout types field `name` (a class word's identity,
+/// layout key + 1), with its claim for it, by identity: what a store of
+/// the field checks its value against to keep TYPES (the MIR tier's
+/// `field_types`, the baseline tier's vouched stores).
+pub(crate) fn field_classes(ctx: &TranslateCtx<'_>, name: crate::ids::NameId) -> Vec<(u32, crate::facts::Claim)> {
+    let mut v: Vec<(u32, crate::facts::Claim)> = ctx
+        .layout_field_types_in
+        .iter()
+        .filter_map(|(k, row)| {
+            let c = *row.get(&name).filter(|c| !c.is_none())?;
+            Some((k.get(), c))
+        })
+        .collect();
+    v.sort_by_key(|e| e.0);
+    v
+}
+
+/// The most classes a store checks its value against by the object's
+/// identity (`field_classes`) before it settles for no check.
+pub(crate) const MAX_STORE_CLASSES: usize = 8;
+
+/// `construct_alloc_word` for the MIR and baseline tiers: TYPES seeded for
+/// a layout that predicts field types (`layout_types_bit`).
+pub(crate) fn typed_alloc_word(ctx: &TranslateCtx<'_>, mono: Option<ScriptId>, site: Site) -> u32 {
+    let w = construct_alloc_word(ctx, mono, site);
+    let si = mono
+        .and_then(|f| ctx.stamp_ctors_in.get(&f))
+        .or_else(|| ctx.construct_sites_in.get(&site));
+    match si {
+        Some(si) if w & CLASS_WORD_SENTINEL != 0 => w | layout_types_bit(ctx, si.layout_id),
+        _ => w,
+    }
+}
+
+/// `ctor_stamp_keep_bits` for the MIR and baseline tiers (TYPES kept by
+/// `layout_types_bit`).
+pub(crate) fn typed_keep_bits(ctx: &TranslateCtx<'_>, si: &StampCtorIn) -> u32 {
+    ctor_stamp_keep_bits(si) | layout_types_bit(ctx, si.layout_id)
+}
+
+/// `restamp_args` for the MIR and baseline tiers (TYPES kept by
+/// `layout_types_bit`).
+pub(crate) fn typed_restamp_args(ctx: &TranslateCtx<'_>, si: &StampCtorIn) -> Option<[u32; 7]> {
+    let mut r = restamp_args(si)?;
+    r[2] |= layout_types_bit(ctx, si.layout_id);
+    Some(r)
+}
+
 /// The validity bits a ctor-exit stamp of `si` carries forward: SLOTS,
 /// plus SHALLOW/RANGES only when the layout has masked fields / range
 /// claims (see `emit_class_idx_stamp_impl`).

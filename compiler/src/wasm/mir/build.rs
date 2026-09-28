@@ -169,6 +169,9 @@ const RT_OPS: bool = true;
 /// Whether `T.apply(this, arguments)` forwards the actuals.
 const APPLY_FWD: bool = true;
 
+/// Whether `T.call(thisArg, args…)` inlines its resolved targets.
+const CALL_FWD: bool = true;
+
 /// Whether scripts that read their actuals are built.
 const ACTUALS: bool = true;
 
@@ -232,48 +235,24 @@ impl<'a> Shape<'a> {
         if let Some(v) = self.name_classes.borrow().get(&name) {
             return v.clone();
         }
-        let mut v: Vec<(u32, TagSet)> = self
-            .ctx
-            .layout_field_types_in
-            .iter()
-            .filter_map(|(k, row)| {
-                let c = row.get(&name).filter(|c| !c.is_none())?;
-                Some((k.get(), claim_tags(*c)))
-            })
+        let v: Vec<(u32, TagSet)> = crate::wasm::bbv::field_classes(self.ctx, name)
+            .into_iter()
+            .map(|(k, c)| (k, claim_tags(c)))
             .collect();
-        v.sort_by_key(|e| e.0);
         let v = std::rc::Rc::new(v);
         self.name_classes.borrow_mut().insert(name, v.clone());
         v
     }
 
-    /// TYPES (the SHALLOW bit) where layout `k` predicts a type for any
-    /// field (`layout_field_types_in`): what MIR's allocations seed and
-    /// its stamps keep, beside bbv's numeric-mask rule.
+    /// TYPES where layout `k` predicts a type for any field
+    /// (`layout_types_bit`).
     fn types_bit(&self, k: u32) -> u32 {
-        let typed = self
-            .ctx
-            .layout_field_types_in
-            .get(&crate::ids::LayoutKey::new(k).stamp())
-            .is_some_and(|m| m.values().any(|c| !c.is_none()));
-        if typed {
-            crate::wasm::bbv::CLASS_WORD_SHALLOW
-        } else {
-            0
-        }
+        crate::wasm::bbv::layout_types_bit(self.ctx, k)
     }
 
-    /// A construct site's allocation word (`construct_alloc_word`), seeding
-    /// TYPES for a layout that predicts field types.
+    /// A construct site's allocation word (`typed_alloc_word`).
     fn alloc_word(&self, mono: Option<ScriptId>, site: crate::ids::Site) -> u32 {
-        let w = crate::wasm::bbv::construct_alloc_word(self.ctx, mono, site);
-        let si = mono
-            .and_then(|f| self.ctx.stamp_ctors_in.get(&f))
-            .or_else(|| self.ctx.construct_sites_in.get(&site));
-        match si {
-            Some(si) if w & crate::wasm::bbv::CLASS_WORD_SENTINEL != 0 => w | self.types_bit(si.layout_id),
-            _ => w,
-        }
+        crate::wasm::bbv::typed_alloc_word(self.ctx, mono, site)
     }
 
     /// Whether a call of script `k` may go straight to its compiled body
@@ -474,7 +453,7 @@ const FIELD_MASKS: bool = true;
 
 /// How many classes a store lists (`field_claim`) before it names only
 /// the receiver's predicted ones.
-const MAX_STORE_CLASSES: usize = 8;
+const MAX_STORE_CLASSES: usize = crate::wasm::bbv::MAX_STORE_CLASSES;
 
 /// Receivers the analysis hints one class for get typed sites
 /// (`hinted_site`).
@@ -1043,7 +1022,10 @@ impl<'s, 'a> Run<'s, 'a> {
             hoist_req: BTreeMap::new(),
             out: BTreeMap::new(),
             f,
-            mm: mir::Module::default(),
+            mm: mir::Module {
+                array_key_min: s.ctx.array_stamp_in.values().map(|&w| w & 0xFFFF).min(),
+                ..mir::Module::default()
+            },
             blocks: BTreeMap::new(),
             preheaders: BTreeMap::new(),
             entry_types: BTreeMap::new(),
@@ -1238,7 +1220,7 @@ impl<'s, 'a> Run<'s, 'a> {
         let op = Opcode::CtorStamp(
             si.layout_id,
             u32::try_from(si.fields.len()).unwrap(),
-            crate::wasm::bbv::ctor_stamp_keep_bits(si) | self.s.types_bit(si.layout_id),
+            crate::wasm::bbv::typed_keep_bits(self.s.ctx, si),
         );
         let t = self.boxed(self.st[0]);
         self.inst(op, vec![t], None);
@@ -1266,7 +1248,7 @@ impl<'s, 'a> Run<'s, 'a> {
             let op = Opcode::CtorPublish(
                 si.layout_id,
                 u32::try_from(si.fields.len()).unwrap(),
-                crate::wasm::bbv::ctor_stamp_keep_bits(si) | self.s.types_bit(si.layout_id),
+                crate::wasm::bbv::typed_keep_bits(self.s.ctx, si),
             );
             self.inst(op, vec![t], None);
         }
@@ -1322,10 +1304,9 @@ impl<'s, 'a> Run<'s, 'a> {
     }
 
     fn restamp(&mut self, si: &StampCtorIn, v: mir::Value) {
-        let Some(mut r) = crate::wasm::bbv::restamp_args(si) else {
+        let Some(r) = crate::wasm::bbv::typed_restamp_args(self.s.ctx, si) else {
             return;
         };
-        r[2] |= self.s.types_bit(si.layout_id);
         let i = u32::try_from(self.mm.restamps.len()).unwrap();
         self.mm.restamps.push(r);
         self.inst(Opcode::Restamp(i), vec![v], None);
@@ -2055,6 +2036,15 @@ impl<'s, 'a> Run<'s, 'a> {
                 (li.layout_id, li.hi_layout_id)
             } else if let Some(si) = ctx.stamp_ctors_in.get(&sid).or_else(|| ctx.deleg_restamps_in.get(&sid)) {
                 (si.layout_id, si.layout_id)
+            } else if let Some(ctors) = ctx.facts.ctor_publish.get(&sid) {
+                // A construction delegate (`ctor_publish`): the layouts
+                // of the constructors whose objects it may be building.
+                let keys: Vec<u32> = ctors
+                    .iter()
+                    .filter_map(|c| Some(ctx.stamp_ctors_in.get(c)?.layout_id + 1))
+                    .collect();
+                let some: Vec<(u32, TagSet)> = all.iter().copied().filter(|(k, _)| keys.contains(k)).collect();
+                return Some((some, false));
             } else {
                 return None;
             }
@@ -2671,6 +2661,77 @@ impl<'s, 'a> Run<'s, 'a> {
         );
         self.at(join);
         result
+    }
+
+    /// `target.call(thisArg, args…)` at a site whose target the analysis
+    /// resolved (`apply_targets`, `apply_target_sets`), operands `call,
+    /// target, thisArg, args…`: with the `.call` the pristine builtin, the
+    /// targets are inlined with `thisArg` as their `this` (a delegating
+    /// constructor's `Super.call(this, …)`), built knowing the closures
+    /// `fns` the call passes; any other target, or another `.call`, calls
+    /// generically. `None` where nothing can be inlined.
+    fn call_forward(&mut self, vals: &[mir::Value], fns: &[Option<ScriptId>]) -> Option<mir::Value> {
+        if !CALL_FWD {
+            return None;
+        }
+        let site = self.site(self.pc);
+        let facts = &self.s.ctx.facts;
+        if facts.apply_sites.get(&site) != Some(&crate::facts::CallForm::Call) {
+            return None;
+        }
+        let sids: Vec<ScriptId> = match facts.apply_targets.get(&site) {
+            Some(&k) => vec![k],
+            None => facts.apply_target_sets.get(&site).cloned().unwrap_or_default(),
+        };
+        let n = sids.len();
+        let targets: Vec<(ScriptId, std::rc::Rc<super::inline::Callee>)> = sids
+            .iter()
+            .take(MAX_INLINE_TARGETS + 1)
+            .filter(|&&k| self.s.fits_site(k, self.pc, n))
+            .filter_map(|&k| Some((k, self.s.callee_in(k, fns)?)))
+            .collect();
+        if targets.is_empty()
+            || targets.len() > MAX_INLINE_TARGETS
+            || !self.inline_budget(targets.iter().map(|(_, c)| c.f.insts.len()).sum())
+        {
+            return None;
+        }
+        let generic = (Opcode::Call, vals.to_vec());
+        // Arms with fences meet at `join`: `Obj` slots go in as `ObjHint`.
+        if targets.iter().any(|(_, c)| c.fenced) || !self.keepable(1) {
+            self.demote_objs();
+        }
+        let join = self.new_block();
+        let result = self.f.add_param(join, MType::VAL_TOP);
+        let (fast, slow) = (self.new_block(), self.new_block());
+        let is_call = self.inst(
+            Opcode::JsIsBuiltin(crate::wasm::translate::BC_FUN_CALL),
+            vec![vals[0]],
+            Some(MType::Bool),
+        );
+        self.term(Opcode::Br, vec![is_call], vec![Self::goto(fast), Self::goto(slow)]);
+        self.at(fast);
+        let r = self.inline_call(&targets, &vals[1..], Some(generic.clone()));
+        self.term(
+            Opcode::Jump,
+            vec![],
+            vec![Edge {
+                block: join,
+                args: vec![EdgeArg::Value(r)],
+            }],
+        );
+        self.at(slow);
+        let r = self.js(generic.0, generic.1, MType::VAL_TOP);
+        self.term(
+            Opcode::Jump,
+            vec![],
+            vec![Edge {
+                block: join,
+                args: vec![EdgeArg::Value(r)],
+            }],
+        );
+        self.at(join);
+        Some(result)
     }
 
     /// A generic op: both success edges continue with its output (of type
@@ -4898,7 +4959,10 @@ impl<'s, 'a> Run<'s, 'a> {
                     .filter(|&&k| self.s.fits_site(k, pc, n))
                     .filter_map(|&k| Some((k, self.s.callee_in(k, &fns)?)))
                     .collect();
-                let r = if argc == 2 && self.s.apply_fwd.as_ref().is_some_and(|f| f.contains(&pc)) {
+                let forward = if argc >= 1 { self.call_forward(&vals, &fns[1..]) } else { None };
+                let r = if let Some(r) = forward {
+                    r
+                } else if argc == 2 && self.s.apply_fwd.as_ref().is_some_and(|f| f.contains(&pc)) {
                     self.apply_forward(&vals)
                 } else if targets.is_empty()
                     || targets.len() > MAX_INLINE_TARGETS

@@ -315,6 +315,10 @@ struct Lower<'a> {
     baseline_calls: Vec<Value>,
     /// The stress mode's period (`Options::mir_stress`); 0 = off.
     stress: u32,
+    /// While a `guard.layout` is lowered: its word, identity and keys, for
+    /// the guard census's miss reason.
+    guard_word: Option<(Value, Value, mir::types::KeyRange)>,
+    guard_obj: Option<Value>,
     /// Whether the function has onramp roots, and (if so) the entry's
     /// test of `ARGC_ONRAMP_BIT`, which says how this activation began.
     has_onramps: bool,
@@ -473,6 +477,8 @@ pub fn lower<'a>(
         cur_frame: 0,
         baseline_calls: vec![],
         stress: o.stress,
+        guard_word: None,
+        guard_obj: None,
         has_onramps: f.roots.iter().any(|r| r.kind != RootKind::Entry),
         onramp_flag: argc,
         mm,
@@ -2366,8 +2372,7 @@ impl<'a> Lower<'a> {
                 let good = self.un(Operator::I32Eqz, frozen, Type::I32);
                 self.check(good, slow);
                 if duty {
-                    let w = self.load_i32(obj, OBJ_CLASS_IDX_OFFSET);
-                    self.clear_bits(obj, w, CLASS_WORD_RANGES | CLASS_WORD_SHALLOW);
+                    self.elem_duty(obj);
                 }
                 if !num {
                     self.pre_barrier(addr, 0);
@@ -2536,8 +2541,7 @@ impl<'a> Lower<'a> {
                 let thawed = self.un(Operator::I32Eqz, frozen, Type::I32);
                 self.check(thawed, fail);
                 if duty {
-                    let w = self.load_i32(a[0], OBJ_CLASS_IDX_OFFSET);
-                    self.clear_bits(a[0], w, CLASS_WORD_RANGES | CLASS_WORD_SHALLOW);
+                    self.elem_duty(a[0]);
                 }
                 if !num {
                     self.pre_barrier(addr, 0);
@@ -2996,7 +3000,11 @@ impl<'a> Lower<'a> {
                     let t = self.bin(Operator::I32Eq, t, bits, Type::I32);
                     ok = self.bin(Operator::I32And, ok, t, Type::I32);
                 }
+                self.guard_word = Some((w, id, keys));
+                self.guard_obj = Some(a[0]);
                 self.guard(inst, ok, &[a[0]])?;
+                self.guard_word = None;
+                self.guard_obj = None;
             }
             Opcode::CheckFuse(fuse) => {
                 let addr = self.mm.fuses[fuse].addr;
@@ -3070,8 +3078,85 @@ impl<'a> Lower<'a> {
         };
         let t = self.edge(inst, 0, outs)?;
         let f = self.edge(inst, 1, &[])?;
-        self.cond_br(ok, t, f);
+        let Some(census) = self.exit_census.filter(|_| self.guard_exits(fail_blk).is_some()) else {
+            self.cond_br(ok, t, f);
+            return Ok(());
+        };
+        // `--mir-exit-census`: which guard failed (an exit's block is
+        // shared by every guard at its pc).
+        let counted = self.body.add_block();
+        self.cond_br(ok, t, Self::to(counted));
+        self.cur = counted;
+        let id = self.census_guard(inst, fail_blk);
+        let (k, i) = (self.i32c(crate::options::MIR_GUARD_CENSUS_KIND), self.i32c(id));
+        self.call1(census, &[k, i], Type::I32);
+        if let Some((w, idx, keys)) = self.guard_word {
+            // A layout guard's miss, by the word: `id * 32 +` sentinel 16,
+            // no identity 8, identity in range 4, TYPES 2, SLOTS 1.
+            let bit = |l: &mut Self, v: Value, sh: u32| {
+                let s = l.i32c(sh);
+                l.bin(Operator::I32Shl, v, s, Type::I32)
+            };
+            let c31 = self.i32c(31);
+            let sent = self.bin(Operator::I32ShrU, w, c31, Type::I32);
+            let z = self.i32c(0);
+            let none = self.bin(Operator::I32Eq, idx, z, Type::I32);
+            let lo = self.i32c(keys.lo.get() + 1);
+            let rel = self.bin(Operator::I32Sub, idx, lo, Type::I32);
+            let span = self.i32c(keys.hi.get() - keys.lo.get());
+            let inr = self.bin(Operator::I32LeU, rel, span, Type::I32);
+            let tb = self.i32c(CLASS_WORD_SHALLOW);
+            let ty = self.bin(Operator::I32And, w, tb, Type::I32);
+            let ty = self.bin(Operator::I32Ne, ty, z, Type::I32);
+            let sbit = self.i32c(CLASS_WORD_SLOTS);
+            let sl = self.bin(Operator::I32And, w, sbit, Type::I32);
+            let sl = self.bin(Operator::I32Ne, sl, z, Type::I32);
+            let mut r = sl;
+            for (v, sh) in [(ty, 1), (inr, 2), (none, 3), (sent, 4)] {
+                let b = bit(self, v, sh);
+                r = self.bin(Operator::I32Or, r, b, Type::I32);
+            }
+            let base = self.i32c(id * 32);
+            let rid = self.bin(Operator::I32Add, base, r, Type::I32);
+            let k = self.i32c(crate::options::MIR_GUARD_CENSUS_KIND + 1);
+            self.call1(census, &[k, rid], Type::I32);
+            // The object itself (the runtime's trace prints it).
+            let obj = self.guard_obj.unwrap();
+            let k = self.i32c(crate::options::MIR_GUARD_CENSUS_KIND + 4);
+            self.call1(census, &[k, obj], Type::I32);
+        }
+        self.terminate(Terminator::Br { target: f });
         Ok(())
+    }
+
+    /// The pc of the exit (root or inline) guard failure block `b` ends in.
+    fn guard_exits(&self, b: mir::Block) -> Option<Pc> {
+        let t = self.f.terminator(b)?;
+        match self.f.insts[t].op {
+            Opcode::Exit { pc, .. } | Opcode::ExitThrow { pc, .. } | Opcode::ExitInline { pc, .. } => Some(pc),
+            _ => None,
+        }
+    }
+
+    /// The static record of a guard-failure census id: the guard, its
+    /// operands' types, and the exit it takes.
+    fn census_guard(&mut self, inst: mir::Inst, fail_blk: mir::Block) -> u32 {
+        static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let d = &self.f.insts[inst];
+        let tys: Vec<String> = d.args.iter().map(|&a| format!("{:?}", self.ty(a))).collect();
+        let pc = self.guard_exits(fail_blk).unwrap();
+        let t = self.f.terminator(fail_blk).unwrap();
+        let inl = matches!(self.f.insts[t].op, Opcode::ExitInline { .. });
+        crate::diag_line!(
+            "night: mir guard {id} sid#{} exit pc {pc}{} {} {:?} [{}]",
+            self.f.script,
+            if inl { " (inline)" } else { "" },
+            mir::print::mnemonic(&d.op),
+            d.op,
+            tys.join(", ")
+        );
+        id
     }
 
     /// A generic JS op through its helper (`ok_clean`, `ok_dirty`, `err`).
@@ -4273,6 +4358,19 @@ impl<'a> Lower<'a> {
         let n = self.i32c(nfields);
         let covers = self.bin(Operator::I32GeU, span, n, Type::I32);
         self.check(covers, done);
+        if let Some(census) = self.exit_census.filter(|_| keep & CLASS_WORD_SHALLOW != 0) {
+            // `--mir-exit-census`: a stamp publishing without the TYPES
+            // its layout claims (lost during construction), by layout.
+            let tb = self.i32c(CLASS_WORD_SHALLOW);
+            let t = self.bin(Operator::I32And, w0, tb, Type::I32);
+            let (count, go) = (self.body.add_block(), self.body.add_block());
+            self.cond_br(t, Self::to(go), Self::to(count));
+            self.cur = count;
+            let (k, i) = (self.i32c(crate::options::MIR_GUARD_CENSUS_KIND + 3), self.i32c(layout));
+            self.call1(census, &[k, i], Type::I32);
+            self.terminate(Terminator::Br { target: Self::to(go) });
+            self.cur = go;
+        }
         let kb = self.i32c(keep);
         let bits = self.bin(Operator::I32And, w0, kb, Type::I32);
         let idx = self.i32c(layout + 1);
@@ -4335,7 +4433,7 @@ impl<'a> Lower<'a> {
             let at = &self.f.attachments[a];
             at.field_types_complete || !at.field_types.is_empty()
         }) else {
-            self.drop_types(obj, w, slow);
+            self.drop_types(inst, obj, w, slow);
             return;
         };
         let at = &self.f.attachments[a];
@@ -4398,7 +4496,7 @@ impl<'a> Lower<'a> {
             self.terminate(Terminator::Br { target: Self::to(join) });
             self.cur = drop_b;
         }
-        self.drop_types(obj, w, slow);
+        self.drop_types(inst, obj, w, slow);
         self.terminate(Terminator::Br { target: Self::to(join) });
         self.cur = join;
     }
@@ -4474,13 +4572,37 @@ impl<'a> Lower<'a> {
     /// fact covers its word) the bit is cleared here; on a published one
     /// the store goes to `slow`, the engine's, which clears it and bumps
     /// the epoch (so the op reports dirt, and facts leave with it).
-    fn drop_types(&mut self, obj: Value, w: Value, slow: Block) {
+    fn drop_types(&mut self, inst: mir::Inst, obj: Value, w: Value, slow: Block) {
         let m = self.i32c(CLASS_WORD_SHALLOW | CLASS_WORD_SENTINEL);
         let bits = self.bin(Operator::I32And, w, m, Type::I32);
         let pub_shallow = self.i32c(CLASS_WORD_SHALLOW);
         let bad = self.bin(Operator::I32Eq, bits, pub_shallow, Type::I32);
         let ok = self.un(Operator::I32Eqz, bad, Type::I32);
         self.check(ok, slow);
+        if let Some(census) = self.exit_census {
+            // `--mir-exit-census`: which stores drop TYPES from an object
+            // under construction (no epoch bump, so no other trace).
+            static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let d = &self.f.insts[inst];
+            let site = d.attach.and_then(|a| self.f.attachments[a].site);
+            crate::diag_line!(
+                "night: mir typesdrop {id} sid#{} {:?} {} [{:?}]",
+                self.f.script,
+                site,
+                mir::print::mnemonic(&d.op),
+                d.args.get(1).map(|&v| self.ty(v))
+            );
+            let all = self.i32c(CLASS_WORD_SHALLOW | CLASS_WORD_SENTINEL);
+            let hit = self.bin(Operator::I32Eq, bits, all, Type::I32);
+            let (count, go) = (self.body.add_block(), self.body.add_block());
+            self.cond_br(hit, Self::to(count), Self::to(go));
+            self.cur = count;
+            let (k, i) = (self.i32c(crate::options::MIR_GUARD_CENSUS_KIND + 2), self.i32c(id));
+            self.call1(census, &[k, i], Type::I32);
+            self.terminate(Terminator::Br { target: Self::to(go) });
+            self.cur = go;
+        }
         self.clear_bits(obj, w, CLASS_WORD_RANGES | CLASS_WORD_SHALLOW);
     }
 
@@ -4494,7 +4616,7 @@ impl<'a> Lower<'a> {
         if vt.is_nonempty_subset_of(mask) {
             self.clear_bits(obj, w, CLASS_WORD_RANGES);
         } else if vt.intersect(mask).is_empty() {
-            self.drop_types(obj, w, slow);
+            self.drop_types(inst, obj, w, slow);
         } else {
             let conf = self.has_tags(val, mask);
             let (keep, drop, join) = (self.body.add_block(), self.body.add_block(), self.body.add_block());
@@ -4503,10 +4625,37 @@ impl<'a> Lower<'a> {
             self.clear_bits(obj, w, CLASS_WORD_RANGES);
             self.terminate(Terminator::Br { target: Self::to(join) });
             self.cur = drop;
-            self.drop_types(obj, w, slow);
+            self.drop_types(inst, obj, w, slow);
             self.terminate(Terminator::Br { target: Self::to(join) });
             self.cur = join;
         }
+    }
+
+    /// An element store's duty to the array stamp's claims on `obj`'s
+    /// word (`ranges_duty` says it owes one): RANGES cleared, and TYPES
+    /// where the word is an array's stamp, whose TYPES claims its
+    /// elements. On any other object (BigInteger's digits are elements of
+    /// a plain object) TYPES is its fields' claim, which an element store
+    /// cannot touch.
+    fn elem_duty(&mut self, obj: Value) {
+        let w = self.load_i32(obj, OBJ_CLASS_IDX_OFFSET);
+        let Some(min) = self.mm.array_key_min else {
+            self.clear_bits(obj, w, CLASS_WORD_RANGES);
+            return;
+        };
+        let m16 = self.i32c(0xFFFF);
+        let idx = self.bin(Operator::I32And, w, m16, Type::I32);
+        let lo = self.i32c(min);
+        let arr = self.bin(Operator::I32GeU, idx, lo, Type::I32);
+        let (a, o, join) = (self.body.add_block(), self.body.add_block(), self.body.add_block());
+        self.cond_br(arr, Self::to(a), Self::to(o));
+        self.cur = a;
+        self.clear_bits(obj, w, CLASS_WORD_RANGES | CLASS_WORD_SHALLOW);
+        self.terminate(Terminator::Br { target: Self::to(join) });
+        self.cur = o;
+        self.clear_bits(obj, w, CLASS_WORD_RANGES);
+        self.terminate(Terminator::Br { target: Self::to(join) });
+        self.cur = join;
     }
 
     /// Clear `mask`'s bits of `obj`'s class word `w`, if any is set.
@@ -4826,8 +4975,7 @@ impl<'a> Lower<'a> {
         let row = self.bin(Operator::I64ShrU, packed, sh, Type::I64);
         let row = self.un(Operator::I32WrapI64, row, Type::I32);
         if duty {
-            let w = self.load_i32(obj, OBJ_CLASS_IDX_OFFSET);
-            self.clear_bits(obj, w, CLASS_WORD_RANGES | CLASS_WORD_SHALLOW);
+            self.elem_duty(obj);
         }
         // A hole or the space past the initialized length holds no GC
         // thing: no pre-barrier.
@@ -5293,8 +5441,7 @@ impl<'a> Lower<'a> {
         let all = self.bin(Operator::I32And, a, b, Type::I32);
         self.check(all, slow);
         if duty {
-            let word = self.load_i32(obj, OBJ_CLASS_IDX_OFFSET);
-            self.clear_bits(obj, word, CLASS_WORD_RANGES | CLASS_WORD_SHALLOW);
+            self.elem_duty(obj);
         }
         self.store_i64(elems, index * 8, val);
         let nl = self.i32c(index + 1);
@@ -5368,8 +5515,7 @@ impl<'a> Lower<'a> {
         let addr = self.bin(Operator::I32Add, elements, off, Type::I32);
         // A stamped array's element claims (RANGES, TYPES) hold for a value
         // no site proves here: dropped (the array stamp's store duty).
-        let w = self.load_i32(obj, OBJ_CLASS_IDX_OFFSET);
-        self.clear_bits(obj, w, CLASS_WORD_RANGES | CLASS_WORD_SHALLOW);
+        self.elem_duty(obj);
         self.store_i64(addr, 0, arg);
         let one = self.i32c(1);
         let newlen = self.bin(Operator::I32Add, initlen, one, Type::I32);

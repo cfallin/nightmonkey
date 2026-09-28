@@ -860,6 +860,11 @@ impl AtomTable {
     /// The dense `atomId` for a name, assigning the next one on first use.
     /// Emission order, so the embedded table holds only what compiled bodies
     /// reference.
+    /// The name of `atomId` `id`.
+    pub fn name_of(&self, id: u32) -> NameId {
+        self.emitted[id as usize]
+    }
+
     pub fn intern(&mut self, name: NameId) -> u32 {
         if let Some(&id) = self.atom_of.get(&name) {
             return id;

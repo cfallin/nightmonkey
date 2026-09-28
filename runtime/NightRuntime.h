@@ -50,7 +50,7 @@ bool night_runtime_get_property(JSContext* cx, uint32_t top, uint64_t recv,
                                 uint32_t atomId);
 NIGHT_RUNTIME_EXPORT(night_runtime_set_property)
 bool night_runtime_set_property(JSContext* cx, uint32_t top, uint64_t recv,
-                                uint32_t atomId, uint64_t val, uint32_t strict);
+                                uint32_t atomId, uint64_t val, uint32_t flags);
 
 // Property inline cache by atom id + per-site cache index. The hit
 // path is emitted inline in the compiled body (a shape/generation/holder guard

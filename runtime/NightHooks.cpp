@@ -45,9 +45,13 @@ static void* NightNewContext(JSContext* cx) { return nullptr; }
 
 static void NightDestroyContext(JSContext* cx, void* state) {}
 
+extern "C" void NightCensusTraceConstructing(uint32_t oldWord,
+                                             uint32_t newWord, uint32_t site);
+
 static void ObjectDemoted(JSContext* cx, JSObject* obj, uintptr_t oldWord,
                           JS::ExternalObjectMutation why) {
   NightNoteDemotion(oldWord, BumpSiteOf(why));
+  NightCensusTraceConstructing(oldWord, obj->externalWord(), BumpSiteOf(why));
 }
 
 static void PropertyAdded(JSContext* cx, NativeObject* obj, JS::PropertyKey id,

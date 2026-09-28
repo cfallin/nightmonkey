@@ -179,6 +179,9 @@ pub struct Instrumentation {
 
 /// The census kind of MIR exits (`Instrumentation::mir_exits`).
 pub const MIR_EXIT_CENSUS_KIND: u32 = 90;
+/// The census kind of MIR guard failures that exit, by guard (with
+/// `--mir-exit-census`): an exit's block is shared by its pc's guards.
+pub const MIR_GUARD_CENSUS_KIND: u32 = 92;
 /// The census kind of MIR property-get IC misses (with `--mir-exit-census`).
 pub const MIR_GET_MISS_CENSUS_KIND: u32 = 91;
 /// Census kind for `--block-census` under MIR: one count per MIR block.

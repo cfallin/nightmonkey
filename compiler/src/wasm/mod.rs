@@ -30,6 +30,8 @@ pub use bbv::EARLY_KEY_MAX;
 pub mod stamp {
     pub const WORD_OFFSET: u32 = 4;
     pub const SLOTS: u32 = 0x0002_0000;
+    /// The TYPES (SHALLOW) validity bit.
+    pub const TYPES: u32 = super::bbv::abi::CLASS_WORD_SHALLOW;
     pub const SHAPE_OFFSET: u32 = super::bbv::abi::SHAPE_OFFSET;
     pub const SHAPE_IMMUTABLE_FLAGS_OFFSET: u32 = super::bbv::abi::SHAPE_IMMUTABLE_FLAGS_OFFSET;
     pub const SHAPE_FIXED_SLOTS_SHIFT: u32 = super::bbv::abi::SHAPE_FIXED_SLOTS_SHIFT;
@@ -155,7 +157,8 @@ pub fn serialize_regex_table(entries: &[(JsString, u32, u32, u32, u32, u32)]) ->
 
 /// Likely this-layout table: `u32 flags`, `u32 count`, then per layout (in
 /// layout_id order) `u32 nfields` + nfields x `u32 atomId` (field index
-/// order == predicted slot) + `u32` add-check bound. Interned before the
+/// order == predicted slot) + `u32` add-check bound + nfields x `u32`
+/// field claim (`Claim` bits). Interned before the
 /// atom table serializes (the ids must be in it).
 ///
 /// The compiled code does not read this table -- it bakes each site's slot
@@ -204,9 +207,20 @@ pub fn serialize_layout_table(env: &EnvLayout, atoms: &mut translate::AtomTable)
             .unwrap_or(fields.len());
         let bound = translate::FIXED_SLOTS_BASE + 8 * u32::try_from(max_len).unwrap();
         out.extend_from_slice(&bound.to_le_bytes());
+        // Each field's predicted type (`Claim` bits, 0 = none): what the
+        // set helpers check a store against to keep TYPES (§4.6), as a
+        // compiled store to a known field does.
+        let claims = env.layout_field_types_tx.get(&ctor.stamp());
+        for name in fields {
+            let c = claims.and_then(|m| m.get(name)).map_or(0, |c| u32::from(c.bits()));
+            out.extend_from_slice(&c.to_le_bytes());
+        }
     }
     out
 }
+
+/// `serialize_layout_table`'s flags bit: TYPES has the any-type meaning.
+pub const LAYOUT_ANY_TYPES: u32 = 0x100;
 
 /// Gname fuse table: u32 count, then per fused binding u32 atomId + u64
 /// predicted literal bits (fuse cell index == position).
@@ -1340,7 +1354,11 @@ pub fn layout_env(
     // validator and the compiled arms in lockstep): 2 = Option-C dual stamp
     // (positional match -> plain stamp + immediates, order mismatch ->
     // observed row + NONPOS stamp + table sub-arm).
-    let layout_mode: u32 = 2;
+    // Bit 8: the TYPES bit means every field holds its predicted type, any
+    // type (MIR.md §4.6; the MIR and baseline tiers), so the runtime's set
+    // helpers may keep it by the field claims serialized with the table.
+    // Legacy reads it by its numeric masks, and they never keep it.
+    let layout_mode: u32 = 2 | if opts.pipeline == crate::options::Pipeline::Legacy { 0 } else { LAYOUT_ANY_TYPES };
     let this_slots_base = this_cells_base + 8 * u32::try_from(layout_ctors.len()).unwrap();
     let masks_of = |ctor: LayoutKey| -> Vec<Claim> {
         facts.classes[&ctor]
@@ -2063,6 +2081,25 @@ pub fn translate_all(
         fused_gnames: &env.fused_gnames_tx,
     };
     let mut tier_census = tier::TierCensus::default();
+    // `--dump-tiers`: each script's function name, for reading censuses.
+    let fn_names: HashMap<u32, String> = if opts.diagnostics.tiers {
+        source
+            .objects
+            .iter()
+            .filter_map(|o| match o {
+                SourceObject::Object(od) => {
+                    let s = od.script?;
+                    match source.object(od.name?) {
+                        SourceObject::String(n) => Some((s.id(), String::from_utf16_lossy(n.chars()))),
+                        _ => None,
+                    }
+                }
+                _ => None,
+            })
+            .collect()
+    } else {
+        HashMap::default()
+    };
     for id in script_ids {
         let SourceObject::Script(script) = source.object(id) else {
             unreachable!()
@@ -2074,6 +2111,9 @@ pub fn translate_all(
         let sid = ScriptId::new(id.id());
         let (outcome, status) =
             translate_for_pipeline(&tx_ctx, m, &mut atoms, sid, script, id == root_id)?;
+        if let Some(n) = fn_names.get(&id.id()) {
+            crate::diag_line!("night: script sid#{sid} {n}");
+        }
         tier_census.record(sid, status, opts.diagnostics.tiers);
         match outcome {
             translate::Outcome::Compiled {

@@ -122,6 +122,11 @@ pub struct Module {
     /// arguments (`bbv::restamp_args`: layout, field count, kept bits,
     /// prefix keys + 1). Not printed.
     pub restamps: Vec<[u32; 7]>,
+    /// The least stamp idx an array allocation carries (array keys grow
+    /// down from the top of the key space, layout keys up from 1); `None`
+    /// if none does. An element store's claim duty is to arrays: on any
+    /// other object TYPES is its fields' claim. Not printed.
+    pub array_key_min: Option<u32>,
 }
 
 impl Module {

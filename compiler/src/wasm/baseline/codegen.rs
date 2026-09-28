@@ -28,7 +28,7 @@ use super::layout::{
 };
 use crate::bytecode::{BytecodeParser, JSOp, Script, TryNoteKind};
 use crate::ids::{Pc, ScriptId, Site};
-use crate::wasm::bbv::{construct_alloc_word, construct_nslots, ctor_stamp_keep_bits, restamp_args};
+use crate::wasm::bbv::{construct_nslots, typed_alloc_word, typed_keep_bits, typed_restamp_args};
 use crate::source::{ScopeData, SourceObject};
 use crate::wasm::bbv::abi::{
     BINOP_BITAND, BINOP_BITNOT, BINOP_BITOR, BINOP_BITXOR, BINOP_DEC, BINOP_DIV, BINOP_INC,
@@ -36,12 +36,14 @@ use crate::wasm::bbv::abi::{
     CMP_LE, CMP_LT, CMP_NE, CMP_STRICTEQ, CMP_STRICTNE, ELEMENTS_INITLEN_BACK, FIXED_SLOTS_BASE,
     FLAGS_ALL, FUNC_ENV_SLOT_OFFSET, IC_WAY_ADDR_PLACEHOLDER, FUNC_SCRIPT_SLOT_OFFSET, INIT_ATTR_ENUMERATE,
     INIT_ATTR_HIDDEN, INIT_ATTR_LOCKED, NO_NSLOTS, OBJ_CLASS_IDX_OFFSET, OBJ_ELEMENTS_OFFSET, CLASS_WORD_SLOTS,
-    SHAPE_IMMUTABLE_FLAGS_OFFSET, SHAPE_IS_NATIVE_BIT, SHAPE_OFFSET,
+    SHAPE_IMMUTABLE_FLAGS_OFFSET, SHAPE_IS_NATIVE_BIT, SHAPE_OFFSET, CLASS_WORD_SENTINEL, EARLY_KEY_MAX,
+    EARLY_KEY_SHIFT,
 };
 use crate::wasm::translate::{
     AtomTable, Helpers, TranslateCtx, INLINE_IC_STRIDE, MAGIC_ELEMENTS_HOLE, MAGIC_GENERATOR_CLOSING,
     MAGIC_IS_CONSTRUCTING, MAGIC_NO_ITER_VALUE, MAGIC_UNINITIALIZED_LEXICAL, TAG_BOOLEAN,
-    TAG_CLEAR, TAG_INT32, TAG_MAGIC, TAG_NULL, TAG_OBJECT, TAG_UNDEFINED,
+    TAG_BIGINT_HI, TAG_CLEAR, TAG_INT32, TAG_MAGIC, TAG_NULL, TAG_OBJECT, TAG_STRING, TAG_SYMBOL,
+    TAG_UNDEFINED,
 };
 
 /// The most frame a baseline body may use above `sp`, in bytes. Runtime
@@ -209,14 +211,14 @@ impl<'a> Gen<'a> {
                 [
                     si.layout_id,
                     u32::try_from(si.fields.len()).unwrap(),
-                    ctor_stamp_keep_bits(si),
+                    typed_keep_bits(ctx, si),
                 ]
             }),
-            ctor_restamp: ctx.deleg_restamps_in.get(&sid).and_then(restamp_args),
+            ctor_restamp: ctx.deleg_restamps_in.get(&sid).and_then(|si| typed_restamp_args(ctx, si)),
             arg_restamp: ctx
                 .arg_restamps_in
                 .get(&sid)
-                .and_then(|(f, si)| Some((*f, restamp_args(si)?))),
+                .and_then(|(f, si)| Some((*f, typed_restamp_args(ctx, si)?))),
             atoms,
             script,
             is_global,
@@ -438,6 +440,93 @@ impl<'a> Gen<'a> {
         let sh = self.i64c(32);
         let hi = self.binop(Operator::I64ShrU, v, sh, Type::I64);
         self.unop(Operator::I32WrapI64, hi, Type::I32)
+    }
+
+    /// `night_runtime_set_property`'s vouch bit (flag 2) for a store of
+    /// `val` to field `atom` through `recv`, by the MIR tier's rule
+    /// (`field_classes`): 2 when `recv` is an object whose class (its
+    /// stamp's identity, or its early key while constructed) types the
+    /// field and `val` is of that type, or a class typing no such field;
+    /// else 0. The engine then keeps its TYPES across a store that runs no
+    /// JS, so a baseline episode (after an exit, say) does not demote the
+    /// conforming objects it writes, which would fail OPT's guards for good.
+    fn vouch_types(&mut self, atom: u32, recv: Value, val: Value) -> Value {
+        let name = self.atoms.name_of(atom);
+        let classes = crate::wasm::bbv::field_classes(self.ctx, name);
+        if classes.is_empty() || classes.len() > crate::wasm::bbv::MAX_STORE_CLASSES {
+            return self.i32c(0);
+        }
+        let is_obj = self.tag_eq(recv, TAG_OBJECT);
+        let o = self.unop(Operator::I32WrapI64, recv, Type::I32);
+        let z = self.i32c(0);
+        // A non-object's word is read off the null page, then ignored.
+        let obj = self.select(Type::I32, o, z, is_obj);
+        let w = self.load_i32(obj, OBJ_CLASS_IDX_OFFSET);
+        let m16 = self.i32c(0xFFFF);
+        let idx = self.binop(Operator::I32And, w, m16, Type::I32);
+        let ksh = self.i32c(EARLY_KEY_SHIFT);
+        let kraw = self.binop(Operator::I32ShrU, w, ksh, Type::I32);
+        let km = self.i32c(EARLY_KEY_MAX);
+        let early = self.binop(Operator::I32And, kraw, km, Type::I32);
+        let sb = self.i32c(CLASS_WORD_SENTINEL);
+        let sent = self.binop(Operator::I32And, w, sb, Type::I32);
+        let id = self.select(Type::I32, early, idx, sent);
+        let tag = self.tag_of(val);
+        let mut ok = self.i32c(0);
+        let mut listed = self.i32c(0);
+        for (k, c) in classes {
+            let kv = self.i32c(k);
+            let is = self.binop(Operator::I32Eq, id, kv, Type::I32);
+            listed = self.binop(Operator::I32Or, listed, is, Type::I32);
+            let conf = self.tag_in_claim(tag, c);
+            let hit = self.binop(Operator::I32And, is, conf, Type::I32);
+            ok = self.binop(Operator::I32Or, ok, hit, Type::I32);
+        }
+        let unlisted = self.unop(Operator::I32Eqz, listed, Type::I32);
+        let keyed = self.binop(Operator::I32Ne, id, z, Type::I32);
+        let other = self.binop(Operator::I32And, unlisted, keyed, Type::I32);
+        let ok = self.binop(Operator::I32Or, ok, other, Type::I32);
+        let ok = self.binop(Operator::I32And, ok, is_obj, Type::I32);
+        let one = self.i32c(1);
+        self.binop(Operator::I32Shl, ok, one, Type::I32)
+    }
+
+    /// Whether a value of tag `tag` is of claimed type `c` (a typed-array
+    /// claim's kind is not checked here: no).
+    fn tag_in_claim(&mut self, tag: Value, c: crate::facts::Claim) -> Value {
+        use crate::opsem::*;
+        if c.ta_kind().is_some() {
+            return self.i32c(0);
+        }
+        let p = c.prims();
+        let singles = [
+            (PRIM_INT32, TAG_INT32 as u32),
+            (PRIM_BOOLEAN, TAG_BOOLEAN as u32),
+            (PRIM_UNDEFINED, TAG_UNDEFINED as u32),
+            (PRIM_NULL, TAG_NULL as u32),
+            (PRIM_STRING, TAG_STRING as u32),
+            (PRIM_SYMBOL, TAG_SYMBOL as u32),
+            (PRIM_BIGINT, TAG_BIGINT_HI),
+        ];
+        let mut acc = self.i32c(0);
+        for (prim, t) in singles {
+            if p.intersects(prim) {
+                let k = self.i32c(t);
+                let e = self.binop(Operator::I32Eq, tag, k, Type::I32);
+                acc = self.binop(Operator::I32Or, acc, e, Type::I32);
+            }
+        }
+        if p.intersects(PRIM_DOUBLE) {
+            let k = self.i32c(TAG_CLEAR as u32);
+            let e = self.binop(Operator::I32LtU, tag, k, Type::I32);
+            acc = self.binop(Operator::I32Or, acc, e, Type::I32);
+        }
+        if c.bits() & crate::facts::Claim::OBJECT.bits() != 0 {
+            let k = self.i32c(TAG_OBJECT as u32);
+            let e = self.binop(Operator::I32Eq, tag, k, Type::I32);
+            acc = self.binop(Operator::I32Or, acc, e, Type::I32);
+        }
+        acc
     }
 
     fn tag_eq(&mut self, v: Value, tag: u64) -> Value {
@@ -1383,7 +1472,7 @@ impl<'a> Gen<'a> {
         let Some(&(local, ref si)) = self.ctx.local_restamps_in.get(&site) else {
             return;
         };
-        let Some(r) = restamp_args(si) else { return };
+        let Some(r) = typed_restamp_args(self.ctx, si) else { return };
         let v = if local & crate::facts::RESTAMP_FORMAL != 0 {
             self.formal(local & !crate::facts::RESTAMP_FORMAL)
         } else {
@@ -2165,7 +2254,7 @@ impl<'a> Gen<'a> {
                 } else {
                     (
                         construct_nslots(self.ctx, mono, site),
-                        construct_alloc_word(self.ctx, mono, site),
+                        typed_alloc_word(self.ctx, mono, site),
                     )
                 };
                 let nslots = self.i32c(n);
@@ -2218,6 +2307,8 @@ impl<'a> Gen<'a> {
                 let recv = self.slot(d - 2);
                 let v = self.slot(d - 1);
                 let (av, sv) = (self.i32c(a), self.i32c(u32::from(op == StrictSetProp)));
+                let vouch = self.vouch_types(a, recv, v);
+                let sv = self.binop(Operator::I32Or, sv, vouch, Type::I32);
                 self.rt(h.set_property, &[recv, av, v, sv]);
                 let v = self.slot(d - 1);
                 self.set_slot(d - 2, v);

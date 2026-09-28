@@ -259,6 +259,10 @@ struct NightLayoutTable {
   // it (self included), parsed from the layout blob; the add check's
   // harmless-append fast path compares assigned slots against it.
   std::vector<uint32_t> extLen;
+  // Per layout, per field: its predicted type (`Claim` bits, 0 = none).
+  std::vector<std::vector<uint32_t>> claims;
+  // Whether TYPES has the any-type meaning, so the claims may keep it.
+  bool anyTypes = false;
 };
 static NightLayoutTable gLayouts;
 
@@ -1475,7 +1479,9 @@ bool night_runtime_install_env(JSContext* cx,
   {
     ByteReader br(env.layoutPtr, env.layoutLen);
     if (env.layoutLen >= 8) {
-      br.u32();  // flags word (unused)
+      // Flags: bit 8, the field claims may keep TYPES (the any-type
+      // meaning of the MIR and baseline tiers).
+      gLayouts.anyTypes = (br.u32() & 0x100) != 0;
       uint32_t count = br.u32();
       for (uint32_t i = 0; i < count && br.p + 4 <= br.end; i++) {
         uint32_t nf = br.u32();
@@ -1497,6 +1503,11 @@ bool night_runtime_install_env(JSContext* cx,
         }
         gLayouts.extLen.push_back(bound >= 16 ? (bound - 16) / 8
                                               : uint32_t(fields.size()));
+        std::vector<uint32_t> claims;
+        for (uint32_t j = 0; j < nf && br.p + 4 <= br.end; j++) {
+          claims.push_back(br.u32());
+        }
+        gLayouts.claims.push_back(std::move(claims));
         gLayouts.rows.push_back(std::move(fields));
       }
     }
@@ -2006,10 +2017,117 @@ static bool GenericSetWithStrict(JSContext* cx, JS::HandleObject obj,
   return result.checkStrictModeError(cx, obj, id, strict != 0);
 }
 
+// While in scope, and `vouched`, the engine's store choke drops RANGES but
+// keeps TYPES: the one store made inside is of a conforming value.
+static void NightCensusTraceSet(uint32_t atomId, uint32_t word,
+                                uint32_t flags);
+
+// Whether a store of `v` to property `atomId` of `obj` keeps the TYPES claim
+// of `obj`'s class (its stamp's identity, or its early key while it is
+// constructed): the field its layout predicts under that name is of the
+// field's predicted type, or its layout has no such typed field. The check
+// a compiled store to a known field makes (`field_types`), made here for
+// the set helpers' stores, which know the field. (The engine's store choke
+// knows no field and drops the bit.)
+static bool NightStoreConforms(JSObject* obj, uint32_t atomId, JS::Value v) {
+  if (!gLayouts.anyTypes) {
+    return false;
+  }
+  uint32_t w = obj->externalWord();
+  uint32_t k = (w & js::night::kWordConstructing) ? (w >> 18) & 0x0FFF
+                                                  : w & 0xFFFF;
+  if (k == 0 || k - 1 >= gLayouts.rows.size() ||
+      k - 1 >= gLayouts.claims.size()) {
+    return false;
+  }
+  const std::vector<uint32_t>& row = gLayouts.rows[k - 1];
+  const std::vector<uint32_t>& claims = gLayouts.claims[k - 1];
+  for (size_t i = 0; i < row.size(); i++) {
+    if (row[i] != atomId) {
+      continue;
+    }
+    uint32_t c = i < claims.size() ? claims[i] : 0;
+    if (c == 0) {
+      return true;
+    }
+    if (c & 0x0F00) {
+      return false;  // a typed-array claim: its kind is not checked here
+    }
+    uint32_t bit = v.isInt32()       ? 0x01
+                   : v.isDouble()    ? 0x02
+                   : v.isString()    ? 0x04
+                   : v.isUndefined() ? 0x08
+                   : v.isNull()      ? 0x10
+                   : v.isBoolean()   ? 0x20
+                   : v.isBigInt()    ? 0x40
+                   : v.isSymbol()    ? 0x80
+                   : v.isObject()    ? 0x8000
+                                     : 0;
+    return (c & bit) != 0;
+  }
+  return true;
+}
+
+class MOZ_RAII AutoVouchedStore {
+  bool on_;
+
+ public:
+  explicit AutoVouchedStore(bool vouched) : on_(vouched) {
+    if (on_) {
+      js::night::gNightHooks.storeClearMask = js::night::kWordRanges;
+      js::night::gNightHooks.storeNonNumberClearMask = 0;
+    }
+  }
+  ~AutoVouchedStore() {
+    if (on_) {
+      js::night::gNightHooks.storeClearMask = js::night::kStoreClearMask;
+      js::night::gNightHooks.storeNonNumberClearMask =
+          js::night::kStoreNonNumberClearMask;
+    }
+  }
+};
+
+// Whether a set of `id` on `obj` is a plain slot write or a plain add, which
+// run no JS: `obj` a plain object with `id` an own writable data property;
+// or extensible, and `id` on neither it nor any prototype, each an ordinary
+// native object with no resolve hook (nothing to shadow, no setter, no
+// proxy trap to run).
+static bool PlainStore(JSObject* obj, JS::HandleId id) {
+  if (!obj->is<js::PlainObject>()) {
+    return false;
+  }
+  js::NativeObject* nobj = &obj->as<js::NativeObject>();
+  mozilla::Maybe<js::PropertyInfo> prop = nobj->lookupPure(id);
+  if (prop.isSome()) {
+    return prop->isDataProperty() && prop->writable();
+  }
+  if (!nobj->isExtensible()) {
+    return false;
+  }
+  for (JSObject* p = nobj->staticPrototype(); p; p = p->staticPrototype()) {
+    if (!p->is<js::NativeObject>() || p->getClass()->getResolve() ||
+        p->getClass()->getAddProperty() ||
+        p->as<js::NativeObject>().lookupPure(id).isSome()) {
+      return false;
+    }
+  }
+  return !nobj->getClass()->getAddProperty();
+}
+
+// `flags`: bit 0 strict; bit 1 the compiled caller vouches that `val` is of
+// the field's predicted type for the object's class (the baseline tier's
+// stores, `night_runtime_set_prop_ic_miss`'s rule): a plain slot write or
+// add then keeps TYPES.
 bool night_runtime_set_property(JSContext* cx, uint32_t top, uint64_t recv,
                                 uint32_t atomId, uint64_t val,
-                                uint32_t strict) {
+                                uint32_t flags) {
+  bool strict = flags & 1;
   SetNightTop(cx, top);
+  if (JS::Value::fromRawBits(recv).isObject()) {
+    NightCensusTraceSet(atomId,
+                        JS::Value::fromRawBits(recv).toObject().externalWord(),
+                        flags | 4);
+  }
   JS::HandleId id = AtomIdChecked(atomId);
   JS::RootedObject obj(cx, ReceiverObject(cx, recv));
   if (!obj) {
@@ -2021,8 +2139,13 @@ bool night_runtime_set_property(JSContext* cx, uint32_t top, uint64_t recv,
     MaybeGnameFuseBlow(atomId, val);
     MaybeBlowBindingFuseAtom(atomId, val);
   }
-  if (!GenericSetWithStrict(cx, obj, id, val, recv, strict)) {
-    return false;
+  {
+    bool vouched = (flags & 2) ||
+                   NightStoreConforms(obj, atomId, JS::Value::fromRawBits(val));
+    AutoVouchedStore v(vouched && !activeGlobal && PlainStore(obj, id));
+    if (!GenericSetWithStrict(cx, obj, id, val, recv, strict)) {
+      return false;
+    }
   }
   if (activeGlobal) {
     MaybeGnameFuseArmAfterStore(cx, atomId, val);
@@ -2339,30 +2462,14 @@ uint32_t night_runtime_set_prop_ic_miss(JSContext* cx, uint32_t top,
   if (rv.isObject()) {
     NightCensusTraceSet(atomId, rv.toObject().externalWord(), flags);
   }
+  bool vouched = (flags & kSetVouchTypes) ||
+                 (rv.isObject() && NightStoreConforms(&rv.toObject(), atomId,
+                                                      JS::Value::fromRawBits(val)));
   return SetPropIcMiss(cx, top, recv, atomId, val, cacheIdx, flags & 1,
-                       flags & kSetVouchTypes);
+                       vouched);
 }
 
-// While in scope, and `vouched`, the engine's store choke drops RANGES but
-// keeps TYPES: the one store made inside is of a conforming value.
-class MOZ_RAII AutoVouchedStore {
-  bool on_;
 
- public:
-  explicit AutoVouchedStore(bool vouched) : on_(vouched) {
-    if (on_) {
-      js::night::gNightHooks.storeClearMask = js::night::kWordRanges;
-      js::night::gNightHooks.storeNonNumberClearMask = 0;
-    }
-  }
-  ~AutoVouchedStore() {
-    if (on_) {
-      js::night::gNightHooks.storeClearMask = js::night::kStoreClearMask;
-      js::night::gNightHooks.storeNonNumberClearMask =
-          js::night::kStoreNonNumberClearMask;
-    }
-  }
-};
 
 static uint32_t SetPropIcMiss(JSContext* cx, uint32_t top, uint64_t recv,
                               uint32_t atomId, uint64_t val, uint32_t cacheIdx,
@@ -2484,8 +2591,14 @@ static uint32_t SetPropIcMiss(JSContext* cx, uint32_t top, uint64_t recv,
   }
   uint32_t shapeBefore = js::night::NightObjectShape(obj);
   uint32_t spanBefore = js::night::NightObjectSlotSpanIfShared(obj);
-  if (!GenericSetWithStrict(cx, obj, id, val, recv, strict)) {
-    return kMissErr;
+  // A vouched store that is a plain slot write or add runs no JS and makes
+  // this one store, so it keeps TYPES too (`PlainStore`).
+  bool plainWrite = vouched && PlainStore(obj, id);
+  {
+    AutoVouchedStore v(plainWrite);
+    if (!GenericSetWithStrict(cx, obj, id, val, recv, strict)) {
+      return kMissErr;
+    }
   }
   if (js::night::NightObjectShape(obj) != shapeBefore) {
     // The set ADDED a property (or otherwise reshaped): try to cache the
@@ -3701,8 +3814,8 @@ js::night::NightRuntimeData& js::night::NightData() {
 }
 }
 
-// `NIGHT_CENSUS_TRACE=N`: also print the first N MIR exits (kind 90) and
-// epoch bumps (kind 66) in the order they happen, with the epoch: the
+// `NIGHT_CENSUS_TRACE=N`: also print the first N MIR exits (kind 90),
+// guard failures (92) and epoch bumps (kind 66) in the order they happen, with the epoch: the
 // counts say what is hot, the order says what started it.
 static int64_t gNightCensusTrace = -1;
 // Re-read after wizer resume (`JS::NightActivate`): the program's top level
@@ -3717,7 +3830,8 @@ void NightCensusTraceRearm() {
   __wasilibc_deinitialize_environ();
   __wasilibc_initialize_environ();
 #endif
-  gNightCensusTrace = -1;
+  const char* e = getenv("NIGHT_CENSUS_TRACE");
+  gNightCensusTrace = e ? atoll(e) : 0;
 }
 static void NightCensusTrace(uint32_t kind, uint64_t id);
 // The trace line of a set-helper store to a published object with TYPES:
@@ -3725,12 +3839,61 @@ static void NightCensusTrace(uint32_t kind, uint64_t id);
 static void NightCensusTraceSet(uint32_t atomId, uint32_t word,
                                 uint32_t flags) {
   if (gNightCensusTrace > 0 && (word & js::night::kWordTypes) &&
-      !(word & js::night::kWordConstructing)) {
+      (!(word & js::night::kWordConstructing) || !(flags & 2))) {
     fprintf(stderr, "night: trace set %s word %x flags %u\n",
             std::string(gNames.atoms[atomId].begin(),
                         gNames.atoms[atomId].end())
                 .c_str(),
             word, flags);
+  }
+}
+// The trace line of a layout guard's failing object: its word, and each
+// own property with its value's type.
+static void NightCensusTraceObject(JSObject* obj) {
+  fprintf(stderr, "night: trace object word %x", obj->externalWord());
+  if (obj->is<js::NativeObject>()) {
+    js::NativeObject& n = obj->as<js::NativeObject>();
+    for (js::ShapePropertyIter<js::NoGC> it(n.shape()); !it.done(); it++) {
+      JS::Value v = it->isDataProperty() ? n.getSlot(it->slot())
+                                         : JS::UndefinedValue();
+      const char* t = v.isInt32()      ? "int32"
+                      : v.isDouble()   ? "double"
+                      : v.isString()   ? "string"
+                      : v.isObject()   ? "object"
+                      : v.isUndefined() ? "undefined"
+                      : v.isNull()     ? "null"
+                      : v.isBoolean()  ? "bool"
+                                       : "other";
+      if (it->key().isAtom()) {
+        JSAtom* a = it->key().toAtom();
+        char buf[32] = {0};
+        for (size_t i = 0; i < a->length() && i < 31; i++) {
+          buf[i] = char(a->latin1OrTwoByteChar(i));
+        }
+        fprintf(stderr, " %s:%s@%u", buf, t, it->slot());
+      }
+    }
+  }
+  fprintf(stderr, "\n");
+}
+// The trace line of a stamp or restamp that leaves TYPES off although the
+// layout claims it (`keepBits`): the object lost it before.
+void NightCensusTraceStamp(const char* what, uint32_t layoutId,
+                           uint32_t oldWord, uint32_t keepBits) {
+  if (gNightCensusTrace > 0 && (keepBits & js::night::kWordTypes) &&
+      !(oldWord & js::night::kWordTypes)) {
+    fprintf(stderr, "night: trace %s-notypes layout %u word %x\n", what,
+            layoutId, oldWord);
+  }
+}
+// The trace line of an engine demotion of an object under construction
+// (no epoch bump, so the ordered trace would not show it otherwise).
+void NightCensusTraceConstructing(uint32_t oldWord, uint32_t newWord,
+                                  uint32_t site) {
+  if (gNightCensusTrace > 0 && (oldWord & js::night::kWordConstructing) &&
+      (oldWord & js::night::kWordTypes) && !(newWord & js::night::kWordTypes)) {
+    fprintf(stderr, "night: trace ctor-demote site %u word %x -> %x\n", site,
+            oldWord, newWord);
   }
 }
 static void NightCensusTrace(uint32_t kind, uint64_t id) {
@@ -3747,8 +3910,16 @@ static void NightCensusTrace(uint32_t kind, uint64_t id) {
 }
 
 int32_t night_runtime_census(uint32_t kind, uint32_t id) {
-  if (kind == 90) {
+  if (kind == 90 || kind == 92) {
     NightCensusTrace(kind, id);
+  }
+  if (kind == 96) {
+    // A layout guard's failing object (`id` its address): printed while
+    // tracing, never counted.
+    if (gNightCensusTrace > 0) {
+      NightCensusTraceObject(LinMem<JSObject>(id));
+    }
+    return 0;
   }
   if (!gNightCensus) {
     gNightCensus = new std::map<uint64_t, uint64_t>();
@@ -4306,6 +4477,7 @@ void night_runtime_ctor_stamp(uint64_t thisBits, uint32_t layoutId,
   if (obj->slotSpan() < nFields) {
     return;
   }
+  NightCensusTraceStamp("ctor", layoutId, w0, keepBits);
   obj->setExternalWord((layoutId + 1) | (w0 & keepBits));
 }
 
@@ -4345,6 +4517,7 @@ void night_runtime_ctor_restamp(uint64_t thisBits, uint32_t layoutId,
   if (!ok || obj->slotSpan() < nFields) {
     return;
   }
+  NightCensusTraceStamp("restamp", layoutId, w0, keepBits);
   obj->setExternalWord((layoutId + 1) | (w0 & keepBits));
 }
 
