@@ -1721,7 +1721,10 @@ compiles now, lowered onto baseline's helpers:
   `env.pop`. An exit, and baseline's unwind after a throw, see the
   current environment in the frame as baseline would. `env.current`
   reads the new `frame.env` region, which `env.set`/`env.pop` write, so
-  nothing hoists it across a scope.
+  nothing hoists it across a scope. Nothing else writes it: code the
+  frame calls runs in frames of its own, so `unknown` does not cover
+  `frame.env`. (The first version let it; env reads then stopped hoisting
+  out of loops with calls, and crypto lost 3.5% until 2026-09-28's fix.)
 - **Names through the chain and eval.** `GetName`, `BindName`,
   `BindUnqualifiedName`, `SetName`, `DelName`, `BindVar` and
   `EnvCallee` read the frame's environment. A direct eval is `call.eval`,

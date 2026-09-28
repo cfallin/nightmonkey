@@ -79,7 +79,9 @@ pub enum Region {
     TypedArrayLength,
     Global(BindingId),
     Env(EnvSlot),
-    /// The frame's current environment (its env slot).
+    /// The frame's current environment (its env slot). Only this frame's
+    /// scope ops (`env.set`, `env.pop`) write it: code the frame calls
+    /// runs in frames of its own, so `Unknown` does not cover it.
     FrameEnv,
     /// Every region.
     Unknown,
@@ -90,6 +92,7 @@ impl Region {
     pub fn overlaps(&self, o: &Region) -> bool {
         use Region::*;
         match (self, o) {
+            (Unknown, FrameEnv) | (FrameEnv, Unknown) => false,
             (Unknown, _) | (_, Unknown) => true,
             (Field { name: a, keys: ka }, Field { name: b, keys: kb }) => {
                 a == b
@@ -177,5 +180,8 @@ mod tests {
         assert!(Region::Elements(None).overlaps(&r(2)));
         assert!(!Region::Elements(None).overlaps(&Region::ArrayLength(None)));
         assert!(Region::Unknown.overlaps(&Region::Env(EnvSlot::new(0))));
+        // Only the frame's own scope ops write its env slot.
+        assert!(!Region::Unknown.overlaps(&Region::FrameEnv));
+        assert!(Region::FrameEnv.overlaps(&Region::FrameEnv));
     }
 }
