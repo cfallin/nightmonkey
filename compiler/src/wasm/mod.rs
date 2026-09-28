@@ -2123,6 +2123,9 @@ pub fn translate_all(
                     sid_to_index.insert(id.id(), index);
                 }
                 source_id_to_func.insert(id.id(), f);
+                if opts.diagnostics.stats {
+                    crate::diag_line!("night: body sid#{} func {}", id.id(), waffle::entity::EntityRef::index(f));
+                }
                 for (expected, call, callee_sid) in lp {
                     likely_patches.push((f, expected, call, callee_sid));
                 }

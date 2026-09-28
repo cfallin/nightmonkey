@@ -381,7 +381,7 @@ const DIRECT_CALLS: bool = true;
 
 /// A call of a closure the frame knows (`Ty::Fn`) has exactly its script
 /// as callee, and a callee built for inlining knows its formals' closures.
-const CALL_KNOWN_FNS: bool = false;
+const CALL_KNOWN_FNS: bool = true;
 
 /// Generic ops keep proven layouts on their clean edge (`js_keep`).
 const KEEP_ON_CLEAN: bool = true;
@@ -3273,6 +3273,11 @@ impl<'s, 'a> Run<'s, 'a> {
                 let r = self.js_static(Opcode::JsLambda(index), vec![e], MType::val(TagSet::OBJECT));
                 let ty = match self.s.script.gcthings.get(index as usize) {
                     Some(&gc) if !gc.is_other() && CALL_KNOWN_FNS => match self.s.ctx.source.object(gc) {
+                        // The function gcthing names its script.
+                        crate::source::SourceObject::Object(o) => match o.script {
+                            Some(k) => Ty::Fn(ScriptId::new(k.id())),
+                            None => Ty::Val(TagSet::OBJECT),
+                        },
                         crate::source::SourceObject::Script(_) => Ty::Fn(ScriptId::new(gc.id())),
                         _ => Ty::Val(TagSet::OBJECT),
                     },
