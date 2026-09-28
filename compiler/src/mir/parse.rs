@@ -722,6 +722,7 @@ impl Parser {
                 Region::Global(b)
             }
             "env" => Region::Env(EnvSlot::new(self.paren_u32()?)),
+            "frame.env" => Region::FrameEnv,
             "unknown" => Region::Unknown,
             _ => {
                 self.pos -= 1;
@@ -1152,6 +1153,7 @@ impl Parser {
                     "int32" => crate::mir::ops::ConstVal::Int32(self.int()?),
                     "double" => crate::mir::ops::ConstVal::Double(self.f64_bits()?),
                     "uninitialized" => crate::mir::ops::ConstVal::Uninitialized,
+                    "hole" => crate::mir::ops::ConstVal::Hole,
                     "dead" => crate::mir::ops::ConstVal::Dead,
                     "is_constructing" => crate::mir::ops::ConstVal::IsConstructing,
                     _ => return self.err(format!("bad const.val literal `{w}`")),
@@ -1182,6 +1184,43 @@ impl Parser {
             JsRt(RtOp::DelProp(_, strict)) => JsRt(RtOp::DelProp(self.atom()?, strict)),
             JsRt(RtOp::Intrinsic(_)) => JsRt(RtOp::Intrinsic(self.atom()?)),
             JsRt(RtOp::GetNameTypeof(_)) => JsRt(RtOp::GetNameTypeof(self.atom()?)),
+            JsRt(RtOp::Check(_)) => JsRt(RtOp::Check(self.int()?)),
+            JsRt(RtOp::SetFunName(_)) => JsRt(RtOp::SetFunName(self.int()?)),
+            JsRt(RtOp::BigInt(_)) => JsRt(RtOp::BigInt(self.int()?)),
+            JsRt(RtOp::CheckIsObj(_)) => JsRt(RtOp::CheckIsObj(self.int()?)),
+            JsRt(RtOp::CloseIter(_)) => JsRt(RtOp::CloseIter(self.int()?)),
+            JsRt(RtOp::SpreadCall(_)) => JsRt(RtOp::SpreadCall(self.int()?)),
+            JsRt(RtOp::EnterWith(_)) => JsRt(RtOp::EnterWith(self.int()?)),
+            CallEval(_) => CallEval(self.int()?),
+            EnvCallee(_) => EnvCallee(self.int()?),
+            ObjectLit(_) => ObjectLit(self.int()?),
+            JsRt(RtOp::InitElemGetSet(_)) => JsRt(RtOp::InitElemGetSet(self.int()?)),
+            JsRt(RtOp::FunWithProto(_)) => JsRt(RtOp::FunWithProto(self.int()?)),
+            JsRt(RtOp::GetPropSuper(_)) => JsRt(RtOp::GetPropSuper(self.atom()?)),
+            JsRt(RtOp::SetPropSuper(_, strict)) => JsRt(RtOp::SetPropSuper(self.atom()?, strict)),
+            JsRt(RtOp::FreshenEnv(_)) => JsRt(RtOp::FreshenEnv(self.int()?)),
+            JsRt(RtOp::PushEnv(..)) => {
+                let c = self.int()?;
+                self.expect_punct(",")?;
+                JsRt(RtOp::PushEnv(c, self.int()?))
+            }
+            JsRt(RtOp::GetName(..)) => {
+                let a = self.atom()?;
+                self.expect_punct(",")?;
+                JsRt(RtOp::GetName(a, self.int()?))
+            }
+            JsRt(RtOp::BindName(..)) => {
+                let a = self.atom()?;
+                self.expect_punct(",")?;
+                JsRt(RtOp::BindName(a, self.int()?))
+            }
+            JsRt(RtOp::DelName(_)) => JsRt(RtOp::DelName(self.atom()?)),
+            JsRt(RtOp::SetName(_, strict)) => JsRt(RtOp::SetName(self.atom()?, strict)),
+            JsRt(RtOp::CheckPrivateField(..)) => {
+                let c = self.int()?;
+                self.expect_punct(",")?;
+                JsRt(RtOp::CheckPrivateField(c, self.int()?))
+            }
             JsRt(RtOp::Symbol(_)) => JsRt(RtOp::Symbol(self.int()?)),
             Restamp(_) => Restamp(self.int()?),
             StampFresh(_) => StampFresh(self.int()?),
@@ -1498,10 +1537,43 @@ fn template(mn: &str) -> Option<Opcode> {
         RestArray(0),
         ArgsLength,
         FrameNewTarget,
+        FrameCallee,
+        JsRt(RtOp::GlobalThis),
+        JsRt(RtOp::MutateProto),
         IterMore,
         IterIsDone,
         IterEnd,
+        IterOptimizable,
         JsRt(RtOp::Iter),
+        JsRt(RtOp::CheckIsObj(0)),
+        JsRt(RtOp::CloseIter(0)),
+        JsRt(RtOp::OptimizeSpreadCall),
+        JsRt(RtOp::SpreadCall(0)),
+        JsRt(RtOp::PushEnv(0, 0)),
+        JsRt(RtOp::EnterWith(0)),
+        JsRt(RtOp::FreshenEnv(0)),
+        JsRt(RtOp::GetName(placeholder_atom, 0)),
+        JsRt(RtOp::BindName(placeholder_atom, 0)),
+        JsRt(RtOp::DelName(placeholder_atom)),
+        JsRt(RtOp::BindVar),
+        JsRt(RtOp::SetName(placeholder_atom, false)),
+        JsRt(RtOp::SetName(placeholder_atom, true)),
+        EnvSet,
+        EnvPop,
+        EnvCallee(0),
+        ObjectLit(0),
+        JsRt(RtOp::InitElemGetSet(0)),
+        JsRt(RtOp::SuperBase),
+        JsRt(RtOp::SuperFun),
+        JsRt(RtOp::GetPropSuper(placeholder_atom)),
+        JsRt(RtOp::GetElemSuper),
+        JsRt(RtOp::SetPropSuper(placeholder_atom, false)),
+        JsRt(RtOp::SetPropSuper(placeholder_atom, true)),
+        JsRt(RtOp::SetElemSuper(false)),
+        JsRt(RtOp::SetElemSuper(true)),
+        JsRt(RtOp::InitHomeObject),
+        JsRt(RtOp::FunWithProto(0)),
+        JsRt(RtOp::CheckReturn),
         ActualArg,
         ActualArgOr(0),
         JsIsBuiltin(0),
@@ -1523,6 +1595,10 @@ fn template(mn: &str) -> Option<Opcode> {
         JsRt(RtOp::InitPropGetSet(placeholder_atom, 0)),
         JsRt(RtOp::Intrinsic(placeholder_atom)),
         JsRt(RtOp::GetNameTypeof(placeholder_atom)),
+        JsRt(RtOp::Check(0)),
+        JsRt(RtOp::SetFunName(0)),
+        JsRt(RtOp::BigInt(0)),
+        JsRt(RtOp::CheckPrivateField(0, 0)),
         JsRt(RtOp::ToString),
         JsRt(RtOp::Symbol(0)),
         JsRt(RtOp::BuiltinObject(0)),
@@ -1552,6 +1628,8 @@ fn template(mn: &str) -> Option<Opcode> {
         EnvLoad(EnvSlot::new(0)),
         EnvStore(EnvSlot::new(0)),
         Call,
+        CallIter,
+        CallEval(0),
         CallDirect,
         Construct(0, 0),
         CreateThis(0, 0),

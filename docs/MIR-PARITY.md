@@ -65,6 +65,12 @@ answer).
    `iter.end`), try/finally (`Finally` a marker; its rethrow exits).
    Octane after them: pdfjs 1001 MIR scripts to 3 baseline (the global
    script, a 32K-bytecode script, one eval user); earley-boyer 463 to 2.
+   Then (MIR.md M5i) everything else on this list but generators and
+   async functions: class constructors (base and derived, `super`),
+   for-of and the iterator protocol, spread, holes, singleton `Object`,
+   element getter/setter inits, scopes that push environments (the
+   frame's env slot kept write-through), names through the chain, `with`
+   and direct eval.
 7. **Unused IR.** `LoadGName`, `StoreGName`, `CheckBinding`,
    `NewObject(_)`, `NewArray`, `InitField`, `PublishLayout`,
    `CallDirect`, `CallNative`, `GuardSingleton`,

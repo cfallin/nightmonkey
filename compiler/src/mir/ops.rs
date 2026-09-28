@@ -39,7 +39,20 @@ pub enum ConstVal {
     /// The `this` placeholder of a `new` (`JS_IS_CONSTRUCTING`), a magic
     /// value.
     IsConstructing,
+    /// An array literal's elision (`JS_ELEMENTS_HOLE`), a magic value.
+    Hole,
 }
+
+/// `RtOp::PushEnv` kinds.
+pub const ENV_LEXICAL: u32 = 0;
+pub const ENV_CLASS_BODY: u32 = 1;
+pub const ENV_VAR: u32 = 2;
+
+/// `RtOp::Check` kinds.
+pub const CHECK_OBJ_COERCIBLE: u32 = 0;
+pub const CHECK_CLASS_HERITAGE: u32 = 1;
+pub const CHECK_THIS: u32 = 2;
+pub const CHECK_THIS_REINIT: u32 = 3;
 
 /// The target of an unbox.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -241,12 +254,114 @@ pub enum RtOp {
     GetNameTypeof(AtomId),
     /// For-in's property iterator over `v` (`Iter`) -> object.
     Iter,
+    /// A check of `v` that throws or does nothing (`CheckObjCoercible`,
+    /// `CheckClassHeritage`, `CheckThis`: `CHECK_*`).
+    Check(u32),
+    /// Name function `fun` by key `name` (`SetFunName`, the prefix kind).
+    SetFunName(u32),
+    /// The global `this` (`GlobalThis`) -> object.
+    GlobalThis,
+    /// The BigInt literal at the script's gcthing index (`BigInt`) -> value.
+    BigInt(u32),
+    /// Set `obj`'s prototype to `proto` (`MutateProto`, `__proto__:` in a
+    /// literal).
+    MutateProto,
+    /// `#x in obj` style checks (`CheckPrivateField`: condition, kind),
+    /// `obj, key` -> boolean.
+    CheckPrivateField(u32, u32),
+    /// Throw unless `v` is an object (`CheckIsObj`, the message kind).
+    CheckIsObj(u32),
+    /// Close iterator `it` (`CloseIter`, the completion kind): calls its
+    /// `return`.
+    CloseIter(u32),
+    /// A spread call's argument array, or undefined when the spread value
+    /// is not a packed array whose iteration is intact
+    /// (`OptimizeSpreadCall`) -> value.
+    OptimizeSpreadCall,
+    /// `f(...arr)` / `new f(...arr)` (`SpreadCall`/`SpreadNew`: whether it
+    /// constructs): `callee, this, arr, new.target` -> value.
+    SpreadCall(u32),
+    /// A scope's environment over the frame's (`PushLexicalEnv`,
+    /// `PushClassBodyEnv`, `PushVarEnv`: `ENV_*`, the scope's pc) ->
+    /// object; `env.set` makes it the frame's.
+    PushEnv(u32, u32),
+    /// A `with` environment over the frame's wrapping `v` (`EnterWith`,
+    /// its pc) -> object.
+    EnterWith(u32),
+    /// A copy of the frame's block environment (`FreshenLexicalEnv`,
+    /// `RecreateLexicalEnv` with 1: fresh bindings) -> object.
+    FreshenEnv(u32),
+    /// A name read through the frame's environment chain (`GetName`; 1 for
+    /// `typeof`, where unbound is undefined) -> value.
+    GetName(AtomId, u32),
+    /// The environment a later `js.rt.setname` stores `name` into, from the
+    /// frame's chain (`BindName`, `BindUnqualifiedName` with 1) -> object.
+    BindName(AtomId, u32),
+    /// `delete name` through the frame's chain (`DelName`) -> boolean.
+    DelName(AtomId),
+    /// The frame's variable environment (`BindVar`) -> object.
+    BindVar,
+    /// `env.name = v` for an environment `BindName` found (`SetName`,
+    /// strict): `env, v`.
+    SetName(AtomId, bool),
+    /// A computed-key accessor in a literal or class (`InitElemGetter`
+    /// and kin: bit 0 setter, bit 1 hidden): `obj, key, fn`.
+    InitElemGetSet(u32),
+    /// The home object's prototype (`SuperBase`: home) -> value.
+    SuperBase,
+    /// The constructor's parent (`SuperFun`: callee) -> value.
+    SuperFun,
+    /// `super.name` (`GetPropSuper`): `recv, base` -> value.
+    GetPropSuper(AtomId),
+    /// `super[key]` (`GetElemSuper`): `recv, key, base` -> value.
+    GetElemSuper,
+    /// `super.name = v` (`SetPropSuper`, strict): `recv, base, v` -> v.
+    SetPropSuper(AtomId, bool),
+    /// `super[key] = v` (`SetElemSuper`, strict): `recv, key, base, v` -> v.
+    SetElemSuper(bool),
+    /// Set method `f`'s home object (`InitHomeObject`): `f, home`.
+    InitHomeObject,
+    /// A class constructor with prototype `proto` (`FunWithProto`, the
+    /// function gcthing), closing over the frame's environment -> object.
+    FunWithProto(u32),
+    /// A derived constructor's result (`CheckReturn`): `this, rval` ->
+    /// value (throws for a non-object, non-undefined rval or an
+    /// uninitialized `this`).
+    CheckReturn,
     /// `ToString` of v -> string.
     ToString,
     /// Well-known symbol `code` (`JSOp::Symbol`) -> symbol.
     Symbol(u32),
     /// Builtin object `kind` (`JSOp::BuiltinObject`) -> object.
     BuiltinObject(u32),
+}
+
+impl RtOp {
+    /// The op with its atoms renamed by `f` (an inlined callee's, into
+    /// the caller's table). Exhaustive, with no wildcard: a new variant
+    /// carrying an atom must say how it maps.
+    pub fn map_atoms(self, f: impl Fn(AtomId) -> AtomId) -> RtOp {
+        use RtOp::*;
+        match self {
+            DelProp(a, s) => DelProp(f(a), s),
+            InitProp(a, t) => InitProp(f(a), t),
+            InitPropGetSet(a, k) => InitPropGetSet(f(a), k),
+            Intrinsic(a) => Intrinsic(f(a)),
+            GetNameTypeof(a) => GetNameTypeof(f(a)),
+            GetName(a, t) => GetName(f(a), t),
+            BindName(a, k) => BindName(f(a), k),
+            DelName(a) => DelName(f(a)),
+            SetName(a, s) => SetName(f(a), s),
+            GetPropSuper(a) => GetPropSuper(f(a)),
+            SetPropSuper(a, s) => SetPropSuper(f(a), s),
+            op @ (Instanceof | In | HasOwn | DelElem(_) | NewObject | NewArray(_) | InitElem(..)
+            | ToPropertyKey | RegExp(_) | Iter | Check(_) | SetFunName(_) | GlobalThis | BigInt(_)
+            | MutateProto | CheckPrivateField(..) | CheckIsObj(_) | CloseIter(_) | OptimizeSpreadCall
+            | SpreadCall(_) | PushEnv(..) | EnterWith(_) | FreshenEnv(_) | BindVar | InitElemGetSet(_)
+            | SuperBase | SuperFun | GetElemSuper | SetElemSuper(_) | InitHomeObject | FunWithProto(_)
+            | CheckReturn | ToString | Symbol(_) | BuiltinObject(_)) => op,
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -411,6 +526,8 @@ pub enum Opcode {
     /// The frame's `new.target` (the op's frame: an inlined construct's
     /// frame holds its own) -> value.
     FrameNewTarget,
+    /// The frame's callee (`Callee`) -> value.
+    FrameCallee,
     /// For-in: the iterator's next property name, or the NO_ITER magic
     /// when it is exhausted (`MoreIter`; advances the iterator).
     IterMore,
@@ -418,6 +535,9 @@ pub enum Opcode {
     IterIsDone,
     /// For-in: close the iterator (`EndIter`).
     IterEnd,
+    /// Whether `v` iterates as a packed array with the iteration protocol
+    /// intact (`OptimizeGetIterator`) -> bool.
+    IterOptimizable,
     /// Actual argument `args[0]` (an i32 index below the count).
     ActualArg,
     /// Actual argument `k`, or undefined if there are not that many.
@@ -462,12 +582,30 @@ pub enum Opcode {
     LoadGName(BindingId),
     StoreGName(BindingId),
     EnvCurrent,
+    /// The callee of the function environment `hops` links up the frame's
+    /// chain (`EnvCallee`, `super` in an arrow or eval) -> object.
+    EnvCallee(u32),
+    /// The script's object gcthing `index` (`Object`, `CallSiteObj`: a
+    /// template or singleton, not a copy) -> object.
+    ObjectLit(u32),
+    /// Make environment `e` (boxed) the frame's current one: a scope's
+    /// entry (write-through, as baseline's frame keeps it).
+    EnvSet,
+    /// Make the frame's current environment's enclosing one current: a
+    /// scope's exit (`PopLexicalEnv`, `LeaveWith`).
+    EnvPop,
     EnvParent,
     EnvLoad(EnvSlot),
     EnvStore(EnvSlot),
 
     // Calls. Operands: callee (or new.target pair), `this`, args.
     Call,
+    /// A call of an iterator method (`CallIter`): `call`, whose uncallable
+    /// callee throws the iterator protocol's error.
+    CallIter,
+    /// A direct `eval` (`Eval`/`StrictEval` at pc): `call`'s operands; the
+    /// code runs in the frame's environment.
+    CallEval(u32),
     CallDirect,
     /// `new`: operands callee, `this` (the IS_CONSTRUCTING magic), args,
     /// new.target. The site's sized-allocation slot count and early stamp
@@ -577,7 +715,7 @@ impl Opcode {
             | InitField(_) => OK_FAIL.to_vec(),
             JsAdd | JsBinop(_) | JsUnop(_) | JsCompare(_) | JsToNumeric | JsGetProp(_)
             | JsSetProp(..) | JsGetElem | JsSetElem(..) | JsBoxThis | JsBindGName(_)
-            | JsSetName(..) | LoadField(_) | StoreField(_) | Call | CallDirect | Construct(..)
+            | JsSetName(..) | LoadField(_) | StoreField(_) | Call | CallIter | CallEval(_) | CallDirect | Construct(..)
             | CallNative(_) | JsGetName(_) | CreateThis(..) => CLEAN_DIRTY_ERR.to_vec(),
             // Clean if the callee's baseline rest demoted nothing.
             ExitInline { .. } => CLEAN_DIRTY_ERR.to_vec(),
@@ -762,7 +900,7 @@ pub fn const_val_type(c: ConstVal) -> Type {
             ObjInfo::TOP,
             StrInfo::TOP,
         )),
-        ConstVal::Uninitialized | ConstVal::IsConstructing => Type::val(TagSet::MAGIC),
+        ConstVal::Uninitialized | ConstVal::IsConstructing | ConstVal::Hole => Type::val(TagSet::MAGIC),
         ConstVal::Dead => Type::VAL_TOP,
     }
 }
@@ -1216,6 +1354,29 @@ pub fn signature(op: &Opcode, args: &[Type], m: &Module) -> SigResult {
                 RtOp::InitPropGetSet(..) => (2, None),
                 RtOp::Intrinsic(_) | RtOp::GetNameTypeof(_) => (0, Some(Type::VAL_TOP)),
                 RtOp::Iter => (1, Some(Type::val(TagSet::OBJECT))),
+                RtOp::Check(_) => (1, None),
+                RtOp::SetFunName(_) | RtOp::MutateProto => (2, None),
+                RtOp::GlobalThis => (0, Some(Type::val(TagSet::OBJECT))),
+                RtOp::BigInt(_) => (0, Some(Type::VAL_TOP)),
+                RtOp::CheckPrivateField(..) => (2, Some(Type::val(TagSet::BOOLEAN))),
+                RtOp::CheckIsObj(_) | RtOp::CloseIter(_) => (1, None),
+                RtOp::OptimizeSpreadCall => (1, Some(Type::VAL_TOP)),
+                RtOp::PushEnv(..) | RtOp::FreshenEnv(_) | RtOp::BindName(..) | RtOp::BindVar => {
+                    (0, Some(Type::val(TagSet::OBJECT)))
+                }
+                RtOp::EnterWith(_) => (1, Some(Type::val(TagSet::OBJECT))),
+                RtOp::GetName(..) => (0, Some(Type::VAL_TOP)),
+                RtOp::DelName(_) => (0, Some(Type::val(TagSet::BOOLEAN))),
+                RtOp::SetName(..) => (2, None),
+                RtOp::InitElemGetSet(_) => (3, None),
+                RtOp::SuperBase | RtOp::SuperFun => (1, Some(Type::VAL_TOP)),
+                RtOp::GetPropSuper(_) | RtOp::CheckReturn => (2, Some(Type::VAL_TOP)),
+                RtOp::GetElemSuper | RtOp::SetPropSuper(..) => (3, Some(Type::VAL_TOP)),
+                RtOp::SetElemSuper(_) => (4, Some(Type::VAL_TOP)),
+                RtOp::InitHomeObject => (2, None),
+                RtOp::FunWithProto(_) => (1, Some(Type::val(TagSet::OBJECT))),
+                RtOp::SpreadCall(0) => (4, Some(Type::VAL_TOP)),
+                RtOp::SpreadCall(_) => (4, Some(Type::val(TagSet::OBJECT))),
                 RtOp::ToString => (1, Some(Type::val(TagSet::STRING))),
                 RtOp::Symbol(_) => (0, Some(Type::val(TagSet::prims(crate::opsem::PRIM_SYMBOL)))),
                 RtOp::BuiltinObject(_) => (0, Some(Type::val(TagSet::OBJECT))),
@@ -1246,6 +1407,10 @@ pub fn signature(op: &Opcode, args: &[Type], m: &Module) -> SigResult {
             arity(args, 0)?;
             Sig::result(Type::VAL_TOP)
         }
+        FrameCallee => {
+            arity(args, 0)?;
+            Sig::result(Type::val(TagSet::OBJECT))
+        }
         IterMore => {
             arity(args, 1)?;
             val(&args[0], "iter.more")?;
@@ -1260,6 +1425,11 @@ pub fn signature(op: &Opcode, args: &[Type], m: &Module) -> SigResult {
             arity(args, 1)?;
             val(&args[0], "iter.end")?;
             Sig::none()
+        }
+        IterOptimizable => {
+            arity(args, 1)?;
+            val(&args[0], "iter.optimizable")?;
+            Sig::result(Type::Bool)
         }
         ActualArg => {
             arity(args, 1)?;
@@ -1610,6 +1780,19 @@ pub fn signature(op: &Opcode, args: &[Type], m: &Module) -> SigResult {
             arity(args, 0)?;
             Sig::result(Type::Obj(ObjInfo::kind(ObjKind::Env)))
         }
+        EnvCallee(_) | ObjectLit(_) => {
+            arity(args, 0)?;
+            Sig::result(Type::val(TagSet::OBJECT))
+        }
+        EnvSet => {
+            arity(args, 1)?;
+            val(&args[0], "env.set")?;
+            Sig::none()
+        }
+        EnvPop => {
+            arity(args, 0)?;
+            Sig::none()
+        }
         EnvParent => {
             arity(args, 1)?;
             want_kind(&obj(&args[0], "env.parent")?, ObjKind::Env, "env.parent")?;
@@ -1627,7 +1810,7 @@ pub fn signature(op: &Opcode, args: &[Type], m: &Module) -> SigResult {
             Sig::none()
         }
 
-        Call | Construct(..) => {
+        Call | CallIter | CallEval(_) | Construct(..) => {
             want(args.len() >= 2, || "call: expected callee and this".into())?;
             for t in args {
                 val(t, "call operand")?;
@@ -1846,7 +2029,7 @@ pub fn effects(op: &Opcode, args: &[Type], m: &Module) -> Effects {
         }
         // The rest of the callee, in baseline: anything.
         ExitInline { .. } => return Effects::generic(FlagsEffect::Dynamic),
-        Call | CallDirect | Construct(..) | CallNative(_) => {
+        Call | CallIter | CallEval(_) | CallDirect | Construct(..) | CallNative(_) => {
             return Effects::generic(FlagsEffect::Callee)
         }
         // The atom's string: its lowering calls a may-GC helper.
@@ -1906,6 +2089,8 @@ pub fn effects(op: &Opcode, args: &[Type], m: &Module) -> Effects {
             fx.reads = vec![Region::Unknown];
             fx.writes = vec![Region::Unknown];
         }
+        // The value's shape and the realm's iteration fuses.
+        IterOptimizable => fx.reads = vec![Region::Unknown],
         LengthTa => fx.reads = vec![Region::TypedArrayLength],
         ElementsPtr => fx.reads = vec![Region::Elements(elements_root(recv, m))],
         // Reading a rope's chars flattens it, which allocates.
@@ -1915,6 +2100,14 @@ pub fn effects(op: &Opcode, args: &[Type], m: &Module) -> Effects {
             fx.writes = vec![Region::Global(*b)];
             fx.kill = KillPattern::of(KillSet::FUSE);
             fx.flags = FlagsEffect::Bits(FlagBits::BIND);
+        }
+        // The frame's current environment, which a scope's entry and exit
+        // replace.
+        EnvCurrent | EnvCallee(_) => fx.reads = vec![Region::FrameEnv],
+        EnvSet => fx.writes = vec![Region::FrameEnv],
+        EnvPop => {
+            fx.reads = vec![Region::FrameEnv];
+            fx.writes = vec![Region::FrameEnv];
         }
         EnvLoad(s) => fx.reads = vec![Region::Env(*s)],
         EnvStore(s) => {

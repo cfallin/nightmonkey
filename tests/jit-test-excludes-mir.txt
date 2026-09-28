@@ -7,3 +7,10 @@
 # liveness-pruned, docs/MIR.md §5.1), as an optimizing JIT does; the
 # interpreter and baseline keep every local slot until it is overwritten.
 gc/compartment-revived-gc.js
+
+# The same artifact: `let [wr, args] = f({})` never reads `args`, so once
+# `checkWeakRef` compiles in MIR (array destructuring, the iterator ops)
+# nothing roots the arguments object, whose deleted/defined element the
+# test expects to keep the WeakRef's target alive. With `args` read after
+# the gc() the test passes.
+arguments/bug1762575-3.js

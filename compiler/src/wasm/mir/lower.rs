@@ -1794,6 +1794,7 @@ impl<'a> Lower<'a> {
                     ConstVal::Uninitialized => (TAG_MAGIC << 32) | MAGIC_UNINITIALIZED_LEXICAL,
                     ConstVal::IsConstructing => (TAG_MAGIC << 32) | MAGIC_IS_CONSTRUCTING,
                     ConstVal::Dead => UNDEF,
+                    ConstVal::Hole => (TAG_MAGIC << 32) | crate::wasm::translate::MAGIC_ELEMENTS_HOLE,
                 };
                 let v = self.i64c(bits);
                 self.def(inst, v);
@@ -2172,10 +2173,32 @@ impl<'a> Lower<'a> {
             // slot, which the fresh entry (or baseline, before an onramp)
             // set, and which is rooted with the frame.
             Opcode::EnvCurrent => {
-                let fid = self.cur_frame as usize;
-                let env = self.load_i64(self.vp, self.frame_off[fid] + self.frame_layouts[fid].env());
+                let env = self.frame_env();
                 let p = self.un(Operator::I32WrapI64, env, Type::I32);
                 self.def(inst, p);
+            }
+            Opcode::EnvCallee(hops) => {
+                let env = self.frame_env();
+                let hv = self.i32c(hops);
+                let r = self.call1(self.h.env_callee, &[self.cx, env, hv], Type::I64);
+                self.def(inst, r);
+            }
+            Opcode::ObjectLit(index) => {
+                let script = self.script_ptr();
+                let iv = self.i32c(index);
+                let r = self.call1(self.h.object, &[self.cx, script, iv], Type::I64);
+                self.def(inst, r);
+            }
+            Opcode::EnvSet => {
+                let off = self.frame_env_off();
+                self.store_i64(self.vp, off, a[0]);
+            }
+            Opcode::EnvPop => {
+                let env = self.frame_env();
+                let p = self.un(Operator::I32WrapI64, env, Type::I32);
+                let up = self.load_i64(p, FIXED_SLOTS_BASE);
+                let off = self.frame_env_off();
+                self.store_i64(self.vp, off, up);
             }
             // `EnvironmentObject::ENCLOSING_ENV_SLOT`, always fixed.
             Opcode::EnvParent => {
@@ -2559,7 +2582,9 @@ impl<'a> Lower<'a> {
                 let f = self.edge(inst, 1, &[])?;
                 self.terminate(Terminator::Br { target: f });
             }
-            Opcode::Call => self.js_call_op(inst, &a)?,
+            Opcode::Call => self.js_call_op(inst, &a, false)?,
+            Opcode::CallIter => self.js_call_op(inst, &a, true)?,
+            Opcode::CallEval(pc) => self.js_eval_op(inst, &a, pc)?,
             Opcode::GuardScript(sid) => {
                 // The callee is a function of `sid`'s script, which is
                 // compiled (§5.5): its class is a function class, its
@@ -2758,6 +2783,107 @@ impl<'a> Lower<'a> {
                         (h.init_prop_getset, vec![a[0], at, a[1], kv])
                     }
                     RtOp::Iter => (h.iter_, vec![a[0]]),
+                    RtOp::Check(k) => {
+                        let f = match k {
+                            mir::ops::CHECK_OBJ_COERCIBLE => h.check_obj_coercible,
+                            mir::ops::CHECK_CLASS_HERITAGE => h.check_class_heritage,
+                            mir::ops::CHECK_THIS_REINIT => h.check_this_reinit,
+                            _ => h.check_this,
+                        };
+                        (f, vec![a[0]])
+                    }
+                    RtOp::SetFunName(prefix) => {
+                        let k = self.i32c(prefix);
+                        (h.set_fun_name, vec![a[0], a[1], k])
+                    }
+                    RtOp::GlobalThis => (h.global_this, vec![]),
+                    RtOp::BigInt(idx) => {
+                        let script = self.script_ptr();
+                        let iv = self.i32c(idx);
+                        (h.bigint, vec![script, iv])
+                    }
+                    RtOp::MutateProto => (h.mutate_proto, vec![a[0], a[1]]),
+                    RtOp::CheckIsObj(kind) => {
+                        let k = self.i32c(kind);
+                        (h.check_is_obj, vec![a[0], k])
+                    }
+                    RtOp::CloseIter(kind) => {
+                        let k = self.i32c(kind);
+                        (h.close_iter, vec![a[0], k])
+                    }
+                    RtOp::OptimizeSpreadCall => (h.optimize_spread_call, vec![a[0]]),
+                    RtOp::PushEnv(kind, pc) => {
+                        let f = match kind {
+                            mir::ops::ENV_LEXICAL => h.push_lexical_env,
+                            mir::ops::ENV_CLASS_BODY => h.push_class_body_env,
+                            _ => h.push_var_env,
+                        };
+                        let env = self.frame_env();
+                        let script = self.script_ptr();
+                        let pcv = self.i32c(pc);
+                        (f, vec![env, script, pcv])
+                    }
+                    RtOp::EnterWith(pc) => {
+                        let env = self.frame_env();
+                        let script = self.script_ptr();
+                        let pcv = self.i32c(pc);
+                        (h.enter_with, vec![env, a[0], script, pcv])
+                    }
+                    RtOp::FreshenEnv(recreate) => {
+                        let f = if recreate != 0 { h.recreate_lexical_env } else { h.freshen_lexical_env };
+                        (f, vec![self.frame_env()])
+                    }
+                    RtOp::GetName(name, for_typeof) => {
+                        let env = self.frame_env();
+                        let (at, tv) = (self.atom(name), self.i32c(for_typeof));
+                        (h.get_name, vec![env, at, tv])
+                    }
+                    RtOp::BindName(name, unqualified) => {
+                        let f = if unqualified != 0 { h.bind_unqualified_name } else { h.bind_name };
+                        let env = self.frame_env();
+                        (f, vec![env, self.atom(name)])
+                    }
+                    RtOp::DelName(name) => {
+                        let env = self.frame_env();
+                        (h.del_name, vec![env, self.atom(name)])
+                    }
+                    RtOp::BindVar => (h.bind_var, vec![self.frame_env()]),
+                    RtOp::SuperBase => (h.super_base, vec![a[0]]),
+                    RtOp::SuperFun => (h.super_fun, vec![a[0]]),
+                    RtOp::GetPropSuper(name) => (h.get_prop_super, vec![a[0], a[1], self.atom(name)]),
+                    RtOp::GetElemSuper => (h.get_elem_super, vec![a[0], a[1], a[2]]),
+                    RtOp::SetPropSuper(name, strict) => {
+                        let (at, sv) = (self.atom(name), self.i32c(u32::from(strict)));
+                        (h.set_prop_super, vec![a[0], a[1], at, a[2], sv])
+                    }
+                    RtOp::SetElemSuper(strict) => {
+                        let sv = self.i32c(u32::from(strict));
+                        (h.set_elem_super, vec![a[0], a[1], a[2], a[3], sv])
+                    }
+                    RtOp::InitHomeObject => (h.init_home_object, vec![a[0], a[1]]),
+                    RtOp::FunWithProto(index) => {
+                        let env = self.frame_env();
+                        let script = self.script_ptr();
+                        let iv = self.i32c(index);
+                        (h.fun_with_proto, vec![env, a[0], script, iv])
+                    }
+                    RtOp::CheckReturn => (h.check_return, vec![a[0], a[1]]),
+                    RtOp::InitElemGetSet(kind) => {
+                        let kv = self.i32c(kind);
+                        (h.init_elem_getset, vec![a[0], a[1], a[2], kv])
+                    }
+                    RtOp::SetName(name, strict) => {
+                        let (at, sv) = (self.atom(name), self.i32c(u32::from(strict)));
+                        (h.set_name, vec![a[0], at, a[1], sv])
+                    }
+                    RtOp::SpreadCall(construct) => {
+                        let c = self.i32c(construct);
+                        (h.spread_call, vec![a[0], a[1], a[2], a[3], c])
+                    }
+                    RtOp::CheckPrivateField(cond, kind) => {
+                        let (cv, kv) = (self.i32c(cond), self.i32c(kind));
+                        (h.check_private_field, vec![a[0], a[1], cv, kv])
+                    }
                     RtOp::GetNameTypeof(name) => {
                         // `get_gname`'s typeof form: unbound is undefined.
                         let (at, one) = (self.atom(name), self.i32c(1));
@@ -2825,10 +2951,23 @@ impl<'a> Lower<'a> {
             Opcode::IterEnd => {
                 self.call(self.h.end_iter, &[self.cx, a[0]], &[]);
             }
+            Opcode::IterOptimizable => {
+                let r = self.call1(self.h.optimize_get_iterator, &[self.cx, a[0]], Type::I32);
+                self.def(inst, r);
+            }
             Opcode::IterIsDone => {
                 let m = self.i64c((TAG_MAGIC << 32) | crate::wasm::translate::MAGIC_NO_ITER_VALUE);
                 let r = self.bin(Operator::I64Eq, a[0], m, Type::I32);
                 self.def(inst, r);
+            }
+            Opcode::FrameCallee => {
+                let fid = self.cur_frame as usize;
+                let v = if fid == 0 {
+                    self.load_i64(self.sp, FrameLayout::CALLEE)
+                } else {
+                    self.load_i64(self.vp, self.frame_off[fid] + FrameLayout::CALLEE)
+                };
+                self.def(inst, v);
             }
             Opcode::FrameNewTarget => {
                 let fid = self.cur_frame as usize;
@@ -5177,11 +5316,51 @@ impl<'a> Lower<'a> {
     /// baseline's calls do: JS call depth is then bounded by the
     /// NightStack, not the native stack), else the generic helper. The
     /// result is at the frame's top. Success takes `ok_dirty`.
-    fn js_call_op(&mut self, inst: mir::Inst, ops: &[Value]) -> R<()> {
+    /// The op's frame's env slot offset from `vp`.
+    fn frame_env_off(&self) -> u32 {
+        let fid = self.cur_frame as usize;
+        self.frame_off[fid] + self.frame_layouts[fid].env()
+    }
+
+    /// The op's frame's current environment (boxed), from its env slot.
+    fn frame_env(&mut self) -> Value {
+        let off = self.frame_env_off();
+        self.load_i64(self.vp, off)
+    }
+
+    /// A direct `eval` (baseline's `Eval`): the call's frame
+    /// `[callee, this, args]` above the live values, and the helper, which
+    /// evaluates in the frame's environment (or calls a callee that is not
+    /// `eval`).
+    fn js_eval_op(&mut self, inst: mir::Inst, ops: &[Value], pc: u32) -> R<()> {
+        let live = self.live_across(inst);
+        self.root(&live)?;
+        let call_pre = self.epoch();
+        let frame = self.top_off(live.len());
+        for (k, &v) in ops.iter().enumerate() {
+            self.store_i64(self.vp, frame + 8 * u32::try_from(k).unwrap(), v);
+        }
+        let argc = u32::try_from(ops.len() - 2).unwrap();
+        let top_off = frame + 8 * (argc + 2);
+        let base = self.add_off(self.vp, frame);
+        let top = self.add_off(self.vp, top_off);
+        let av = self.i32c(argc);
+        let env = self.frame_env();
+        let script = self.script_ptr();
+        let pcv = self.i32c(pc);
+        let ok = self.call1(self.h.eval, &[self.cx, top, base, av, env, script, pcv], Type::I32);
+        self.after_gc(&live);
+        let result = self.load_i64(self.vp, top_off);
+        let post = self.epoch();
+        let same = self.bin(Operator::I32Eq, call_pre, post, Type::I32);
+        self.clean_or_dirty(inst, ok, same, &[result])
+    }
+
+    fn js_call_op(&mut self, inst: mir::Inst, ops: &[Value], iter: bool) -> R<()> {
         /// Headroom a compiled body may use past its actuals (the runtime
         /// entries' `kNightStackHeadroomSlots`).
         const HEADROOM: u32 = 64 * 1024;
-        if ops.len() == 3 {
+        if ops.len() == 3 && !iter {
             let call = self.body.add_block();
             self.char_arms(inst, ops, call)?;
             self.cur = call;
@@ -5191,14 +5370,14 @@ impl<'a> Lower<'a> {
                 self.cur = call;
             }
         }
-        if ops.len() == 2 && self.names_atom("pop") {
+        if ops.len() == 2 && !iter && self.names_atom("pop") {
             let call = self.body.add_block();
             self.pop_arm(inst, ops, call)?;
             self.cur = call;
         }
         // A leaf: nothing to root yet.
         let (funcidx, script, native) = self.classify_native(ops[0]);
-        if ops.len() == 3 || ops.len() == 4 {
+        if (ops.len() == 3 || ops.len() == 4) && !iter {
             let call = self.body.add_block();
             self.math_arms(inst, ops, native, call)?;
             self.cur = call;
@@ -5318,7 +5497,10 @@ impl<'a> Lower<'a> {
             });
             self.cur = gen_b;
         }
-        let ok_generic = self.call1(self.h.call, &[self.cx, top, base, argc_v], Type::I32);
+        // An iterator method's call reports an uncallable callee as the
+        // iterator protocol does.
+        let generic_f = if iter { self.h.call_iter } else { self.h.call };
+        let ok_generic = self.call1(generic_f, &[self.cx, top, base, argc_v], Type::I32);
         self.terminate(Terminator::Br {
             target: BlockTarget {
                 block: join,

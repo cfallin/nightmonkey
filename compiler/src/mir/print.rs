@@ -368,9 +368,11 @@ pub fn mnemonic(op: &Opcode) -> String {
         RestArray(_) => "args.rest".into(),
         ArgsLength => "args.length".into(),
         FrameNewTarget => "frame.new_target".into(),
+        FrameCallee => "frame.callee".into(),
         IterMore => "iter.more".into(),
         IterIsDone => "iter.done".into(),
         IterEnd => "iter.end".into(),
+        IterOptimizable => "iter.optimizable".into(),
         ActualArg => "args.actual".into(),
         ActualArgOr(_) => "args.actual_or".into(),
         JsIsBuiltin(_) => "js.is_builtin".into(),
@@ -394,6 +396,37 @@ pub fn mnemonic(op: &Opcode) -> String {
             RtOp::Intrinsic(_) => "js.rt.intrinsic",
             RtOp::GetNameTypeof(_) => "js.rt.getname.typeof",
             RtOp::Iter => "js.rt.iter",
+            RtOp::Check(_) => "js.rt.check",
+            RtOp::SetFunName(_) => "js.rt.setfunname",
+            RtOp::GlobalThis => "js.rt.globalthis",
+            RtOp::BigInt(_) => "js.rt.bigint",
+            RtOp::MutateProto => "js.rt.mutateproto",
+            RtOp::CheckPrivateField(..) => "js.rt.checkprivatefield",
+            RtOp::CheckIsObj(_) => "js.rt.checkisobj",
+            RtOp::CloseIter(_) => "js.rt.closeiter",
+            RtOp::OptimizeSpreadCall => "js.rt.optimizespreadcall",
+            RtOp::SpreadCall(_) => "js.rt.spreadcall",
+            RtOp::PushEnv(..) => "js.rt.pushenv",
+            RtOp::EnterWith(_) => "js.rt.enterwith",
+            RtOp::FreshenEnv(_) => "js.rt.freshenenv",
+            RtOp::GetName(..) => "js.rt.getname",
+            RtOp::BindName(..) => "js.rt.bindname",
+            RtOp::DelName(_) => "js.rt.delname",
+            RtOp::BindVar => "js.rt.bindvar",
+            RtOp::InitElemGetSet(_) => "js.rt.initelemgetset",
+            RtOp::SuperBase => "js.rt.superbase",
+            RtOp::SuperFun => "js.rt.superfun",
+            RtOp::GetPropSuper(_) => "js.rt.getpropsuper",
+            RtOp::GetElemSuper => "js.rt.getelemsuper",
+            RtOp::SetPropSuper(_, false) => "js.rt.setpropsuper",
+            RtOp::SetPropSuper(_, true) => "js.rt.setpropsuper.strict",
+            RtOp::SetElemSuper(false) => "js.rt.setelemsuper",
+            RtOp::SetElemSuper(true) => "js.rt.setelemsuper.strict",
+            RtOp::InitHomeObject => "js.rt.inithomeobject",
+            RtOp::FunWithProto(_) => "js.rt.funwithproto",
+            RtOp::CheckReturn => "js.rt.checkreturn",
+            RtOp::SetName(_, false) => "js.rt.setname",
+            RtOp::SetName(_, true) => "js.rt.setname.strict",
             RtOp::ToString => "js.rt.tostring",
             RtOp::Symbol(_) => "js.rt.symbol",
             RtOp::BuiltinObject(_) => "js.rt.builtinobject",
@@ -421,10 +454,16 @@ pub fn mnemonic(op: &Opcode) -> String {
         LoadGName(_) => "load_gname".into(),
         StoreGName(_) => "store_gname".into(),
         EnvCurrent => "env.current".into(),
+        EnvSet => "env.set".into(),
+        EnvCallee(_) => "env.callee".into(),
+        ObjectLit(_) => "object.lit".into(),
+        EnvPop => "env.pop".into(),
         EnvParent => "env.parent".into(),
         EnvLoad(_) => "env.load".into(),
         EnvStore(_) => "env.store".into(),
         Call => "call".into(),
+        CallIter => "call.iter".into(),
+        CallEval(_) => "call.eval".into(),
         CallDirect => "call_direct".into(),
         Construct(..) => "construct".into(),
         CreateThis(..) => "create_this".into(),
@@ -450,6 +489,7 @@ fn immediates(m: &Module, op: &Opcode) -> Option<String> {
             crate::mir::ops::ConstVal::Int32(n) => format!("int32 {n}"),
             crate::mir::ops::ConstVal::Double(bits) => format!("double {}", f64_str(*bits)),
             crate::mir::ops::ConstVal::Uninitialized => "uninitialized".into(),
+            crate::mir::ops::ConstVal::Hole => "hole".into(),
             crate::mir::ops::ConstVal::Dead => "dead".into(),
             crate::mir::ops::ConstVal::IsConstructing => "is_constructing".into(),
         },
@@ -495,7 +535,28 @@ fn immediates(m: &Module, op: &Opcode) -> Option<String> {
             k.to_string()
         }
         JsRt(RtOp::DelProp(a, _)) | JsRt(RtOp::Intrinsic(a)) | JsRt(RtOp::GetNameTypeof(a)) => atom(Some(m), *a),
-        JsRt(RtOp::NewArray(n)) | JsRt(RtOp::InitElem(n, _)) | JsRt(RtOp::Symbol(n)) | JsRt(RtOp::BuiltinObject(n)) => {
+        JsRt(RtOp::CheckPrivateField(c, k)) | JsRt(RtOp::PushEnv(c, k)) => format!("{c}, {k}"),
+        JsRt(RtOp::GetName(a, k)) | JsRt(RtOp::BindName(a, k)) => format!("{}, {k}", atom(Some(m), *a)),
+        JsRt(RtOp::DelName(a)) | JsRt(RtOp::SetName(a, _)) | JsRt(RtOp::GetPropSuper(a)) | JsRt(RtOp::SetPropSuper(a, _)) => {
+            atom(Some(m), *a)
+        }
+        JsRt(RtOp::NewArray(n))
+        | JsRt(RtOp::InitElem(n, _))
+        | JsRt(RtOp::Symbol(n))
+        | JsRt(RtOp::BuiltinObject(n))
+        | JsRt(RtOp::Check(n))
+        | JsRt(RtOp::SetFunName(n))
+        | JsRt(RtOp::BigInt(n))
+        | JsRt(RtOp::CheckIsObj(n))
+        | JsRt(RtOp::CloseIter(n))
+        | JsRt(RtOp::SpreadCall(n))
+        | CallEval(n)
+        | EnvCallee(n)
+        | ObjectLit(n)
+        | JsRt(RtOp::InitElemGetSet(n))
+        | JsRt(RtOp::FunWithProto(n))
+        | JsRt(RtOp::EnterWith(n))
+        | JsRt(RtOp::FreshenEnv(n)) => {
             n.to_string()
         }
         JsRt(RtOp::InitProp(a, attrs)) => format!("{}, {attrs}", atom(Some(m), *a)),
@@ -525,6 +586,7 @@ fn region_str(m: &Module, r: &Region) -> String {
         Region::TypedArrayLength => "talength".into(),
         Region::Global(b) => format!("global({b})"),
         Region::Env(s) => format!("env({s})"),
+        Region::FrameEnv => "frame.env".into(),
         Region::Unknown => "unknown".into(),
     }
 }

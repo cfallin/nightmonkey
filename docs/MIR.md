@@ -1102,9 +1102,9 @@ stores and may-run-JS fences.
 MIR builder meets one of these** (under `pipeline=mir`; BASELINE.md §5):
 
 - generator and async bodies
-- `arguments` and rest
-- `with` and eval
-- scripts using env ops, until M5
+
+(`arguments` and rest, `with`, direct eval and the environment ops were
+on this list; they compile now: M5d, M5i.)
 
 Try/catch is supported (§5.3). There is no hidden decline for inlining.
 The MIR builder does not inline anything, so calls in a MIR-compiled
@@ -1694,6 +1694,57 @@ which found the helper calls the ICs cannot avoid:
   bytes) gains 12% over 300 bytes, earley-boyer loses 9%; the cause of
   the latter is not yet known.
 - Allocation micro-benchmark: 176 -> 116 ms (bbv 100).
+
+**M5i. Completeness: the jit-test decline census (2026-09-28).** A
+`--dump-tiers` census over the jit-tests (the first decline of each
+script) ranked the ops; every one but generator and async bodies
+compiles now, lowered onto baseline's helpers:
+- **Class constructors** compile (a plain call is never inlined or
+  forwarded to one; baseline's call throws). Derived constructors:
+  `super(…)` is a `construct` with no site sizing, as baseline's;
+  `super(...a)` is the spread helper; `CheckThisReinit`, `CheckReturn`
+  (which reads the frame's rval, so rval liveness counts it),
+  `SuperBase`/`SuperFun`, `super.x`/`super[k]` reads and writes,
+  `InitHomeObject`, `FunWithProto`, and the class checks
+  (`CheckClassHeritage`, `CheckThis`, `CheckPrivateField`), `SetFunName`.
+- **The iterator protocol and spread.** `CallIter` is `call.iter` (the
+  call, with the iterator error for an uncallable callee);
+  `OptimizeGetIterator` is `iter.optimizable`; `CheckIsObj`, `CloseIter`,
+  `OptimizeSpreadCall`, `SpreadCall`/`SpreadNew`, and array spread
+  (`InitElemInc`, its index an int32, wrapping as baseline's) are
+  `js.rt` ops.
+- **Scopes that push environments (§5.1's fixed chain, extended).** The
+  frame's env slot is write-through: a scope's entry (`PushLexicalEnv`,
+  `PushClassBodyEnv`, `PushVarEnv`, `EnterWith`, `FreshenLexicalEnv`,
+  `RecreateLexicalEnv`) makes the new environment with baseline's helper
+  and `env.set` stores it; its exit (`PopLexicalEnv`, `LeaveWith`) is
+  `env.pop`. An exit, and baseline's unwind after a throw, see the
+  current environment in the frame as baseline would. `env.current`
+  reads the new `frame.env` region, which `env.set`/`env.pop` write, so
+  nothing hoists it across a scope.
+- **Names through the chain and eval.** `GetName`, `BindName`,
+  `BindUnqualifiedName`, `SetName`, `DelName`, `BindVar` and
+  `EnvCallee` read the frame's environment. A direct eval is `call.eval`,
+  a call frame for baseline's eval helper over the frame's environment.
+  (Such scripts keep their bindings in environments, which eval's code
+  reads and writes; `call.eval`'s effects are a call's.)
+- **The rest.** `Callee`, `GlobalThis`, BigInt literals, `MutateProto`,
+  holes, `??`, `Object`/`CallSiteObj` (the script's object: no copy),
+  computed-key accessors, `debugger` (a no-op, as baseline's), `ThrowMsg`,
+  and a `CheckLexical` whose value is surely uninitialized, which exits
+  (baseline throws).
+- **Generators and async functions** remain declined: a resumed
+  generator enters at a `yield`'s pc, which needs an entry that §5.2's
+  onramps (loop headers and function entry) do not provide. See
+  docs/MIR-KICKOFF-3.md.
+- An inlined callee's `js.rt` atoms are renamed into the caller's table
+  by `RtOp::map_atoms`, an exhaustive match: the splice's old list
+  missed the new name ops, so an inlined `GetName` looked up an
+  unrelated string (four jit-tests caught it).
+- Night tests: mir-iter-spread.js, mir-scopes.js, mir-misc-ops.js. One
+  jit-test joins `jit-test-excludes-mir.txt`: bug1762575-3.js depends on
+  a dead local keeping its object alive, as gc/compartment-revived-gc.js
+  does.
 
 **M6. The rest of §10**: box/unbox cleanup, memory optimizations, and
 numeric optimizations, each with its guard-count and instruction-count

@@ -125,13 +125,7 @@ impl Maps {
             InitField(a) => InitField(self.atom(a)),
             CheckFuse(f) => CheckFuse(self.fuses[&f]),
             CheckNative(n) => CheckNative(self.natives[&n]),
-            JsRt(mir::ops::RtOp::DelProp(a, s)) => JsRt(mir::ops::RtOp::DelProp(self.atom(a), s)),
-            JsRt(mir::ops::RtOp::InitProp(a, t)) => JsRt(mir::ops::RtOp::InitProp(self.atom(a), t)),
-            JsRt(mir::ops::RtOp::InitPropGetSet(a, k)) => {
-                JsRt(mir::ops::RtOp::InitPropGetSet(self.atom(a), k))
-            }
-            JsRt(mir::ops::RtOp::Intrinsic(a)) => JsRt(mir::ops::RtOp::Intrinsic(self.atom(a))),
-            JsRt(mir::ops::RtOp::GetNameTypeof(a)) => JsRt(mir::ops::RtOp::GetNameTypeof(self.atom(a))),
+            JsRt(r) => JsRt(r.map_atoms(|a| self.atom(a))),
             Restamp(i) => Restamp(self.restamp_base + i),
             ConstObj(_) | GuardSingleton(_) | CheckBinding(_) | LoadGName(_)
             | StoreGName(_) | CallNative(_) => {

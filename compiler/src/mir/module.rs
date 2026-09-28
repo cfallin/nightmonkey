@@ -79,6 +79,8 @@ pub enum Region {
     TypedArrayLength,
     Global(BindingId),
     Env(EnvSlot),
+    /// The frame's current environment (its env slot).
+    FrameEnv,
     /// Every region.
     Unknown,
 }

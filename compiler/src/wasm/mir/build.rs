@@ -276,6 +276,15 @@ impl<'a> Shape<'a> {
         crate::wasm::bbv::typed_alloc_word(self.ctx, mono, site)
     }
 
+    /// Whether script `k` is a class constructor: callable only by `new`
+    /// (a plain call throws), so never inlined at a call.
+    fn is_class_ctor(&self, k: ScriptId) -> bool {
+        matches!(
+            self.ctx.source.object(crate::source::SourceObjectId::new(k.get())),
+            crate::source::SourceObject::Script(ks) if ks.is_class_ctor
+        )
+    }
+
     /// Whether a call of script `k` may go straight to its compiled body
     /// (bbv's `likely_call_target`): not a class constructor, generator or
     /// async function.
@@ -588,9 +597,6 @@ fn build_at<'a>(
     if script.is_generator_or_async {
         return Err("generator or async".into());
     }
-    if script.is_class_ctor {
-        return Err("class constructor".into());
-    }
     let fl = FrameLayout::of(script);
     // A mapped arguments object aliases the formals. With no formals there
     // is nothing to alias, and the object (made by the runtime, which maps
@@ -699,7 +705,7 @@ fn liveness(script: &Script, nargs: u32, nlocals: u32) -> BTreeMap<Pc, Vec<bool>
             ),
             JSOp::GetArg | JSOp::GetFrameArg => (Some(1 + usize::from(p.next_uint16().unwrap())), None),
             JSOp::SetArg => (None, Some(1 + usize::from(p.next_uint16().unwrap()))),
-            JSOp::GetRval | JSOp::RetRval => (Some(rval), None),
+            JSOp::GetRval | JSOp::RetRval | JSOp::CheckReturn => (Some(rval), None),
             JSOp::SetRval => (None, Some(rval)),
             _ => (None, None),
         }
@@ -3020,6 +3026,7 @@ impl<'s, 'a> Run<'s, 'a> {
         let targets: Vec<(ScriptId, std::rc::Rc<super::inline::Callee>)> = sids
             .iter()
             .take(MAX_INLINE_TARGETS + 1)
+            .filter(|&&k| !self.s.is_class_ctor(k))
             .filter_map(|&k| Some((k, self.s.callee(k)?)))
             .collect();
         let helper = (Opcode::ApplyFwd, vec![vals[0], vals[1], vals[2]]);
@@ -3098,7 +3105,7 @@ impl<'s, 'a> Run<'s, 'a> {
         let targets: Vec<(ScriptId, std::rc::Rc<super::inline::Callee>)> = sids
             .iter()
             .take(MAX_INLINE_TARGETS + 1)
-            .filter(|&&k| self.s.fits_site(k, self.pc, n))
+            .filter(|&&k| self.s.fits_site(k, self.pc, n) && !self.s.is_class_ctor(k))
             .filter_map(|&k| Some((k, self.s.callee_ctx(k, fns, this_ctor.map(|(c, ..)| c))?)))
             .collect();
         if targets.is_empty()
@@ -4025,10 +4032,10 @@ impl<'s, 'a> Run<'s, 'a> {
         let mut p = self.s.imms(pc);
         let int_ty = Ty::I32;
         match op {
-            // (`DebugLeaveLexicalEnv` only matters with lexical
-            // environments, which MIR declines.)
+            // (`DebugLeaveLexicalEnv` only matters to a debugger; so does
+            // `Debugger`, a no-op with none attached, as in baseline.)
             Nop | Lineno | JumpTarget | LoopHead | NopDestructuring | NopIsAssignOp
-            | DebugLeaveLexicalEnv => {}
+            | DebugLeaveLexicalEnv | Debugger => {}
             // A try block's code is ordinary code: a throw in it exits
             // (`exit.throw`) and baseline takes the pc's handler. The catch
             // code, entered only by a throw, is never reached here.
@@ -4228,7 +4235,11 @@ impl<'s, 'a> Run<'s, 'a> {
                     if t.magic {
                         let js = TagSet { magic: false, ..t };
                         if js.is_empty() {
-                            return Err("CheckLexical of a sure TDZ value".into());
+                            // Always uninitialized: baseline throws the
+                            // ReferenceError at this pc.
+                            let b = self.exit_block(false);
+                            self.term(Opcode::Jump, vec![], vec![Self::goto(b)]);
+                            return Ok(());
                         }
                         let v = self.guard(Opcode::GuardTags(js), vec![x.v], MType::val(js));
                         self.st.pop();
@@ -5331,6 +5342,24 @@ impl<'s, 'a> Run<'s, 'a> {
                 let e = crate::wasm::bbv::abi::INIT_ATTR_ENUMERATE;
                 self.js_void(Opcode::JsRt(RtOp::InitElem(e, r)), vec![x, k, z]);
             }
+            InitElemInc if RT_OPS => {
+                // [obj, idx, v] -> [obj, idx + 1]: an array literal's
+                // spread, its index an int32 (the literal's positions).
+                let v = self.pop();
+                let i = self.pop();
+                if i.ty.num() != Some(Num::I32) {
+                    return Err("InitElemInc index not int32".into());
+                }
+                let o = self.top();
+                let r = self.ranges_duty(pc, v);
+                let (x, k, z) = (self.boxed(o), self.boxed(i), self.boxed(v));
+                let e = crate::wasm::bbv::abi::INIT_ATTR_ENUMERATE;
+                self.js_void(Opcode::JsRt(RtOp::InitElem(e, r)), vec![x, k, z]);
+                let iv = self.as_i32(i);
+                let one = self.const_i32(1);
+                let n = self.inst(Opcode::I32Wrap(ArithOp::Add), vec![iv, one], Some(MType::I32_TOP));
+                self.push(n, Ty::I32);
+            }
             ToPropertyKey if RT_OPS => {
                 // An int32, a string or a symbol is its own key.
                 let x = self.top();
@@ -5418,6 +5447,65 @@ impl<'s, 'a> Run<'s, 'a> {
                 let v = self.boxed(it);
                 self.inst(Opcode::IterEnd, vec![v], None);
             }
+            Callee => {
+                let v = self.inst(Opcode::FrameCallee, vec![], Some(MType::val(TagSet::OBJECT)));
+                self.push(v, Ty::Val(TagSet::OBJECT));
+            }
+            CheckObjCoercible | CheckClassHeritage | CheckThis => {
+                // The runtime's check of the value, which stays.
+                let k = match op {
+                    CheckObjCoercible => mir::ops::CHECK_OBJ_COERCIBLE,
+                    CheckClassHeritage => mir::ops::CHECK_CLASS_HERITAGE,
+                    _ => mir::ops::CHECK_THIS,
+                };
+                let x = self.top();
+                let v = self.boxed(x);
+                self.js_void(Opcode::JsRt(RtOp::Check(k)), vec![v]);
+            }
+            SetFunName => {
+                let prefix = u32::from(p.next_uint8().unwrap());
+                let name = self.pop();
+                let fun = self.top();
+                let (f, n) = (self.boxed(fun), self.boxed(name));
+                self.js_void(Opcode::JsRt(RtOp::SetFunName(prefix)), vec![f, n]);
+            }
+            GlobalThis => {
+                let r = self.js(Opcode::JsRt(RtOp::GlobalThis), vec![], MType::val(TagSet::OBJECT));
+                self.push(r, Ty::Val(TagSet::OBJECT));
+            }
+            BigInt => {
+                let idx = p.next_uint32().unwrap();
+                let r = self.js(Opcode::JsRt(RtOp::BigInt(idx)), vec![], MType::VAL_TOP);
+                self.push(r, Ty::Val(TagSet::ALL));
+            }
+            MutateProto => {
+                let proto = self.pop();
+                let obj = self.top();
+                let (o, pr) = (self.boxed(obj), self.boxed(proto));
+                self.js_void(Opcode::JsRt(RtOp::MutateProto), vec![o, pr]);
+            }
+            CheckPrivateField => {
+                let cond = u32::from(p.next_uint8().unwrap());
+                let kind = u32::from(p.next_uint8().unwrap());
+                let n = self.st.len();
+                let (obj, key) = (self.st[n - 2], self.st[n - 1]);
+                let (o, k) = (self.boxed(obj), self.boxed(key));
+                let r = self.js(
+                    Opcode::JsRt(RtOp::CheckPrivateField(cond, kind)),
+                    vec![o, k],
+                    MType::val(TagSet::BOOLEAN),
+                );
+                self.push(r, Ty::Val(TagSet::BOOLEAN));
+            }
+            Hole => {
+                let v = self.const_val(ConstVal::Hole);
+                self.push(v, Ty::Val(TagSet::MAGIC));
+            }
+            // Always throws: baseline does, from here.
+            ThrowMsg | ThrowSetConst => {
+                let b = self.exit_block(false);
+                self.term(Opcode::Jump, vec![], vec![Self::goto(b)]);
+            }
             NewTarget => {
                 // The frame's new.target (undefined unless constructed).
                 let v = self.inst(Opcode::FrameNewTarget, vec![], Some(MType::VAL_TOP));
@@ -5459,6 +5547,250 @@ impl<'s, 'a> Run<'s, 'a> {
                     self.val_cls.insert(r, si.layout_id);
                 }
                 self.push(r, Ty::Val(TagSet::OBJECT));
+            }
+            PushLexicalEnv | PushClassBodyEnv | PushVarEnv => {
+                // A scope's environment, made the frame's (write-through:
+                // an exit's baseline frame, and its unwind, see it).
+                let kind = match op {
+                    PushLexicalEnv => mir::ops::ENV_LEXICAL,
+                    PushClassBodyEnv => mir::ops::ENV_CLASS_BODY,
+                    _ => mir::ops::ENV_VAR,
+                };
+                let e = self.js(Opcode::JsRt(RtOp::PushEnv(kind, pc.get())), vec![], MType::val(TagSet::OBJECT));
+                self.inst(Opcode::EnvSet, vec![e], None);
+            }
+            EnterWith => {
+                let x = self.pop();
+                let v = self.boxed(x);
+                let e = self.js(Opcode::JsRt(RtOp::EnterWith(pc.get())), vec![v], MType::val(TagSet::OBJECT));
+                self.inst(Opcode::EnvSet, vec![e], None);
+            }
+            FreshenLexicalEnv | RecreateLexicalEnv => {
+                let recreate = u32::from(op == RecreateLexicalEnv);
+                let e = self.js(Opcode::JsRt(RtOp::FreshenEnv(recreate)), vec![], MType::val(TagSet::OBJECT));
+                self.inst(Opcode::EnvSet, vec![e], None);
+            }
+            PopLexicalEnv | LeaveWith => {
+                self.inst(Opcode::EnvPop, vec![], None);
+            }
+            GetName => {
+                let a = self.atom(p.next_uint32().unwrap())?;
+                let t = u32::from(self.s.next_is_typeof(pc, op));
+                let r = self.js(Opcode::JsRt(RtOp::GetName(a, t)), vec![], MType::VAL_TOP);
+                self.push(r, Ty::Val(TagSet::ALL));
+            }
+            BindName | BindUnqualifiedName => {
+                let a = self.atom(p.next_uint32().unwrap())?;
+                let k = u32::from(op == BindUnqualifiedName);
+                let r = self.js(Opcode::JsRt(RtOp::BindName(a, k)), vec![], MType::val(TagSet::OBJECT));
+                self.push(r, Ty::Val(TagSet::OBJECT));
+            }
+            DelName => {
+                let a = self.atom(p.next_uint32().unwrap())?;
+                let r = self.js(Opcode::JsRt(RtOp::DelName(a)), vec![], MType::val(TagSet::BOOLEAN));
+                self.push(r, Ty::Val(TagSet::BOOLEAN));
+            }
+            BindVar => {
+                let r = self.js(Opcode::JsRt(RtOp::BindVar), vec![], MType::val(TagSet::OBJECT));
+                self.push(r, Ty::Val(TagSet::OBJECT));
+            }
+            SetName | StrictSetName => {
+                let a = self.atom(p.next_uint32().unwrap())?;
+                let v = self.pop();
+                let env = self.pop();
+                let (e, y) = (self.boxed(env), self.boxed(v));
+                self.js_void(Opcode::JsRt(RtOp::SetName(a, op == StrictSetName)), vec![e, y]);
+                self.repush(v);
+            }
+            Eval | StrictEval => {
+                let argc = usize::from(p.next_uint16().unwrap());
+                self.publish_this();
+                let n = self.st.len();
+                let operands: Vec<Slot> = self.st.drain(n - argc - 2..).collect();
+                let vals: Vec<mir::Value> = operands.into_iter().map(|x| self.boxed(x)).collect();
+                let r = self.js(Opcode::CallEval(pc.get()), vals, MType::VAL_TOP);
+                self.push(r, Ty::Val(TagSet::ALL));
+            }
+            Coalesce => {
+                // `a ?? b`: on to `b` when the top is null or undefined,
+                // else keep it and jump past.
+                let off = p.next_int32().unwrap();
+                let a = self.top();
+                let nullish = TagSet::prims(PRIM_NULL | PRIM_UNDEFINED);
+                let tags = a.ty.tags();
+                let b = if tags.subset_of(nullish) {
+                    self.inst(Opcode::ConstBool(true), vec![], Some(MType::Bool))
+                } else if tags.intersect(nullish).is_empty() {
+                    self.inst(Opcode::ConstBool(false), vec![], Some(MType::Bool))
+                } else {
+                    let x = self.boxed(a);
+                    self.tag_test(x, nullish)
+                };
+                let (target, next) = (pc.branch(off), pc + op.len());
+                self.branch(b, next, target);
+            }
+            Object | CallSiteObj => {
+                let index = p.next_uint32().unwrap();
+                let r = self.inst(Opcode::ObjectLit(index), vec![], Some(MType::val(TagSet::OBJECT)));
+                self.push(r, Ty::Val(TagSet::OBJECT));
+            }
+            EnvCallee => {
+                let hops = match op.len() {
+                    2 => u32::from(p.next_uint8().unwrap()),
+                    _ => u32::from(p.next_uint16().unwrap()),
+                };
+                let r = self.inst(Opcode::EnvCallee(hops), vec![], Some(MType::val(TagSet::OBJECT)));
+                self.push(r, Ty::Val(TagSet::OBJECT));
+            }
+            InitElemGetter | InitHiddenElemGetter | InitElemSetter | InitHiddenElemSetter => {
+                let kind = u32::from(matches!(op, InitElemSetter | InitHiddenElemSetter))
+                    | (u32::from(matches!(op, InitHiddenElemGetter | InitHiddenElemSetter)) << 1);
+                let f = self.pop();
+                let k = self.pop();
+                let o = self.top();
+                let (x, y, z) = (self.boxed(o), self.boxed(k), self.boxed(f));
+                self.js_void(Opcode::JsRt(RtOp::InitElemGetSet(kind)), vec![x, y, z]);
+            }
+            SuperCall => {
+                // `super(args)`: the runtime's construct of the parent
+                // (`[callee, IS_CONSTRUCTING, args…, new.target]`), which
+                // makes `this`; no site sizing, as in baseline.
+                self.publish_this();
+                let argc = usize::from(p.next_uint16().unwrap());
+                let n = self.st.len();
+                let operands: Vec<Slot> = self.st.drain(n - argc - 3..).collect();
+                let vals: Vec<mir::Value> = operands.into_iter().map(|x| self.boxed(x)).collect();
+                let nslots = crate::wasm::bbv::abi::NO_NSLOTS;
+                let r = self.js(Opcode::Construct(nslots, 0), vals, MType::val(TagSet::OBJECT));
+                self.push(r, Ty::Val(TagSet::OBJECT));
+            }
+            SuperBase | SuperFun => {
+                let x = self.pop();
+                let v = self.boxed(x);
+                let r = if op == SuperBase { RtOp::SuperBase } else { RtOp::SuperFun };
+                let r = self.js(Opcode::JsRt(r), vec![v], MType::VAL_TOP);
+                self.push(r, Ty::Val(TagSet::ALL));
+            }
+            GetPropSuper => {
+                let a = self.atom(p.next_uint32().unwrap())?;
+                let base = self.pop();
+                let recv = self.pop();
+                let (x, y) = (self.boxed(recv), self.boxed(base));
+                let r = self.js(Opcode::JsRt(RtOp::GetPropSuper(a)), vec![x, y], MType::VAL_TOP);
+                self.push(r, Ty::Val(TagSet::ALL));
+            }
+            GetElemSuper => {
+                let base = self.pop();
+                let key = self.pop();
+                let recv = self.pop();
+                let vals = vec![self.boxed(recv), self.boxed(key), self.boxed(base)];
+                let r = self.js(Opcode::JsRt(RtOp::GetElemSuper), vals, MType::VAL_TOP);
+                self.push(r, Ty::Val(TagSet::ALL));
+            }
+            SetPropSuper | StrictSetPropSuper => {
+                let a = self.atom(p.next_uint32().unwrap())?;
+                let v = self.pop();
+                let base = self.pop();
+                let recv = self.pop();
+                let vals = vec![self.boxed(recv), self.boxed(base), self.boxed(v)];
+                let r = self.js(Opcode::JsRt(RtOp::SetPropSuper(a, op == StrictSetPropSuper)), vals, MType::VAL_TOP);
+                self.push(r, Ty::Val(TagSet::ALL));
+            }
+            SetElemSuper | StrictSetElemSuper => {
+                let v = self.pop();
+                let base = self.pop();
+                let key = self.pop();
+                let recv = self.pop();
+                let vals = vec![self.boxed(recv), self.boxed(key), self.boxed(base), self.boxed(v)];
+                let r = self.js(Opcode::JsRt(RtOp::SetElemSuper(op == StrictSetElemSuper)), vals, MType::VAL_TOP);
+                self.push(r, Ty::Val(TagSet::ALL));
+            }
+            InitHomeObject => {
+                let home = self.pop();
+                let f = self.top();
+                let (x, y) = (self.boxed(f), self.boxed(home));
+                self.js_void(Opcode::JsRt(RtOp::InitHomeObject), vec![x, y]);
+            }
+            FunWithProto => {
+                let index = p.next_uint32().unwrap();
+                let x = self.pop();
+                let v = self.boxed(x);
+                let r = self.js(Opcode::JsRt(RtOp::FunWithProto(index)), vec![v], MType::val(TagSet::OBJECT));
+                self.push(r, Ty::Val(TagSet::OBJECT));
+            }
+            CheckThisReinit => {
+                let x = self.top();
+                let v = self.boxed(x);
+                self.js_void(Opcode::JsRt(RtOp::Check(mir::ops::CHECK_THIS_REINIT)), vec![v]);
+            }
+            CheckReturn => {
+                // [this] -> [result], with the frame's rval.
+                let t = self.pop();
+                let rv = self.st[self.rval_ix()];
+                let (x, y) = (self.boxed(t), self.boxed(rv));
+                let r = self.js(Opcode::JsRt(RtOp::CheckReturn), vec![x, y], MType::VAL_TOP);
+                self.push(r, Ty::Val(TagSet::ALL));
+            }
+            CallIter | CallContentIter => {
+                // An iterator method (`obj[Symbol.iterator]()`, a
+                // `return`): the ordinary call, whose uncallable callee
+                // throws the iterator protocol's error.
+                let argc = usize::from(p.next_uint16().unwrap());
+                self.publish_this();
+                let n = self.st.len();
+                let operands: Vec<Slot> = self.st.drain(n - argc - 2..).collect();
+                let vals: Vec<mir::Value> = operands.into_iter().map(|x| self.boxed(x)).collect();
+                let r = self.js(Opcode::CallIter, vals, MType::VAL_TOP);
+                self.push(r, Ty::Val(TagSet::ALL));
+                let claim = self.s.ctx.facts.call_types.get(&self.site(pc)).copied();
+                self.guard_result(claim.unwrap_or_default(), pc + op.len(), false);
+            }
+            SpreadCall | SpreadNew | SpreadSuperCall => {
+                // `f(...a)` / `new f(...a)` / `super(...a)`: baseline's
+                // helper, over the spread's argument array.
+                let construct = op != SpreadCall;
+                self.publish_this();
+                let nt = if construct {
+                    let x = self.pop();
+                    self.boxed(x)
+                } else {
+                    self.const_val(ConstVal::Null)
+                };
+                let arr = self.pop();
+                let thisv = self.pop();
+                let callee = self.pop();
+                let vals = vec![self.boxed(callee), self.boxed(thisv), self.boxed(arr), nt];
+                let (out, ty) = if construct {
+                    (MType::val(TagSet::OBJECT), TagSet::OBJECT)
+                } else {
+                    (MType::VAL_TOP, TagSet::ALL)
+                };
+                let r = self.js(Opcode::JsRt(RtOp::SpreadCall(u32::from(construct))), vals, out);
+                self.push(r, Ty::Val(ty));
+            }
+            OptimizeSpreadCall => {
+                let x = self.pop();
+                let v = self.boxed(x);
+                let r = self.js(Opcode::JsRt(RtOp::OptimizeSpreadCall), vec![v], MType::VAL_TOP);
+                self.push(r, Ty::Val(TagSet::ALL));
+            }
+            OptimizeGetIterator => {
+                let x = self.pop();
+                let v = self.boxed(x);
+                let b = self.inst(Opcode::IterOptimizable, vec![v], Some(MType::Bool));
+                self.push(b, Ty::Bool);
+            }
+            CheckIsObj => {
+                let kind = u32::from(p.next_uint8().unwrap());
+                let x = self.top();
+                let v = self.boxed(x);
+                self.js_void(Opcode::JsRt(RtOp::CheckIsObj(kind)), vec![v]);
+            }
+            CloseIter => {
+                let kind = u32::from(p.next_uint8().unwrap());
+                let x = self.pop();
+                let v = self.boxed(x);
+                self.js_void(Opcode::JsRt(RtOp::CloseIter(kind)), vec![v]);
             }
             Call | CallIgnoresRv | CallContent => {
                 let argc = usize::from(p.next_uint16().unwrap());
@@ -5516,7 +5848,7 @@ impl<'s, 'a> Run<'s, 'a> {
                 let targets: Vec<(ScriptId, std::rc::Rc<super::inline::Callee>)> = sids
                     .iter()
                     .take(MAX_INLINE_TARGETS + 1)
-                    .filter(|&&k| self.s.fits_site(k, pc, n))
+                    .filter(|&&k| self.s.fits_site(k, pc, n) && !self.s.is_class_ctor(k))
                     .filter_map(|&k| Some((k, self.s.callee_ctx(k, &fns, recv_ctor.map(|(c, _)| c))?)))
                     .collect();
                 let forward = if argc >= 1 {
