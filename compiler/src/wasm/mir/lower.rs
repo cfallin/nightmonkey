@@ -116,6 +116,9 @@ pub struct Lowered {
     pub call_cell_patches: Vec<(Value, u32)>,
     pub alloc_cell_patches: Vec<(Value, u32)>,
     pub intrinsic_cell_patches: Vec<(Value, u32)>,
+    /// Likely-callee direct calls: the expected-funcidx const, the stub
+    /// `call`, and the callee's script id (`wasm/mod.rs` patches both).
+    pub likely_patches: Vec<(Value, Value, u32)>,
     /// Per mnemonic: how many instructions, and the wasm values they
     /// lowered to (`--dump-opsize`).
     pub opsize: BTreeMap<String, (u32, u32)>,
@@ -293,6 +296,7 @@ struct Lower<'a> {
     construct_cell_patches: Vec<(Value, u32)>,
     /// Call value cell placeholders (bbv's per-site cell; 0: the trash row).
     call_cell_patches: Vec<(Value, u32)>,
+    likely_patches: Vec<(Value, Value, u32)>,
     alloc_cell_patches: Vec<(Value, u32)>,
     intrinsic_cell_patches: Vec<(Value, u32)>,
     opsize: BTreeMap<String, (u32, u32)>,
@@ -444,6 +448,7 @@ pub fn lower<'a>(
         iof_cell_patches: vec![],
         construct_cell_patches: vec![],
         call_cell_patches: vec![],
+        likely_patches: vec![],
         alloc_cell_patches: vec![],
         intrinsic_cell_patches: vec![],
         opsize: BTreeMap::new(),
@@ -471,6 +476,7 @@ pub fn lower<'a>(
         call_cell_patches: l.call_cell_patches,
         alloc_cell_patches: l.alloc_cell_patches,
         intrinsic_cell_patches: l.intrinsic_cell_patches,
+        likely_patches: l.likely_patches,
         opsize: l.opsize,
     })
 }
@@ -1968,7 +1974,19 @@ impl<'a> Lower<'a> {
                 self.guard(inst, cond, &[out])?;
             }
             Opcode::GuardTags(t) => {
-                let c = self.has_tags(a[0], t);
+                // Of the tags the input may have, test the fewer: those
+                // in `t`, or those outside it.
+                let have = match self.ty(d.args[0]) {
+                    MType::Val(s) => s.tags,
+                    _ => TagSet::ALL,
+                };
+                let (inside, outside) = (have.intersect(t), have.minus(t));
+                let c = if outside.count() < inside.count() {
+                    let o = self.has_tags(a[0], outside);
+                    self.un(Operator::I32Eqz, o, Type::I32)
+                } else {
+                    self.has_tags(a[0], inside)
+                };
                 self.guard(inst, c, &[a[0]])?;
             }
             Opcode::F64ToIntExact => {
@@ -4511,6 +4529,46 @@ impl<'a> Lower<'a> {
         self.cur = direct_b;
         let argc_v = self.i32c(argc);
         let undef = self.i64c(UNDEF);
+        // The site's likely callee (bbv's likely-callee arm): its table
+        // index (a patched const; `u32::MAX` while uncompiled, so the arm
+        // is dead) against the classified funcidx, and on a match a static
+        // `call` of its body, which wasmtime may inline.
+        let likely = self.f.insts[inst]
+            .attach
+            .map(|a| &self.f.attachments[a].targets)
+            .and_then(|t| match t.as_slice() {
+                [k] => Some(k.get()),
+                _ => None,
+            });
+        if let Some(sid) = likely {
+            let expected = self.i32c(u32::MAX);
+            let is_likely = self.bin(Operator::I32Eq, funcidx, expected, Type::I32);
+            let (likely_b, indirect_b) = (self.body.add_block(), self.body.add_block());
+            self.cond_br(is_likely, Self::to(likely_b), Self::to(indirect_b));
+            self.cur = likely_b;
+            let args = self
+                .body
+                .arg_pool
+                .from_iter([self.cx, base, argc_v, top, script, undef].into_iter());
+            let tys = self.body.type_pool.from_iter([Type::I32, Type::I32].into_iter());
+            let call = self.push_val(ValueDef::Operator(
+                Operator::Call {
+                    function_index: self.h.direct_call_stub2,
+                },
+                args,
+                tys,
+            ));
+            self.likely_patches.push((expected, call, sid));
+            let err = self.push_val(ValueDef::PickOutput(call, 0, Type::I32));
+            let ok_likely = self.un(Operator::I32Eqz, err, Type::I32);
+            self.terminate(Terminator::Br {
+                target: BlockTarget {
+                    block: join,
+                    args: vec![ok_likely],
+                },
+            });
+            self.cur = indirect_b;
+        }
         // Bodies sit `N` table slots below their adapters (`wasm/mod.rs`).
         let off = self.i32c(u32::MAX);
         self.body_off_patches.push(off);

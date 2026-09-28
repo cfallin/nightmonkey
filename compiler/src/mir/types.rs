@@ -120,6 +120,19 @@ impl TagSet {
         self.prims.subset_of(o.prims) && (!self.object || o.object) && (!self.magic || o.magic)
     }
 
+    pub fn minus(self, o: TagSet) -> TagSet {
+        TagSet {
+            prims: self.prims - o.prims,
+            object: self.object && !o.object,
+            magic: self.magic && !o.magic,
+        }
+    }
+
+    /// How many tags it names (a membership test's compares).
+    pub fn count(self) -> u32 {
+        self.prims.bits().count_ones() + u32::from(self.object) + u32::from(self.magic)
+    }
+
     pub fn is_empty(self) -> bool {
         self.prims.is_empty() && !self.object && !self.magic
     }

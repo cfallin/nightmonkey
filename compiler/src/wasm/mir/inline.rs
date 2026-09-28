@@ -377,6 +377,10 @@ pub(crate) fn splice(
                 })
                 .collect::<Result<_, String>>()?,
         };
+        if let Some(a) = d.attach {
+            let na = f.attachments.push(kf.attachments[a].clone());
+            f.insts[ni].attach = Some(na);
+        }
         let nd = &mut f.insts[ni];
         nd.args = if matches!(d.op, Opcode::Return | Opcode::ExitThrow { .. }) {
             vec![]

@@ -221,6 +221,16 @@ impl<'a> Shape<'a> {
         )
     }
 
+    /// Whether a call of script `k` may go straight to its compiled body
+    /// (bbv's `likely_call_target`): not a class constructor, generator or
+    /// async function.
+    fn direct_ok(&self, k: ScriptId) -> bool {
+        matches!(
+            self.ctx.source.object(crate::source::SourceObjectId::new(k.get())),
+            crate::source::SourceObject::Script(ks) if !ks.is_class_ctor && !ks.is_generator_or_async
+        )
+    }
+
     /// Whether nothing in the script catches or closes on a throw (only
     /// loop notes; not a generator): baseline's landing for any throw is
     /// its error return, which reads nothing of the frame.
@@ -343,7 +353,11 @@ const DIRTY_EXITS: bool = true;
 
 /// A type test a branch consumes narrows the tested value on the branch
 /// it proves (`fuse_test`).
-const NARROW_TESTS: bool = false;
+const NARROW_TESTS: bool = true;
+
+/// A call of a known single callee not inlined gets a direct arm
+/// (`attach_targets`).
+const DIRECT_CALLS: bool = false;
 
 /// Generic ops keep proven layouts on their clean edge (`js_keep`).
 const KEEP_ON_CLEAN: bool = true;
@@ -814,6 +828,8 @@ struct Run<'s, 'a> {
     renames: Vec<(mir::Value, Slot)>,
     /// The pc after the op being built (`js_keep`'s exits).
     next_pc: Option<Pc>,
+    /// The likely callee the next generic `call` gets (`attach_targets`).
+    likely_target: Option<ScriptId>,
 }
 
 impl<'s, 'a> Run<'s, 'a> {
@@ -853,6 +869,7 @@ impl<'s, 'a> Run<'s, 'a> {
             throw_blk: None,
             renames: vec![],
             next_pc: None,
+            likely_target: None,
             inline_sites: 0,
             inline_insts: 0,
         }
@@ -888,8 +905,27 @@ impl<'s, 'a> Run<'s, 'a> {
     fn term(&mut self, op: Opcode, args: Vec<mir::Value>, mut succs: Vec<Edge>) {
         self.retain_locals(&op);
         self.fence_params(&op, &args, &mut succs);
-        self.f.add_inst(self.cur, op, args, &[], succs);
+        let (inst, _) = self.f.add_inst(self.cur, op, args, &[], succs);
+        self.attach_targets(inst);
         self.live = false;
+    }
+
+    /// Give a generic `call` the site's likely callee (`likely_target`),
+    /// for its lowering's direct arm.
+    fn attach_targets(&mut self, inst: mir::Inst) {
+        if self.f.insts[inst].op != Opcode::Call || self.likely_target.is_none() {
+            return;
+        }
+        let k = self.likely_target.take().unwrap();
+        let a = self.f.attachments.push(mir::func::Attachment {
+            site: Some(self.site(self.pc)),
+            ic_cell: None,
+            call_cell: None,
+            slot: None,
+            field_mask: None,
+            targets: vec![k],
+        });
+        self.f.insts[inst].attach = Some(a);
     }
 
     /// A terminator that may change what an `Obj` slot proves (a call, a
@@ -1885,7 +1921,8 @@ impl<'s, 'a> Run<'s, 'a> {
         };
         let err = self.exit_block(true);
         self.retain_locals(&op);
-        self.f.add_inst(self.cur, op, args, &[], vec![clean, dirty, Self::goto(err)]);
+        let (inst, _) = self.f.add_inst(self.cur, op, args, &[], vec![clean, dirty, Self::goto(err)]);
+        self.attach_targets(inst);
         self.live = false;
         self.at(ok);
         Some(p)
@@ -2428,6 +2465,15 @@ impl<'s, 'a> Run<'s, 'a> {
         let cond_true = if bop == JSOp::JumpIfTrue { taken } else { fall };
         let cond_false = if bop == JSOp::JumpIfTrue { fall } else { taken };
         let (inside, outside) = if negate { (cond_false, cond_true) } else { (cond_true, cond_false) };
+        // Narrow the side that learns something: a value that is not null
+        // or undefined, rather than one that is.
+        let nullish = TagSet::prims(PRIM_NULL | PRIM_UNDEFINED);
+        let (tags, narrowed, inside, outside) = if tags.subset_of(nullish) {
+            let rest = have.minus(tags);
+            (rest, rest, outside, inside)
+        } else {
+            (tags, narrowed, inside, outside)
+        };
         let v = self.boxed(x);
         let (nb, fb) = (self.new_block(), self.new_block());
         let nv = self.f.add_param(nb, MType::val(narrowed));
@@ -4315,7 +4361,15 @@ impl<'s, 'a> Run<'s, 'a> {
                     || targets.len() > MAX_INLINE_TARGETS
                     || !self.inline_budget(targets.iter().map(|(_, c)| c.f.insts.len()).sum())
                 {
-                    self.js(Opcode::Call, vals, MType::VAL_TOP)
+                    // Not inlined: a known single callee is called
+                    // directly while it is the callee.
+                    self.likely_target = match sids {
+                        [k] if DIRECT_CALLS && self.s.direct_ok(*k) => Some(*k),
+                        _ => None,
+                    };
+                    let r = self.js(Opcode::Call, vals, MType::VAL_TOP);
+                    self.likely_target = None;
+                    r
                 } else {
                     self.inline_call(&targets, &vals, None)
                 };

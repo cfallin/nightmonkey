@@ -199,7 +199,7 @@ pub fn translate_script(
     Ok(Ok(Outcome::Compiled {
         sig: ctx.helpers.night_abi_sig2,
         body: lowered.body,
-        likely_patches: vec![],
+        likely_patches: lowered.likely_patches,
         fuse_call_patches: vec![],
         call_cell_patches: lowered.call_cell_patches,
         alloc_cell_patches: lowered.alloc_cell_patches,
