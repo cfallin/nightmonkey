@@ -67,6 +67,11 @@ enum Ty {
     /// A typed array of this kind (`obj{TypedArray(k)}`, raw): its
     /// elements are `load_ta`/`store_ta`. Immutable.
     Ta(crate::opsem::TaKind),
+    /// A closure of this script (boxed, `val{object}`): made by a
+    /// `Lambda` here, or the caller's for a formal of a callee built for
+    /// inlining at a call passing one (the context-sensitive target: a
+    /// call of it has exactly this callee).
+    Fn(ScriptId),
     /// A local, formal or rval that is dead here (never read before it is
     /// next written): no value, no block param. An exit passes it as
     /// `const.val dead`.
@@ -87,6 +92,7 @@ impl Ty {
             Ty::F64 => MType::F64_TOP,
             Ty::Bool => MType::Bool,
             Ty::Val(t) => MType::val(t),
+            Ty::Fn(_) => MType::val(TagSet::OBJECT),
             Ty::Obj(keys, types) => MType::Obj(ObjInfo {
                 layout: Some(LayoutClaim {
                     keys,
@@ -108,7 +114,7 @@ impl Ty {
             Ty::F64 => TagSet::NUMBER,
             Ty::Bool => TagSet::BOOLEAN,
             Ty::Val(t) => t,
-            Ty::Obj(..) | Ty::ObjHint(_) | Ty::Native | Ty::Ta(_) => TagSet::OBJECT,
+            Ty::Obj(..) | Ty::ObjHint(_) | Ty::Native | Ty::Ta(_) | Ty::Fn(_) => TagSet::OBJECT,
             Ty::Dead => TagSet::NONE,
         }
     }
@@ -247,15 +253,27 @@ impl<'a> Shape<'a> {
     /// inline-eligible script that is not this one, not a constructor
     /// that stamps its `this`, and small enough once built.
     fn callee(&self, k: ScriptId) -> Option<std::rc::Rc<super::inline::Callee>> {
-        if let Some(c) = self.callees.borrow().get(&k) {
+        self.callee_in(k, &[])
+    }
+
+    /// `callee`, built knowing which of its formals the call passes a
+    /// known closure in (`Ty::Fn`, by formal; missing ones none): its
+    /// calls of those have exactly that callee.
+    fn callee_in(&self, k: ScriptId, fns: &[Option<ScriptId>]) -> Option<std::rc::Rc<super::inline::Callee>> {
+        let mut fns = fns.to_vec();
+        while fns.last() == Some(&None) {
+            fns.pop();
+        }
+        let key = (k, fns);
+        if let Some(c) = self.callees.borrow().get(&key) {
             return c.clone();
         }
-        let c = self.build_callee(k).map(std::rc::Rc::new);
-        self.callees.borrow_mut().insert(k, c.clone());
+        let c = self.build_callee(k, &key.1).map(std::rc::Rc::new);
+        self.callees.borrow_mut().insert(key, c.clone());
         c
     }
 
-    fn build_callee(&self, k: ScriptId) -> Option<super::inline::Callee> {
+    fn build_callee(&self, k: ScriptId, fns: &[Option<ScriptId>]) -> Option<super::inline::Callee> {
         if self.inline_depth >= MAX_INLINE_DEPTH || k == self.sid {
             return None;
         }
@@ -268,7 +286,9 @@ impl<'a> Shape<'a> {
         if !super::inline_eligible(self.ctx, ks) {
             return None;
         }
-        let (mut mm, f) = build_at(self.ctx, names, k, ks, false, self.inline_depth + 1).ok()?;
+        let nargs = usize::from(ks.nargs);
+        let fns: Vec<Option<ScriptId>> = fns.iter().copied().take(nargs).collect();
+        let (mut mm, f) = build_at(self.ctx, names, k, ks, false, self.inline_depth + 1, &fns).ok()?;
         if f.insts.len() > MAX_INLINE_INSTS {
             return None;
         }
@@ -327,7 +347,7 @@ pub fn build<'a>(
     script: &'a Script,
     is_global: bool,
 ) -> Result<(mir::Module, mir::Func), String> {
-    build_at(ctx, names, sid, script, is_global, 0)
+    build_at(ctx, names, sid, script, is_global, 0, &[])
 }
 
 /// Element accesses the analysis predicts on arrays, with int32 keys, are
@@ -357,7 +377,11 @@ const NARROW_TESTS: bool = true;
 
 /// A call of a known single callee not inlined gets a direct arm
 /// (`attach_targets`).
-const DIRECT_CALLS: bool = false;
+const DIRECT_CALLS: bool = true;
+
+/// A call of a closure the frame knows (`Ty::Fn`) has exactly its script
+/// as callee, and a callee built for inlining knows its formals' closures.
+const CALL_KNOWN_FNS: bool = false;
 
 /// Generic ops keep proven layouts on their clean edge (`js_keep`).
 const KEEP_ON_CLEAN: bool = true;
@@ -386,6 +410,7 @@ fn build_at<'a>(
     script: &'a Script,
     is_global: bool,
     depth: u32,
+    formal_fns: &[Option<ScriptId>],
 ) -> Result<(mir::Module, mir::Func), String> {
     if is_global {
         return Err("global script".into());
@@ -426,6 +451,7 @@ fn build_at<'a>(
     shape.apply_fwd = crate::wasm::translate::compute_apply_fwd_pcs(script, &ctx.facts.apply_sites, sid.get())
         .filter(|s| APPLY_FWD && !s.is_empty());
     shape.inline_depth = depth;
+    shape.formal_fns = formal_fns.to_vec();
     for (i, &gc) in script.gcthings.iter().enumerate() {
         if gc.is_other() {
             continue;
@@ -681,7 +707,10 @@ struct Shape<'a> {
     /// How deep in inlining this build is (0: a script's own).
     inline_depth: u32,
     /// Callees built for inlining, by script; `None` if one cannot be.
-    callees: std::cell::RefCell<BTreeMap<ScriptId, Option<std::rc::Rc<super::inline::Callee>>>>,
+    callees: std::cell::RefCell<BTreeMap<(ScriptId, Vec<Option<ScriptId>>), Option<std::rc::Rc<super::inline::Callee>>>>,
+    /// For a build for inlining at a call passing known closures: the
+    /// formals holding one (`Ty::Fn`), by formal.
+    formal_fns: Vec<Option<ScriptId>>,
 }
 
 impl<'a> Shape<'a> {
@@ -728,6 +757,7 @@ impl<'a> Shape<'a> {
             apply_fwd: None,
             inline_depth: 0,
             callees: Default::default(),
+            formal_fns: vec![],
         })
     }
 
@@ -1173,7 +1203,7 @@ impl<'s, 'a> Run<'s, 'a> {
     fn retain_all(&mut self) {
         for ix in 1..self.frame_len().min(self.st.len()) {
             let x = self.st[ix];
-            let managed = matches!(x.ty, Ty::Val(_) | Ty::Obj(..) | Ty::ObjHint(_) | Ty::Native | Ty::Ta(_));
+            let managed = matches!(x.ty, Ty::Val(_) | Ty::Fn(_) | Ty::Obj(..) | Ty::ObjHint(_) | Ty::Native | Ty::Ta(_));
             if !managed {
                 continue;
             }
@@ -1206,7 +1236,7 @@ impl<'s, 'a> Run<'s, 'a> {
     /// `x` as a boxed value, of type `Val(x.ty.tags())`.
     fn boxed(&mut self, x: Slot) -> mir::Value {
         let v = match x.ty {
-            Ty::Val(_) => return x.v,
+            Ty::Val(_) | Ty::Fn(_) => return x.v,
             _ => {
                 let t = mir::ops::box_type(&self.f.ty(x.v)).expect("raw values box");
                 self.inst(Opcode::Box, vec![x.v], Some(t))
@@ -2517,7 +2547,8 @@ impl<'s, 'a> Run<'s, 'a> {
         match x.ty {
             Ty::Dead => unreachable!("a dead slot is never read"),
             Ty::Bool => x.v,
-            Ty::Obj(..) | Ty::ObjHint(_) | Ty::Native | Ty::Ta(_) => {
+            // A closure never emulates `undefined`.
+            Ty::Obj(..) | Ty::ObjHint(_) | Ty::Native | Ty::Ta(_) | Ty::Fn(_) => {
                 self.inst(Opcode::ConstBool(true), vec![], Some(MType::Bool))
             }
             Ty::I32 => {
@@ -2815,6 +2846,52 @@ impl<'s, 'a> Run<'s, 'a> {
                 Ty::Val(tags) if tags == TagSet::ALL => None,
                 Ty::Val(tags) => Some(Opcode::GuardTags(tags)),
                 Ty::ObjHint(_) => Some(Opcode::GuardUnbox(UnboxKind::Obj)),
+                Ty::Fn(k) => {
+                    // An object, a function of script `k`; passed boxed.
+                    let obj = TagSet::OBJECT;
+                    let (b1, b2, b3) = (self.new_block(), self.new_block(), self.new_block());
+                    let bv = self.f.add_param(b1, MType::val(obj));
+                    self.term(
+                        Opcode::GuardTags(obj),
+                        vec![v],
+                        vec![
+                            Edge {
+                                block: b1,
+                                args: vec![EdgeArg::Out(0)],
+                            },
+                            Self::goto(fail),
+                        ],
+                    );
+                    self.at(b1);
+                    let o = self.f.add_param(b2, MType::OBJ_TOP);
+                    self.term(
+                        Opcode::GuardUnbox(UnboxKind::Obj),
+                        vec![bv],
+                        vec![
+                            Edge {
+                                block: b2,
+                                args: vec![EdgeArg::Out(0)],
+                            },
+                            Self::goto(fail),
+                        ],
+                    );
+                    self.at(b2);
+                    self.f.add_param(b3, MType::Obj(ObjInfo::kind(ObjKind::Function(Some(k)))));
+                    self.term(
+                        Opcode::GuardScript(k),
+                        vec![o],
+                        vec![
+                            Edge {
+                                block: b3,
+                                args: vec![EdgeArg::Out(0)],
+                            },
+                            Self::goto(fail),
+                        ],
+                    );
+                    self.at(b3);
+                    args.push(EdgeArg::Value(bv));
+                    continue;
+                }
                 Ty::Native | Ty::Ta(_) => {
                     let o = self.guard_narrow(v, t, fail);
                     args.push(EdgeArg::Value(o));
@@ -2988,9 +3065,14 @@ impl<'s, 'a> Run<'s, 'a> {
         let this = self.f.add_param(b0, MType::VAL_TOP);
         let all = Ty::Val(TagSet::ALL);
         self.st.push(Slot { v: this, ty: all });
-        for _ in 0..self.s.nargs {
-            let v = self.f.add_param(b0, MType::VAL_TOP);
-            self.st.push(Slot { v, ty: all });
+        for i in 0..self.s.nargs {
+            // A closure the inlining call passes (`formal_fns`).
+            let ty = match self.s.formal_fns.get(i as usize) {
+                Some(&Some(k)) => Ty::Fn(k),
+                _ => all,
+            };
+            let v = self.f.add_param(b0, ty.mir());
+            self.st.push(Slot { v, ty });
         }
         let undef = self.const_val(ConstVal::Undefined);
         let uty = Ty::Val(TagSet::prims(PRIM_UNDEFINED));
@@ -3189,7 +3271,14 @@ impl<'s, 'a> Run<'s, 'a> {
                 let index = p.next_uint32().unwrap();
                 let e = self.env_at(0);
                 let r = self.js_static(Opcode::JsLambda(index), vec![e], MType::val(TagSet::OBJECT));
-                self.push(r, Ty::Val(TagSet::OBJECT));
+                let ty = match self.s.script.gcthings.get(index as usize) {
+                    Some(&gc) if !gc.is_other() && CALL_KNOWN_FNS => match self.s.ctx.source.object(gc) {
+                        crate::source::SourceObject::Script(_) => Ty::Fn(ScriptId::new(gc.id())),
+                        _ => Ty::Val(TagSet::OBJECT),
+                    },
+                    _ => Ty::Val(TagSet::OBJECT),
+                };
+                self.push(r, ty);
             }
             CheckLexical | CheckAliasedLexical => {
                 // The top may be the TDZ sentinel only if its type admits
@@ -3661,7 +3750,7 @@ impl<'s, 'a> Run<'s, 'a> {
                 // anything else takes the default.
                 let i = match x.ty {
                     Ty::I32 => x.v,
-                    Ty::F64 | Ty::Val(_) => {
+                    Ty::F64 | Ty::Val(_) | Ty::Fn(_) => {
                         let f = match x.ty {
                             Ty::F64 => x.v,
                             _ => {
@@ -4346,14 +4435,30 @@ impl<'s, 'a> Run<'s, 'a> {
                 let argc = usize::from(p.next_uint16().unwrap());
                 let n = self.st.len();
                 let operands: Vec<Slot> = self.st.drain(n - argc - 2..).collect();
+                // A known closure is the callee (context-sensitive: known
+                // here, maybe not where the analysis looked); the closures
+                // the call passes go to the callee's build.
+                let known = match operands[0].ty {
+                    Ty::Fn(k) => Some(k),
+                    _ => None,
+                };
+                let fns: Vec<Option<ScriptId>> = operands[2..]
+                    .iter()
+                    .map(|x| match x.ty {
+                        Ty::Fn(k) => Some(k),
+                        _ => None,
+                    })
+                    .collect();
                 let vals: Vec<mir::Value> = operands.into_iter().map(|x| self.boxed(x)).collect();
-                let sids = self.s.ctx.facts.scripted_targets(self.site(pc));
+                let facts_sids = self.s.ctx.facts.scripted_targets(self.site(pc));
+                let known_sids: Vec<ScriptId> = known.into_iter().collect();
+                let sids: &[ScriptId] = if known.is_some() { &known_sids } else { facts_sids };
                 let n = sids.len();
                 let targets: Vec<(ScriptId, std::rc::Rc<super::inline::Callee>)> = sids
                     .iter()
                     .take(MAX_INLINE_TARGETS + 1)
                     .filter(|&&k| self.s.fits_site(k, pc, n))
-                    .filter_map(|&k| Some((k, self.s.callee(k)?)))
+                    .filter_map(|&k| Some((k, self.s.callee_in(k, &fns)?)))
                     .collect();
                 let r = if argc == 2 && self.s.apply_fwd.as_ref().is_some_and(|f| f.contains(&pc)) {
                     self.apply_forward(&vals)
