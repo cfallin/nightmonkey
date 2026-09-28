@@ -670,7 +670,7 @@ pub fn cse_loads(m: &Module, f: &mut Func) -> usize {
 }
 
 /// Whether loop-invariant ops are hoisted.
-const LICM: bool = false;
+const LICM: bool = true;
 
 /// Loop-invariant code motion (MIR.md §10.2, over effects): a
 /// non-terminator in a loop that writes nothing, cannot GC, throw or kill
@@ -708,7 +708,9 @@ pub fn licm(m: &Module, f: &mut Func) -> usize {
                 work.extend(preds.get(&b).into_iter().flatten().copied());
             }
         }
-        if body.contains(&p) || f.terminator(p).is_none() {
+        // An onramp into a loop nested in this one enters its body past
+        // the preheader: then nothing can be hoisted there.
+        if body.contains(&p) || f.terminator(p).is_none() || !body.iter().all(|&b| cfg.dominates(p, b)) {
             continue;
         }
         let mut writes = vec![];
@@ -754,6 +756,13 @@ pub fn licm(m: &Module, f: &mut Func) -> usize {
                     continue;
                 }
                 if !d.args.iter().all(|&v| outside(v, &hoisted)) {
+                    continue;
+                }
+                // A managed result live across the whole loop is rooted at
+                // each of its GC points: only the environment reads, whose
+                // reload is the saving.
+                let env_read = matches!(d.op, Opcode::EnvCurrent | Opcode::EnvParent | Opcode::EnvLoad(_));
+                if !env_read && d.results.iter().any(|&r| f.values[r].ty.repr().is_managed()) {
                     continue;
                 }
                 hoisted.extend(d.results.iter().copied());
