@@ -222,7 +222,10 @@ pub enum RtOp {
     /// Define own property `name` of `obj` to `v`, with the attributes.
     InitProp(AtomId, u32),
     /// Define own element `key` of `obj` to `v`, with the attributes.
-    InitElem(u32),
+    /// Its attrs, and whether the store owes the array stamp's RANGES
+    /// claim a clear (`ranges`: a claim applies and the value is not
+    /// proven inside it).
+    InitElem(u32, bool),
     /// ToPropertyKey (a string, a symbol or an int32) -> val.
     ToPropertyKey,
     /// The regexp literal the script's gcthing `index` names, cloned ->
@@ -370,7 +373,8 @@ pub enum Opcode {
     /// Strict-mode (`true`) or sloppy assignment.
     JsSetProp(AtomId, bool),
     JsGetElem,
-    JsSetElem(bool),
+    /// Strictness, and the RANGES duty (as `InitElem`'s).
+    JsSetElem(bool, bool),
     JsGetName(AtomId),
     /// Sloppy-mode `this` that is not an object: the global `this` for
     /// null/undefined, a wrapper object for a primitive.
@@ -420,7 +424,8 @@ pub enum Opcode {
     NewObject(LayoutKey),
     NewArray,
     LoadElem,
-    StoreElem,
+    /// The RANGES duty (as `InitElem`'s).
+    StoreElem(bool),
     LoadTa,
     StoreTa,
     LengthArray,
@@ -454,6 +459,15 @@ pub enum Opcode {
     /// Whether object `o` emulates `undefined` (`document.all`): what
     /// loose equality with null or undefined asks of an object.
     ObjEmulatesUndef,
+    /// Advance boxed `v`'s prefix-stamped object to its full layout key
+    /// when its bits and shape allow (the module's restamp descriptor
+    /// `i`): the two-phase restamp at an init delegate's or fill script's
+    /// returns, or after a fill sequence's last add.
+    Restamp(u32),
+    /// Write class word `w` into a freshly allocated object literal or
+    /// array (`lit_stamps_in`, `array_stamp_in`): nothing can have read
+    /// the old word, and the claims it seeds hold vacuously.
+    StampFresh(u32),
     /// A layout constructor's first stamp of its completed `this`
     /// (layout, field count, kept bits): a no-op unless `this` is an
     /// object of this constructor still under construction.
@@ -526,17 +540,19 @@ impl Opcode {
             | CheckNative(_)
             | I32Ovf(_)
             | LoadElem
-            | StoreElem
+            | StoreElem(_)
             | LoadTa
             | StoreTa
             | StrCharCodeAt
             | InitField(_) => OK_FAIL.to_vec(),
             JsAdd | JsBinop(_) | JsUnop(_) | JsCompare(_) | JsToNumeric | JsGetProp(_)
-            | JsSetProp(..) | JsGetElem | JsSetElem(_) | JsBoxThis | JsBindGName(_)
+            | JsSetProp(..) | JsGetElem | JsSetElem(..) | JsBoxThis | JsBindGName(_)
             | JsSetName(..) | LoadField(_) | StoreField(_) | Call | CallDirect | Construct(..)
-            | CallNative(_) => CLEAN_DIRTY_ERR.to_vec(),
-            // No dynamic effect report: the kill is static, on `ok`.
-            JsGetName(_) | JsLambda(_) | CreateThis(..) | ExitInline { .. } => OK_ERR.to_vec(),
+            | CallNative(_) | JsGetName(_) | CreateThis(..) => CLEAN_DIRTY_ERR.to_vec(),
+            // Clean if the callee's baseline rest demoted nothing.
+            ExitInline { .. } => CLEAN_DIRTY_ERR.to_vec(),
+            // Allocations: no kill, so no effect report.
+            JsLambda(_) => OK_ERR.to_vec(),
             JsRt(_) | ApplyFwd => CLEAN_DIRTY_ERR.to_vec(),
             ArgsObject | RestArray(_) => OK_ERR.to_vec(),
             JsThrow => vec![SuccRole::Err],
@@ -1150,7 +1166,7 @@ pub fn signature(op: &Opcode, args: &[Type], m: &Module) -> SigResult {
                 RtOp::DelProp(..) => (1, Some(Type::val(TagSet::BOOLEAN))),
                 RtOp::NewObject | RtOp::NewArray(_) => (0, Some(Type::val(TagSet::OBJECT))),
                 RtOp::InitProp(..) => (2, None),
-                RtOp::InitElem(_) => (3, None),
+                RtOp::InitElem(..) => (3, None),
                 RtOp::ToPropertyKey => (1, Some(Type::VAL_TOP)),
                 RtOp::RegExp(_) => (0, Some(Type::val(TagSet::OBJECT))),
                 RtOp::InitPropGetSet(..) => (2, None),
@@ -1226,7 +1242,7 @@ pub fn signature(op: &Opcode, args: &[Type], m: &Module) -> SigResult {
             val(&args[0], "js.tonumeric")?;
             Sig::output(Type::val(number_or_bigint))
         }
-        JsGetProp(_) | JsGetElem | JsSetProp(..) | JsSetElem(_) => {
+        JsGetProp(_) | JsGetElem | JsSetProp(..) | JsSetElem(..) => {
             let n = match op {
                 JsGetProp(_) => 1,
                 JsGetElem | JsSetProp(..) => 2,
@@ -1278,6 +1294,16 @@ pub fn signature(op: &Opcode, args: &[Type], m: &Module) -> SigResult {
             arity(args, 1)?;
             obj(&args[0], "obj.emulates_undef")?;
             Sig::result(Type::Bool)
+        }
+        Restamp(_) => {
+            arity(args, 1)?;
+            val(&args[0], "restamp")?;
+            Sig::none()
+        }
+        StampFresh(_) => {
+            arity(args, 1)?;
+            val(&args[0], "stamp.fresh")?;
+            Sig::none()
         }
         CtorStamp(..) => {
             arity(args, 1)?;
@@ -1415,7 +1441,7 @@ pub fn signature(op: &Opcode, args: &[Type], m: &Module) -> SigResult {
             i32r(&args[0], "new_array")?;
             Sig::result(Type::Obj(ObjInfo::kind(ObjKind::Array)))
         }
-        LoadElem | StoreElem => {
+        LoadElem | StoreElem(_) => {
             arity(args, if *op == LoadElem { 2 } else { 3 })?;
             want_kind(&obj(&args[0], "elem op")?, ObjKind::Native, "elem op")?;
             i32r(&args[1], "elem op index")?;
@@ -1725,27 +1751,36 @@ pub fn effects(op: &Opcode, args: &[Type], m: &Module) -> Effects {
     let mut fx = Effects::PURE;
     match op {
         JsAdd | JsBinop(_) | JsUnop(_) | JsCompare(_) | JsToNumeric | JsGetProp(_)
-        | JsSetProp(..) | JsGetElem | JsSetElem(_) | JsBoxThis | JsBindGName(_) | JsSetName(..) => {
+        | JsSetProp(..) | JsGetElem | JsSetElem(..) | JsBoxThis | JsBindGName(_) | JsSetName(..) => {
             return Effects::generic(FlagsEffect::Dynamic)
         }
-        JsGetName(_) => return Effects::generic(FlagsEffect::Bits(FlagBits::ALL)),
+        JsGetName(_) => return Effects::generic(FlagsEffect::Dynamic),
         JsRt(_) => return Effects::generic(FlagsEffect::Dynamic),
         ApplyFwd => return Effects::generic(FlagsEffect::Callee),
-        // Allocations; conservatively generic.
-        ArgsObject | RestArray(_) => return Effects::generic(FlagsEffect::Bits(FlagBits::ALL)),
+        // Allocations: they run no JS and change no class word (a GC moves
+        // objects but keeps their words), so they kill nothing.
+        ArgsObject | RestArray(_) | JsLambda(_) => {
+            fx.may_gc = true;
+            fx.may_throw = true;
+        }
         JsThrow => return Effects::generic(FlagsEffect::Bits(FlagBits::ALL)),
-        // An allocation, but reported as generic: it runs no JS, yet a GC
-        // may move anything.
-        JsLambda(_) => return Effects::generic(FlagsEffect::Bits(FlagBits::ALL)),
-        // `.prototype` of the callee: conservatively generic.
-        CreateThis(..) => return Effects::generic(FlagsEffect::Bits(FlagBits::ALL)),
+        // `.prototype` of the callee: generic, reported.
+        CreateThis(..) => return Effects::generic(FlagsEffect::Dynamic),
         // Writes the class word of an object no guard can have proven.
         CtorStamp(..) => {
             fx.writes = vec![Region::Unknown];
             fx.flags = FlagsEffect::Bits(FlagBits::MUT_THIS);
         }
+        // The object is fresh: no fact about its word exists yet.
+        StampFresh(_) => fx.flags = FlagsEffect::Bits(FlagBits::MUT_THIS),
+        // Advances a prefix key to its full one: slots stay put, so a
+        // fact about the prefix stays true; a prefix-key guard just misses.
+        Restamp(_) => {
+            fx.writes = vec![Region::Unknown];
+            fx.flags = FlagsEffect::Bits(FlagBits::MUT_OTHER);
+        }
         // The rest of the callee, in baseline: anything.
-        ExitInline { .. } => return Effects::generic(FlagsEffect::Bits(FlagBits::ALL)),
+        ExitInline { .. } => return Effects::generic(FlagsEffect::Dynamic),
         Call | CallDirect | Construct(..) | CallNative(_) => {
             return Effects::generic(FlagsEffect::Callee)
         }
@@ -1783,7 +1818,7 @@ pub fn effects(op: &Opcode, args: &[Type], m: &Module) -> Effects {
             fx.writes = vec![Region::Unknown];
             fx.flags = FlagsEffect::Bits(FlagBits::MUT_OTHER);
         }
-        StoreElem => {
+        StoreElem(_) => {
             fx.writes = vec![Region::Elements(elements_root(recv, m))];
             fx.flags = FlagsEffect::Bits(FlagBits::MUT_OTHER);
         }
@@ -1897,7 +1932,7 @@ mod tests {
                 KillSite::None,
                 KillSite::None,
                 KillSite::DirtyEdge,
-                KillSite::OkEdge,
+                KillSite::DirtyEdge,
                 KillSite::Op,
                 KillSite::None
             ]

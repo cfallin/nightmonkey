@@ -118,6 +118,10 @@ pub struct Module {
     /// The runtime `JSScript*` of each script a `guard.script` names
     /// (§5.5). Not printed: a module parsed from text has none.
     pub script_addrs: BTreeMap<crate::ids::ScriptId, u32>,
+    /// Restamp descriptors `restamp` ops index: the runtime helper's
+    /// arguments (`bbv::restamp_args`: layout, field count, kept bits,
+    /// prefix keys + 1). Not printed.
+    pub restamps: Vec<[u32; 7]>,
 }
 
 impl Module {

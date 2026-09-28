@@ -35,7 +35,7 @@ use crate::wasm::bbv::abi::{
     BINOP_LSH, BINOP_MOD, BINOP_MUL, BINOP_RSH, BINOP_SUB, BINOP_URSH, CMP_EQ, CMP_GE, CMP_GT,
     CMP_LE, CMP_LT, CMP_NE, CMP_STRICTEQ, CMP_STRICTNE, ELEMENTS_INITLEN_BACK, FIXED_SLOTS_BASE,
     FLAGS_ALL, FUNC_ENV_SLOT_OFFSET, IC_WAY_ADDR_PLACEHOLDER, FUNC_SCRIPT_SLOT_OFFSET, INIT_ATTR_ENUMERATE,
-    INIT_ATTR_HIDDEN, INIT_ATTR_LOCKED, NO_NSLOTS, OBJ_ELEMENTS_OFFSET,
+    INIT_ATTR_HIDDEN, INIT_ATTR_LOCKED, NO_NSLOTS, OBJ_CLASS_IDX_OFFSET, OBJ_ELEMENTS_OFFSET, CLASS_WORD_SLOTS,
     SHAPE_IMMUTABLE_FLAGS_OFFSET, SHAPE_IS_NATIVE_BIT, SHAPE_OFFSET,
 };
 use crate::wasm::translate::{
@@ -75,6 +75,9 @@ pub(super) struct Gen<'a> {
     /// An init delegate's restamp (`night_runtime_ctor_restamp`'s
     /// arguments after `this`).
     ctor_restamp: Option<[u32; 7]>,
+    /// A fill script's restamp of a formal at its returns
+    /// (`arg_restamps_in`): the formal and the restamp arguments.
+    arg_restamp: Option<(u32, [u32; 7])>,
     atoms: &'a mut AtomTable,
     script: &'a Script,
     is_global: bool,
@@ -210,6 +213,10 @@ impl<'a> Gen<'a> {
                 ]
             }),
             ctor_restamp: ctx.deleg_restamps_in.get(&sid).and_then(restamp_args),
+            arg_restamp: ctx
+                .arg_restamps_in
+                .get(&sid)
+                .and_then(|(f, si)| Some((*f, restamp_args(si)?))),
             atoms,
             script,
             is_global,
@@ -322,6 +329,16 @@ impl<'a> Gen<'a> {
         let args = self.body.arg_pool.double(addr, value);
         self.push_val(ValueDef::Operator(
             Operator::I64Store { memory: m },
+            args,
+            Default::default(),
+        ));
+    }
+
+    fn store_i32(&mut self, addr: Value, offset: u32, value: Value) {
+        let m = self.mem(2, offset);
+        let args = self.body.arg_pool.double(addr, value);
+        self.push_val(ValueDef::Operator(
+            Operator::I32Store { memory: m },
             args,
             Default::default(),
         ));
@@ -966,6 +983,9 @@ impl<'a> Gen<'a> {
             (self.pc, self.d) = (pc, d);
             let before = p.remaining();
             self.op(&mut p, op)?;
+            if self.live {
+                self.local_restamp(pc);
+            }
             let consumed = before - p.remaining() + 1;
             if consumed != op.len() as usize {
                 return Err(format!(
@@ -1337,6 +1357,51 @@ impl<'a> Gen<'a> {
         });
     }
 
+    fn restamp(&mut self, v: Value, r: [u32; 7]) {
+        let mut args = vec![v];
+        for x in r {
+            args.push(self.i32c(x));
+        }
+        self.call(self.h.ctor_restamp, &args, None);
+    }
+
+    /// Formal `n`'s current value.
+    fn formal(&mut self, n: u32) -> Value {
+        if self.script.has_mapped_args {
+            let obj = self.load_i64(self.vp, self.layout.args_obj());
+            let i = self.i32c(n);
+            self.call(self.h.get_mapped_arg, &[obj, i], Some(Type::I64)).unwrap()
+        } else {
+            self.load_i64(self.sp, self.layout.arg(n))
+        }
+    }
+
+    /// After the last add of a post-construction fill sequence
+    /// (`local_restamps_in`), the restamp of the named local or formal.
+    fn local_restamp(&mut self, pc: Pc) {
+        let site = crate::ids::Site::new(self.sid, pc);
+        let Some(&(local, ref si)) = self.ctx.local_restamps_in.get(&site) else {
+            return;
+        };
+        let Some(r) = restamp_args(si) else { return };
+        let v = if local & crate::facts::RESTAMP_FORMAL != 0 {
+            self.formal(local & !crate::facts::RESTAMP_FORMAL)
+        } else {
+            self.load_i64(self.vp, self.layout.local(local))
+        };
+        self.restamp(v, r);
+    }
+
+    /// Write stamp word `w` into fresh object `r` (bbv's literal and array
+    /// allocation stamps).
+    fn stamp_fresh(&mut self, r: Value, w: Option<u32>) {
+        if let Some(w) = w {
+            let obj = self.unop(Operator::I32WrapI64, r, Type::I32);
+            let wv = self.i32c(w);
+            self.store_i32(obj, OBJ_CLASS_IDX_OFFSET, wv);
+        }
+    }
+
     fn ret(&mut self, v: Value) {
         if let Some([layout, nfields, keep]) = self.ctor_stamp {
             let thisv = self.load_i64(self.sp, FrameLayout::THIS);
@@ -1344,11 +1409,12 @@ impl<'a> Gen<'a> {
             self.call(self.h.ctor_stamp, &[thisv, l, n, k], None);
         }
         if let Some(r) = self.ctor_restamp {
-            let mut args = vec![self.load_i64(self.sp, FrameLayout::THIS)];
-            for x in r {
-                args.push(self.i32c(x));
-            }
-            self.call(self.h.ctor_restamp, &args, None);
+            let thisv = self.load_i64(self.sp, FrameLayout::THIS);
+            self.restamp(thisv, r);
+        }
+        if let Some((n, r)) = self.arg_restamp {
+            let v = self.formal(n);
+            self.restamp(v, r);
         }
         self.store_i64(self.retval_out, 0, v);
         let zero = self.i32c(0);
@@ -2242,12 +2308,18 @@ impl<'a> Gen<'a> {
                 skip(p, op);
                 let z = self.i32c(0);
                 let r = self.rt(h.new_object, &[z]);
+                let site = crate::ids::Site::new(self.sid, self.pc);
+                let w = self.ctx.lit_stamps_in.get(&site).map(|&l| (l + 1) | CLASS_WORD_SLOTS);
+                self.stamp_fresh(r, w);
                 self.set_slot(d, r);
             }
             NewArray => {
                 let len = p.next_uint32().unwrap();
                 let (lv, z) = (self.i32c(len), self.i32c(0));
                 let r = self.rt(h.new_array, &[lv, z]);
+                let site = crate::ids::Site::new(self.sid, self.pc);
+                let w = self.ctx.array_stamp_in.get(&site).copied();
+                self.stamp_fresh(r, w);
                 self.set_slot(d, r);
             }
             InitProp | InitHiddenProp | InitLockedProp => {

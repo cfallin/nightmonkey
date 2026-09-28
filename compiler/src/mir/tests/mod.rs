@@ -408,22 +408,9 @@ fn predictions() {
     verify_ok(&ctor(" !pred{constructing}"));
     verify_err(&ctor(""), Check::Prediction, "(no witness)");
     verify_err(&ctor(" !pred{fuse}"), Check::Prediction, "does not cover");
-    // A static kill on an `ok` edge needs the witness too; a kill on an
-    // `ok_dirty` edge (the §10.3 call) does not.
-    let getname = |w: &str| {
-        func(&format!(
-            "b0(v0: obj{{Function(s1)}}, v1: val):\n  js.getname g{w} -> ok b1(v2: val), err b98\n\
-             b1(v2: val):\n  return v2\nb98:\n  exit.throw pc=0 this=v1 args=[] locals=[] rval=v1 stack=[]\n"
-        ))
-    };
-    verify_ok(&getname(
-        " !pred{layout,types,constructing,fuse,binding,native}",
-    ));
-    verify_err(
-        &getname(" !pred{layout,types}"),
-        Check::Prediction,
-        "js.getname statically kills",
-    );
+    // A kill on an `ok_dirty` edge (the §10.3 call, and since facts are
+    // fixed every op that runs JS) needs no witness: its clean edge kills
+    // nothing.
 }
 
 // --- 7. raw pointers across GC ------------------------------------------

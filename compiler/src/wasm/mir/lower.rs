@@ -300,13 +300,12 @@ struct Lower<'a> {
     exit_census: Option<Func>,
     /// The census helper, when blocks are counted (`--block-census`).
     block_census: Option<Func>,
-    ctor_restamp: Option<[u32; 7]>,
     /// One exit hub per frame shape (`exit_hub`).
     exit_hubs: BTreeMap<Vec<Option<BoxKind>>, Block>,
     /// One `exit.inline` hub per inline frame: its entry and last blocks,
     /// its site-index param and call status, and each site's tail
     /// (`exit_inline`).
-    inline_hubs: BTreeMap<u32, (Block, Block, Value, Value, Vec<Block>)>,
+    inline_hubs: BTreeMap<u32, (Block, Block, Value, Value, Value, Vec<Block>)>,
     strict: bool,
     plain_env: bool,
     own_env: bool,
@@ -356,8 +355,6 @@ pub struct LowerOpts {
     pub exit_census: bool,
     /// Count every MIR block's executions (`--block-census`).
     pub block_census: bool,
-    /// An init delegate's restamp arguments (`bbv::restamp_args`).
-    pub ctor_restamp: Option<[u32; 7]>,
     /// Strict-mode code: a field store's generic fallback throws on failure.
     pub strict: bool,
     /// The activation's environment is its callee's (`baseline::env_is_plain`).
@@ -452,7 +449,6 @@ pub fn lower<'a>(
         opsize: BTreeMap::new(),
         exit_census: if o.exit_census { h.census } else { None },
         block_census: if o.block_census { h.census } else { None },
-        ctor_restamp: o.ctor_restamp,
         exit_hubs: BTreeMap::new(),
         inline_hubs: BTreeMap::new(),
         strict: o.strict,
@@ -926,12 +922,12 @@ impl<'a> Lower<'a> {
             return Err(format!("lowering: an edge into {b} was never placed"));
         }
         // Each `exit.inline` hub continues at its site's tail.
-        for (_, last, site, err, tails) in std::mem::take(&mut self.inline_hubs).into_values() {
+        for (_, last, site, err, same, tails) in std::mem::take(&mut self.inline_hubs).into_values() {
             let targets: Vec<BlockTarget> = tails
                 .iter()
                 .map(|&t| BlockTarget {
                     block: t,
-                    args: vec![err],
+                    args: vec![err, same],
                 })
                 .collect();
             let default = targets[0].clone();
@@ -1903,14 +1899,21 @@ impl<'a> Lower<'a> {
                     default,
                 });
             }
-            Opcode::Return => {
-                if let Some(r) = self.ctor_restamp {
-                    let mut args = vec![self.load_i64(self.sp, FrameLayout::THIS)];
-                    for x in r {
-                        args.push(self.i32c(x));
-                    }
-                    self.call(self.h.ctor_restamp, &args, &[]);
+            Opcode::StampFresh(w) => {
+                let obj = self.un(Operator::I32WrapI64, a[0], Type::I32);
+                let wv = self.i32c(w);
+                self.store_i32(obj, OBJ_CLASS_IDX_OFFSET, wv);
+            }
+            Opcode::Restamp(i) => {
+                // A leaf: the runtime's two-phase restamp gates.
+                let r = self.mm.restamps[i as usize];
+                let mut args = vec![a[0]];
+                for x in r {
+                    args.push(self.i32c(x));
                 }
+                self.call(self.h.ctor_restamp, &args, &[]);
+            }
+            Opcode::Return => {
                 self.store_i64(self.retval_out, 0, a[0]);
                 let z = self.i32c(0);
                 self.ret(z);
@@ -2129,17 +2132,14 @@ impl<'a> Lower<'a> {
                 self.cond_br(ok, t, e);
             }
             Opcode::JsGetName(name) => {
-                // `ok` and `err` (a static kill): not a clean/dirty op.
+                // A getter may run: clean only if no class word was
+                // demoted meanwhile.
                 if let Some(&bid) = self.gname_bids.get(&name) {
                     self.gname_fast_arms(inst, bid)?;
                 }
                 let at = self.atom(name);
                 let z = self.i32c(0);
-                let live = self.live_across(inst);
-                let (ok, r) = self.gc_call(self.h.get_gname, &[at, z], &live)?;
-                let t = self.edge(inst, 0, &[r])?;
-                let e = self.edge(inst, 1, &[])?;
-                self.cond_br(ok, t, e);
+                self.js_call(inst, self.h.get_gname, &[at, z], false)?;
             }
             Opcode::JsGetProp(name) => {
                 // The site's inline cache (as bbv's fact-free reads): the
@@ -2235,11 +2235,13 @@ impl<'a> Lower<'a> {
                 self.cur = slow;
                 self.js_call(inst, self.h.get_element, &[a[0], a[1]], false)?;
             }
-            Opcode::JsSetElem(strict) => {
+            Opcode::JsSetElem(strict, duty) => {
                 // An in-bounds overwrite of a non-hole dense element inline,
                 // taking `ok_clean`: an own writable data property unless
                 // the elements are frozen. The store bypasses the engine,
-                // so it also requires no RANGES on the object's word.
+                // so it owes the array stamp's RANGES claim its duty: a
+                // clear, as bbv's for a value not proven inside the claim
+                // (no MIR fact rests on it; the epoch bump tells callers').
                 let num = matches!(self.ty(d.args[2]), MType::Val(s) if s.tags.subset_of(TagSet::NUMBER));
                 let slow = self.body.add_block();
                 let (obj, elements, idx, addr, _) = self.dense_slot(a[0], a[1], slow);
@@ -2248,12 +2250,12 @@ impl<'a> Lower<'a> {
                 let flags = self.load_i32(header, 0);
                 let fz = self.i32c(ELEMENTS_FROZEN_FLAG);
                 let frozen = self.bin(Operator::I32And, flags, fz, Type::I32);
-                let w = self.load_i32(obj, OBJ_CLASS_IDX_OFFSET);
-                let rb = self.i32c(CLASS_WORD_RANGES);
-                let ranges = self.bin(Operator::I32And, w, rb, Type::I32);
-                let bad = self.bin(Operator::I32Or, frozen, ranges, Type::I32);
-                let good = self.un(Operator::I32Eqz, bad, Type::I32);
+                let good = self.un(Operator::I32Eqz, frozen, Type::I32);
                 self.check(good, slow);
+                if duty {
+                    let w = self.load_i32(obj, OBJ_CLASS_IDX_OFFSET);
+                    self.clear_bits(obj, w, CLASS_WORD_RANGES);
+                }
                 if !num {
                     self.pre_barrier(addr, 0);
                 }
@@ -2383,10 +2385,10 @@ impl<'a> Lower<'a> {
                 let f = self.edge(inst, 1, &[])?;
                 self.terminate(Terminator::Br { target: f });
             }
-            Opcode::StoreElem => {
+            Opcode::StoreElem(duty) => {
                 // An in-bounds overwrite of a non-hole dense element of
                 // unfrozen elements (an own writable data property); else
-                // `fail`. RANGES, consumed by no MIR claim, is dropped.
+                // `fail`. RANGES is dropped under the store's duty.
                 let num = matches!(self.ty(d.args[2]), MType::Val(s) if s.tags.subset_of(TagSet::NUMBER));
                 let fail = self.body.add_block();
                 let (addr, _) = self.elem_addr(a[0], a[1], fail, true);
@@ -2398,8 +2400,10 @@ impl<'a> Lower<'a> {
                 let frozen = self.bin(Operator::I32And, flags, fz, Type::I32);
                 let thawed = self.un(Operator::I32Eqz, frozen, Type::I32);
                 self.check(thawed, fail);
-                let w = self.load_i32(a[0], OBJ_CLASS_IDX_OFFSET);
-                self.clear_bits(a[0], w, CLASS_WORD_RANGES);
+                if duty {
+                    let w = self.load_i32(a[0], OBJ_CLASS_IDX_OFFSET);
+                    self.clear_bits(a[0], w, CLASS_WORD_RANGES);
+                }
                 if !num {
                     self.pre_barrier(addr, 0);
                 }
@@ -2459,12 +2463,15 @@ impl<'a> Lower<'a> {
                 self.root(&live)?;
                 let top_off = self.top_off(live.len());
                 let top = self.add_off(self.vp, top_off);
+                // `.prototype` may be a getter (a proxy's): clean only if
+                // no class word was demoted meanwhile.
+                let pre = self.epoch();
                 let ok = self.construct_this(top, a[0], a[1], nslots, word);
                 self.after_gc(&live);
+                let post = self.epoch();
+                let same = self.bin(Operator::I32Eq, pre, post, Type::I32);
                 let r = self.load_i64(self.vp, top_off);
-                let t = self.edge(inst, 0, &[r])?;
-                let e = self.edge(inst, 1, &[])?;
-                self.cond_br(ok, t, e);
+                self.clean_or_dirty(inst, ok, same, &[r])?;
             }
             Opcode::ObjEmulatesUndef => {
                 // Only while some object's class emulates `undefined` (the
@@ -2532,7 +2539,7 @@ impl<'a> Lower<'a> {
                         let (at, av, sv) = (self.atom(name), self.i32c(attrs), self.i32c(site));
                         (h.init_prop, vec![a[0], at, a[1], av, sv])
                     }
-                    RtOp::InitElem(attrs) => {
+                    RtOp::InitElem(attrs, duty) => {
                         let key = self.f.insts[inst].args[1];
                         let index = match self.f.values[key].def {
                             mir::func::ValueDef::Result(i, _) => match self.f.insts[i].op {
@@ -2546,7 +2553,7 @@ impl<'a> Lower<'a> {
                                 if attrs == crate::wasm::bbv::abi::INIT_ATTR_ENUMERATE
                                     && i < crate::constants::INLINE_INIT_ELEM_CAP =>
                             {
-                                self.init_elem_inline(inst, a[0], i, a[2])?
+                                self.init_elem_inline(inst, a[0], i, a[2], duty)?
                             }
                             _ => {}
                         }
@@ -4765,11 +4772,11 @@ impl<'a> Lower<'a> {
 
     /// `InitElemArray index` filling an array literal (bbv's
     /// `emit_init_elem_array`): with a value that is neither a GC thing
-    /// (no barrier) nor the hole, an unstamped array (no element claim to
-    /// keep), dense elements with no flag but FIXED, and the initialized
-    /// length at `index` with room, store and bump it, taking `ok_clean`;
+    /// (no barrier) nor the hole, dense elements with no flag but FIXED,
+    /// and the initialized length at `index` with room, store and bump it
+    /// (clearing RANGES under the store's `duty`), taking `ok_clean`;
     /// `cur` is left on the miss.
-    fn init_elem_inline(&mut self, inst: mir::Inst, arr: Value, index: u32, val: Value) -> R<()> {
+    fn init_elem_inline(&mut self, inst: mir::Inst, arr: Value, index: u32, val: Value, duty: bool) -> R<()> {
         use crate::wasm::bbv::abi::ELEMENTS_FLAG_FIXED;
         let slow = self.body.add_block();
         let vt = self.tag_of(val);
@@ -4780,9 +4787,6 @@ impl<'a> Lower<'a> {
         let ok = self.bin(Operator::I32And, v_ok, a_obj, Type::I32);
         self.check(ok, slow);
         let obj = self.un(Operator::I32WrapI64, arr, Type::I32);
-        let word = self.load_i32(obj, OBJ_CLASS_IDX_OFFSET);
-        let unstamped = self.un(Operator::I32Eqz, word, Type::I32);
-        self.check(unstamped, slow);
         let elems = self.load_i32(obj, OBJ_ELEMENTS_OFFSET);
         let flags = self.elem_header(elems, ELEMENTS_FLAGS_BACK);
         let initlen = self.elem_header(elems, ELEMENTS_INITLEN_BACK);
@@ -4799,6 +4803,10 @@ impl<'a> Lower<'a> {
         let b = self.bin(Operator::I32And, c_ok, l_ok, Type::I32);
         let all = self.bin(Operator::I32And, a, b, Type::I32);
         self.check(all, slow);
+        if duty {
+            let word = self.load_i32(obj, OBJ_CLASS_IDX_OFFSET);
+            self.clear_bits(obj, word, CLASS_WORD_RANGES);
+        }
         self.store_i64(elems, index * 8, val);
         let nl = self.i32c(index + 1);
         self.set_elem_header(elems, ELEMENTS_INITLEN_BACK, nl);
@@ -5149,12 +5157,13 @@ impl<'a> Lower<'a> {
             let hub = self.inline_hub(fid, nargs, nlocals, max_depth)?;
             self.inline_hubs.insert(fid, hub);
         }
-        let (hub, _, _, _, tails) = self.inline_hubs.get_mut(&fid).unwrap();
+        let (hub, _, _, _, _, tails) = self.inline_hubs.get_mut(&fid).unwrap();
         let hub = *hub;
         let idx = u32::try_from(tails.len()).unwrap();
         let tail = self.body.add_block();
         let err = self.body.add_blockparam(tail, Type::I32);
-        self.inline_hubs.get_mut(&fid).unwrap().4.push(tail);
+        let same = self.body.add_blockparam(tail, Type::I32);
+        self.inline_hubs.get_mut(&fid).unwrap().5.push(tail);
         let mode = if throw {
             ResumeMode::Throw
         } else {
@@ -5173,10 +5182,7 @@ impl<'a> Lower<'a> {
         let end = self.frame_end[fid as usize];
         let result = self.load_i64(self.vp, end);
         let ok = self.un(Operator::I32Eqz, err, Type::I32);
-        let t = self.edge(inst, 0, &[result])?;
-        let e = self.edge(inst, 1, &[])?;
-        self.cond_br(ok, t, e);
-        Ok(())
+        self.clean_or_dirty(inst, ok, same, &[result])
     }
 
     /// The `exit.inline` hub for inline frame `fid`: params the resume
@@ -5191,7 +5197,7 @@ impl<'a> Lower<'a> {
         nargs: u32,
         nlocals: u32,
         max_depth: u32,
-    ) -> R<(Block, Block, Value, Value, Vec<Block>)> {
+    ) -> R<(Block, Block, Value, Value, Value, Vec<Block>)> {
         let saved = self.cur;
         let hub = self.body.add_block();
         let word = self.body.add_blockparam(hub, Type::I32);
@@ -5245,6 +5251,9 @@ impl<'a> Lower<'a> {
             .arg_pool
             .from_iter([self.cx, frame, argc, top, script, undef, body_idx].into_iter());
         let tys = self.body.type_pool.from_iter([Type::I32, Type::I32].into_iter());
+        // Whether the callee's baseline rest demoted a class word: the
+        // sites continue on their clean edge only if not.
+        let pre = self.epoch();
         let call = self.push_val(ValueDef::Operator(
             Operator::CallIndirect {
                 sig_index: self.h.night_abi_sig2,
@@ -5254,10 +5263,12 @@ impl<'a> Lower<'a> {
             tys,
         ));
         let err = self.push_val(ValueDef::PickOutput(call, 0, Type::I32));
+        let post = self.epoch();
+        let same = self.bin(Operator::I32Eq, pre, post, Type::I32);
         // The dispatch goes where the body ends (classify branches).
         let last = self.cur;
         self.cur = saved;
-        Ok((hub, last, site, err, vec![]))
+        Ok((hub, last, site, err, same, vec![]))
     }
 
     /// Leave MIR at `w` with the frame state `ops` (this, formals,

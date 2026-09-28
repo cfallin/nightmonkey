@@ -354,8 +354,10 @@ pub fn mnemonic(op: &Opcode) -> String {
         JsSetProp(_, false) => "js.setprop".into(),
         JsSetProp(_, true) => "js.setprop.strict".into(),
         JsGetElem => "js.getelem".into(),
-        JsSetElem(false) => "js.setelem".into(),
-        JsSetElem(true) => "js.setelem.strict".into(),
+        JsSetElem(false, false) => "js.setelem".into(),
+        JsSetElem(true, false) => "js.setelem.strict".into(),
+        JsSetElem(false, true) => "js.setelem.ranges".into(),
+        JsSetElem(true, true) => "js.setelem.strict.ranges".into(),
         JsGetName(_) => "js.getname".into(),
         JsBoxThis => "js.box_this".into(),
         JsBindGName(_) => "js.bindgname".into(),
@@ -379,7 +381,8 @@ pub fn mnemonic(op: &Opcode) -> String {
             RtOp::NewObject => "js.rt.newobject",
             RtOp::NewArray(_) => "js.rt.newarray",
             RtOp::InitProp(..) => "js.rt.initprop",
-            RtOp::InitElem(_) => "js.rt.initelem",
+            RtOp::InitElem(_, false) => "js.rt.initelem",
+            RtOp::InitElem(_, true) => "js.rt.initelem.ranges",
             RtOp::ToPropertyKey => "js.rt.topropertykey",
             RtOp::RegExp(_) => "js.rt.regexp",
             RtOp::InitPropGetSet(..) => "js.rt.initgetset",
@@ -399,7 +402,8 @@ pub fn mnemonic(op: &Opcode) -> String {
         NewObject(_) => "new_object".into(),
         NewArray => "new_array".into(),
         LoadElem => "load_elem".into(),
-        StoreElem => "store_elem".into(),
+        StoreElem(false) => "store_elem".into(),
+        StoreElem(true) => "store_elem.ranges".into(),
         LoadTa => "load_ta".into(),
         StoreTa => "store_ta".into(),
         LengthArray => "length.array".into(),
@@ -419,6 +423,8 @@ pub fn mnemonic(op: &Opcode) -> String {
         CreateThis(..) => "create_this".into(),
         FnIsCtor => "fn.is_ctor".into(),
         ObjEmulatesUndef => "obj.emulates_undef".into(),
+        Restamp(_) => "restamp".into(),
+        StampFresh(_) => "stamp.fresh".into(),
         CtorStamp(..) => "ctor.stamp".into(),
         CallNative(_) => "call_native".into(),
     }
@@ -474,11 +480,13 @@ fn immediates(m: &Module, op: &Opcode) -> Option<String> {
             k.to_string()
         }
         JsRt(RtOp::DelProp(a, _)) | JsRt(RtOp::Intrinsic(a)) => atom(Some(m), *a),
-        JsRt(RtOp::NewArray(n)) | JsRt(RtOp::InitElem(n)) | JsRt(RtOp::Symbol(n)) | JsRt(RtOp::BuiltinObject(n)) => {
+        JsRt(RtOp::NewArray(n)) | JsRt(RtOp::InitElem(n, _)) | JsRt(RtOp::Symbol(n)) | JsRt(RtOp::BuiltinObject(n)) => {
             n.to_string()
         }
         JsRt(RtOp::InitProp(a, attrs)) => format!("{}, {attrs}", atom(Some(m), *a)),
         Construct(n, w) | CreateThis(n, w) => format!("{n}, {w}"),
+        Restamp(i) => i.to_string(),
+        StampFresh(w) => format!("{w:#x}"),
         CtorStamp(l, n, k) => format!("{l}, {n}, {k}"),
         _ => return None,
     })

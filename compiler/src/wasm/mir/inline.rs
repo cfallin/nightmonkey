@@ -24,12 +24,60 @@ pub(crate) struct Callee {
     pub mm: Module,
     pub f: Func,
     pub max_depth: u32,
+    /// Whether some op in it may kill facts and continue (a fence): then
+    /// the caller's facts do not survive the splice. Without one, every
+    /// kill exits (its dirty edge leaves for baseline, and an exit's
+    /// rest, run there, reports whether it demoted anything).
+    pub fenced: bool,
+}
+
+/// The blocks a kill's dirty edge leads to that exit.
+fn dirty_exit_blocks(f: &Func, mm: &Module) -> BTreeSet<Block> {
+    use mir::ops::KillSite;
+    let mut out = BTreeSet::new();
+    for &b in &f.layout {
+        for &i in &f.blocks[b].insts {
+            let d = &f.insts[i];
+            let tys: Vec<Type> = d.args.iter().map(|&v| f.ty(v)).collect();
+            let fx = mir::ops::effects(&d.op, &tys, mm);
+            if d.op.kill_site(&fx) == KillSite::DirtyEdge {
+                out.insert(d.succs[1].block);
+            }
+        }
+    }
+    out
+}
+
+/// Whether `f` has a fence (`Callee::fenced`).
+pub(crate) fn fenced(f: &Func, mm: &Module) -> bool {
+    use mir::ops::KillSite;
+    let exits = |b: Block| {
+        f.blocks[b]
+            .insts
+            .last()
+            .is_some_and(|&i| matches!(f.insts[i].op, Opcode::Exit { .. }))
+    };
+    f.layout.iter().flat_map(|&b| f.blocks[b].insts.iter()).any(|&i| {
+        let d = &f.insts[i];
+        let tys: Vec<Type> = d.args.iter().map(|&v| f.ty(v)).collect();
+        let fx = mir::ops::effects(&d.op, &tys, mm);
+        match d.op.kill_site(&fx) {
+            KillSite::OkEdge => true,
+            KillSite::DirtyEdge => !exits(d.succs[1].block),
+            // A fuse write (a caller's fuse facts); publishing kills only
+            // claims on the object under construction.
+            KillSite::Op => !matches!(d.op, Opcode::PublishLayout),
+            KillSite::None => false,
+        }
+    })
 }
 
 /// How the callee's module entities are named in the caller's.
 struct Maps {
     atoms: BTreeMap<AtomId, AtomId>,
     fuses: BTreeMap<FuseId, FuseId>,
+    /// Where the callee's restamp descriptors start in the caller's table.
+    restamp_base: u32,
 }
 
 impl Maps {
@@ -75,6 +123,7 @@ impl Maps {
                 JsRt(mir::ops::RtOp::InitPropGetSet(self.atom(a), k))
             }
             JsRt(mir::ops::RtOp::Intrinsic(a)) => JsRt(mir::ops::RtOp::Intrinsic(self.atom(a))),
+            Restamp(i) => Restamp(self.restamp_base + i),
             ConstObj(_) | GuardSingleton(_) | CheckBinding(_) | CheckNative(_) | LoadGName(_)
             | StoreGName(_) | CallNative(_) => {
                 return Err(format!("inline: {} is not remapped", mir::print::mnemonic(&op)))
@@ -91,7 +140,9 @@ fn merge_module(mm: &mut Module, k: &Module) -> Result<Maps, String> {
     let mut maps = Maps {
         atoms: BTreeMap::new(),
         fuses: BTreeMap::new(),
+        restamp_base: u32::try_from(mm.restamps.len()).unwrap(),
     };
+    mm.restamps.extend(k.restamps.iter().copied());
     for (a, s) in k.atoms.iter() {
         maps.atoms.insert(a, mm.intern_atom(s.chars()));
     }
@@ -148,9 +199,21 @@ pub(crate) fn splice(
     operands: &[Value],
     new_target: Option<Value>,
     join: Block,
+    dirty: Option<Edge>,
     err: Block,
 ) -> Result<(), String> {
     let kf = &k.f;
+    // Where an exit continues when the callee's rest (or the kill it
+    // exits from) may have demoted a class word: the caller's dirty exit,
+    // or, if the caller fences here instead, the join.
+    let dirty = dirty.unwrap_or(Edge {
+        block: join,
+        args: vec![EdgeArg::Out(0)],
+    });
+    let dirty_exits: BTreeSet<Inst> = dirty_exit_blocks(kf, &k.mm)
+        .into_iter()
+        .filter_map(|b| kf.blocks[b].insts.last().copied())
+        .collect();
     if operands.len() != 2 + kf.frame.formals as usize {
         return Err("inline: operands are not callee, this and the formals".into());
     }
@@ -273,11 +336,22 @@ pub(crate) fn splice(
                 block: err,
                 args: vec![],
             }],
+            // A kill's dirty exit already saw the demotion the hub's
+            // epoch samples would miss: it continues dirty either way.
+            Opcode::Exit { .. } if dirty_exits.contains(&i) => vec![
+                dirty.clone(),
+                dirty.clone(),
+                Edge {
+                    block: err,
+                    args: vec![],
+                },
+            ],
             Opcode::Exit { .. } => vec![
                 Edge {
                     block: join,
                     args: vec![EdgeArg::Out(0)],
                 },
+                dirty.clone(),
                 Edge {
                     block: err,
                     args: vec![],

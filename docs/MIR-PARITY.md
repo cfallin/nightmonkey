@@ -71,9 +71,17 @@ Ordered by expected effect across the suite:
    then effect summaries for non-inlined calls). First step done: generic
    ops whose result is the op's own take `ok_clean` when the stamp epoch
    is unchanged across their helper and keep layouts there (`js_keep`);
-   ~9% fewer dynamic layout guards in richards. Still fenced: ops inside
-   diamonds (already demoted), static-kill ops (`JsGetName`, `JsLambda`,
-   `CreateThis`, ...), calls' callee effects (no flags words).
+   ~9% fewer dynamic layout guards in richards. Second step (facts are
+   fixed; a kill exits): diamonds keep facts when their generic arm can
+   exit at the next pc (`keepable`); allocations (`JsLambda`,
+   `ArgsObject`, `RestArray`) kill nothing; `JsGetName`, `CreateThis` and
+   `exit.inline` report clean/dirty by the epoch; an inlined call keeps
+   the caller's facts unless a target callee has a fence
+   (`inline::fenced`), its dirty exits and its `exit.inline`s' dirty
+   edges leaving at the call's next pc; `js_dirty_exits` fences where it
+   cannot exit. Still fenced: `CreateThis`'s dirty edge (no pc to exit
+   to before the constructor runs), `inline_construct`, ops whose next
+   pc has another depth; calls' callee effects (no flags words).
 2. Side arms instead of exits for the common guard misses. Measured:
    deltablue exits 186k times a run at `this`-layout entry guards
    (`BinaryConstraint.prototype.output` and callees, sid 261/254/256),
@@ -85,11 +93,17 @@ Ordered by expected effect across the suite:
    stores to the IC with the store choke, kind mismatches to the generic
    op.
 3. Coverage: the whole-script declines in 1.6.
-4. Stamps MIR never writes: object-literal stamps (`lit_stamps_in`),
-   array stamps (`array_stamp_in`), argument/local restamps
-   (`arg_restamps_in`, `local_restamps_in`), inline delegate restamp.
-   Under `--pipeline mir` nothing stamps these populations, so every
-   class-fact guard predicting them misses.
+4. Stamps: done. MIR and baseline write object-literal stamps
+   (`lit_stamps_in`), array stamps (`array_stamp_in`), and restamps of
+   init delegates (inlined too), fill scripts' formals and fill
+   sequences' locals (`restamp`, the runtime's gates). MIR's element
+   stores take legacy's RANGES duty per site (`ranges_duty`: none
+   without a claim, none for a value whose type range is inside it,
+   else a clear). Neither tier's `push` arm pays the duty (legacy's
+   neither); nothing under `--pipeline mir` consumes RANGES yet. Still
+   missing: `new Array()`'s stamp (the construct arm), and the
+   consumers (typed values from stamps: the array read fold, masks and
+   ranges of fields).
 5. Refinement from dynamic tests (1.3), and object/string claims in
    `guard_result` and entry claims.
 6. LICM over the lowered code or in MIR (1.4); ranges (1.5) and overflow
@@ -152,11 +166,11 @@ Ordered by expected effect across the suite:
 | Apply-forward: splice wrapper, per-entry targets (`apply_targets_in`), up to 16 static arms + dynamic arm | wrappers never inlined; ≤4 inline targets else runtime helper | partial |
 | Inline policy (mono 150/200, poly 500, depth 4/8 by root nest, closure cost, fuel) | caps and depth 4; in-loop test uses own loops; instruction budgets; no fuel (declines instead) | partial |
 | Inline guard: call-cell hit + patched funcidx compare | `GuardScript`, ~7 dependent loads | partial |
-| Caller facts into inlined callee, restored at return | demoted before splice | partial |
+| Caller facts into inlined callee, restored at return | kept through the splice unless the callee has a fence; its kills exit | same |
 | Construct: likely-ctor static arm, per-funcidx nslots region, class guard on result, fresh marking | `call_indirect`, static nslots only, `Val(object)` result | partial |
 | Ctor-exit stamp | `ctor_stamp_inline` | same |
-| Delegate restamp inline | helper call; delegates never inlined | partial |
-| Arg/local restamps | none | missing |
+| Delegate restamp inline | `restamp` (a helper call); inlined too | same |
+| Arg/local restamps | `restamp` at returns and after fill sequences | same |
 | SpreadCall, SuperCall, CallIter, eval | decline script | missing |
 
 ## 5. Elements, arithmetic, types
@@ -165,8 +179,8 @@ Ordered by expected effect across the suite:
 |---|---|---|
 | Dense read arm always (runtime native check) | only when predicted and key typed I32; kind miss exits | partial |
 | Array-stamp read fold with element range | none | missing |
-| Array allocation stamps (`array_stamp_in`) | word 0 | missing |
-| Element store duty (prove or clear RANGES) | always clears | partial |
+| Array allocation stamps (`array_stamp_in`) | `stamp.fresh` (not yet `new Array()`) | partial |
+| Element store duty (prove or clear RANGES) | per site, proven by the value's type range | same |
 | Dense append / hole store arm | none (push arm only) | missing |
 | Typed-array read, unboxed result with kind interval, Uint32 | re-boxed and joined as `Val(ALL)`; Uint32 excluded; kind miss exits | partial |
 | Typed-array store, F64 into int kinds | int and boxed-int only (since a01edb9) | partial |
@@ -195,9 +209,9 @@ Ordered by expected effect across the suite:
 | Legacy | MIR | Status |
 |---|---|---|
 | Literal bump allocation | `alloc_inline` | same (but a fence) |
-| Object-literal stamps (`lit_stamps_in`) | none | missing |
+| Object-literal stamps (`lit_stamps_in`) | `stamp.fresh` (baseline too) | same |
 | InitProp transition replay | `init_prop_inline` | same (a fence per property) |
-| InitElemArray fill | `init_elem_inline` | same (no store duty) |
+| InitElemArray fill | `init_elem_inline` | same |
 | Holey/spread/singleton literals, `__proto__`, home objects, fun names | decline script | missing |
 | Construct cell + nursery bump | `construct_this` | same |
 | Fused literal globals | `fused_gname` (exits when blown) | same |
@@ -214,12 +228,14 @@ Ordered by expected effect across the suite:
 
 Read by legacy only: `accessor_sites`, `accessor_names`,
 `apply_natives`, `apply_targets_in`, `arg_cls`, `field_cls_sites`,
-`arg_restamps_in`, `local_restamps_in`, `lit_stamps_in`,
-`array_stamp_in`, `array_any_claim`, `likely_elems`,
+`likely_elems`,
 `layout_field_masks_in`, `layout_field_ranges_in`, `gcell_bids`,
 `elem_poly_sites`, `fractional_arith_sites`, `string_arith_sites`,
 `bigint_free`, `script_effects`, `flag_demand`, `classes`,
 `group_tables`, `ctor_nslots_in` (region form).
+
+Read by both: `arg_restamps_in`, `local_restamps_in`, `lit_stamps_in`,
+`array_stamp_in`, `array_any_claim`.
 
 Read by both, but narrower in MIR: `arg_types` (numeric only),
 `call_types` (numeric only), `gname_types` (numeric only),

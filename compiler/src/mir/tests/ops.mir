@@ -98,7 +98,7 @@ b15(v58: val{int32,double,string,bigint}):
 b16(v59: val):
   js.setprop v1, v59 "x y" -> ok_clean b17, ok_dirty b17, err b92
 b17:
-  js.getname print !pred{layout,types,constructing,fuse,binding,native} -> ok b18(v60: val), err b92
+  js.getname print -> ok_clean b18(v60: val), ok_dirty b18(v60: val), err b92
 b18(v60: val):
   js.compare.stricteq v60, v6 -> ok_clean b19(v61: bool), ok_dirty b19(v61: bool), err b92
 b19(v61: bool):

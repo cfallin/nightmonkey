@@ -40,7 +40,7 @@ use crate::mir::types::{
 };
 use crate::opsem::{PRIM_BIGINT, PRIM_INT32, PRIM_NULL, PRIM_UNDEFINED};
 use crate::wasm::baseline::layout::{self, FrameLayout, StackDepths};
-use crate::wasm::translate::TranslateCtx;
+use crate::wasm::translate::{StampCtorIn, TranslateCtx};
 
 type R<T> = Result<T, String>;
 
@@ -255,9 +255,7 @@ impl<'a> Shape<'a> {
         else {
             return None;
         };
-        // A stamping constructor or an init delegate stamps `this` at its
-        // returns, which an inlined copy's returns would skip.
-        if !super::inline_eligible(self.ctx, ks) || self.ctx.deleg_restamps_in.contains_key(&k) {
+        if !super::inline_eligible(self.ctx, ks) {
             return None;
         }
         let (mut mm, f) = build_at(self.ctx, names, k, ks, false, self.inline_depth + 1).ok()?;
@@ -266,7 +264,8 @@ impl<'a> Shape<'a> {
         }
         mm.script_addrs.insert(k, ks.addr);
         let max_depth = StackDepths::compute(ks).ok()?.max;
-        Some(super::inline::Callee { mm, f, max_depth })
+        let fenced = super::inline::fenced(&f, &mm);
+        Some(super::inline::Callee { mm, f, max_depth, fenced })
     }
 }
 
@@ -341,6 +340,10 @@ const INLINE_CONSTRUCT: bool = true;
 
 /// Typed field accesses exit on a dirty IC arm rather than rejoin.
 const DIRTY_EXITS: bool = true;
+
+/// A type test a branch consumes narrows the tested value on the branch
+/// it proves (`fuse_test`).
+const NARROW_TESTS: bool = false;
 
 /// Generic ops keep proven layouts on their clean edge (`js_keep`).
 const KEEP_ON_CLEAN: bool = true;
@@ -714,6 +717,12 @@ impl<'a> Shape<'a> {
         })
     }
 
+    /// The op at `pc`, if one starts there.
+    fn op_at(&self, pc: Pc) -> Option<JSOp> {
+        let i = self.ops.binary_search_by_key(&pc, |o| o.pc).ok()?;
+        Some(self.ops[i].op)
+    }
+
     /// A parser positioned just after the opcode at `pc`.
     fn imms(&self, pc: Pc) -> BytecodeParser<'a> {
         let mut p = self.script.parser();
@@ -975,6 +984,84 @@ impl<'s, 'a> Run<'s, 'a> {
         );
         let t = self.boxed(self.st[0]);
         self.inst(op, vec![t], None);
+    }
+
+    /// At an init delegate's or a fill script's return, the two-phase
+    /// restamp of `this` or the named formal (`deleg_restamps_in`,
+    /// `arg_restamps_in`); an inlined copy's returns restamp its own.
+    fn return_restamps(&mut self) {
+        let ctx = self.s.ctx;
+        let sid = self.s.sid;
+        if let Some(si) = ctx.deleg_restamps_in.get(&sid) {
+            if self.st[0].ty != Ty::Dead {
+                let t = self.boxed(self.st[0]);
+                self.restamp(si, t);
+            }
+        }
+        if let Some((formal, si)) = ctx.arg_restamps_in.get(&sid) {
+            if let Some(v) = self.formal_now(*formal) {
+                self.restamp(si, v);
+            }
+        }
+    }
+
+    /// After the last add of a post-construction fill sequence
+    /// (`local_restamps_in`), the restamp of the named local or formal.
+    fn local_restamp(&mut self, pc: Pc) {
+        let Some((local, si)) = self.s.ctx.local_restamps_in.get(&self.site(pc)) else {
+            return;
+        };
+        let v = if local & crate::facts::RESTAMP_FORMAL != 0 {
+            self.formal_now(local & !crate::facts::RESTAMP_FORMAL)
+        } else {
+            let x = self.st[self.local_ix(*local)];
+            (x.ty != Ty::Dead).then(|| self.boxed(x))
+        };
+        if let Some(v) = v {
+            self.restamp(si, v);
+        }
+    }
+
+    /// Formal `n`'s current value, boxed; `None` if dead here (nothing
+    /// reads it, so nothing reads the object through it).
+    fn formal_now(&mut self, n: u32) -> Option<mir::Value> {
+        if n >= self.s.nargs {
+            return None;
+        }
+        if self.mapped() {
+            return Some(self.inst(Opcode::ArgsMapped(n), vec![], Some(MType::VAL_TOP)));
+        }
+        let x = self.st[self.arg_ix(n)];
+        (x.ty != Ty::Dead).then(|| self.boxed(x))
+    }
+
+    fn restamp(&mut self, si: &StampCtorIn, v: mir::Value) {
+        let Some(r) = crate::wasm::bbv::restamp_args(si) else {
+            return;
+        };
+        let i = u32::try_from(self.mm.restamps.len()).unwrap();
+        self.mm.restamps.push(r);
+        self.inst(Opcode::Restamp(i), vec![v], None);
+    }
+
+    /// Whether an element store at `pc` of `v` owes the array stamp's
+    /// RANGES claim a clear (bbv's `emit_elem_store_duty`): the site's
+    /// claim, or the intersection of every claim for a receiver the
+    /// analysis did not place, unless `v` is proven inside it. No claim,
+    /// no duty.
+    fn ranges_duty(&self, pc: Pc, v: Slot) -> bool {
+        let ctx = self.s.ctx;
+        let claim = ctx.array_elem_in.get(&self.site(pc)).map(|a| a.range).or(ctx.array_any_claim);
+        let Some(r) = claim else { return false };
+        let inside = |lo: i64, hi: i64| lo >= r.lo && hi <= r.hi;
+        let proven = match self.f.ty(v.v) {
+            MType::I32(ir) | MType::Int(ir) => inside(ir.lo, ir.hi),
+            MType::Val(s) if s.tags.is_nonempty_subset_of(TagSet::NUMBER) => {
+                s.num.integral && !s.num.may_nan && s.num.range.is_some_and(|x| inside(x.lo, x.hi))
+            }
+            _ => false,
+        };
+        !proven
     }
 
     /// Whether the script's formals are its mapped `arguments` object's.
@@ -1729,66 +1816,26 @@ impl<'s, 'a> Run<'s, 'a> {
         next: Pc,
         post: Option<Slot>,
     ) -> Option<mir::Value> {
+        debug_assert_eq!(self.next_pc, Some(next));
+        let dirty = if DIRTY_EXITS { self.dirty_exit(out, post) } else { None };
+        let Some(dirty) = dirty else {
+            // Nowhere to exit to: a fence.
+            return match out {
+                Some(t) => Some(self.js_fence(op, args, t)),
+                None => {
+                    self.js_void(op, args);
+                    None
+                }
+            };
+        };
         let ok = self.new_block();
         let p = out.map(|t| self.f.add_param(ok, t));
-        let depth = self.st.len() - self.frame_len() + usize::from(post.is_some() || out.is_some());
-        let dirty = if DIRTY_EXITS && self.s.depths.at(next) == Some(u32::try_from(depth).unwrap()) {
-            let saved = (self.cur, self.live);
-            let b = self.new_block();
-            let dp = out.map(|_| self.f.add_param(b, MType::VAL_TOP));
-            // The dirty edge is a fence: `Obj` slots reach the exit
-            // through weaker params (`fence_params`).
-            let mut objs: Vec<(mir::Value, mir::Value)> = vec![];
-            for x in &self.st {
-                if matches!(x.ty, Ty::Obj(..)) && !objs.iter().any(|&(v, _)| v == x.v) {
-                    objs.push((x.v, self.f.add_param(b, MType::OBJ_TOP)));
-                }
-            }
-            self.at(b);
-            let mut st = self.st.clone();
-            for x in st.iter_mut() {
-                if let (Ty::Obj(k, _), Some(&(_, p))) = (x.ty, objs.iter().find(|&&(v, _)| v == x.v)) {
-                    *x = Slot {
-                        v: p,
-                        ty: Ty::ObjHint(k),
-                    };
-                }
-            }
-            let post = post.map(|x| match (x.ty, objs.iter().find(|&&(v, _)| v == x.v)) {
-                (Ty::Obj(k, _), Some(&(_, p))) => Slot {
-                    v: p,
-                    ty: Ty::ObjHint(k),
-                },
-                _ => x,
-            });
-            match (dp, post) {
-                (Some(v), _) => st.push(Slot {
-                    v,
-                    ty: Ty::Val(TagSet::ALL),
-                }),
-                (None, Some(x)) => st.push(x),
-                (None, None) => {}
-            }
-            let ops = self.exit_operands(next, &st);
-            let eop = self.exit_op(next, false);
-            self.term(eop, ops, vec![]);
-            (self.cur, self.live) = saved;
-            let mut args: Vec<EdgeArg> = dp.map(|_| vec![EdgeArg::Out(0)]).unwrap_or_default();
-            args.extend(objs.iter().map(|&(v, _)| EdgeArg::Value(v)));
-            Edge { block: b, args }
-        } else {
-            Edge {
-                block: ok,
-                args: p.map(|_| vec![EdgeArg::Out(0)]).unwrap_or_default(),
-            }
-        };
         let clean = Edge {
             block: ok,
             args: p.map(|_| vec![EdgeArg::Out(0)]).unwrap_or_default(),
         };
         let err = self.exit_block(true);
-        // Not `term`: the dirty edge's params are made above, and the
-        // clean edge is no fence.
+        // Not `term`: the clean edge is no fence.
         self.retain_locals(&op);
         self.f.add_inst(self.cur, op, args, &[], vec![clean, dirty, Self::goto(err)]);
         self.live = false;
@@ -1819,11 +1866,9 @@ impl<'s, 'a> Run<'s, 'a> {
         post: Option<Slot>,
     ) -> Option<Option<mir::Value>> {
         use mir::ops::KillSite;
-        if !KEEP_ON_CLEAN {
-            return None;
-        }
-        let next = self.next_pc?;
-        if !self.st.iter().chain(&self.pre).any(|x| matches!(x.ty, Ty::Obj(..))) {
+        // A callee built for inlining keeps with no `Obj` of its own: its
+        // caller's facts ride on its every kill exiting.
+        if self.s.inline_depth == 0 && !self.st.iter().chain(&self.pre).any(|x| matches!(x.ty, Ty::Obj(..))) {
             return None;
         }
         let tys: Vec<MType> = args.iter().map(|&v| self.f.ty(v)).collect();
@@ -1831,27 +1876,74 @@ impl<'s, 'a> Run<'s, 'a> {
         if op.kill_site(&fx) != KillSite::DirtyEdge {
             return None;
         }
-        let depth = self.st.len() - self.frame_len() + usize::from(post.is_some() || out.is_some());
-        if self.s.depths.at(next) != Some(u32::try_from(depth).ok()?) {
+        let dirty = self.dirty_exit(out, post)?;
+        let ok = self.new_block();
+        let p = out.map(|t| self.f.add_param(ok, t));
+        let clean = Edge {
+            block: ok,
+            args: p.map(|_| vec![EdgeArg::Out(0)]).unwrap_or_default(),
+        };
+        let err = self.exit_block(true);
+        self.retain_locals(&op);
+        self.f.add_inst(self.cur, op, args, &[], vec![clean, dirty, Self::goto(err)]);
+        self.live = false;
+        self.at(ok);
+        Some(p)
+    }
+
+    /// Whether a kill here can exit at the next pc (`dirty_exit`), with
+    /// `results` values there on top of the frame as it is now.
+    fn keepable(&self, results: usize) -> bool {
+        KEEP_ON_CLEAN
+            && self
+                .next_pc
+                .and_then(|next| self.s.depths.at(next))
+                .is_some_and(|d| d as usize == self.st.len() - self.frame_len() + results)
+    }
+
+    /// The dirty edge of a kill that keeps facts on its clean one: an exit
+    /// at the next pc with the frame as it is now plus the op's result
+    /// (`out`, the edge's `Out(0)`) or the value it leaves (`post`). `Obj`
+    /// slots reach it through weaker params, or, for an inline splice
+    /// (`weakened`), as weakened copies made here: the callee's dirty
+    /// exits name the edge's args in blocks after the kill, where no fact
+    /// may be live. `None` where there is no such exit (`keepable`).
+    fn dirty_exit(&mut self, out: Option<MType>, post: Option<Slot>) -> Option<Edge> {
+        self.dirty_exit_as(out, post, false)
+    }
+
+    fn dirty_exit_as(&mut self, out: Option<MType>, post: Option<Slot>, weakened: bool) -> Option<Edge> {
+        if !self.keepable(usize::from(post.is_some() || out.is_some())) {
             return None;
         }
+        let next = self.next_pc?;
         let out_ty = match out {
             None => None,
             Some(MType::Bool) => Some(Ty::Bool),
             Some(MType::Val(v)) => Some(Ty::Val(v.tags)),
             Some(_) => return None,
         };
-        let ok = self.new_block();
-        let p = out.map(|t| self.f.add_param(ok, t));
+        let olds: Vec<Slot> = self.st.iter().chain(&post).copied().collect();
+        let mut copies: Vec<(mir::Value, mir::Value)> = vec![];
+        if weakened {
+            for x in &olds {
+                if matches!(x.ty, Ty::Obj(..)) && !copies.iter().any(|&(v, _)| v == x.v) {
+                    let w = self.weaken(x.v, MType::OBJ_TOP);
+                    copies.push((x.v, w));
+                }
+            }
+        }
         let saved = (self.cur, self.live);
         let b = self.new_block();
         let dp = out.map(|t| self.f.add_param(b, t));
-        // The dirty edge is a fence: `Obj` slots reach the exit through
-        // weaker params.
         let mut objs: Vec<(mir::Value, mir::Value)> = vec![];
-        for x in &self.st {
+        for x in &olds {
             if matches!(x.ty, Ty::Obj(..)) && !objs.iter().any(|&(v, _)| v == x.v) {
-                objs.push((x.v, self.f.add_param(b, MType::OBJ_TOP)));
+                let p = match copies.iter().find(|&&(v, _)| v == x.v) {
+                    Some(&(_, w)) => w,
+                    None => self.f.add_param(b, MType::OBJ_TOP),
+                };
+                objs.push((x.v, p));
             }
         }
         self.at(b);
@@ -1876,18 +1968,10 @@ impl<'s, 'a> Run<'s, 'a> {
         self.term(eop, ops, vec![]);
         (self.cur, self.live) = saved;
         let mut dargs: Vec<EdgeArg> = dp.map(|_| vec![EdgeArg::Out(0)]).unwrap_or_default();
-        dargs.extend(objs.iter().map(|&(v, _)| EdgeArg::Value(v)));
-        let dirty = Edge { block: b, args: dargs };
-        let clean = Edge {
-            block: ok,
-            args: p.map(|_| vec![EdgeArg::Out(0)]).unwrap_or_default(),
-        };
-        let err = self.exit_block(true);
-        self.retain_locals(&op);
-        self.f.add_inst(self.cur, op, args, &[], vec![clean, dirty, Self::goto(err)]);
-        self.live = false;
-        self.at(ok);
-        Some(p)
+        if !weakened {
+            dargs.extend(objs.iter().map(|&(v, _)| EdgeArg::Value(v)));
+        }
+        Some(Edge { block: b, args: dargs })
     }
 
     fn js_void(&mut self, op: Opcode, args: Vec<mir::Value>) {
@@ -1911,9 +1995,19 @@ impl<'s, 'a> Run<'s, 'a> {
         vals: &[mir::Value],
         fallback: Option<(Opcode, Vec<mir::Value>)>,
     ) -> mir::Value {
-        // The spliced callees' fences know nothing of this frame's `Obj`
-        // slots: they continue as `ObjHint` through it.
-        self.demote_objs();
+        // Facts are fixed: with every kill in the callees exiting (none
+        // fenced), a kill leaves for baseline at the call's next pc, and
+        // this frame's `Obj` slots keep their facts through the splice.
+        // A fenced callee's continue as `ObjHint`.
+        let keep = !targets.iter().any(|(_, c)| c.fenced) && self.keepable(1);
+        if !keep {
+            self.demote_objs();
+        }
+        let dirty = if keep {
+            self.dirty_exit_as(Some(MType::VAL_TOP), None, true)
+        } else {
+            None
+        };
         let join = self.new_block();
         let result = self.f.add_param(join, MType::VAL_TOP);
         let err = self.exit_block(true);
@@ -1958,7 +2052,7 @@ impl<'s, 'a> Run<'s, 'a> {
             let saved_mm = self.mm.clone();
             let saved_frames = self.f.inline_frames.len();
             self.retain_all();
-            match super::inline::splice(&mut self.mm, &mut self.f, callee, 0, hit, &operands, None, join, err) {
+            match super::inline::splice(&mut self.mm, &mut self.f, callee, 0, hit, &operands, None, join, dirty.clone(), err) {
                 Ok(()) => {
                     self.mm.script_addrs.insert(*k, callee.mm.script_addrs[k]);
                 }
@@ -1978,7 +2072,15 @@ impl<'s, 'a> Run<'s, 'a> {
             args: vec![EdgeArg::Out(0)],
         };
         let (op, args) = fallback.unwrap_or((Opcode::Call, vals.to_vec()));
-        self.term(op, args, vec![e.clone(), e, Self::goto(err)]);
+        match dirty {
+            Some(d) => {
+                // Not `term`: the clean edge is no fence.
+                self.retain_locals(&op);
+                self.f.add_inst(self.cur, op, args, &[], vec![e, d, Self::goto(err)]);
+                self.live = false;
+            }
+            None => self.term(op, args, vec![e.clone(), e, Self::goto(err)]),
+        }
         self.at(join);
         result
     }
@@ -2038,7 +2140,9 @@ impl<'s, 'a> Run<'s, 'a> {
         let ctor = self.new_block();
         self.term(Opcode::Br, vec![is_ctor], vec![Self::goto(ctor), Self::goto(generic)]);
         self.at(ctor);
-        let this = self.js_static(Opcode::CreateThis(nslots, word), vec![vals[0], nt], MType::val(TagSet::OBJECT));
+        // A fence: the next pc's value is the construct's, not `this`, so
+        // a kill here has nowhere to exit to.
+        let this = self.js_fence(Opcode::CreateThis(nslots, word), vec![vals[0], nt], MType::val(TagSet::OBJECT));
         let nformals = callee.f.frame.formals as usize;
         let nargs = vals.len() - 3;
         let mut operands = vec![kobj, this];
@@ -2053,7 +2157,7 @@ impl<'s, 'a> Run<'s, 'a> {
         let saved_frames = self.f.inline_frames.len();
         let here = self.cur;
         self.retain_all();
-        match super::inline::splice(&mut self.mm, &mut self.f, callee, 0, here, &operands, Some(nt), ret, err) {
+        match super::inline::splice(&mut self.mm, &mut self.f, callee, 0, here, &operands, Some(nt), ret, None, err) {
             Ok(()) => {
                 self.mm.script_addrs.insert(k, callee.mm.script_addrs[&k]);
                 self.live = false;
@@ -2119,7 +2223,10 @@ impl<'s, 'a> Run<'s, 'a> {
             return self.js(helper.0, helper.1, MType::VAL_TOP);
         }
         // Arms with fences meet at `join`: `Obj` slots go in as `ObjHint`.
-        self.demote_objs();
+        // Without one (both arms keep), they keep their facts.
+        if targets.iter().any(|(_, c)| c.fenced) || !self.keepable(1) {
+            self.demote_objs();
+        }
         let join = self.new_block();
         let result = self.f.add_param(join, MType::VAL_TOP);
         let (fast, slow) = (self.new_block(), self.new_block());
@@ -2164,6 +2271,11 @@ impl<'s, 'a> Run<'s, 'a> {
         if let Some(r) = self.js_keep(op, args.clone(), Some(out), None) {
             return r.unwrap();
         }
+        self.js_fence(op, args, out)
+    }
+
+    /// A generic op whose both success edges continue (a fence).
+    fn js_fence(&mut self, op: Opcode, args: Vec<mir::Value>, out: MType) -> mir::Value {
         let ok = self.new_block();
         let p = self.f.add_param(ok, out);
         let err = self.exit_block(true);
@@ -2286,6 +2398,63 @@ impl<'s, 'a> Run<'s, 'a> {
             Some(e) => self.term(Opcode::Jump, vec![], vec![e]),
             None => self.term(Opcode::Unreachable, vec![], vec![]),
         }
+    }
+
+    /// Narrowing from a dynamic test (§4.4): a test of whether `x`'s tag
+    /// is in `tags` (negated if `negate`) that the next op branches on,
+    /// fused with that branch into one `guard.tags` whose ok edge carries
+    /// `x` narrowed to the branch it takes, every slot holding it
+    /// replaced there, and whose fail edge is the other branch. False
+    /// (nothing emitted) unless the next op is a `JumpIfTrue` or
+    /// `JumpIfFalse` that no other edge reaches and `x` is a boxed value
+    /// the test can narrow.
+    fn fuse_test(&mut self, x: Slot, tags: TagSet, negate: bool) -> bool {
+        let Ty::Val(have) = x.ty else { return false };
+        let narrowed = have.intersect(tags);
+        if !NARROW_TESTS || narrowed.is_empty() || narrowed == have {
+            return false;
+        }
+        let Some(bpc) = self.next_pc else { return false };
+        if self.s.leaders.contains(&bpc) {
+            return false;
+        }
+        let Some(bop) = self.s.op_at(bpc) else { return false };
+        if !matches!(bop, JSOp::JumpIfTrue | JSOp::JumpIfFalse) {
+            return false;
+        }
+        let off = self.s.imms(bpc).next_int32().unwrap();
+        let (taken, fall) = (bpc.branch(off), bpc + bop.len());
+        // Where control goes when the tag is in `tags`, and when not.
+        let cond_true = if bop == JSOp::JumpIfTrue { taken } else { fall };
+        let cond_false = if bop == JSOp::JumpIfTrue { fall } else { taken };
+        let (inside, outside) = if negate { (cond_false, cond_true) } else { (cond_true, cond_false) };
+        let v = self.boxed(x);
+        let (nb, fb) = (self.new_block(), self.new_block());
+        let nv = self.f.add_param(nb, MType::val(narrowed));
+        self.term(
+            Opcode::GuardTags(tags),
+            vec![v],
+            vec![
+                Edge {
+                    block: nb,
+                    args: vec![EdgeArg::Out(0)],
+                },
+                Self::goto(fb),
+            ],
+        );
+        self.at(nb);
+        let saved = self.st.clone();
+        for y in self.st.iter_mut().filter(|y| y.v == x.v) {
+            *y = Slot {
+                v: nv,
+                ty: Ty::Val(narrowed),
+            };
+        }
+        self.jump_to(inside, Some(bpc));
+        self.st = saved;
+        self.at(fb);
+        self.jump_to(outside, Some(bpc));
+        true
     }
 
     /// Branch on raw bool `c` to leaders `then` and `els`.
@@ -2519,6 +2688,9 @@ impl<'s, 'a> Run<'s, 'a> {
                 self.exit_blk = None;
                 self.throw_blk = None;
                 self.op(op)?;
+                if self.live {
+                    self.local_restamp(pc);
+                }
             }
             i += 1;
         }
@@ -3256,6 +3428,17 @@ impl<'s, 'a> Run<'s, 'a> {
                     None
                 };
                 if let Some((x, k)) = konst {
+                    let negate = matches!(op, Ne | StrictNe);
+                    let exact = if matches!(op, StrictEq | StrictNe) {
+                        Some(k.ty.tags())
+                    } else if x.ty.tags().intersect(TagSet::OBJECT).is_empty() {
+                        Some(TagSet::prims(PRIM_NULL | PRIM_UNDEFINED))
+                    } else {
+                        None
+                    };
+                    if exact.is_some_and(|t| self.fuse_test(x, t, negate)) {
+                        return Ok(());
+                    }
                     let r = if matches!(op, StrictEq | StrictNe) {
                         let v = self.boxed(x);
                         self.tag_test(v, k.ty.tags())
@@ -3320,12 +3503,14 @@ impl<'s, 'a> Run<'s, 'a> {
                 let x = self.pop();
                 let v = self.boxed(x);
                 self.ctor_stamp();
+                self.return_restamps();
                 self.term(Opcode::Return, vec![v], vec![]);
             }
             RetRval => {
                 let x = self.st[self.rval_ix()];
                 let v = self.boxed(x);
                 self.ctor_stamp();
+                self.return_restamps();
                 self.term(Opcode::Return, vec![v], vec![]);
             }
 
@@ -3336,7 +3521,9 @@ impl<'s, 'a> Run<'s, 'a> {
                 } else {
                     // Sloppy: an object `this` is itself; anything else is
                     // boxed (null and undefined become the global `this`).
-                    self.demote_objs();
+                    if !self.keepable(1) {
+                        self.demote_objs();
+                    }
                     let obj = TagSet::OBJECT;
                     let (t, e, j) = (self.new_block(), self.new_block(), self.new_block());
                     let p = self.f.add_param(t, MType::val(obj));
@@ -3528,6 +3715,15 @@ impl<'s, 'a> Run<'s, 'a> {
             StrictConstantEq | StrictConstantNe => {
                 let operand = p.next_uint16().unwrap();
                 let a = self.pop();
+                // Against undefined or null: a tag test.
+                let exact = match (operand >> 8) & 0xFF {
+                    3 => Some(TagSet::prims(PRIM_UNDEFINED)),
+                    4 => Some(TagSet::prims(PRIM_NULL)),
+                    _ => None,
+                };
+                if exact.is_some_and(|t| self.fuse_test(a, t, op == StrictConstantNe)) {
+                    return Ok(());
+                }
                 let x = self.boxed(a);
                 let mut r = self.inst(
                     Opcode::JsConstantStrictEq(operand),
@@ -3550,6 +3746,9 @@ impl<'s, 'a> Run<'s, 'a> {
                 } else if tags.intersect(nullish).is_empty() {
                     self.inst(Opcode::ConstBool(false), vec![], Some(MType::Bool))
                 } else {
+                    if self.fuse_test(a, nullish, false) {
+                        return Ok(());
+                    }
                     let x = self.boxed(a);
                     self.tag_test(x, nullish)
                 };
@@ -3558,6 +3757,19 @@ impl<'s, 'a> Run<'s, 'a> {
             TypeofEq => {
                 let operand = p.next_uint8().unwrap();
                 let a = self.pop();
+                // A type whose values are exactly some tags (no object is
+                // one): a tag test.
+                let exact = match operand & 0x0f {
+                    3 => Some(TagSet::STRING),
+                    4 => Some(TagSet::NUMBER),
+                    5 => Some(TagSet::BOOLEAN),
+                    6 => Some(TagSet::prims(crate::opsem::PRIM_SYMBOL)),
+                    7 => Some(TagSet::prims(PRIM_BIGINT)),
+                    _ => None,
+                };
+                if exact.is_some_and(|t| self.fuse_test(a, t, operand & 0x80 != 0)) {
+                    return Ok(());
+                }
                 let x = self.boxed(a);
                 let r = self.inst(Opcode::JsTypeofEq(operand), vec![x], Some(MType::Bool));
                 self.push(r, Ty::Bool);
@@ -3575,7 +3787,7 @@ impl<'s, 'a> Run<'s, 'a> {
                         return Ok(());
                     }
                 }
-                let r = self.js_static(Opcode::JsGetName(a), vec![], MType::VAL_TOP);
+                let r = self.js(Opcode::JsGetName(a), vec![], MType::VAL_TOP);
                 self.push(r, Ty::Val(TagSet::ALL));
                 if let Some(&claim) = self.s.gname_types.get(&index) {
                     self.guard_result(claim, pc + op.len(), true);
@@ -3599,8 +3811,11 @@ impl<'s, 'a> Run<'s, 'a> {
                     // exiting: a prediction that is wrong for some receivers
                     // must not send the rest of the activation to baseline
                     // every time. The claim is guarded after the join. The
-                    // IC arm is a fence: `Obj` slots meet as `ObjHint`.
-                    self.demote_objs();
+                    // IC arm keeps facts, a kill exiting; where it cannot,
+                    // it is a fence, and `Obj` slots meet as `ObjHint`.
+                    if !self.keepable(1) {
+                        self.demote_objs();
+                    }
                     let x = self.boxed(recv);
                     let join = self.new_block();
                     let jr = self.f.add_param(join, MType::VAL_TOP);
@@ -3651,10 +3866,11 @@ impl<'s, 'a> Run<'s, 'a> {
                 // store's own check keeps the object's bits.
                 let site = self.typed_site(pc, a).filter(|s| num || !s.types);
                 let proven = site.and_then(|site| self.proven_recv(recv, &site));
-                // The IC arm of an unproven typed store is a fence the two
-                // arms meet after: `Obj` slots (and the value, pushed back
-                // after it) go in as `ObjHint`.
-                let v = if site.is_some() && proven.is_none() {
+                // The IC arm of an unproven typed store keeps facts, a kill
+                // exiting; where it cannot, it is a fence the two arms meet
+                // after: `Obj` slots (and the value, pushed back after it)
+                // go in as `ObjHint`.
+                let v = if site.is_some() && proven.is_none() && !self.keepable(1) {
                     self.demote_objs();
                     self.demote(v)
                 } else {
@@ -3684,7 +3900,7 @@ impl<'s, 'a> Run<'s, 'a> {
                         self.term(Opcode::Jump, vec![], vec![Self::goto(join)]);
                         self.at(generic);
                         let y = self.boxed(v);
-                        self.js_void(Opcode::JsSetProp(a, op == StrictSetProp), vec![r, y]);
+                        self.js_void_keep(Opcode::JsSetProp(a, op == StrictSetProp), vec![r, y], v);
                         self.term(Opcode::Jump, vec![], vec![Self::goto(join)]);
                         self.at(join);
                     }
@@ -3701,8 +3917,10 @@ impl<'s, 'a> Run<'s, 'a> {
                 let ta = self.ta_elem(pc, recv, key);
                 let r = if let Some((o, i, k)) = ta {
                     // The element inline, as a boxed number; out of
-                    // bounds, the generic op.
-                    self.demote_objs();
+                    // bounds, the generic op (a fence unless it keeps).
+                    if !self.keepable(1) {
+                        self.demote_objs();
+                    }
                     let (ok, generic, join) = (self.new_block(), self.new_block(), self.new_block());
                     let raw = if k.is_float() { MType::F64_TOP } else { MType::I32_TOP };
                     let p = self.f.add_param(ok, raw);
@@ -3752,8 +3970,10 @@ impl<'s, 'a> Run<'s, 'a> {
                 match self.native_elem(pc, recv, key) {
                     Some((o, i)) => {
                         // A dense element inline; out of bounds or a
-                        // hole, the generic op.
-                        self.demote_objs();
+                        // hole, the generic op (a fence unless it keeps).
+                        if !self.keepable(1) {
+                            self.demote_objs();
+                        }
                         let (ok, generic, join) = (self.new_block(), self.new_block(), self.new_block());
                         let p = self.f.add_param(ok, MType::VAL_TOP);
                         let jr = self.f.add_param(join, MType::VAL_TOP);
@@ -3805,6 +4025,7 @@ impl<'s, 'a> Run<'s, 'a> {
                 let v = self.pop();
                 let key = self.pop();
                 let recv = self.pop();
+                let duty = self.ranges_duty(pc, v);
                 // The value as the kind stores it, raw: an int32 for an
                 // integer kind (Uint8Clamped clamps it), a number for a
                 // float one. A value of unknown type is unboxed at run
@@ -3817,8 +4038,12 @@ impl<'s, 'a> Run<'s, 'a> {
                     _ => None,
                 });
                 if let Some((o, i, k, raw)) = ta {
-                    self.demote_objs();
-                    let v = self.demote(v);
+                    let v = if self.keepable(1) {
+                        v
+                    } else {
+                        self.demote_objs();
+                        self.demote(v)
+                    };
                     let (ok, generic, join) = (self.new_block(), self.new_block(), self.new_block());
                     let raw = match raw {
                         Some(r) => r,
@@ -3855,7 +4080,7 @@ impl<'s, 'a> Run<'s, 'a> {
                     self.term(Opcode::Jump, vec![], vec![Self::goto(join)]);
                     self.at(generic);
                     let (x, kb, y) = (self.boxed(recv), self.boxed(key), self.boxed(v));
-                    self.js_void(Opcode::JsSetElem(op == StrictSetElem), vec![x, kb, y]);
+                    self.js_void_keep(Opcode::JsSetElem(op == StrictSetElem, duty), vec![x, kb, y], v);
                     self.term(Opcode::Jump, vec![], vec![Self::goto(join)]);
                     self.at(join);
                     self.st.push(v);
@@ -3863,12 +4088,16 @@ impl<'s, 'a> Run<'s, 'a> {
                 match self.native_elem(pc, recv, key) {
                     Some((o, i)) => {
                         // A dense overwrite inline; else the generic op.
-                        self.demote_objs();
-                        let v = self.demote(v);
+                        let v = if self.keepable(1) {
+                            v
+                        } else {
+                            self.demote_objs();
+                            self.demote(v)
+                        };
                         let y = self.boxed(v);
                         let (ok, generic, join) = (self.new_block(), self.new_block(), self.new_block());
                         self.term(
-                            Opcode::StoreElem,
+                            Opcode::StoreElem(duty),
                             vec![o, i, y],
                             vec![Self::goto(ok), Self::goto(generic)],
                         );
@@ -3876,14 +4105,14 @@ impl<'s, 'a> Run<'s, 'a> {
                         self.term(Opcode::Jump, vec![], vec![Self::goto(join)]);
                         self.at(generic);
                         let (x, k) = (self.boxed(recv), self.boxed(key));
-                        self.js_void(Opcode::JsSetElem(op == StrictSetElem), vec![x, k, y]);
+                        self.js_void_keep(Opcode::JsSetElem(op == StrictSetElem, duty), vec![x, k, y], v);
                         self.term(Opcode::Jump, vec![], vec![Self::goto(join)]);
                         self.at(join);
                         self.st.push(v);
                     }
                     None => {
                         let (x, k, y) = (self.boxed(recv), self.boxed(key), self.boxed(v));
-                        self.js_void_keep(Opcode::JsSetElem(op == StrictSetElem), vec![x, k, y], v);
+                        self.js_void_keep(Opcode::JsSetElem(op == StrictSetElem, duty), vec![x, k, y], v);
                         self.repush(v);
                     }
                 }
@@ -3920,11 +4149,23 @@ impl<'s, 'a> Run<'s, 'a> {
             }
             NewInit | NewObject if RT_OPS => {
                 let v = self.js(Opcode::JsRt(RtOp::NewObject), vec![], MType::val(TagSet::OBJECT));
+                // An object-literal stamp site: the layout idx with SLOTS
+                // (the inits land at the row's slots by construction).
+                if let Some(&lid) = self.s.ctx.lit_stamps_in.get(&self.site(self.pc)) {
+                    let w = (lid + 1) | crate::wasm::bbv::abi::CLASS_WORD_SLOTS;
+                    self.inst(Opcode::StampFresh(w), vec![v], None);
+                }
                 self.push(v, Ty::Val(TagSet::OBJECT));
             }
             NewArray if RT_OPS => {
                 let len = p.next_uint32().unwrap();
                 let v = self.js(Opcode::JsRt(RtOp::NewArray(len)), vec![], MType::val(TagSet::OBJECT));
+                // An array stamp site: the key with TYPES and RANGES, which
+                // an empty array's elements satisfy vacuously; element
+                // stores keep them.
+                if let Some(&w) = self.s.ctx.array_stamp_in.get(&self.site(self.pc)) {
+                    self.inst(Opcode::StampFresh(w), vec![v], None);
+                }
                 self.push(v, Ty::Val(TagSet::OBJECT));
             }
             InitProp | InitHiddenProp | InitLockedProp if RT_OPS => {
@@ -3952,8 +4193,9 @@ impl<'s, 'a> Run<'s, 'a> {
                 let v = self.pop();
                 let k = self.pop();
                 let o = self.top();
+                let r = self.ranges_duty(pc, v);
                 let (x, y, z) = (self.boxed(o), self.boxed(k), self.boxed(v));
-                self.js_void(Opcode::JsRt(RtOp::InitElem(attrs)), vec![x, y, z]);
+                self.js_void(Opcode::JsRt(RtOp::InitElem(attrs, r)), vec![x, y, z]);
             }
             InitElemArray if RT_OPS => {
                 // [obj, v] -> [obj]
@@ -3961,9 +4203,10 @@ impl<'s, 'a> Run<'s, 'a> {
                 let v = self.pop();
                 let o = self.top();
                 let k = self.const_val(ConstVal::Int32(index as i32));
+                let r = self.ranges_duty(pc, v);
                 let (x, z) = (self.boxed(o), self.boxed(v));
                 let e = crate::wasm::bbv::abi::INIT_ATTR_ENUMERATE;
-                self.js_void(Opcode::JsRt(RtOp::InitElem(e)), vec![x, k, z]);
+                self.js_void(Opcode::JsRt(RtOp::InitElem(e, r)), vec![x, k, z]);
             }
             ToPropertyKey if RT_OPS => {
                 // An int32, a string or a symbol is its own key.
