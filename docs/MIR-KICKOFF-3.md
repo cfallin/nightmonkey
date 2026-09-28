@@ -91,6 +91,11 @@ What landed (see the commit messages for detail):
 
 ### Done since (MIR.md M5j)
 
+Octane after ef8ba2e (MIR / legacy, same method): crypto 17412/15652,
+deltablue 8185/6037, earley-boyer 11530/13376, navier-stokes
+19421/21116, pdfjs 17956/21010, raytrace 10676/12370, regexp 2259/2288,
+richards 9860/11583, splay 8045/8142.
+
 - Generators and async functions, as proposed: `gen.suspend`, `Resume`
   roots at yield landings, the body's own resume dispatch.
 - Inlining admission is bbv's. Correction to the richards note that was
