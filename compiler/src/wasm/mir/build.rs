@@ -396,6 +396,47 @@ const MAX_DIRECT_TARGETS: usize = 4;
 /// A callee too big to inline with its own inlining is inlined without it.
 const LEAN_CALLEES: bool = true;
 
+/// A typed array's `.length` is its length slot (`length.ta`).
+const LENGTH_TA: bool = false;
+
+/// `Math.<fn>(...)` calls are typed ops behind a native check (`math_call`).
+const MATH_CALLS: bool = false;
+
+/// The Math functions `math_call` types, by property name.
+fn math_fn_named(s: &str) -> Option<MathFn> {
+    Some(match s {
+        "abs" => MathFn::Abs,
+        "floor" => MathFn::Floor,
+        "ceil" => MathFn::Ceil,
+        "trunc" => MathFn::Trunc,
+        "sqrt" => MathFn::Sqrt,
+        "fround" => MathFn::Fround,
+        "min" => MathFn::Min,
+        "max" => MathFn::Max,
+        "pow" => MathFn::Pow,
+        "sin" => MathFn::Sin,
+        "cos" => MathFn::Cos,
+        _ => return None,
+    })
+}
+
+fn math_fn_name(m: MathFn) -> &'static str {
+    match m {
+        MathFn::Abs => "abs",
+        MathFn::Floor => "floor",
+        MathFn::Ceil => "ceil",
+        MathFn::Trunc => "trunc",
+        MathFn::Sqrt => "sqrt",
+        MathFn::Fround => "fround",
+        MathFn::Min => "min",
+        MathFn::Max => "max",
+        MathFn::Pow => "pow",
+        MathFn::Sin => "sin",
+        MathFn::Cos => "cos",
+        _ => "?",
+    }
+}
+
 /// Generic ops keep proven layouts on their clean edge (`js_keep`).
 const KEEP_ON_CLEAN: bool = true;
 
@@ -873,6 +914,10 @@ struct Run<'s, 'a> {
     next_pc: Option<Pc>,
     /// The likely callees the next generic `call` gets (`attach_targets`).
     likely_targets: Vec<ScriptId>,
+    /// Values read from a global by name, and the Math functions read off
+    /// `Math` (`math_call`).
+    gname_vals: BTreeMap<mir::Value, mir::entity::AtomId>,
+    math_fns: BTreeMap<mir::Value, MathFn>,
 }
 
 impl<'s, 'a> Run<'s, 'a> {
@@ -913,6 +958,8 @@ impl<'s, 'a> Run<'s, 'a> {
             renames: vec![],
             next_pc: None,
             likely_targets: vec![],
+            gname_vals: BTreeMap::new(),
+            math_fns: BTreeMap::new(),
             inline_sites: 0,
             inline_insts: 0,
         }
@@ -1141,6 +1188,53 @@ impl<'s, 'a> Run<'s, 'a> {
             _ => false,
         };
         !proven
+    }
+
+    /// Whether atom `a` is `s`.
+    fn atom_is(&self, a: mir::entity::AtomId, s: &str) -> bool {
+        self.mm.atoms[a].chars().iter().copied().eq(s.encode_utf16())
+    }
+
+    /// `Math.<fn>(args)` of a function with a typed op (`math_fns`), with
+    /// `argc` its arity: the callee checked to be the pristine native, the
+    /// arguments to be numbers (exiting at the call on a miss: the site
+    /// runs in baseline then), and the op on raw f64s, whose result is a
+    /// raw f64 rather than a boxed value to guard. False if not such a
+    /// call (nothing emitted).
+    fn math_call(&mut self, argc: usize) -> bool {
+        let n = self.st.len();
+        let Some(&m) = self.math_fns.get(&self.st[n - argc - 2].v) else {
+            return false;
+        };
+        if !MATH_CALLS || argc != m.arity() {
+            return false;
+        }
+        let operands: Vec<Slot> = self.st.drain(n - argc - 2..).collect();
+        let callee = self.boxed(operands[0]);
+        let name = format!("Math.{}", math_fn_name(m));
+        let found = self.mm.natives.iter().find(|(_, d)| d.name == name).map(|(id, _)| id);
+        let nid = match found {
+            Some(id) => id,
+            None => self.mm.natives.push(mir::module::NativeDef { name }),
+        };
+        self.guard(
+            Opcode::CheckNative(nid),
+            vec![callee],
+            MType::Fact(mir::types::FactKind::NativeIntact(nid)),
+        );
+        let mut args = vec![];
+        for x in &operands[2..] {
+            let f = if x.ty.num().is_some() {
+                self.as_f64(*x)
+            } else {
+                let b = self.boxed(*x);
+                self.guard(Opcode::GuardUnbox(UnboxKind::F64Num), vec![b], MType::F64_TOP)
+            };
+            args.push(f);
+        }
+        let r = self.inst(Opcode::Math(m), args, Some(MType::F64_TOP));
+        self.push(r, Ty::F64);
+        true
     }
 
     /// Whether the script's formals are its mapped `arguments` object's.
@@ -3941,6 +4035,7 @@ impl<'s, 'a> Run<'s, 'a> {
                     }
                 }
                 let r = self.js(Opcode::JsGetName(a), vec![], MType::VAL_TOP);
+                self.gname_vals.insert(r, a);
                 self.push(r, Ty::Val(TagSet::ALL));
                 if let Some(&claim) = self.s.gname_types.get(&index) {
                     self.guard_result(claim, pc + op.len(), true);
@@ -3949,6 +4044,14 @@ impl<'s, 'a> Run<'s, 'a> {
             GetProp => {
                 let a = self.atom(p.next_uint32().unwrap())?;
                 let recv = self.pop();
+                // A typed array's length: its length slot.
+                if let (Ty::Ta(_), true) = (recv.ty, LENGTH_TA) {
+                    if self.mm.atoms[a].chars() == "length".encode_utf16().collect::<Vec<u16>>().as_slice() {
+                        let n = self.inst(Opcode::LengthTa, vec![recv.v], Some(MType::i32_range(0, i64::from(i32::MAX))));
+                        self.push(n, Ty::I32);
+                        return Ok(());
+                    }
+                }
                 let site = self.typed_site(pc, a);
                 if let Some((o, site)) = site.and_then(|site| self.proven_recv(recv, &site)) {
                     let r = self
@@ -4002,6 +4105,12 @@ impl<'s, 'a> Run<'s, 'a> {
                 } else {
                     let x = self.boxed(recv);
                     let r = self.js(Opcode::JsGetProp(a), vec![x], MType::VAL_TOP);
+                    // `Math.<fn>`, for a typed call (`math_call`).
+                    if self.gname_vals.get(&recv.v).is_some_and(|&g| self.atom_is(g, "Math")) {
+                        if let Some(m) = math_fn_named(&std::string::String::from_utf16_lossy(self.mm.atoms[a].chars())) {
+                            self.math_fns.insert(r, m);
+                        }
+                    }
                     self.push(r, Ty::Val(TagSet::ALL));
                     let claim = self.s.ctx.facts.field_sites.get(&self.site(pc)).copied();
                     self.guard_result(claim.unwrap_or_default(), pc + op.len(), false);
@@ -4451,6 +4560,9 @@ impl<'s, 'a> Run<'s, 'a> {
             }
             Call | CallIgnoresRv | CallContent => {
                 let argc = usize::from(p.next_uint16().unwrap());
+                if self.math_call(argc) {
+                    return Ok(());
+                }
                 let n = self.st.len();
                 let operands: Vec<Slot> = self.st.drain(n - argc - 2..).collect();
                 // A known closure is the callee (context-sensitive: known

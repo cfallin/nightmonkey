@@ -3,7 +3,10 @@
 //! - [`fold_guards`]: guard folding (§10.1), by type and by availability.
 //! - [`forward_params`]: a param of a block with one predecessor is the
 //!   value that predecessor passes.
-//! - [`optimize`]: both, to a fixpoint.
+//! - [`cse_loads`]: a field load of a field already loaded (or stored)
+//!   through the same object, with nothing in between that may write it,
+//!   is that value.
+//! - [`optimize`]: all, to a fixpoint.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
@@ -50,7 +53,17 @@ fn is_guard(op: &Opcode) -> bool {
             | Opcode::GuardLayout { .. }
             | Opcode::GuardSingleton(_)
             | Opcode::GuardScript(_)
+            | Opcode::CheckFuse(_)
     )
+}
+
+/// The operand a guard is keyed by: its operand up to unboxing, or, for
+/// an operand-less check (`check.fuse`), a stand-in.
+fn guard_arg(f: &Func, d: &crate::mir::func::InstData) -> Value {
+    match d.args.first() {
+        Some(&a) => canon(f, a),
+        None => Value::from_u32(u32::MAX),
+    }
 }
 
 /// Predecessors, reverse postorder from the roots, and immediate
@@ -199,7 +212,7 @@ fn ok_output(f: &Func, ok: &Edge) -> Option<Value> {
 pub fn optimize(m: &Module, f: &mut Func) -> usize {
     let mut total = 0;
     loop {
-        let n = fold_guards(m, f);
+        let n = fold_guards(m, f) + if CSE_LOADS { cse_loads(m, f) } else { 0 };
         forward_params(m, f);
         total += n;
         if n == 0 {
@@ -369,6 +382,12 @@ pub fn fold_guards(m: &Module, f: &mut Func) -> usize {
             if site == KillSite::Op {
                 cur.retain(|_, v| !fx.kill.matches(&f.values[*v].ty));
             }
+            // A fuse can blow wherever JS runs, and blowing one bumps no
+            // epoch: its check is not kept across such an op, clean edge
+            // or not.
+            if fx.may_run_js {
+                cur.retain(|(op, _), _| !matches!(op, Opcode::CheckFuse(_)));
+            }
             if idx + 1 != insts.len() {
                 continue;
             }
@@ -384,7 +403,7 @@ pub fn fold_guards(m: &Module, f: &mut Func) -> usize {
                 }
                 if role == SuccRole::Ok && is_guard(&d.op) {
                     if let Some(v) = ok_output(f, e) {
-                        a.insert((d.op, canon(f, d.args[0])), v);
+                        a.insert((d.op, guard_arg(f, d)), v);
                     }
                 }
                 out.push((e.block, a));
@@ -423,15 +442,16 @@ pub fn fold_guards(m: &Module, f: &mut Func) -> usize {
         if !is_guard(&d.op) {
             continue;
         }
-        let x = d.args[0];
-        let xt = f.values[x].ty;
+        let x = d.args.first().copied();
         let ok = d.succs[0].clone();
         let Some(outp) = ok_output(f, &ok) else {
             continue;
         };
         let want = f.values[outp].ty;
         // By type: the operand's own type proves the guard.
-        let by_type: Option<(Option<Opcode>, Type)> = match signature(&d.op, &[xt], m) {
+        let by_type: Option<(Option<Opcode>, Type)> = match x.map(|x| (x, f.values[x].ty)) {
+            None => None,
+            Some((_, xt)) => match signature(&d.op, &[xt], m) {
             Ok(sig) => {
                 let out = sig.outputs[0];
                 match d.op {
@@ -444,17 +464,18 @@ pub fn fold_guards(m: &Module, f: &mut Func) -> usize {
                 }
             }
             Err(_) => None,
+            },
         };
-        let known: Option<(Option<Opcode>, Value, Type)> = match by_type {
-            Some((op, t)) => Some((op, x, t)),
-            None => {
+        let known: Option<(Option<Opcode>, Value, Type)> = match (by_type, x) {
+            (Some((op, t)), Some(x)) => Some((op, x, t)),
+            _ => {
                 // A guard ends its block, so what reaches it is the
                 // block's entry set.
                 // The same guard, or one of its kind on the same value
                 // whose output implies this one's (a layout within the
                 // range guarded here).
                 let avail = avail_in.get(&b).cloned().flatten().unwrap_or_default();
-                let cx = canon(f, x);
+                let cx = guard_arg(f, &d);
                 let mut hits: Vec<Value> = avail
                     .iter()
                     .filter(|((op, y), v1)| {
@@ -481,12 +502,12 @@ pub fn fold_guards(m: &Module, f: &mut Func) -> usize {
         }
         // Replace the guard with (an unbox and) a jump.
         f.blocks[b].insts.pop();
-        let v = match unbox {
-            Some(op) => {
+        let v = match (unbox, x) {
+            (Some(op), Some(x)) => {
                 let (_, rs) = f.add_inst(b, op, vec![x], &[vt], vec![]);
                 rs[0]
             }
-            None => v,
+            _ => v,
         };
         let args = ok
             .args
@@ -503,6 +524,139 @@ pub fn fold_guards(m: &Module, f: &mut Func) -> usize {
             &[],
             vec![Edge {
                 block: ok.block,
+                args,
+            }],
+        );
+        folded += 1;
+    }
+    folded
+}
+
+/// Whether field loads are made redundant by earlier loads and stores.
+const CSE_LOADS: bool = true;
+
+/// A field's identity for [`cse_loads`]: its name and the object (up to
+/// unboxing) it is reached through.
+type LoadKey = (crate::mir::entity::AtomId, Value);
+
+/// Redundant field loads (§10.1's availability, over the heap): a
+/// `load_field` of a field that a dominating `load_field` read, or a
+/// `store_field` wrote, through the same object, with no instruction in
+/// between whose effects may write that field (any object's: two values
+/// may be one object), is the value read or written. It becomes a `jump`
+/// to its clean successor with that value. The clean edge only: a load's
+/// dirty edge reports the engine ran, and a store's value is the field's
+/// only on its clean edge (a setter may have run on the others).
+pub fn cse_loads(m: &Module, f: &mut Func) -> usize {
+    use crate::mir::module::Region;
+    let cfg = Cfg::new(f);
+    let mut inst_block = BTreeMap::new();
+    for &b in &f.layout {
+        for &i in &f.blocks[b].insts {
+            inst_block.insert(i, b);
+        }
+    }
+    let mut avail_in: BTreeMap<Block, Option<HashMap<LoadKey, Value>>> = BTreeMap::new();
+    for r in &f.roots {
+        avail_in.insert(r.block, Some(HashMap::new()));
+    }
+    let edge_out = |f: &Func, b: Block, avail: &HashMap<LoadKey, Value>| {
+        let mut out: Vec<(Block, HashMap<LoadKey, Value>)> = vec![];
+        let mut cur = avail.clone();
+        let insts = &f.blocks[b].insts;
+        for (idx, &i) in insts.iter().enumerate() {
+            let d = &f.insts[i];
+            let tys: Vec<Type> = d.args.iter().map(|&v| f.values[v].ty).collect();
+            let fx = effects(&d.op, &tys, m);
+            for w in &fx.writes {
+                cur.retain(|(name, _), _| {
+                    !w.overlaps(&Region::Field {
+                        name: *name,
+                        keys: None,
+                    })
+                });
+            }
+            if idx + 1 != insts.len() {
+                continue;
+            }
+            for (role, e) in f.succ_edges(i) {
+                let mut a = cur.clone();
+                if role == SuccRole::OkClean {
+                    match d.op {
+                        Opcode::LoadField(name) => {
+                            if let Some(v) = ok_output(f, e) {
+                                a.insert((name, canon(f, d.args[0])), v);
+                            }
+                        }
+                        Opcode::StoreField(name) => {
+                            a.insert((name, canon(f, d.args[0])), d.args[1]);
+                        }
+                        _ => {}
+                    }
+                }
+                out.push((e.block, a));
+            }
+        }
+        out
+    };
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for &b in &cfg.rpo {
+            let Some(Some(inb)) = avail_in.get(&b).cloned() else {
+                continue;
+            };
+            for (s, a) in edge_out(f, b, &inb) {
+                let merged = match avail_in.get(&s).cloned().flatten() {
+                    None if !f.roots.iter().any(|r| r.block == s) => a,
+                    None => HashMap::new(),
+                    Some(old) => old
+                        .into_iter()
+                        .filter(|(k, v)| a.get(k) == Some(v))
+                        .collect(),
+                };
+                if avail_in.get(&s).cloned().flatten().as_ref() != Some(&merged) {
+                    avail_in.insert(s, Some(merged));
+                    changed = true;
+                }
+            }
+        }
+    }
+    let mut folded = 0;
+    for &b in &cfg.rpo.clone() {
+        let Some(t) = f.terminator(b) else { continue };
+        let d = f.insts[t].clone();
+        let Opcode::LoadField(name) = d.op else { continue };
+        let clean = d.succs[0].clone();
+        let Some(outp) = ok_output(f, &clean) else {
+            continue;
+        };
+        let want = f.values[outp].ty;
+        let avail = avail_in.get(&b).cloned().flatten().unwrap_or_default();
+        let Some(&v) = avail.get(&(name, canon(f, d.args[0]))) else {
+            continue;
+        };
+        let dominated = def_block(f, v, &inst_block).is_some_and(|db| db != b && cfg.dominates(db, b));
+        let vt = f.values[v].ty;
+        if !dominated || !(is_subtype(&vt, &want) || vt == want) {
+            continue;
+        }
+        f.blocks[b].insts.pop();
+        let args = clean
+            .args
+            .iter()
+            .map(|a| match a {
+                EdgeArg::Out(0) => EdgeArg::Value(v),
+                a => *a,
+            })
+            .collect();
+        f.add_inst(
+            b,
+            Opcode::Jump,
+            vec![],
+            &[],
+            vec![Edge {
+                block: clean.block,
                 args,
             }],
         );

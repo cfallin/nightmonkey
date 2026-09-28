@@ -76,6 +76,7 @@ pub(crate) fn fenced(f: &Func, mm: &Module) -> bool {
 struct Maps {
     atoms: BTreeMap<AtomId, AtomId>,
     fuses: BTreeMap<FuseId, FuseId>,
+    natives: BTreeMap<crate::mir::entity::NativeId, crate::mir::entity::NativeId>,
     /// Where the callee's restamp descriptors start in the caller's table.
     restamp_base: u32,
 }
@@ -93,6 +94,7 @@ impl Maps {
                 Type::Val(v)
             }
             Type::Fact(FactKind::Fuse(f)) => Type::Fact(FactKind::Fuse(self.fuses[&f])),
+            Type::Fact(FactKind::NativeIntact(n)) => Type::Fact(FactKind::NativeIntact(self.natives[&n])),
             Type::Fact(_) => return Err("inline: a binding or native fact".into()),
             t => t,
         })
@@ -117,6 +119,7 @@ impl Maps {
             StoreField(a) => StoreField(self.atom(a)),
             InitField(a) => InitField(self.atom(a)),
             CheckFuse(f) => CheckFuse(self.fuses[&f]),
+            CheckNative(n) => CheckNative(self.natives[&n]),
             JsRt(mir::ops::RtOp::DelProp(a, s)) => JsRt(mir::ops::RtOp::DelProp(self.atom(a), s)),
             JsRt(mir::ops::RtOp::InitProp(a, t)) => JsRt(mir::ops::RtOp::InitProp(self.atom(a), t)),
             JsRt(mir::ops::RtOp::InitPropGetSet(a, k)) => {
@@ -124,7 +127,7 @@ impl Maps {
             }
             JsRt(mir::ops::RtOp::Intrinsic(a)) => JsRt(mir::ops::RtOp::Intrinsic(self.atom(a))),
             Restamp(i) => Restamp(self.restamp_base + i),
-            ConstObj(_) | GuardSingleton(_) | CheckBinding(_) | CheckNative(_) | LoadGName(_)
+            ConstObj(_) | GuardSingleton(_) | CheckBinding(_) | LoadGName(_)
             | StoreGName(_) | CallNative(_) => {
                 return Err(format!("inline: {} is not remapped", mir::print::mnemonic(&op)))
             }
@@ -140,6 +143,7 @@ fn merge_module(mm: &mut Module, k: &Module) -> Result<Maps, String> {
     let mut maps = Maps {
         atoms: BTreeMap::new(),
         fuses: BTreeMap::new(),
+        natives: BTreeMap::new(),
         restamp_base: u32::try_from(mm.restamps.len()).unwrap(),
     };
     mm.restamps.extend(k.restamps.iter().copied());
@@ -154,8 +158,16 @@ fn merge_module(mm: &mut Module, k: &Module) -> Result<Maps, String> {
         };
         maps.fuses.insert(fid, id);
     }
-    if !k.snap_objs.is_empty() || !k.bindings.is_empty() || !k.natives.is_empty() {
-        return Err("inline: snapshot objects, bindings or natives".into());
+    for (nid, d) in k.natives.iter() {
+        let found = mm.natives.iter().find(|(_, x)| x.name == d.name).map(|(n, _)| n);
+        let id = match found {
+            Some(n) => n,
+            None => mm.natives.push(d.clone()),
+        };
+        maps.natives.insert(nid, id);
+    }
+    if !k.snap_objs.is_empty() || !k.bindings.is_empty() {
+        return Err("inline: snapshot objects or bindings".into());
     }
     for (&key, lay) in &k.layouts {
         let mine = mm.layouts.entry(key).or_default();

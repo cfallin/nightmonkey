@@ -960,8 +960,10 @@ pub fn signature(op: &Opcode, args: &[Type], m: &Module) -> SigResult {
             })?;
             Sig::output(Type::Fact(FactKind::Binding(*b)))
         }
+        // The callee is native `n` (its pristine JSNative).
         CheckNative(n) => {
-            arity(args, 0)?;
+            arity(args, 1)?;
+            val(&args[0], "check.native callee")?;
             want(m.natives.contains(*n), || {
                 format!("check.native: {n} is not in the module")
             })?;
@@ -1501,7 +1503,8 @@ pub fn signature(op: &Opcode, args: &[Type], m: &Module) -> SigResult {
             want(matches!(o.kind, ObjKind::TypedArray(_)), || {
                 "length.ta: expected a typed array".into()
             })?;
-            Sig::result(Type::Int(IRange::new(0, INT_LIM)))
+            // A wasm32 engine's typed arrays are shorter than 2^31.
+            Sig::result(Type::I32(IRange::new(0, I32_MAX)))
         }
         ElementsPtr => {
             arity(args, 1)?;

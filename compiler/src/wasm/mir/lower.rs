@@ -124,6 +124,28 @@ pub struct Lowered {
     pub opsize: BTreeMap<String, (u32, u32)>,
 }
 
+/// The `math_natives_base` slot of a Math native the builder names
+/// (`Math.<fn>`).
+pub(crate) fn native_math_index(name: &str) -> Option<u32> {
+    use crate::wasm::translate::{
+        MN_ABS, MN_CEIL, MN_COS, MN_FLOOR, MN_FROUND, MN_MAX, MN_MIN, MN_POW, MN_SIN, MN_SQRT, MN_TRUNC,
+    };
+    Some(match name {
+        "Math.abs" => MN_ABS,
+        "Math.floor" => MN_FLOOR,
+        "Math.ceil" => MN_CEIL,
+        "Math.trunc" => MN_TRUNC,
+        "Math.sqrt" => MN_SQRT,
+        "Math.fround" => MN_FROUND,
+        "Math.min" => MN_MIN,
+        "Math.max" => MN_MAX,
+        "Math.pow" => MN_POW,
+        "Math.sin" => MN_SIN,
+        "Math.cos" => MN_COS,
+        _ => return None,
+    })
+}
+
 /// `guard.layout` also requires SLOTS, and field ops under a claim do
 /// not test it again.
 const GUARD_SLOTS: bool = true;
@@ -1871,9 +1893,53 @@ impl<'a> Lower<'a> {
                 let v = self.bin(o, a[0], a[1], Type::I32);
                 self.def(inst, v);
             }
-            Opcode::Math(MathFn::Abs) => {
-                let v = self.un(Operator::F64Abs, a[0], Type::F64);
+            Opcode::Math(m) => {
+                let v = match m {
+                    MathFn::Abs => self.un(Operator::F64Abs, a[0], Type::F64),
+                    MathFn::Floor => self.un(Operator::F64Floor, a[0], Type::F64),
+                    MathFn::Ceil => self.un(Operator::F64Ceil, a[0], Type::F64),
+                    MathFn::Trunc => self.un(Operator::F64Trunc, a[0], Type::F64),
+                    MathFn::Sqrt => self.un(Operator::F64Sqrt, a[0], Type::F64),
+                    MathFn::Fround => {
+                        let f = self.un(Operator::F32DemoteF64, a[0], Type::F32);
+                        self.un(Operator::F64PromoteF32, f, Type::F64)
+                    }
+                    // wasm's min/max are JS's: NaN wins, -0 < +0.
+                    MathFn::Min => self.bin(Operator::F64Min, a[0], a[1], Type::F64),
+                    MathFn::Max => self.bin(Operator::F64Max, a[0], a[1], Type::F64),
+                    MathFn::Pow => self.call1(self.h.math_pow, &[a[0], a[1]], Type::F64),
+                    MathFn::Sin | MathFn::Cos => {
+                        let k = self.i32c(u32::from(m == MathFn::Cos));
+                        self.call1(self.h.math_unary, &[k, a[0]], Type::F64)
+                    }
+                    _ => return Err(format!("lowering: math {m:?}")),
+                };
                 self.def(inst, v);
+            }
+            Opcode::CheckNative(n) => {
+                // The callee's JSNative is the pristine one (a function
+                // object's native sits in its env slot's place, as
+                // `math_arms` reads it).
+                let idx = native_math_index(&self.mm.natives[n].name)
+                    .ok_or_else(|| format!("lowering: native {}", self.mm.natives[n].name))?;
+                let (_, _, native) = self.classify_native(a[0]);
+                let fail = self.body.add_block();
+                self.check(native, fail);
+                let cp = self.un(Operator::I32WrapI64, a[0], Type::I32);
+                let nf = self.load_i32(cp, FUNC_ENV_SLOT_OFFSET);
+                let c = self.i32c(self.h.math_natives_base + 4 * idx);
+                let slot = self.load_i32(c, 0);
+                let same = self.bin(Operator::I32Eq, nf, slot, Type::I32);
+                let (ok_b, cont) = (self.body.add_block(), self.body.add_block());
+                self.cond_br(same, Self::to(ok_b), Self::to(fail));
+                self.cur = fail;
+                self.terminate(Terminator::Br { target: Self::to(cont) });
+                self.cur = ok_b;
+                let t = self.edge(inst, 0, &[])?;
+                self.terminate(Terminator::Br { target: t });
+                self.cur = cont;
+                let e = self.edge(inst, 1, &[])?;
+                self.terminate(Terminator::Br { target: e });
             }
             Opcode::ToInt32 => {
                 let x = match at(0) {
@@ -2291,6 +2357,11 @@ impl<'a> Lower<'a> {
                 self.cur = slow;
                 let sv = self.i32c(u32::from(strict));
                 self.js_call(inst, self.h.set_element, &[a[0], a[1], a[2], sv], false)?;
+            }
+            Opcode::LengthTa => {
+                // Its length slot's payload (a detached one reads 0).
+                let len = self.load_i32(a[0], TA_LENGTH_PAYLOAD_OFFSET);
+                self.def(inst, len);
             }
             Opcode::GuardKind(ObjKind::Native) => {
                 let shape = self.load_i32(a[0], SHAPE_OFFSET);
