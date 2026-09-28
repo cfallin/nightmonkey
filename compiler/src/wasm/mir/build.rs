@@ -397,10 +397,10 @@ const MAX_DIRECT_TARGETS: usize = 4;
 const LEAN_CALLEES: bool = true;
 
 /// A typed array's `.length` is its length slot (`length.ta`).
-const LENGTH_TA: bool = false;
+const LENGTH_TA: bool = true;
 
 /// `Math.<fn>(...)` calls are typed ops behind a native check (`math_call`).
-const MATH_CALLS: bool = false;
+const MATH_CALLS: bool = true;
 
 /// The Math functions `math_call` types, by property name.
 fn math_fn_named(s: &str) -> Option<MathFn> {

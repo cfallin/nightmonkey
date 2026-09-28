@@ -63,3 +63,18 @@ for (var round = 0; round < 30; round++) {
   var f = storeMixed(new Float64Array(6), mixed);
   assertEq(Array.prototype.join.call(f), "300,-5,2.5,7,10000000000,-1");
 }
+
+// `.length` of a proven typed array (a hoisted kind guard) in the loop
+// test, and after the buffer is detached.
+function sumTa(a) { var s = 0; for (var i = 0; i < a.length; i++) s += a[i]; return s; }
+for (var n = 0; n < 50; n++) {
+  var ta = new Int32Array(8 + (n & 3));
+  for (var i = 0; i < ta.length; i++) ta[i] = i;
+  assertEq(sumTa(ta), (ta.length - 1) * ta.length / 2);
+  assertEq(sumTa(new Float64Array([0.5, 1.5])), 2);
+}
+if (typeof ArrayBuffer.prototype.transfer == "function") {
+  var det = new Uint8Array(16);
+  det.buffer.transfer();
+  assertEq(sumTa(det), 0);
+}

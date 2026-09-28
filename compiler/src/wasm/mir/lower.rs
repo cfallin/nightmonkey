@@ -124,6 +124,9 @@ pub struct Lowered {
     pub opsize: BTreeMap<String, (u32, u32)>,
 }
 
+/// A generic element store tries the call-free append/hole arm first.
+const APPEND_ARM: bool = false;
+
 /// The `math_natives_base` slot of a Math native the builder names
 /// (`Math.<fn>`).
 pub(crate) fn native_math_index(name: &str) -> Option<u32> {
@@ -2355,6 +2358,11 @@ impl<'a> Lower<'a> {
                 let t = self.edge(inst, 0, &[])?;
                 self.terminate(Terminator::Br { target: t });
                 self.cur = slow;
+                if APPEND_ARM {
+                    let generic = self.body.add_block();
+                    self.elem_append_arm(inst, a[0], a[1], a[2], duty, num, generic)?;
+                    self.cur = generic;
+                }
                 let sv = self.i32c(u32::from(strict));
                 self.js_call(inst, self.h.set_element, &[a[0], a[1], a[2], sv], false)?;
             }
@@ -4555,6 +4563,66 @@ impl<'a> Lower<'a> {
         let not_hole = self.un(Operator::I32Eqz, hole, Type::I32);
         self.check(not_hole, fail);
         (obj, elements, idx, addr, v)
+    }
+
+    /// A dense append, or a store into a hole, call-free (bbv's
+    /// `emit_elem_append_arm`): with `night_elem_append_check` proving it
+    /// legal (the receiver's shape in the append cache, its prototypes
+    /// holding no indexed property, room left) and returning the element's
+    /// address, store it and, for an append, bump the initialized length,
+    /// and an Array's length when the index passes it; taking `ok_clean`.
+    /// Else `miss`.
+    fn elem_append_arm(&mut self, inst: mir::Inst, recv: Value, key: Value, val: Value, duty: bool, num: bool, miss: Block) -> R<()> {
+        let tag = self.tag_of(recv);
+        let is_obj = self.tag_is(tag, TAG_OBJECT as u32);
+        let ktag = self.tag_of(key);
+        let is_int = self.tag_is(ktag, TAG_INT32 as u32);
+        let both = self.bin(Operator::I32And, is_obj, is_int, Type::I32);
+        self.check(both, miss);
+        let obj = self.un(Operator::I32WrapI64, recv, Type::I32);
+        let elements = self.load_i32(obj, OBJ_ELEMENTS_OFFSET);
+        let initlen = self.elem_header(elements, ELEMENTS_INITLEN_BACK);
+        let idx = self.un(Operator::I32WrapI64, key, Type::I32);
+        let packed = self.call1(self.h.elem_append_check, &[obj, elements, initlen, idx], Type::I64);
+        let z = self.i64c(0);
+        let ok = self.bin(Operator::I64Ne, packed, z, Type::I32);
+        self.check(ok, miss);
+        let addr = self.un(Operator::I32WrapI64, packed, Type::I32);
+        let sh = self.i64c(32);
+        let row = self.bin(Operator::I64ShrU, packed, sh, Type::I64);
+        let row = self.un(Operator::I32WrapI64, row, Type::I32);
+        if duty {
+            let w = self.load_i32(obj, OBJ_CLASS_IDX_OFFSET);
+            self.clear_bits(obj, w, CLASS_WORD_RANGES);
+        }
+        // A hole or the space past the initialized length holds no GC
+        // thing: no pre-barrier.
+        self.store_i64(addr, 0, val);
+        let is_app = self.bin(Operator::I32Eq, idx, initlen, Type::I32);
+        let (bump, done) = (self.body.add_block(), self.body.add_block());
+        self.cond_br(is_app, Self::to(bump), Self::to(done));
+        self.cur = bump;
+        let one = self.i32c(1);
+        let n = self.bin(Operator::I32Add, idx, one, Type::I32);
+        self.set_elem_header(elements, ELEMENTS_INITLEN_BACK, n);
+        let len = self.elem_header(elements, ELEMENTS_LENGTH_BACK);
+        let passes = self.bin(Operator::I32GeU, idx, len, Type::I32);
+        // The length word is an Array's (the row's isArray, from its prime).
+        let is_arr = self.load_i32(row, 20);
+        let both = self.bin(Operator::I32And, passes, is_arr, Type::I32);
+        let lb = self.body.add_block();
+        self.cond_br(both, Self::to(lb), Self::to(done));
+        self.cur = lb;
+        self.set_elem_header(elements, ELEMENTS_LENGTH_BACK, n);
+        self.terminate(Terminator::Br { target: Self::to(done) });
+        self.cur = done;
+        if !num {
+            let f = self.h.post_write_barrier_elem;
+            self.post_barrier(f, obj, idx, val);
+        }
+        let t = self.edge(inst, 0, &[])?;
+        self.terminate(Terminator::Br { target: t });
+        Ok(())
     }
 
     /// The helpers' atom id for MIR atom `a`, as an i32 constant.
