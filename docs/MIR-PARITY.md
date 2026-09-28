@@ -33,18 +33,22 @@ answer).
    arms, unchanged epochs (`rt_call_keep*`), clean callee effect words
    (`emit_flag_fork`), and callee effect summaries
    (`summary_conflict_free`). MIR bodies always return `FLAGS_ALL`.
-3. **No type refinement from dynamic tests.** Legacy's int arm of an
-   untyped `+`, compare, bitop or inc refines the operand's source slot
-   to int32 (`arith.rs`, `compare.rs:757`); a passed class guard is
-   written back to the local/argument (`refine_src`). MIR results of
-   generic ops stay boxed and operand slots never narrow.
+3. **Type refinement from dynamic tests: partial.** Legacy's int arm of
+   an untyped `+`, compare, bitop or inc refines the operand's source
+   slot to int32 (`arith.rs`, `compare.rs:757`); a passed class guard is
+   written back to the local/argument (`refine_src`). MIR narrows the
+   tested value on the branch a tag-exact test proves (`fuse_test`:
+   nullish compares, `typeof` of a primitive type, `?.`/`??`), and a
+   guarded receiver refines its slots where the guard exits on a miss;
+   results of generic ops stay boxed.
 4. **No loop-invariant code motion.** Legacy runs an effect-aware LICM
    (`bbv/licm.rs`) over shapes, class words, elements headers,
    typed-array data/length, gname rows, fuse cells, env loads. MIR
    hoists only Native/TypedArray kind guards (`HOIST_NATIVE`); its
-   optimizer (`mir/opt.rs`) folds guards and forwards params, nothing
-   else (no GVN/CSE, no constant folding, no range propagation;
-   `CheckFuse` is not even folded).
+   optimizer (`mir/opt.rs`) folds guards (and `check.fuse`, killed where
+   JS may run), forwards params, and folds redundant field loads by
+   their effects (`cse_loads`); no general GVN, constant folding or range
+   propagation.
 5. **No ranges.** Legacy's interval/I53 machinery removes overflow and
    -0 checks, runs exact i64 arithmetic (including `%` via `rem_s`),
    seeds element/field ranges from stamps. MIR ignores `ValueRange`
@@ -58,9 +62,11 @@ answer).
    (`PushLexicalEnv`...), non-global `GetName`/`SetName`, eval.
 7. **Unused IR.** `LoadGName`, `StoreGName`, `CheckBinding`,
    `NewObject(_)`, `NewArray`, `InitField`, `PublishLayout`,
-   `CallDirect`, `CallNative`, `CheckNative`, `GuardSingleton`,
-   `LengthArray`/`LengthString`/`LengthTa`, most `MathFn`, `IntArith`
-   are defined but never built or lowered.
+   `CallDirect`, `CallNative`, `GuardSingleton`,
+   `LengthArray`/`LengthString`, `IntArith` are defined but never built
+   or lowered. Built now: `CheckNative` (on the callee) and `Math` of
+   abs/floor/ceil/trunc/sqrt/fround/min/max/pow/sin/cos (typed
+   `Math.<fn>` calls), `LengthTa`.
 
 ## 2. Priorities
 
@@ -151,20 +157,21 @@ Ordered by expected effect across the suite:
 | Legacy | MIR | Status |
 |---|---|---|
 | Call cell classify | `classify_native` | same |
-| Likely-direct static call (`likely_patches`) | always `call_indirect` | missing |
+| Likely-direct static call (`likely_patches`) | up to 4 likely callees' direct arms (attachments) | same |
 | Fuse-guarded direct call to a global function | none (inlining only) | missing |
 | Typed entry (ARGC_SEL_BIT) proven by caller | never set; callee always re-validates | missing |
 | Entry claims for this/object/string/bool/symbol/TA | numeric formals + `this` layout only | partial |
 | `call_types` result claims, all shapes | numeric only | partial |
 | Flag fork / epoch keep / summary keep after calls | none; facts die | missing |
-| Native dispatch route (`native_dispatch`, `BC_STR_*`) | natives via `night_runtime_call` | missing |
-| Math arms | `math_arms` (results boxed) | same |
+| Native dispatch route (`native_dispatch`, `BC_STR_*`) | `native_dispatch` for native callees | same |
+| Math arms | typed `Math.<fn>` calls (raw f64); `math_arms` elsewhere | better |
 | parseInt arm | none | missing |
 | char arms after direct dispatch fails | before classify, on every 1-arg call | partial |
 | push/pop arms | `push_arm`/`pop_arm` | same |
 | `hasOwnProperty.call` arm (`apply_natives`) | none | missing |
 | Apply-forward: splice wrapper, per-entry targets (`apply_targets_in`), up to 16 static arms + dynamic arm | wrappers never inlined; ≤4 inline targets else runtime helper | partial |
-| Inline policy (mono 150/200, poly 500, depth 4/8 by root nest, closure cost, fuel) | caps and depth 4; in-loop test uses own loops; instruction budgets; no fuel (declines instead) | partial |
+| Inline policy (mono 150/200, poly 500, depth 4/8 by root nest, closure cost, fuel) | caps and depth 4; in-loop test uses own loops; instruction budgets; a callee too big with its own inlining is inlined without it (lean) | partial |
+| Context-sensitive targets through inlining | known closures (`Ty::Fn`) and callee builds keyed by the closures passed | better |
 | Inline guard: call-cell hit + patched funcidx compare | `GuardScript`, ~7 dependent loads | partial |
 | Caller facts into inlined callee, restored at return | kept through the splice unless the callee has a fence; its kills exit | same |
 | Construct: likely-ctor static arm, per-funcidx nslots region, class guard on result, fresh marking | `call_indirect`, static nslots only, `Val(object)` result | partial |
@@ -181,10 +188,10 @@ Ordered by expected effect across the suite:
 | Array-stamp read fold with element range | none | missing |
 | Array allocation stamps (`array_stamp_in`) | `stamp.fresh` (not yet `new Array()`) | partial |
 | Element store duty (prove or clear RANGES) | per site, proven by the value's type range | same |
-| Dense append / hole store arm | none (push arm only) | missing |
+| Dense append / hole store arm | `elem_append_arm` (`night_elem_append_check`) | same |
 | Typed-array read, unboxed result with kind interval, Uint32 | re-boxed and joined as `Val(ALL)`; Uint32 excluded; kind miss exits | partial |
 | Typed-array store, F64 into int kinds | int and boxed-int only (since a01edb9) | partial |
-| Polymorphic TA arm (`elem_poly_sites`) | none | missing |
+| Polymorphic TA arm (`elem_poly_sites`) | `ta_get_poly`/`ta_set_poly` probes (`ta=1` attachment) | same |
 | `s[i]` string arm | none | missing |
 | `arguments[i]` via GetElem | bytecode forms only | partial |
 | Mega string-key elem get/set | none | missing |
@@ -198,9 +205,9 @@ Ordered by expected effect across the suite:
 | `>>>` as I64 | F64 (loses int indexing) | partial |
 | Generic untyped unops | NUM\|BIGINT results | partial |
 | `bigint_free` | per-operand tags only (since a01edb9) | partial |
-| String equality, literal-RHS compares, switch-on-string | helper | missing |
+| String equality, literal-RHS compares, switch-on-string | pointer/length/atom arm before the helper | partial |
 | Post-compare refinement | none | missing |
-| Math results unboxed | boxed | partial |
+| Math results unboxed | typed `Math.<fn>` calls | same |
 | Mixed numeric claims: boxed, no exit | int32-first, exit on double | different |
 | Loop re-entry with range guards | tag/kind/layout guards only | partial |
 

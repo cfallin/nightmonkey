@@ -6,6 +6,8 @@
 //! - [`cse_loads`]: a field load of a field already loaded (or stored)
 //!   through the same object, with nothing in between that may write it,
 //!   is that value.
+//! - [`licm`]: loop-invariant code motion of pure ops and of reads no
+//!   op in the loop may write, into the loop's preheader.
 //! - [`optimize`]: all, to a fixpoint.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -212,7 +214,9 @@ fn ok_output(f: &Func, ok: &Edge) -> Option<Value> {
 pub fn optimize(m: &Module, f: &mut Func) -> usize {
     let mut total = 0;
     loop {
-        let n = fold_guards(m, f) + if CSE_LOADS { cse_loads(m, f) } else { 0 };
+        let n = fold_guards(m, f)
+            + if CSE_LOADS { cse_loads(m, f) } else { 0 }
+            + if LICM { licm(m, f) } else { 0 };
         forward_params(m, f);
         total += n;
         if n == 0 {
@@ -663,4 +667,106 @@ pub fn cse_loads(m: &Module, f: &mut Func) -> usize {
         folded += 1;
     }
     folded
+}
+
+/// Whether loop-invariant ops are hoisted.
+const LICM: bool = false;
+
+/// Loop-invariant code motion (MIR.md §10.2, over effects): a
+/// non-terminator in a loop that writes nothing, cannot GC, throw or kill
+/// facts, reads only regions no instruction in the loop may write, and
+/// whose operands are all defined outside the loop (or hoisted), moves to
+/// the end of the loop's preheader. Such an op is safe to run once before
+/// the loop even where the loop would not have reached it. Constants stay
+/// (nothing to save). Returns how many moved.
+pub fn licm(m: &Module, f: &mut Func) -> usize {
+    let cfg = Cfg::new(f);
+    let mut preds: BTreeMap<Block, Vec<Block>> = BTreeMap::new();
+    for &b in &f.layout {
+        for s in f.succs(b) {
+            preds.entry(s).or_default().push(b);
+        }
+    }
+    let mut inst_block = BTreeMap::new();
+    for &b in &f.layout {
+        for &i in &f.blocks[b].insts {
+            inst_block.insert(i, b);
+        }
+    }
+    let mut moved = 0;
+    for l in f.loops.clone() {
+        let (h, p) = (l.header, l.preheader);
+        // The natural loop: back from the header's in-loop predecessors.
+        let mut body: BTreeSet<Block> = BTreeSet::new();
+        body.insert(h);
+        let mut work: Vec<Block> = preds
+            .get(&h)
+            .map(|ps| ps.iter().copied().filter(|&q| cfg.dominates(h, q)).collect())
+            .unwrap_or_default();
+        while let Some(b) = work.pop() {
+            if body.insert(b) {
+                work.extend(preds.get(&b).into_iter().flatten().copied());
+            }
+        }
+        if body.contains(&p) || f.terminator(p).is_none() {
+            continue;
+        }
+        let mut writes = vec![];
+        for &b in &body {
+            for &i in &f.blocks[b].insts {
+                let d = &f.insts[i];
+                let tys: Vec<Type> = d.args.iter().map(|&v| f.values[v].ty).collect();
+                writes.extend(effects(&d.op, &tys, m).writes);
+            }
+        }
+        let mut hoisted: BTreeSet<Value> = BTreeSet::new();
+        let outside = |v: Value, hoisted: &BTreeSet<Value>| {
+            hoisted.contains(&v)
+                || match f.values[v].def {
+                    ValueDef::Param(b, _) => !body.contains(&b),
+                    ValueDef::Result(i, _) => inst_block.get(&i).is_some_and(|b| !body.contains(b)),
+                    ValueDef::Unused => false,
+                }
+        };
+        let frame = f.inst_frame[f.terminator(p).unwrap()];
+        let mut picks: Vec<(Block, Inst)> = vec![];
+        for &b in cfg.rpo.iter().filter(|b| body.contains(b)) {
+            for &i in &f.blocks[b].insts {
+                let d = &f.insts[i];
+                if !d.succs.is_empty() || d.op.is_terminator() {
+                    continue;
+                }
+                if matches!(d.op, Opcode::ConstVal(_) | Opcode::ConstI32(_) | Opcode::ConstF64(_) | Opcode::ConstBool(_)) {
+                    continue;
+                }
+                // An inlined callee's frame exists only once entered: its
+                // frame-relative ops stay in it.
+                if f.inst_frame[i] != frame {
+                    continue;
+                }
+                let tys: Vec<Type> = d.args.iter().map(|&v| f.values[v].ty).collect();
+                let fx = effects(&d.op, &tys, m);
+                let quiet = fx.writes.is_empty() && !fx.may_gc && !fx.may_throw && !fx.may_run_js && fx.kill.is_empty();
+                if !quiet || fx.reads.iter().any(|r| writes.iter().any(|w| w.overlaps(r))) {
+                    continue;
+                }
+                if !matches!(fx.flags, crate::mir::ops::FlagsEffect::Bits(b) if b == crate::mir::ops::FlagBits::NONE) {
+                    continue;
+                }
+                if !d.args.iter().all(|&v| outside(v, &hoisted)) {
+                    continue;
+                }
+                hoisted.extend(d.results.iter().copied());
+                picks.push((b, i));
+            }
+        }
+        for (b, i) in picks {
+            f.blocks[b].insts.retain(|&x| x != i);
+            let pos = f.blocks[p].insts.len() - 1;
+            f.blocks[p].insts.insert(pos, i);
+            inst_block.insert(i, p);
+            moved += 1;
+        }
+    }
+    moved
 }

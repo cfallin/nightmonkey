@@ -125,11 +125,11 @@ pub struct Lowered {
 }
 
 /// A generic call of a native goes straight to it (`native_dispatch`).
-const NATIVE_ROUTE: bool = false;
+const NATIVE_ROUTE: bool = true;
 
 /// A generic equality of two strings decides by pointer, length and
 /// atomness before the helper.
-const STRING_EQ_ARM: bool = false;
+const STRING_EQ_ARM: bool = true;
 
 /// A generic element store tries the call-free append/hole arm first.
 const APPEND_ARM: bool = true;
