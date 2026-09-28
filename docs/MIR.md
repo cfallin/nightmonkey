@@ -1767,7 +1767,8 @@ guard hoisting (2026-09-28).**
   the types the slots had at the yield (a miss exits at the landing).
   The body's entry, after the resume and onramp forks, takes a
   generator's resume (`EnterNightResume`'s generator-closing `this`):
-  it dispatches on the resume index first, restores the frame with
+  it dispatches on the resume index first (compares for up to four
+  yields, a `br_table` past that), restores the frame with
   `gen_restore`, pushes `[sent value, generator, resume kind]`, and
   enters the root; an index with no root (a yield in catch code, which
   is baseline's) goes to baseline's own dispatch, descriptor untouched.

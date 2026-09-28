@@ -160,6 +160,10 @@ pub(crate) fn native_math_index(name: &str) -> Option<u32> {
 /// not test it again.
 const GUARD_SLOTS: bool = true;
 
+/// A generator's resume dispatch over at most this many yields is a chain
+/// of compares; past it, a `br_table`.
+const RESUME_CHAIN_MAX: usize = 4;
+
 /// The resume words `f`'s exits and throws carry: the set the baseline
 /// body must accept (`docs/BASELINE.md` §4).
 pub fn resume_words(f: &mir::Func) -> Vec<ResumeWord> {
@@ -1574,11 +1578,31 @@ impl<'a> Lower<'a> {
             self.enter_onramp(pc, root)?;
         }
         self.cur = disp;
-        self.terminate(Terminator::Select {
-            value: ridx,
-            targets,
-            default: Self::to(other),
-        });
+        let known: Vec<(u32, BlockTarget)> = targets
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| t.block != other)
+            .map(|(k, t)| (u32::try_from(k).unwrap(), t.clone()))
+            .collect();
+        if known.len() <= RESUME_CHAIN_MAX {
+            // A few yields (the usual generator, an async function's
+            // awaits): compares, each a predicted branch, rather than a
+            // `br_table`'s bounds check and indirect jump.
+            for (k, t) in known {
+                let kv = self.i32c(k);
+                let hit = self.bin(Operator::I32Eq, ridx, kv, Type::I32);
+                let next = self.body.add_block();
+                self.cond_br(hit, t, Self::to(next));
+                self.cur = next;
+            }
+            self.terminate(Terminator::Br { target: Self::to(other) });
+        } else {
+            self.terminate(Terminator::Select {
+                value: ridx,
+                targets,
+                default: Self::to(other),
+            });
+        }
         self.cur = other;
         let argc = self.argc;
         self.tail_to_baseline(argc);
