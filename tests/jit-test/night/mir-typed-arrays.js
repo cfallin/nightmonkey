@@ -78,3 +78,22 @@ if (typeof ArrayBuffer.prototype.transfer == "function") {
   det.buffer.transfer();
   assertEq(sumTa(det), 0);
 }
+
+// One site, typed arrays of several kinds (a polymorphic site): reads and
+// writes through the kind probe, out of bounds and non-number values
+// through the generic path.
+function polyCopy(dst, src) { for (var i = 0; i < src.length; i++) dst[i] = src[i]; return dst; }
+function polySum(a) { var s = 0; for (var i = 0; i < 6; i++) s += a[i] === undefined ? 100 : a[i]; return s; }
+for (var n = 0; n < 40; n++) {
+  var kinds = [Int8Array, Uint16Array, Float32Array, Float64Array, Int32Array, Uint8ClampedArray];
+  for (var k = 0; k < kinds.length; k++) {
+    var t = polyCopy(new kinds[k](4), [1, 2.5, -3, 300]);
+    var expect = Array.prototype.slice.call(new kinds[k]([1, 2.5, -3, 300]));
+    assertEq(Array.prototype.join.call(t), expect.join());
+    assertEq(polySum(t), expect.reduce(function (x, y) { return x + y; }, 0) + 200);
+  }
+  var arr = polyCopy([], [1, 2, 3, 4]);
+  assertEq(arr.join(), "1,2,3,4");
+  var mixed = polyCopy(new Int16Array(3), ["7", null, {}]);
+  assertEq(Array.prototype.join.call(mixed), "7,0,0");
+}

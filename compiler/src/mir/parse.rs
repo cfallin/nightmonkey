@@ -1257,6 +1257,7 @@ impl Parser {
                 "call" => a.call_cell = Some(self.int()?),
                 "slot" => a.slot = Some(SlotIndex::new(self.int()?)),
                 "mask" => a.field_mask = Some(self.int()?),
+                "ta" => a.ta_poly = self.int::<u32>()? != 0,
                 "targets" => {
                     self.expect_punct("[")?;
                     while !self.eat_punct("]") {

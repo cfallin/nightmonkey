@@ -396,6 +396,10 @@ const MAX_DIRECT_TARGETS: usize = 4;
 /// A callee too big to inline with its own inlining is inlined without it.
 const LEAN_CALLEES: bool = true;
 
+/// A generic element op at a polymorphic typed-array site probes the
+/// typed-array kinds (`ta_poly`).
+const TA_POLY: bool = true;
+
 /// A typed array's `.length` is its length slot (`length.ta`).
 const LENGTH_TA: bool = true;
 
@@ -918,6 +922,8 @@ struct Run<'s, 'a> {
     /// `Math` (`math_call`).
     gname_vals: BTreeMap<mir::Value, mir::entity::AtomId>,
     math_fns: BTreeMap<mir::Value, MathFn>,
+    /// The element op being built is at an `elem_poly_sites` site.
+    ta_poly_site: bool,
 }
 
 impl<'s, 'a> Run<'s, 'a> {
@@ -960,6 +966,7 @@ impl<'s, 'a> Run<'s, 'a> {
             likely_targets: vec![],
             gname_vals: BTreeMap::new(),
             math_fns: BTreeMap::new(),
+            ta_poly_site: false,
             inline_sites: 0,
             inline_insts: 0,
         }
@@ -1003,6 +1010,15 @@ impl<'s, 'a> Run<'s, 'a> {
     /// Give a generic `call` the site's likely callees (`likely_targets`),
     /// for its lowering's direct arms.
     fn attach_targets(&mut self, inst: mir::Inst) {
+        if self.ta_poly_site && matches!(self.f.insts[inst].op, Opcode::JsGetElem | Opcode::JsSetElem(..)) {
+            let a = self.f.attachments.push(mir::func::Attachment {
+                site: Some(self.site(self.pc)),
+                ta_poly: true,
+                ..Default::default()
+            });
+            self.f.insts[inst].attach = Some(a);
+            return;
+        }
         if self.f.insts[inst].op != Opcode::Call || self.likely_targets.is_empty() {
             return;
         }
@@ -1014,6 +1030,7 @@ impl<'s, 'a> Run<'s, 'a> {
             slot: None,
             field_mask: None,
             targets,
+            ta_poly: false,
         });
         self.f.insts[inst].attach = Some(a);
     }
@@ -3213,6 +3230,7 @@ impl<'s, 'a> Run<'s, 'a> {
         use JSOp::*;
         let pc = self.pc;
         self.next_pc = Some(pc + op.len());
+        self.ta_poly_site = false;
         let mut p = self.s.imms(pc);
         let int_ty = Ty::I32;
         match op {
@@ -4174,6 +4192,7 @@ impl<'s, 'a> Run<'s, 'a> {
                 self.repush(v);
             }
             GetElem => {
+                self.ta_poly_site = TA_POLY && self.s.ctx.facts.elem_poly_sites.contains(&self.site(pc));
                 let key = self.pop();
                 let recv = self.pop();
                 let ta = self.ta_elem(pc, recv, key);
@@ -4279,11 +4298,13 @@ impl<'s, 'a> Run<'s, 'a> {
                     }
                 }
                 };
+                self.ta_poly_site = false;
                 self.push(r, Ty::Val(TagSet::ALL));
                 let claim = self.s.ctx.facts.elem_sites.get(&self.site(pc)).copied();
                 self.guard_result(claim.unwrap_or_default(), pc + op.len(), true);
             }
             SetElem | StrictSetElem => {
+                self.ta_poly_site = TA_POLY && self.s.ctx.facts.elem_poly_sites.contains(&self.site(pc));
                 let v = self.pop();
                 let key = self.pop();
                 let recv = self.pop();

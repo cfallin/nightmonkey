@@ -761,6 +761,9 @@ pub fn print_func(m: &Module, f: &Func) -> String {
                     let ts: Vec<_> = at.targets.iter().map(|s| format!("s{s}")).collect();
                     items.push(format!("targets=[{}]", ts.join(", ")));
                 }
+                if at.ta_poly {
+                    items.push("ta=1".to_string());
+                }
                 write!(out, " @{{{}}}", items.join(", ")).unwrap();
             }
             if let Some(w) = f.witness(inst) {

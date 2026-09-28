@@ -148,6 +148,9 @@ pub struct Attachment {
     pub field_mask: Option<u32>,
     /// Candidate call targets, for later inlining.
     pub targets: Vec<ScriptId>,
+    /// An element site whose receivers are typed arrays of several kinds
+    /// (`elem_poly_sites`): its generic op probes them (`ta=1`).
+    pub ta_poly: bool,
 }
 
 /// A prediction witness (§4.5): what likelier says the op may invalidate.

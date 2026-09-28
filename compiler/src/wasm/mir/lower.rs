@@ -124,8 +124,15 @@ pub struct Lowered {
     pub opsize: BTreeMap<String, (u32, u32)>,
 }
 
+/// A generic call of a native goes straight to it (`native_dispatch`).
+const NATIVE_ROUTE: bool = false;
+
+/// A generic equality of two strings decides by pointer, length and
+/// atomness before the helper.
+const STRING_EQ_ARM: bool = false;
+
 /// A generic element store tries the call-free append/hole arm first.
-const APPEND_ARM: bool = false;
+const APPEND_ARM: bool = true;
 
 /// The `math_natives_base` slot of a Math native the builder names
 /// (`Math.<fn>`).
@@ -2324,6 +2331,21 @@ impl<'a> Lower<'a> {
                 let t = self.edge(inst, 0, &[v])?;
                 self.terminate(Terminator::Br { target: t });
                 self.cur = slow;
+                if self.ta_poly(inst) {
+                    // A typed array of any kind (bbv's poly-TA arm): the
+                    // probe's value, or the magic tag on a miss.
+                    let generic = self.body.add_block();
+                    let (obj, idx) = self.obj_int(a[0], a[1], generic);
+                    let r = self.call1(self.h.ta_get_poly, &[obj, idx], Type::I64);
+                    let tag = self.tag_of(r);
+                    let miss = self.tag_is(tag, TAG_MAGIC as u32);
+                    let hit = self.body.add_block();
+                    self.cond_br(miss, Self::to(generic), Self::to(hit));
+                    self.cur = hit;
+                    let t = self.edge(inst, 0, &[r])?;
+                    self.terminate(Terminator::Br { target: t });
+                    self.cur = generic;
+                }
                 self.js_call(inst, self.h.get_element, &[a[0], a[1]], false)?;
             }
             Opcode::JsSetElem(strict, duty) => {
@@ -2361,6 +2383,18 @@ impl<'a> Lower<'a> {
                 if APPEND_ARM {
                     let generic = self.body.add_block();
                     self.elem_append_arm(inst, a[0], a[1], a[2], duty, num, generic)?;
+                    self.cur = generic;
+                }
+                if self.ta_poly(inst) {
+                    // A typed array of any kind (bbv's poly-TA store probe).
+                    let generic = self.body.add_block();
+                    let (obj, idx) = self.obj_int(a[0], a[1], generic);
+                    let ok = self.call1(self.h.ta_set_poly, &[obj, idx, a[2]], Type::I32);
+                    let hit = self.body.add_block();
+                    self.cond_br(ok, Self::to(hit), Self::to(generic));
+                    self.cur = hit;
+                    let t = self.edge(inst, 0, &[])?;
+                    self.terminate(Terminator::Br { target: t });
                     self.cur = generic;
                 }
                 let sv = self.i32c(u32::from(strict));
@@ -3625,6 +3659,42 @@ impl<'a> Lower<'a> {
         let t = self.edge(inst, 0, &[r])?;
         self.terminate(Terminator::Br { target: t });
         self.cur = slow;
+        if STRING_EQ_ARM {
+            // Two strings (bbv's `emit_string_eq_arm`): one pointer is
+            // equal; different lengths (a rope carries its length, so no
+            // flatten) or two atoms (deduplicated) are unequal. Else the
+            // helper compares the characters.
+            use crate::wasm::bbv::abi::{STRING_ATOM_BIT, STRING_FLAGS_OFFSET};
+            let generic = self.body.add_block();
+            let sa = self.tag_is(ta, TAG_STRING as u32);
+            let sb = self.tag_is(tb, TAG_STRING as u32);
+            let both = self.bin(Operator::I32And, sa, sb, Type::I32);
+            self.check(both, generic);
+            let negate = matches!(cc, JsCc::Ne | JsCc::StrictNe);
+            let (eq_b, ne_b, len_b) = (self.body.add_block(), self.body.add_block(), self.body.add_block());
+            self.cond_br(bits_eq, Self::to(eq_b), Self::to(len_b));
+            self.cur = len_b;
+            let (ap, bp) = (self.un(Operator::I32WrapI64, a, Type::I32), self.un(Operator::I32WrapI64, b, Type::I32));
+            let al = self.load_i32(ap, STRING_LENGTH_OFFSET);
+            let bl = self.load_i32(bp, STRING_LENGTH_OFFSET);
+            let len_eq = self.bin(Operator::I32Eq, al, bl, Type::I32);
+            let atom_b = self.body.add_block();
+            self.cond_br(len_eq, Self::to(atom_b), Self::to(ne_b));
+            self.cur = atom_b;
+            let af = self.load_i32(ap, STRING_FLAGS_OFFSET);
+            let bf = self.load_i32(bp, STRING_FLAGS_OFFSET);
+            let flags = self.bin(Operator::I32And, af, bf, Type::I32);
+            let atom = self.i32c(STRING_ATOM_BIT);
+            let both_atom = self.bin(Operator::I32And, flags, atom, Type::I32);
+            self.cond_br(both_atom, Self::to(ne_b), Self::to(generic));
+            for (blk, equal) in [(eq_b, true), (ne_b, false)] {
+                self.cur = blk;
+                let v = self.i32c(u32::from(equal != negate));
+                let t = self.edge(inst, 0, &[v])?;
+                self.terminate(Terminator::Br { target: t });
+            }
+            self.cur = generic;
+        }
         Ok(())
     }
 
@@ -4625,6 +4695,25 @@ impl<'a> Lower<'a> {
         Ok(())
     }
 
+    /// Whether `inst` is at a polymorphic typed-array site.
+    fn ta_poly(&self, inst: mir::Inst) -> bool {
+        self.f.insts[inst].attach.is_some_and(|a| self.f.attachments[a].ta_poly)
+    }
+
+    /// Boxed `recv` as an object pointer and `key` as an int32, else
+    /// `miss`.
+    fn obj_int(&mut self, recv: Value, key: Value, miss: Block) -> (Value, Value) {
+        let tag = self.tag_of(recv);
+        let is_obj = self.tag_is(tag, TAG_OBJECT as u32);
+        let ktag = self.tag_of(key);
+        let is_int = self.tag_is(ktag, TAG_INT32 as u32);
+        let both = self.bin(Operator::I32And, is_obj, is_int, Type::I32);
+        self.check(both, miss);
+        let obj = self.un(Operator::I32WrapI64, recv, Type::I32);
+        let idx = self.un(Operator::I32WrapI64, key, Type::I32);
+        (obj, idx)
+    }
+
     /// The helpers' atom id for MIR atom `a`, as an i32 constant.
     fn atom(&mut self, a: mir::entity::AtomId) -> Value {
         let id = self.atoms.intern_chars(self.mm.atoms[a].chars());
@@ -4761,6 +4850,23 @@ impl<'a> Lower<'a> {
 
         self.cur = generic_b;
         let argc_v = self.i32c(argc);
+        if NATIVE_ROUTE {
+            // A native callee (the classify proved a function with no
+            // script) goes straight to its JSNative (bbv's native route);
+            // `native_dispatch` punts the natives that need the generic
+            // call's handling back to it.
+            let (nat_b, gen_b) = (self.body.add_block(), self.body.add_block());
+            self.cond_br(native, Self::to(nat_b), Self::to(gen_b));
+            self.cur = nat_b;
+            let ok_nat = self.call1(self.h.native_dispatch, &[self.cx, top, base, argc_v], Type::I32);
+            self.terminate(Terminator::Br {
+                target: BlockTarget {
+                    block: join,
+                    args: vec![ok_nat],
+                },
+            });
+            self.cur = gen_b;
+        }
         let ok_generic = self.call1(self.h.call, &[self.cx, top, base, argc_v], Type::I32);
         self.terminate(Terminator::Br {
             target: BlockTarget {

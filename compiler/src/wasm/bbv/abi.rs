@@ -143,7 +143,7 @@ pub(crate) const STRING_LENGTH_OFFSET: u32 = 4;
 pub(crate) const STRING_CHARS_OFFSET: u32 = 8;
 /// `JSString::ATOM_BIT` -- atoms are deduped, so two atoms compare by
 /// pointer.
-pub(super) const STRING_ATOM_BIT: u32 = 1 << 3;
+pub(crate) const STRING_ATOM_BIT: u32 = 1 << 3;
 pub(crate) const STRING_LINEAR_BIT: u32 = 1 << 4;
 pub(crate) const STRING_INLINE_CHARS_BIT: u32 = 1 << 6;
 pub(crate) const STRING_LATIN1_CHARS_BIT: u32 = 1 << 10;
