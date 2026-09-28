@@ -124,6 +124,10 @@ pub struct Lowered {
     pub opsize: BTreeMap<String, (u32, u32)>,
 }
 
+/// `guard.layout` also requires SLOTS, and field ops under a claim do
+/// not test it again.
+const GUARD_SLOTS: bool = true;
+
 /// The resume words `f`'s exits and throws carry: the set the baseline
 /// body must accept (`docs/BASELINE.md` §4).
 pub fn resume_words(f: &mir::Func) -> Vec<ResumeWord> {
@@ -2855,7 +2859,11 @@ impl<'a> Lower<'a> {
             }
             Opcode::GuardLayout { keys, types } => {
                 // The stamp word (`JSObject*+4`): identity is layout key + 1
-                // in the low 16 bits; TYPES is the SHALLOW bit (§4.3).
+                // in the low 16 bits; TYPES is the SHALLOW bit (§4.3). The
+                // SLOTS bit too, as bbv's class guard: a claim then holds
+                // the fields at their slots, until a kill (only the engine
+                // clears SLOTS, bumping the epoch), so the field ops under
+                // it load and store with no test of their own.
                 let w = self.load_i32(a[0], OBJ_CLASS_IDX_OFFSET);
                 let m = self.i32c(0xFFFF);
                 let id = self.bin(Operator::I32And, w, m, Type::I32);
@@ -2867,11 +2875,11 @@ impl<'a> Lower<'a> {
                     let span = self.i32c(keys.hi.get() - keys.lo.get());
                     self.bin(Operator::I32LeU, rel, span, Type::I32)
                 };
-                if types {
-                    let bit = self.i32c(CLASS_WORD_SHALLOW);
-                    let t = self.bin(Operator::I32And, w, bit, Type::I32);
-                    let z = self.i32c(0);
-                    let t = self.bin(Operator::I32Ne, t, z, Type::I32);
+                if types || GUARD_SLOTS {
+                    let want = if GUARD_SLOTS { CLASS_WORD_SLOTS } else { 0 } | if types { CLASS_WORD_SHALLOW } else { 0 };
+                    let bits = self.i32c(want);
+                    let t = self.bin(Operator::I32And, w, bits, Type::I32);
+                    let t = self.bin(Operator::I32Eq, t, bits, Type::I32);
                     ok = self.bin(Operator::I32And, ok, t, Type::I32);
                 }
                 self.guard(inst, ok, &[a[0]])?;
@@ -3569,11 +3577,13 @@ impl<'a> Lower<'a> {
         val: Option<Value>,
     ) -> R<()> {
         let recv_ty = self.ty(self.f.insts[inst].args[0]);
-        let keys = recv_ty
+        let claim = recv_ty
             .obj_info()
             .and_then(|o| o.layout)
-            .ok_or("lowering: a field op without a layout claim")?
-            .keys;
+            .ok_or("lowering: a field op without a layout claim")?;
+        let keys = claim.keys;
+        // A published claim was guarded with SLOTS (`guard.layout`).
+        let slots_proven = GUARD_SLOTS && claim.state == mir::types::LayoutState::Published;
         let slot = self
             .mm
             .layouts
@@ -3588,6 +3598,20 @@ impl<'a> Lower<'a> {
         let num = val.is_some()
             && matches!(self.ty(self.f.insts[inst].args[1]), MType::Val(s) if s.tags.subset_of(TagSet::NUMBER));
         let w = self.load_i32(obj, OBJ_CLASS_IDX_OFFSET);
+        if slots_proven && (val.is_none() || num) {
+            // No test: a load, or a number store (TYPES survives it).
+            let outs = match val {
+                None => vec![self.load_i64(obj, off)],
+                Some(v) => {
+                    self.clear_bits(obj, w, CLASS_WORD_RANGES);
+                    self.store_i64(obj, off, v);
+                    vec![]
+                }
+            };
+            let t = self.edge(inst, 0, &outs)?;
+            self.terminate(Terminator::Br { target: t });
+            return Ok(());
+        }
         let fast_ok = if val.is_none() {
             let bit = self.i32c(CLASS_WORD_SLOTS);
             self.bin(Operator::I32And, w, bit, Type::I32)
@@ -4529,18 +4553,16 @@ impl<'a> Lower<'a> {
         self.cur = direct_b;
         let argc_v = self.i32c(argc);
         let undef = self.i64c(UNDEF);
-        // The site's likely callee (bbv's likely-callee arm): its table
-        // index (a patched const; `u32::MAX` while uncompiled, so the arm
-        // is dead) against the classified funcidx, and on a match a static
-        // `call` of its body, which wasmtime may inline.
-        let likely = self.f.insts[inst]
+        // The site's likely callees (bbv's likely-callee arm, and its guard
+        // chain for a small polymorphic set): each one's table index (a
+        // patched const; `u32::MAX` while uncompiled, so the arm is dead)
+        // against the classified funcidx, and on a match a static `call`
+        // of its body, which wasmtime may inline.
+        let likely: Vec<u32> = self.f.insts[inst]
             .attach
-            .map(|a| &self.f.attachments[a].targets)
-            .and_then(|t| match t.as_slice() {
-                [k] => Some(k.get()),
-                _ => None,
-            });
-        if let Some(sid) = likely {
+            .map(|a| self.f.attachments[a].targets.iter().map(|k| k.get()).collect())
+            .unwrap_or_default();
+        for sid in likely {
             let expected = self.i32c(u32::MAX);
             let is_likely = self.bin(Operator::I32Eq, funcidx, expected, Type::I32);
             let (likely_b, indirect_b) = (self.body.add_block(), self.body.add_block());

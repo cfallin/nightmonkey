@@ -288,7 +288,14 @@ impl<'a> Shape<'a> {
         }
         let nargs = usize::from(ks.nargs);
         let fns: Vec<Option<ScriptId>> = fns.iter().copied().take(nargs).collect();
-        let (mut mm, f) = build_at(self.ctx, names, k, ks, false, self.inline_depth + 1, &fns).ok()?;
+        let (mut mm, mut f) = build_at(self.ctx, names, k, ks, false, self.inline_depth + 1, &fns).ok()?;
+        // Too big with its own inlining: the callee alone, its calls left
+        // as calls (direct where their callee is known), as bbv's
+        // top-down budget leaves a spliced callee's inner sites once the
+        // splice has spent it.
+        if f.insts.len() > MAX_INLINE_INSTS && LEAN_CALLEES && self.inline_depth + 1 < MAX_INLINE_DEPTH {
+            (mm, f) = build_at(self.ctx, names, k, ks, false, MAX_INLINE_DEPTH, &fns).ok()?;
+        }
         if f.insts.len() > MAX_INLINE_INSTS {
             return None;
         }
@@ -382,6 +389,12 @@ const DIRECT_CALLS: bool = true;
 /// A call of a closure the frame knows (`Ty::Fn`) has exactly its script
 /// as callee, and a callee built for inlining knows its formals' closures.
 const CALL_KNOWN_FNS: bool = true;
+
+/// How many likely callees a call not inlined gets direct arms for.
+const MAX_DIRECT_TARGETS: usize = 4;
+
+/// A callee too big to inline with its own inlining is inlined without it.
+const LEAN_CALLEES: bool = true;
 
 /// Generic ops keep proven layouts on their clean edge (`js_keep`).
 const KEEP_ON_CLEAN: bool = true;
@@ -858,8 +871,8 @@ struct Run<'s, 'a> {
     renames: Vec<(mir::Value, Slot)>,
     /// The pc after the op being built (`js_keep`'s exits).
     next_pc: Option<Pc>,
-    /// The likely callee the next generic `call` gets (`attach_targets`).
-    likely_target: Option<ScriptId>,
+    /// The likely callees the next generic `call` gets (`attach_targets`).
+    likely_targets: Vec<ScriptId>,
 }
 
 impl<'s, 'a> Run<'s, 'a> {
@@ -899,7 +912,7 @@ impl<'s, 'a> Run<'s, 'a> {
             throw_blk: None,
             renames: vec![],
             next_pc: None,
-            likely_target: None,
+            likely_targets: vec![],
             inline_sites: 0,
             inline_insts: 0,
         }
@@ -940,20 +953,20 @@ impl<'s, 'a> Run<'s, 'a> {
         self.live = false;
     }
 
-    /// Give a generic `call` the site's likely callee (`likely_target`),
-    /// for its lowering's direct arm.
+    /// Give a generic `call` the site's likely callees (`likely_targets`),
+    /// for its lowering's direct arms.
     fn attach_targets(&mut self, inst: mir::Inst) {
-        if self.f.insts[inst].op != Opcode::Call || self.likely_target.is_none() {
+        if self.f.insts[inst].op != Opcode::Call || self.likely_targets.is_empty() {
             return;
         }
-        let k = self.likely_target.take().unwrap();
+        let targets = std::mem::take(&mut self.likely_targets);
         let a = self.f.attachments.push(mir::func::Attachment {
             site: Some(self.site(self.pc)),
             ic_cell: None,
             call_cell: None,
             slot: None,
             field_mask: None,
-            targets: vec![k],
+            targets,
         });
         self.f.insts[inst].attach = Some(a);
     }
@@ -4473,12 +4486,16 @@ impl<'s, 'a> Run<'s, 'a> {
                 {
                     // Not inlined: a known single callee is called
                     // directly while it is the callee.
-                    self.likely_target = match sids {
-                        [k] if DIRECT_CALLS && self.s.direct_ok(*k) => Some(*k),
-                        _ => None,
+                    self.likely_targets = if DIRECT_CALLS
+                        && sids.len() <= MAX_DIRECT_TARGETS
+                        && sids.iter().all(|&k| self.s.direct_ok(k))
+                    {
+                        sids.to_vec()
+                    } else {
+                        vec![]
                     };
                     let r = self.js(Opcode::Call, vals, MType::VAL_TOP);
-                    self.likely_target = None;
+                    self.likely_targets.clear();
                     r
                 } else {
                     self.inline_call(&targets, &vals, None)
