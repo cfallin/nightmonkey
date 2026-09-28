@@ -25,6 +25,12 @@ Octane (MIR, AOT, best of 2; legacy in brackets):
 | richards | 9253 | 11819 |
 | splay | 8063 | 8434 |
 
+After the completeness batch (4c92af5, 278c691, cde41f6; same method):
+crypto 17216, deltablue 8205, earley-boyer 12014, navier-stokes 19866,
+pdfjs 17903, raytrace 10887, regexp 2262, richards 9274, splay 8086, all
+within noise of the table above. An A/B against the build before the
+batch shows crypto and navier-stokes equal under the same conditions.
+
 At the start of the last session deltablue was 3438, crypto ~10200, pdfjs
 ~12600, raytrace ~8900: those were TYPES losses (objects reaching OPT
 without the bit, so entry guards failed and methods ran in baseline). The
