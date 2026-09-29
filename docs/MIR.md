@@ -180,10 +180,15 @@ LayoutClaim := { keys: [lo,hi], types: bool, constructing: Option<…> }   (§2.
   add (`PlainStore`: runs no JS), vouched (TYPES kept), filling the
   site's add-transition row; `fail` (exit) unless the object is then
   `constructing(n+1)`. Cold sites therefore stay in MIR.
-- **Everywhere else** (a non-inlined constructor body, a delegate reached
-  without a constructing `this`), `this` is an untyped object, and the
-  dynamic early publish of `ctor_publish` stamps it before calls once all
-  its fields are there.
+- **Standalone.** A stamping constructor compiled on its own (called by a
+  `new` that was not inlined) hints its `this` as `create_this` makes it,
+  `constructing(0)` for its own layout: the first add guards that state
+  (`guard.ctor K, 0`, exiting on a miss, which is a call without `new` or
+  an object made elsewhere), and the adds are `init_field`s, as in an
+  inlined construct. (Added 2026-09-29: earley-boyer +4.2%, splay +5.9%.)
+- **Everywhere else** (a delegate reached without a constructing `this`),
+  `this` is an untyped object, and the dynamic early publish of
+  `ctor_publish` stamps it before calls once all its fields are there.
 
 The design as written:
 

@@ -1501,6 +1501,10 @@ impl<'s, 'a> Run<'s, 'a> {
         let Some(si) = self.s.ctx.stamp_ctors_in.get(&self.s.sid) else {
             return;
         };
+        // Published on this path (`publish_layout`): nothing to stamp.
+        if matches!(self.st[0].ty, Ty::Obj(r, _, true) if r == KeyRange::one(crate::ids::LayoutKey::new(si.layout_id))) {
+            return;
+        }
         let op = Opcode::CtorStamp(
             si.layout_id,
             u32::try_from(si.fields.len()).unwrap(),
@@ -2183,6 +2187,14 @@ impl<'s, 'a> Run<'s, 'a> {
                 may_kill: mir::types::KillPattern::of(mir::types::KillSet::CONSTRUCTING),
             });
             self.replace_slot(o, Slot { v: rs[0], ty: pty });
+            // A builder run's only constructing object is its own `this`,
+            // so the frame's `this` is now this published object (a
+            // standalone constructor's raw `this` slot never saw the
+            // guard that refined its boxed copy): `ctor_stamp` then has
+            // nothing left to do.
+            if self.s.ctx.stamp_ctors_in.get(&self.s.sid).is_some_and(|si| si.layout_id == key) {
+                self.st[0] = Slot { v: rs[0], ty: pty };
+            }
         }
         true
     }
@@ -2336,6 +2348,22 @@ impl<'s, 'a> Run<'s, 'a> {
         }
         let ctx = self.s.ctx;
         let sid = self.s.sid;
+        // A constructor compiled standalone (§2.3; not inlined at a `new`):
+        // its `this` is hinted as `create_this` makes it, under
+        // construction for the constructor's own layout with no field yet,
+        // so its first add guards that state (`guard.ctor K, 0`, exiting on
+        // a miss: a call without `new`, an object made elsewhere) and its
+        // adds are `init_field`s, as in an inlined construct.
+        if CTOR_TYPES && matches!(self.top().ty, Ty::Val(_)) {
+            if let Some(si) = ctx.stamp_ctors_in.get(&sid) {
+                let key = si.layout_id;
+                if self.ctor_layout(key).is_some() {
+                    let t = self.s.types_bit(key) != 0;
+                    let v = self.top().v;
+                    self.ctor_hint.insert(v, (key, 0, t));
+                }
+            }
+        }
         let Some(&(lo, hi)) = ctx.facts.this_layouts.get(&sid) else {
             return;
         };
