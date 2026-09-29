@@ -2256,6 +2256,16 @@ impl Solver<'_> {
         // fence, which is pure cost unless some typed read consumes the
         // position, and the reads are not all seen yet.
         let mut typed_write_pending: Vec<PendingTypedWrite> = Vec::new();
+        // Plain objects that receive computed-name writes (a for-in copy
+        // like `Object.extend`): those land in the `[]` cell, so a named
+        // field's cell misses them and its read claim may be false.
+        let dyn_named: HashSet<super::types::ClassId> = self
+            .heap
+            .dyn_named_writes
+            .iter()
+            .filter_map(|&s| self.heap.class_id(super::heap::ClassKey::Site(s)))
+            .filter(|&c| !self.heap[c].is_array)
+            .collect();
         for ci in 0..self.engine.cons.len() {
             let (recv, name, pc, is_read) = match &self.engine.cons[ci] {
                 Constraint::Read { recv, name, pc, .. } => (*recv, *name, *pc, true),
@@ -2307,7 +2317,12 @@ impl Solver<'_> {
                 // read whose value is always an object gets the object-only
                 // claim, which the layout mask (a store-conformance claim,
                 // numeric by construction) cannot express.
-                if let Some(m) = self.site_read_ts.get(&site).and_then(TypeSet::site_claim) {
+                let dyn_recv = self
+                    .site_recv_class
+                    .get(&site)
+                    .and_then(Agreed::get)
+                    .is_some_and(|c| dyn_named.contains(c));
+                if let Some(m) = self.site_read_ts.get(&site).and_then(TypeSet::site_claim).filter(|_| !dyn_recv) {
                     facts.field_sites.insert(site, m);
                 }
             }
