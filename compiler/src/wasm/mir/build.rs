@@ -2666,6 +2666,123 @@ impl<'s, 'a> Run<'s, 'a> {
         self.site_for(cls, cls, slot, claim, true, name)
     }
 
+    /// The accessor an accessor-site property access calls (bbv's
+    /// `accessor_sites`, the modeled `Object.defineProperty` accessors):
+    /// the site's resolved getter or setter, or, for a name registered as
+    /// an accessor somewhere, `None` (probed without a static target).
+    /// `None` outright where neither applies.
+    fn accessor_site(&self, pc: Pc, a: mir::entity::AtomId, set: bool) -> Option<Option<ScriptId>> {
+        let facts = &self.s.ctx.facts;
+        match facts.accessor_sites.get(&self.site(pc)) {
+            Some(&(k, kind)) if kind == u8::from(set) => return Some(Some(k)),
+            _ => {}
+        }
+        let n = self.s.names?.lookup(self.mm.atoms[a].chars())?;
+        facts.accessor_names.contains(&n).then_some(None)
+    }
+
+    /// `recv.a` at an accessor site: the receiver's shape probed in the
+    /// runtime's accessor-call cache (`accessor.probe`), the getter it
+    /// finds called with `recv` as `this` (directly, where the site
+    /// resolves it); any other receiver reads through the IC.
+    fn accessor_get(&mut self, pc: Pc, a: mir::entity::AtomId, recv: Slot) -> bool {
+        let Some(target) = self.accessor_site(pc, a, false) else {
+            return false;
+        };
+        let x = self.boxed(recv);
+        let r = self.accessor_call(a, false, target, vec![x], MType::VAL_TOP, Opcode::JsGetProp(a));
+        self.push(r, Ty::Val(TagSet::ALL));
+        let claim = self.s.ctx.facts.field_sites.get(&self.site(pc)).copied();
+        self.guard_result(claim.unwrap_or_default(), pc + JSOp::GetProp.len(), false);
+        true
+    }
+
+    /// `recv.a = v` at an accessor site: the setter the probe finds
+    /// called with `recv` and `v`; any other receiver stores through the
+    /// IC. The value stays on the stack.
+    fn accessor_set(&mut self, pc: Pc, a: mir::entity::AtomId, recv: Slot, v: Slot, strict: bool) -> bool {
+        let Some(target) = self.accessor_site(pc, a, true) else {
+            return false;
+        };
+        let (x, y) = (self.boxed(recv), self.boxed(v));
+        self.accessor_call(a, true, target, vec![x, y], MType::VAL_TOP, Opcode::JsSetProp(a, strict));
+        true
+    }
+
+    /// The probe-and-call diamond of `accessor_get`/`accessor_set`:
+    /// `vals` the receiver (and the value); `generic` the IC op on a miss.
+    /// A getter's result, or (for a setter) the call's, unused.
+    fn accessor_call(
+        &mut self,
+        a: mir::entity::AtomId,
+        set: bool,
+        target: Option<ScriptId>,
+        vals: Vec<mir::Value>,
+        out: MType,
+        generic: Opcode,
+    ) -> mir::Value {
+        // Arms that fence meet at `join`: `Obj` slots go in as `ObjHint`.
+        if !self.keepable(1) {
+            self.demote_objs();
+        }
+        let join = self.new_block();
+        let jr = self.f.add_param(join, out);
+        let (hit, miss) = (self.new_block(), self.new_block());
+        let callee = self.f.add_param(hit, MType::val(TagSet::OBJECT));
+        self.term(
+            Opcode::AccessorProbe(a, set),
+            vec![vals[0]],
+            vec![
+                Edge {
+                    block: hit,
+                    args: vec![EdgeArg::Out(0)],
+                },
+                Self::goto(miss),
+            ],
+        );
+        self.at(hit);
+        let mut call = vec![callee];
+        call.extend(&vals);
+        self.likely_targets = match target {
+            Some(k) if DIRECT_CALLS && self.s.direct_ok(k) => vec![k],
+            _ => vec![],
+        };
+        let r = if set {
+            // The stack after the op holds the stored value, not the
+            // setter's result.
+            self.js_void_keep(Opcode::Call, call, Slot { v: vals[1], ty: Ty::Val(TagSet::ALL) });
+            vals[1]
+        } else {
+            self.js(Opcode::Call, call, out)
+        };
+        self.likely_targets.clear();
+        self.term(
+            Opcode::Jump,
+            vec![],
+            vec![Edge {
+                block: join,
+                args: vec![EdgeArg::Value(r)],
+            }],
+        );
+        self.at(miss);
+        let r = if set {
+            self.js_void_keep(generic, vals.clone(), Slot { v: vals[1], ty: Ty::Val(TagSet::ALL) });
+            vals[1]
+        } else {
+            self.js(generic, vals, out)
+        };
+        self.term(
+            Opcode::Jump,
+            vec![],
+            vec![Edge {
+                block: join,
+                args: vec![EdgeArg::Value(r)],
+            }],
+        );
+        self.at(join);
+        jr
+    }
+
     /// A field of a receiver proven with TYPES whose layouts all type it
     /// but predict no slot for it (added outside the constructors): read
     /// or written through an IC for the slot, of its predicted type.
@@ -5265,6 +5382,9 @@ impl<'s, 'a> Run<'s, 'a> {
                 if self.ctor_get(pc + op.len(), a, recv) {
                     return Ok(());
                 }
+                if self.accessor_get(pc, a, recv) {
+                    return Ok(());
+                }
                 let site = self
                     .typed_site(pc, a)
                     .or_else(|| self.hinted_site(recv.v, a))
@@ -5337,6 +5457,10 @@ impl<'s, 'a> Run<'s, 'a> {
                 let v = self.pop();
                 let recv = self.pop();
                 if self.ctor_set(pc + op.len(), a, recv, v) {
+                    self.repush(v);
+                    return Ok(());
+                }
+                if self.accessor_set(pc, a, recv, v, op == StrictSetProp) {
                     self.repush(v);
                     return Ok(());
                 }

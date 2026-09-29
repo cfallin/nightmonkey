@@ -135,6 +135,7 @@ impl Maps {
             LoadGName(b) => LoadGName(self.bindings[&b]),
             StoreGName(b) => StoreGName(self.bindings[&b]),
             CheckNative(n) => CheckNative(self.natives[&n]),
+            AccessorProbe(a, set) => AccessorProbe(self.atom(a), set),
             JsRt(r) => JsRt(r.map_atoms(|a| self.atom(a))),
             Restamp(i) => Restamp(self.restamp_base + i),
             ConstObj(_) | GuardSingleton(_) | CallNative(_) => {

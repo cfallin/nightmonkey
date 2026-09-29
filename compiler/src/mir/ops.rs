@@ -481,6 +481,11 @@ pub enum Opcode {
     /// shape (and, with `write`, is a writable data property).
     CheckBinding(BindingId, bool),
     CheckNative(NativeId),
+    /// The receiver (boxed) has, for property `name`, the accessor the
+    /// runtime's accessor-call cache recorded for its shape (a getter, or
+    /// with the flag a setter), on a holder whose shape is still the one
+    /// recorded (bbv's accessor arm): ok with that accessor function.
+    AccessorProbe(AtomId, bool),
 
     // Control.
     Jump,
@@ -772,6 +777,7 @@ impl Opcode {
             | CheckFuse(_)
             | CheckBinding(..)
             | CheckNative(_)
+            | AccessorProbe(..)
             | I32Ovf(_)
             | LoadElem
             | StoreElem(_)
@@ -1232,6 +1238,11 @@ pub fn signature(op: &Opcode, args: &[Type], m: &Module) -> SigResult {
                 format!("check.binding: {b} is not in the module")
             })?;
             Sig::output(Type::Fact(FactKind::Binding(*b)))
+        }
+        AccessorProbe(..) => {
+            arity(args, 1)?;
+            val(&args[0], "accessor.probe receiver")?;
+            Sig::output(Type::val(TagSet::OBJECT))
         }
         // The callee is native `n` (its pristine JSNative).
         CheckNative(n) => {

@@ -1291,6 +1291,11 @@ impl Parser {
             LoadGName(_) => LoadGName(BindingId::from_u32(self.prefixed("G", "a binding")?)),
             StoreGName(_) => StoreGName(BindingId::from_u32(self.prefixed("G", "a binding")?)),
             CheckNative(_) => CheckNative(NativeId::from_u32(self.prefixed("N", "a native")?)),
+            AccessorProbe(..) => {
+                let a = self.atom()?;
+                let set = self.eat_word("set");
+                AccessorProbe(a, set)
+            }
             CallNative(_) => CallNative(NativeId::from_u32(self.prefixed("N", "a native")?)),
             NewObject(_) => NewObject(self.layout_key()?),
             EnvLoad(_) => EnvLoad(EnvSlot::new(self.int()?)),
@@ -1530,6 +1535,7 @@ fn template(mn: &str) -> Option<Opcode> {
         CheckBinding(BindingId::from_u32(0), false),
         CheckBinding(BindingId::from_u32(0), true),
         CheckNative(NativeId::from_u32(0)),
+        AccessorProbe(AtomId::from_u32(0), false),
         Jump,
         Br,
         Switch(0),

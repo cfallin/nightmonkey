@@ -318,6 +318,7 @@ pub fn mnemonic(op: &Opcode) -> String {
         CheckBinding(_, false) => "check.binding".into(),
         CheckBinding(_, true) => "check.binding.write".into(),
         CheckNative(_) => "check.native".into(),
+        AccessorProbe(..) => "accessor.probe".into(),
         Jump => "jump".into(),
         Br => "br".into(),
         Switch(_) => "switch".into(),
@@ -558,6 +559,13 @@ fn immediates(m: &Module, op: &Opcode) -> Option<String> {
         CheckFuse(f) => f.to_string(),
         CheckBinding(b, _) | LoadGName(b) | StoreGName(b) => b.to_string(),
         CheckNative(n) | CallNative(n) => n.to_string(),
+        AccessorProbe(a, set) => {
+            let mut s = atom(Some(m), *a);
+            if *set {
+                s.push_str(" set");
+            }
+            s
+        }
         NewObject(k) => format!("L{k}"),
         EnvLoad(s) | EnvStore(s) => s.to_string(),
         JsLambda(k) | FrameStore(k) | RestArray(k) | ActualArgOr(k) | JsIsBuiltin(k) => {

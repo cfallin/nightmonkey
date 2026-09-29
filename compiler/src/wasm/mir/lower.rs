@@ -2819,6 +2819,54 @@ impl<'a> Lower<'a> {
             Opcode::CallIter => self.js_call_op(inst, &a, true)?,
             Opcode::CallEval(pc) => self.js_eval_op(inst, &a, pc)?,
             Opcode::GuardScript(sid) => self.guard_script(inst, &d, &a, sid)?,
+            Opcode::AccessorProbe(name, set) => {
+                // bbv's accessor arm: the (receiver shape, atom, kind)-hashed
+                // row the IC miss helpers prime for a prototype getter or
+                // setter, its holder's shape still the recorded one.
+                use crate::wasm::translate::{
+                    ACCESSOR_ATOM_KIND, ACCESSOR_CACHE_ENTRY_BYTES, ACCESSOR_CACHE_SIZE, ACCESSOR_CALLEE,
+                    ACCESSOR_HOLDER_PTR, ACCESSOR_HOLDER_SHAPE, ACCESSOR_RECV_SHAPE,
+                };
+                let aid = self.atoms.intern_chars(self.mm.atoms[name].chars());
+                let ak = (aid << 1) | u32::from(set);
+                let fail_b = self.body.add_block();
+                let tag = self.tag_of(a[0]);
+                let is_obj = self.tag_is(tag, TAG_OBJECT as u32);
+                self.check(is_obj, fail_b);
+                let obj = self.un(Operator::I32WrapI64, a[0], Type::I32);
+                let shape = self.load_i32(obj, SHAPE_OFFSET);
+                let three = self.i32c(3);
+                let sh = self.bin(Operator::I32ShrU, shape, three, Type::I32);
+                let k1 = self.i32c(2654435761);
+                let h1 = self.bin(Operator::I32Mul, sh, k1, Type::I32);
+                let k2 = self.i32c(ak.wrapping_mul(0x9e37_79b9));
+                let hh = self.bin(Operator::I32Xor, h1, k2, Type::I32);
+                let mask = self.i32c(ACCESSOR_CACHE_SIZE - 1);
+                let idx = self.bin(Operator::I32And, hh, mask, Type::I32);
+                let stride = self.i32c(ACCESSOR_CACHE_ENTRY_BYTES);
+                let off = self.bin(Operator::I32Mul, idx, stride, Type::I32);
+                let base = self.i32c(self.h.accessor_cache_base);
+                let entry = self.bin(Operator::I32Add, base, off, Type::I32);
+                let es = self.load_i32(entry, ACCESSOR_RECV_SHAPE);
+                let ea = self.load_i32(entry, ACCESSOR_ATOM_KIND);
+                let m1 = self.bin(Operator::I32Eq, es, shape, Type::I32);
+                let akv = self.i32c(ak);
+                let m2 = self.bin(Operator::I32Eq, ea, akv, Type::I32);
+                let m = self.bin(Operator::I32And, m1, m2, Type::I32);
+                self.check(m, fail_b);
+                // A matched row is primed: its holder is non-null.
+                let hp = self.load_i32(entry, ACCESSOR_HOLDER_PTR);
+                let hs = self.load_i32(entry, ACCESSOR_HOLDER_SHAPE);
+                let live = self.load_i32(hp, SHAPE_OFFSET);
+                let m3 = self.bin(Operator::I32Eq, live, hs, Type::I32);
+                self.check(m3, fail_b);
+                let callee = self.load_i64(entry, ACCESSOR_CALLEE);
+                let t = self.edge(inst, 0, &[callee])?;
+                self.terminate(Terminator::Br { target: t });
+                self.cur = fail_b;
+                let f = self.edge(inst, 1, &[])?;
+                self.terminate(Terminator::Br { target: f });
+            }
             Opcode::InlineEnter => self.inline_enter(&d, &a)?,
             Opcode::CreateThis(nslots, word) => {
                 // May GC: root what is live across it.
@@ -3752,6 +3800,13 @@ impl<'a> Lower<'a> {
             },
             Opcode::JsCompare(cc) => {
                 if matches!(cc, JsCc::Eq | JsCc::Ne | JsCc::StrictEq | JsCc::StrictNe) {
+                    // Against a string literal (an atom): bbv's ladder.
+                    let args = self.f.insts[inst].args.clone();
+                    if self.is_str_literal(args[1]) {
+                        self.literal_eq(inst, cc, a[0], a[1])?;
+                    } else if self.is_str_literal(args[0]) {
+                        self.literal_eq(inst, cc, a[1], a[0])?;
+                    }
                     self.equality_fast_arm(inst, cc, a[0], a[1])?;
                 }
                 let kind = match cc {
@@ -4324,6 +4379,73 @@ impl<'a> Lower<'a> {
         self.terminate(Terminator::Br { target: BlockTarget { block: join, args: vec![t] } });
         self.cur = join;
         r
+    }
+
+    /// Whether `v` is a string literal (an atom): a `const.str`, boxed
+    /// and weakened.
+    fn is_str_literal(&self, mut v: mir::Value) -> bool {
+        loop {
+            let mir::func::ValueDef::Result(i, _) = self.f.values[v].def else { return false };
+            match self.f.insts[i].op {
+                Opcode::ConstStr(_) => return true,
+                Opcode::Box | Opcode::Weaken => v = self.f.insts[i].args[0],
+                _ => return false,
+            }
+        }
+    }
+
+    /// `x ==/=== lit` for a string literal `lit` (an atom), bbv's
+    /// literal-RHS ladder, each deciding arm taking `ok_clean`: a
+    /// non-string is unequal (strictly; loosely it coerces: the helper's);
+    /// the same pointer is equal; an atom that is not it is unequal (one
+    /// flag load, the common miss of a `switch` on an atomized key); a
+    /// different length is unequal; two linear strings compare their
+    /// characters (a pure leaf). A rope falls through to the generic arms.
+    fn literal_eq(&mut self, inst: mir::Inst, cc: JsCc, x: Value, lit: Value) -> R<()> {
+        use crate::wasm::bbv::abi::{STRING_ATOM_BIT, STRING_FLAGS_OFFSET};
+        let negate = matches!(cc, JsCc::Ne | JsCc::StrictNe);
+        let strict = matches!(cc, JsCc::StrictEq | JsCc::StrictNe);
+        let generic = self.body.add_block();
+        let (eq_b, ne_b) = (self.body.add_block(), self.body.add_block());
+        let tx = self.tag_of(x);
+        let is_s = self.tag_is(tx, TAG_STRING as u32);
+        let str_b = self.body.add_block();
+        self.cond_br(is_s, Self::to(str_b), Self::to(if strict { ne_b } else { generic }));
+        self.cur = str_b;
+        let same = self.bin(Operator::I64Eq, x, lit, Type::I32);
+        let other = self.body.add_block();
+        self.cond_br(same, Self::to(eq_b), Self::to(other));
+        self.cur = other;
+        let (xp, lp) = (self.un(Operator::I32WrapI64, x, Type::I32), self.un(Operator::I32WrapI64, lit, Type::I32));
+        let xf = self.load_i32(xp, STRING_FLAGS_OFFSET);
+        let ab = self.i32c(STRING_ATOM_BIT);
+        let atom = self.bin(Operator::I32And, xf, ab, Type::I32);
+        let len_b = self.body.add_block();
+        self.cond_br(atom, Self::to(ne_b), Self::to(len_b));
+        self.cur = len_b;
+        let xl = self.load_i32(xp, STRING_LENGTH_OFFSET);
+        let ll = self.load_i32(lp, STRING_LENGTH_OFFSET);
+        let len_eq = self.bin(Operator::I32Eq, xl, ll, Type::I32);
+        let lin_b = self.body.add_block();
+        self.cond_br(len_eq, Self::to(lin_b), Self::to(ne_b));
+        self.cur = lin_b;
+        let lb = self.i32c(STRING_LINEAR_BIT);
+        let lin = self.bin(Operator::I32And, xf, lb, Type::I32);
+        let chars_b = self.body.add_block();
+        self.cond_br(lin, Self::to(chars_b), Self::to(generic));
+        self.cur = chars_b;
+        let r = self.call1(self.h.str_chars_eq, &[xp, lp], Type::I32);
+        let r = if negate { self.un(Operator::I32Eqz, r, Type::I32) } else { r };
+        let t = self.edge(inst, 0, &[r])?;
+        self.terminate(Terminator::Br { target: t });
+        for (blk, equal) in [(eq_b, true), (ne_b, false)] {
+            self.cur = blk;
+            let v = self.i32c(u32::from(equal != negate));
+            let t = self.edge(inst, 0, &[v])?;
+            self.terminate(Terminator::Br { target: t });
+        }
+        self.cur = generic;
+        Ok(())
     }
 
     /// The inline arm of an equality compare, taking `ok_clean` with the
