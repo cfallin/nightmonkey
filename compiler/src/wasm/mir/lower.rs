@@ -101,6 +101,24 @@ const ONRAMP_BACKOFF: u32 = 32;
 /// `JS::GenericNaN()`'s bits.
 const CANONICAL_NAN_BITS: u64 = 0x7FF8_0000_0000_0000;
 
+/// How much of an inline frame's fixed slots (env, arguments object,
+/// new.target, rval, resume word, backoff) its `inline.enter` writes.
+/// BBV's splices write none of them: only an exit into the callee's
+/// baseline body reads them, so the exit hub writes what the entry left
+/// out, and the frame's GC scan (`frame_top`) stops below it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Fixed {
+    /// All six: the callee reads its arguments object or new.target from
+    /// the frame, or it is a construct.
+    All,
+    /// The env slot only: the callee sets its environment (`EnvSet`,
+    /// `EnvPop`).
+    Env,
+    /// None: the callee's environment is its function's, read from the
+    /// callee where used.
+    None,
+}
+
 /// A lowered MIR function.
 pub struct Lowered {
     pub body: FunctionBody,
@@ -333,6 +351,10 @@ struct Lower<'a> {
     frame_voff: Vec<u32>,
     frame_end: Vec<u32>,
     frame_top: Vec<u32>,
+    /// Per frame: how much of an inline frame's fixed slots its
+    /// `inline.enter` writes (and its GC scan covers); the exit hub writes
+    /// the rest (§5.5).
+    fixed: Vec<Fixed>,
     frame_layouts: Vec<FrameLayout>,
     /// The frame of the instruction being lowered.
     cur_frame: u32,
@@ -512,6 +534,7 @@ pub fn lower<'a>(
         frame_voff: vec![0],
         frame_end: vec![root_base],
         frame_top: vec![root_base],
+        fixed: vec![Fixed::All],
         frame_layouts: vec![layout],
         cur_frame: 0,
         baseline_calls: vec![],
@@ -1825,10 +1848,29 @@ impl<'a> Lower<'a> {
             };
             let off = self.frame_top[fr.parent as usize];
             let voff = off + 8 * fr.argc.map_or(0, |n| n.saturating_sub(fr.shape.formals));
+            let fid = u32::try_from(self.frame_off.len()).unwrap();
+            let nact = fr.argc.map_or(lay.nargs, |n| n.max(lay.nargs)) as usize;
+            let mut fixed = Fixed::None;
+            for (i, d) in self.f.insts.iter() {
+                if self.f.inst_frame[i] != fid {
+                    continue;
+                }
+                match d.op {
+                    Opcode::ArgsObject | Opcode::FrameNewTarget => fixed = Fixed::All,
+                    Opcode::InlineEnter if d.args.len() != 2 + nact => fixed = Fixed::All,
+                    Opcode::EnvSet | Opcode::EnvPop if fixed == Fixed::None => fixed = Fixed::Env,
+                    _ => {}
+                }
+            }
             self.frame_off.push(off);
             self.frame_voff.push(voff);
             self.frame_end.push(voff + lay.top(fr.max_depth + 3));
-            self.frame_top.push(voff + lay.operand_base());
+            self.frame_top.push(match fixed {
+                Fixed::All => voff + lay.operand_base(),
+                Fixed::Env => voff + lay.env() + 8,
+                Fixed::None => voff + lay.env(),
+            });
+            self.fixed.push(fixed);
             self.frame_layouts.push(lay);
         }
     }
@@ -6123,6 +6165,14 @@ impl<'a> Lower<'a> {
 
     /// The op's frame's current environment (boxed), from its env slot.
     fn frame_env(&mut self) -> Value {
+        let fid = self.cur_frame as usize;
+        if self.fixed[fid] == Fixed::None {
+            // Not in the frame: the callee's own (an inlined callee has no
+            // activation environment of its own).
+            let callee = self.load_i64(self.vp, self.frame_off[fid] + FrameLayout::CALLEE);
+            let fun = self.un(Operator::I32WrapI64, callee, Type::I32);
+            return self.load_i64(fun, FUNC_ENV_SLOT_OFFSET);
+        }
         let off = self.frame_env_off();
         self.load_i64(self.vp, off)
     }
@@ -7020,12 +7070,18 @@ impl<'a> Lower<'a> {
         for j in 0..l.nlocals {
             self.store_i64(sp, vbase + l.local(j), undef);
         }
+        if self.fixed[fid] == Fixed::None {
+            return Ok(());
+        }
         // The callee's own environment: what its prologue loads, for a
         // script whose activation has none of its own (the only kind
         // inlined).
         let fun = self.un(Operator::I32WrapI64, boxed[0], Type::I32);
         let env = self.load_i64(fun, FUNC_ENV_SLOT_OFFSET);
         self.store_i64(sp, vbase + l.env(), env);
+        if self.fixed[fid] == Fixed::Env {
+            return Ok(());
+        }
         self.store_i64(sp, vbase + l.args_obj(), undef);
         let nt = if construct { boxed[boxed.len() - 1] } else { undef };
         self.store_i64(sp, vbase + l.new_target(), nt);
@@ -7034,7 +7090,8 @@ impl<'a> Lower<'a> {
         self.store_i64(sp, vbase + l.resume(), zero);
         self.store_i64(sp, vbase + l.backoff(), zero);
         // The operand stack is past the frame's GC scan limit
-        // (`frame_top`): its exits write it.
+        // (`frame_top`): its exits write it, as they write the fixed slots
+        // a leaner frame leaves out (`Fixed`).
         Ok(())
     }
 
@@ -7184,6 +7241,18 @@ impl<'a> Lower<'a> {
         self.store_i64(sp, vbase + l.resume(), wv);
         let backoff = self.i64c((TAG_INT32 << 32) | u64::from(ONRAMP_BACKOFF));
         self.store_i64(sp, vbase + l.backoff(), backoff);
+        // The fixed slots the frame's entry left out (`Fixed`).
+        if self.fixed[f] == Fixed::None {
+            let callee = self.load_i64(sp, base + FrameLayout::CALLEE);
+            let fun = self.un(Operator::I32WrapI64, callee, Type::I32);
+            let env = self.load_i64(fun, FUNC_ENV_SLOT_OFFSET);
+            self.store_i64(sp, vbase + l.env(), env);
+        }
+        if self.fixed[f] != Fixed::All {
+            let undef = self.i64c(UNDEF);
+            self.store_i64(sp, vbase + l.args_obj(), undef);
+            self.store_i64(sp, vbase + l.new_target(), undef);
+        }
         let callee = self.load_i64(sp, base + FrameLayout::CALLEE);
         let (funcidx, script) = self.classify(callee);
         let off = self.i32c(u32::MAX);

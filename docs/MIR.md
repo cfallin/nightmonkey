@@ -776,7 +776,13 @@ baseline, and baseline has one body per script. The design:
 - **Stack layout.** The caller frame comes first, then the rooting
   area (§4.4), then the inline frames, then the frames of real calls.
   The rooting area is initialized at entry and each inline frame at its
-  `inline.enter`, since the GC traces up to `top`.
+  `inline.enter`, since the GC traces up to `top`. An inline frame's GC
+  scan (`frame_top`) stops below the fixed slots its callee never reads
+  while MIR runs: `inline.enter` writes callee, `this`, the actuals and
+  the locals (as bbv's splice does), plus env only for a callee that sets
+  its environment, and all six only for a construct or a callee reading
+  its arguments object or new.target. The `exit.inline` hub writes the
+  rest before entering the baseline body. (Amended 2026-09-29.)
 
 ## 6. Effects and memory
 
