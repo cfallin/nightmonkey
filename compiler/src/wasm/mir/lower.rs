@@ -4832,11 +4832,22 @@ impl<'a> Lower<'a> {
     /// `way_off`), the value from its own fixed slot, or through the way's
     /// holder (a prototype method) while the holder keeps its shape,
     /// taking `ok_clean`; else `probe`.
-    fn get_ic_ways(&mut self, inst: mir::Inst, recv: Value, way0: Value, way_off: u32, probe: Block) -> R<()> {
-        use crate::region_shape::{INLINE_IC_WAYS, INLINE_IC_WAY_BYTES};
+    /// A property IC's receiver test: an object, or `miss`. Skipped when
+    /// the receiver's type (`args[0]`) already says object, as bbv skips
+    /// it for an object-only operand.
+    fn check_recv_object(&mut self, inst: mir::Inst, recv: Value, miss: Block) {
+        let tags = value_tags(&self.ty(self.f.insts[inst].args[0]));
+        if tags.is_nonempty_subset_of(TagSet::OBJECT) {
+            return;
+        }
         let tag = self.tag_of(recv);
         let is_obj = self.tag_is(tag, TAG_OBJECT as u32);
-        self.check(is_obj, probe);
+        self.check(is_obj, miss);
+    }
+
+    fn get_ic_ways(&mut self, inst: mir::Inst, recv: Value, way0: Value, way_off: u32, probe: Block) -> R<()> {
+        use crate::region_shape::{INLINE_IC_WAYS, INLINE_IC_WAY_BYTES};
+        self.check_recv_object(inst, recv, probe);
         let obj = self.un(Operator::I32WrapI64, recv, Type::I32);
         let shape = self.load_i32(obj, SHAPE_OFFSET);
         let hit_b = self.body.add_block();
@@ -4909,9 +4920,7 @@ impl<'a> Lower<'a> {
     ) -> R<()> {
         use crate::region_shape::{MEGA_SET_ABS_SLOT_OFF, MEGA_SET_SLOT_ENC_OFF};
         let num = matches!(self.ty(self.f.insts[inst].args[1]), MType::Val(s) if s.tags.subset_of(TagSet::NUMBER));
-        let tag = self.tag_of(recv);
-        let is_obj = self.tag_is(tag, TAG_OBJECT as u32);
-        self.check(is_obj, slow);
+        self.check_recv_object(inst, recv, slow);
         let obj = self.un(Operator::I32WrapI64, recv, Type::I32);
         let shape = self.load_i32(obj, SHAPE_OFFSET);
         let store = self.body.add_block();
@@ -5033,9 +5042,7 @@ impl<'a> Lower<'a> {
         slow: Block,
     ) -> R<()> {
         let num = matches!(self.ty(self.f.insts[inst].args[1]), MType::Val(s) if s.tags.subset_of(TagSet::NUMBER));
-        let tag = self.tag_of(recv);
-        let is_obj = self.tag_is(tag, TAG_OBJECT as u32);
-        self.check(is_obj, slow);
+        self.check_recv_object(inst, recv, slow);
         let obj = self.un(Operator::I32WrapI64, recv, Type::I32);
         let row = self.add_off(way, IC_TRANS_ROW_OFF);
         let shape = self.load_i32(obj, SHAPE_OFFSET);
