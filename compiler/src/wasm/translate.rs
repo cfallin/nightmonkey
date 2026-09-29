@@ -1738,6 +1738,146 @@ pub(crate) fn compute_apply_fwd_pcs(
     }
 }
 
+/// The pcs of the `.length` reads and `GetElem`s that consume `script`'s
+/// arguments object, when those are its only uses, so the object need
+/// never be made (MIR's arguments elision; `sc_list`, `sc_append`). The
+/// object is unobservable when:
+///   - the script has no formals (nothing maps, nothing aliases) and is
+///     not a generator;
+///   - every value an `Arguments` op pushes, or a `GetLocal` of a local it
+///     is stored into (the `arguments` binding, `var a = arguments`: each
+///     stored once, before any branch), is consumed by a `GetProp` of
+///     `length` (the object on top), a `GetElem` (the object under the
+///     index), a `Pop`, or such a store;
+///   - none is on the operand stack at a block leader (so the model stays
+///     straight-line), and those locals are written by nothing else.
+/// `is_length` says whether a `GetProp`'s name index is `length`.
+pub(crate) fn compute_args_reads(script: &Script, is_length: &dyn Fn(u32) -> bool) -> Option<HashSet<Pc>> {
+    use crate::wasm::baseline::layout::{leaders, StackDepths};
+    if script.nargs != 0 || script.is_generator_or_async || !uses_arguments(script) {
+        return None;
+    }
+    let depths = StackDepths::compute(script).ok()?;
+    let leaders = leaders(script);
+    let first_branch = leaders.iter().copied().find(|p| p.get() > 0).map_or(u32::MAX, |p| p.get());
+    struct Scan<'a> {
+        depths: &'a StackDepths,
+        leaders: &'a std::collections::BTreeSet<Pc>,
+        first_branch: u32,
+        is_length: &'a dyn Fn(u32) -> bool,
+        /// Per operand-stack slot: whether it holds the arguments object.
+        stack: Vec<bool>,
+        args_locals: HashSet<u32>,
+        pc: u32,
+        /// The current op's pending check, resolved by its hook.
+        pending: Pending,
+        reads: HashSet<Pc>,
+        ok: bool,
+    }
+    #[derive(PartialEq)]
+    enum Pending {
+        None,
+        /// A `GetProp` of the object: its name must be `length`.
+        Length,
+        /// A `SetLocal` of the object (the value stays on top).
+        Store,
+        /// A `SetLocal` of something else: it must not be the args local.
+        Other,
+    }
+    impl OpcodeVisitor for Scan<'_> {
+        fn before_op(&mut self, pc: Pc, op: JSOp, nuses: usize, ndefs: usize) {
+            use JSOp::*;
+            if !self.ok {
+                return;
+            }
+            self.pc = pc.get();
+            self.pending = Pending::None;
+            let depth = self.depths.at(pc).map(|d| d as usize);
+            if self.leaders.contains(&pc) || depth.is_some_and(|d| d != self.stack.len()) {
+                if self.stack.iter().any(|&b| b) {
+                    self.ok = false;
+                    return;
+                }
+                self.stack = vec![false; depth.unwrap_or(0)];
+            }
+            if nuses > self.stack.len() {
+                self.ok = false;
+                return;
+            }
+            let popped = self.stack.split_off(self.stack.len() - nuses);
+            let args_in = popped.iter().any(|&b| b);
+            match op {
+                Arguments => self.stack.push(true),
+                GetProp if args_in => {
+                    self.pending = Pending::Length;
+                    self.reads.insert(pc);
+                    self.stack.push(false);
+                }
+                GetElem if args_in => {
+                    if popped != [true, false] {
+                        self.ok = false;
+                        return;
+                    }
+                    self.reads.insert(pc);
+                    self.stack.push(false);
+                }
+                Pop => {}
+                SetLocal => {
+                    self.pending = if args_in { Pending::Store } else { Pending::Other };
+                    self.stack.push(args_in);
+                }
+                // A `GetLocal`'s value is pushed by its hook.
+                GetLocal => {}
+                _ if args_in => self.ok = false,
+                _ => self.stack.extend(std::iter::repeat(false).take(ndefs)),
+            }
+        }
+        fn get_prop(&mut self, n: u32) {
+            if self.pending == Pending::Length && !(self.is_length)(n) {
+                self.ok = false;
+            }
+        }
+        fn set_local(&mut self, n: u32) {
+            if !self.ok {
+                return;
+            }
+            match self.pending {
+                Pending::Store => {
+                    if self.pc >= self.first_branch || !self.args_locals.insert(n) {
+                        self.ok = false;
+                    }
+                }
+                Pending::Other if self.args_locals.contains(&n) => self.ok = false,
+                _ => {}
+            }
+        }
+        fn init_lexical(&mut self, _n: u32) {
+            // `let a = arguments`: not modelled.
+            if self.stack.last() == Some(&true) {
+                self.ok = false;
+            }
+        }
+        fn get_local(&mut self, n: u32) {
+            if self.ok {
+                self.stack.push(self.args_locals.contains(&n));
+            }
+        }
+    }
+    let s = script.parser().visit(Scan {
+        depths: &depths,
+        leaders: &leaders,
+        first_branch,
+        is_length,
+        stack: vec![],
+        args_locals: HashSet::default(),
+        pc: 0,
+        pending: Pending::None,
+        reads: HashSet::default(),
+        ok: true,
+    });
+    (s.ok && !s.reads.is_empty()).then_some(s.reads)
+}
+
 /// Call pcs whose callee operand came from a `GetGName` of a syntactic
 /// global binding, mapped to that binding id. Carrying it on the operand
 /// instead does not work under per-op BBV, which loses operand-local state at

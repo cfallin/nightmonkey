@@ -1596,6 +1596,14 @@ and exit censuses against bbv, not by op coverage.
   `T.apply(this, arguments)` at bbv's proven sites does not make the
   object: known targets are inlined over the frame's actuals, else the
   runtime forwards them; an exit while it is elided makes it first.
+  Nor does an object only read for `.length` and elements
+  (`compute_args_reads`: no formals, each value consumed straight-line
+  by those reads, stored only into locals written once before any
+  branch; scheme runtimes' variadic `sc_list`, `sc_append`): `.length`
+  is `args.length`, `a[i]` an int32 index within it reads `args.actual`,
+  and anything else exits, making the object. (Added 2026-09-29:
+  earley-boyer +5.0%. Such a script still inlines nothing, bbv's rule;
+  letting it inline over the actuals read in place is to measure.)
 - **Construction.** `new` of a compiled constructor is direct:
   `this` is a nursery bump from the site's construct cell (while the
   callee's shape, IC generation and `.prototype` match), else

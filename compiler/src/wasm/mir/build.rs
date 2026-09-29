@@ -189,6 +189,9 @@ const RT_OPS: bool = true;
 
 /// Whether `T.apply(this, arguments)` forwards the actuals.
 const APPLY_FWD: bool = true;
+/// Whether an arguments object read only for its length and elements is
+/// elided (`compute_args_reads`).
+const ARGS_READS: bool = true;
 
 /// Whether `T.call(thisArg, args…)` inlines its resolved targets.
 const CALL_FWD: bool = true;
@@ -607,6 +610,16 @@ fn build_at<'a>(
     shape.names = Some(names);
     shape.apply_fwd = crate::wasm::translate::compute_apply_fwd_pcs(script, &ctx.facts.apply_sites, sid.get())
         .filter(|s| APPLY_FWD && !s.is_empty());
+    if shape.apply_fwd.is_none() && ARGS_READS {
+        let length: Vec<u16> = "length".encode_utf16().collect();
+        let is_length = |n: u32| {
+            script.gcthings.get(n as usize).is_some_and(|&gc| {
+                !gc.is_other()
+                    && matches!(ctx.source.object(gc), crate::source::SourceObject::String(s) if s.chars() == length.as_slice())
+            })
+        };
+        shape.args_reads = crate::wasm::translate::compute_args_reads(script, &is_length);
+    }
     shape.inline_depth = ictx.depth;
     shape.ictx = ictx;
     shape.formal_fns = formal_fns.to_vec();
@@ -901,6 +914,10 @@ struct Shape<'a> {
     /// never observed (bbv's `compute_apply_fwd_pcs`), if the script has
     /// them.
     apply_fwd: Option<rustc_hash::FxHashSet<Pc>>,
+    /// The `.length` reads and `GetElem`s of an arguments object that has
+    /// no other use (`compute_args_reads`), so it is never made either: a
+    /// read is the frame's actual count or one of its actuals.
+    args_reads: Option<rustc_hash::FxHashSet<Pc>>,
     /// How deep in inlining this build is (0: a script's own).
     inline_depth: u32,
     /// Where this build is inlined (`InlineCtx::ROOT` for a script's own).
@@ -966,6 +983,7 @@ impl<'a> Shape<'a> {
             syn_bids: BTreeMap::new(),
             names: None,
             apply_fwd: None,
+            args_reads: None,
             inline_depth: 0,
             ictx: InlineCtx::ROOT,
             callees: Default::default(),
@@ -1054,10 +1072,16 @@ struct Run<'s, 'a> {
     /// The value standing for the elided arguments object at an apply
     /// forward site (`apply_forward`), if `Arguments` has run.
     args_placeholder: Option<mir::Value>,
-    /// The local the placeholder was stored into (the `arguments` binding,
-    /// written once: `compute_apply_fwd_pcs`); tracked by slot, since
-    /// block params rename the value.
-    args_local: Option<usize>,
+    /// The locals the placeholder was stored into (the `arguments`
+    /// binding, a `var a = arguments`: each written once,
+    /// `compute_apply_fwd_pcs` / `compute_args_reads`); tracked by slot,
+    /// since block params rename the value, and an onramp finds the real
+    /// object there.
+    args_locals: std::collections::BTreeSet<usize>,
+    /// Values read from those locals onto the operand stack (renamed
+    /// placeholders, or an onramp's real object): an exit before the op
+    /// consuming one makes the object for it too.
+    args_copies: std::collections::BTreeSet<mir::Value>,
     /// The op being built, its state before it, and its shared exit and
     /// throw blocks.
     pc: Pc,
@@ -1141,7 +1165,8 @@ impl<'s, 'a> Run<'s, 'a> {
             live: true,
             st: vec![],
             args_placeholder: None,
-            args_local: None,
+            args_locals: std::collections::BTreeSet::new(),
+            args_copies: std::collections::BTreeSet::new(),
             pc: Pc::new(0),
             pre: vec![],
             exit_blk: None,
@@ -1843,7 +1868,7 @@ impl<'s, 'a> Run<'s, 'a> {
         // slots that hold it, and in the operands), at the exit's own cost.
         let mut st = st.to_vec();
         let ph = self.args_placeholder;
-        let holds = |i: usize, x: &Slot| Some(x.v) == ph || Some(i) == self.args_local;
+        let holds = |i: usize, x: &Slot| Some(x.v) == ph || self.args_locals.contains(&i) || self.args_copies.contains(&x.v);
         if ph.is_some() && st.iter().enumerate().any(|(i, x)| holds(i, x)) {
             let ok = self.new_block();
             let obj = self.f.add_param(ok, MType::val(TagSet::OBJECT));
@@ -1877,7 +1902,7 @@ impl<'s, 'a> Run<'s, 'a> {
             self.args_placeholder = saved;
             self.at(ok);
             for (i, x) in st.iter_mut().enumerate() {
-                if Some(x.v) == ph || Some(i) == self.args_local {
+                if Some(x.v) == ph || self.args_locals.contains(&i) || self.args_copies.contains(&x.v) {
                     if self.write_through(i) {
                         self.inst(Opcode::FrameStore(u32::try_from(i).unwrap()), vec![obj], None);
                     }
@@ -4014,8 +4039,8 @@ impl<'s, 'a> Run<'s, 'a> {
             Some(&c) => self.slot_cls.insert(ix, c),
             None => self.slot_cls.remove(&ix),
         };
-        if self.args_placeholder == Some(x.v) {
-            self.args_local = Some(ix);
+        if self.args_placeholder == Some(x.v) || self.args_copies.contains(&x.v) {
+            self.args_locals.insert(ix);
         }
         if x.ty != Ty::Dead && self.write_through(ix) {
             self.inst(Opcode::FrameStore(u32::try_from(ix).unwrap()), vec![x.v], None);
@@ -4608,6 +4633,11 @@ impl<'s, 'a> Run<'s, 'a> {
                 let n = p.next_uint24().unwrap();
                 let ix = self.local_ix(n);
                 let x = self.st[ix];
+                // A read of the elided arguments object's local: an exit
+                // before the op consuming it makes the object for it too.
+                if self.args_locals.contains(&ix) {
+                    self.args_copies.insert(x.v);
+                }
                 if let Some(&c) = self.slot_cls.get(&ix) {
                     self.val_cls.insert(x.v, c);
                 }
@@ -5436,6 +5466,12 @@ impl<'s, 'a> Run<'s, 'a> {
             GetProp => {
                 let a = self.atom(p.next_uint32().unwrap())?;
                 let recv = self.pop();
+                // The elided arguments object's length: the actual count.
+                if self.s.args_reads.as_ref().is_some_and(|r| r.contains(&pc)) {
+                    let n = self.inst(Opcode::ArgsLength, vec![], Some(MType::i32_range(0, i64::from(i32::MAX))));
+                    self.push(n, Ty::I32);
+                    return Ok(());
+                }
                 // A typed array's length: its length slot.
                 if let (Ty::Ta(_), true) = (recv.ty, LENGTH_TA) {
                     if self.mm.atoms[a].chars() == "length".encode_utf16().collect::<Vec<u16>>().as_slice() {
@@ -5606,6 +5642,33 @@ impl<'s, 'a> Run<'s, 'a> {
                     }
                 }
                 self.repush(v);
+            }
+            GetElem if self.s.args_reads.as_ref().is_some_and(|r| r.contains(&pc)) => {
+                // An element of the elided arguments object: an int32 index
+                // within the actual count reads that actual; anything else
+                // exits here, where the object is made (`exit_operands`)
+                // and baseline reads it.
+                let key = *self.st.last().unwrap();
+                let ki = if key.ty == Ty::I32 {
+                    key.v
+                } else {
+                    let b = self.boxed(key);
+                    self.guard(Opcode::GuardUnbox(UnboxKind::I32), vec![b], MType::I32_TOP)
+                };
+                let n = self.inst(Opcode::ArgsLength, vec![], Some(MType::i32_range(0, i64::from(i32::MAX))));
+                let zero = self.const_i32(0);
+                let exit = self.exit_block(false);
+                let nonneg = self.inst(Opcode::Cmp(NumRepr::I32, Cc::Ge), vec![ki, zero], Some(MType::Bool));
+                let (b1, b2) = (self.new_block(), self.new_block());
+                self.term(Opcode::Br, vec![nonneg], vec![Self::goto(b1), Self::goto(exit)]);
+                self.at(b1);
+                let below = self.inst(Opcode::Cmp(NumRepr::I32, Cc::Lt), vec![ki, n], Some(MType::Bool));
+                self.term(Opcode::Br, vec![below], vec![Self::goto(b2), Self::goto(exit)]);
+                self.at(b2);
+                self.pop();
+                self.pop();
+                let v = self.inst(Opcode::ActualArg, vec![ki], Some(MType::VAL_TOP));
+                self.push(v, Ty::Val(TagSet::ALL));
             }
             GetElem => {
                 self.ta_poly_site = TA_POLY && self.s.ctx.facts.elem_poly_sites.contains(&self.site(pc));
@@ -5973,7 +6036,7 @@ impl<'s, 'a> Run<'s, 'a> {
             // The actuals (the frame's variable region is past them: the
             // lowering's `vp`).
             Arguments => {
-                if self.s.apply_fwd.is_some() {
+                if self.s.apply_fwd.is_some() || self.s.args_reads.is_some() {
                     // Only forwarded (`apply_forward`): never made, unless an
                     // exit needs it (`exit_operands`). A value of its own,
                     // so no other undefined is mistaken for it.

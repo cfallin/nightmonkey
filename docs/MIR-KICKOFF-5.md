@@ -125,10 +125,39 @@ placement medians against lean:
   lean once combined. Every function then pays extra clears or inits.
 - Copy classes for `framed`: neutral to -1%, 0.2% fewer stores.
 
+## Landed after the first write-up (same session)
+
+- **Retention** (afcffa2): a dead value stays in its home slot; only
+  slots not yet written since entry are cleared. richards +2.8%,
+  deltablue +1.3%.
+- **Stack clearing, shelved** (patches in `prof5/stackclear-*.patch`).
+  Zeroing the NightStack above `top` at each GC, up to a since-GC mark
+  that every body raises on entry, is memory-sound and lets frames skip
+  every GC-only store. But a slot a frame never writes then keeps what a
+  popped sibling left there: `f(obj); obj = null; longRunning()` pins
+  `obj` for longRunning's whole activation, and mirstress failed
+  gc/weak-marking-01.js on exactly that. Gain over retention alone:
+  earley-boyer +0.9%, others about 0. Decided: keep the bounded
+  retention, not this.
+- **Compact frames** (dcf19fa): env, arguments-object and new.target
+  slots only where used. -3.8% stores, time unchanged. It exposed a latent
+  overlap: a lean inline frame's retaining store past its scan landed in
+  a nested frame (closures/t001).
+- **GVN** (77364e3) of env/global/unbox ops: env chain reads halved in
+  earley-boyer's closures; time unchanged.
+- **Standalone constructors** (00a2d60) type their constructing `this`
+  (KICKOFF-3 item 3): earley-boyer +4.2%, splay +5.9%.
+- **Arguments elision** for `.length`/element reads (`sc_list`,
+  `sc_append`): earley-boyer +5.0% (measured with inlining into such
+  scripts allowed; landed without that relaxation, to be re-measured, as
+  pdfjs/raytrace/react dipped 1-2% with it).
+
 ## Next
 
-1. **earley-boyer (-7.4%)**: frame traffic per activation (above) and hot
-   code size. The remaining levers need a decision:
+1. **earley-boyer**: about at legacy after the constructor and arguments
+   work (MIR 12460 vs legacy 12300-12650 in same-day sweeps; re-measure
+   quietly). What remains is per-activation frame traffic and hot code
+   size. The levers that were open:
    - retention (KEEPDEAD);
    - the runtime stack clear with a since-GC mark (NOJUNK);
    - a compact frame layout shared by baseline and MIR (fixed slots only
