@@ -418,18 +418,26 @@ impl LayoutState {
 pub struct LayoutClaim {
     pub keys: KeyRange,
     pub types: bool,
+    /// SLOTS: the layout's predicted fields are at their predicted slots.
+    /// Independent of `types` (a type claim holds by name); an access
+    /// with a slot prediction needs it, one without reads through an IC.
+    pub slots: bool,
     pub state: LayoutState,
 }
 
 impl LayoutClaim {
     pub fn le(&self, o: &LayoutClaim) -> bool {
-        o.keys.contains(&self.keys) && (!o.types || self.types) && self.state.le(o.state)
+        o.keys.contains(&self.keys)
+            && (!o.types || self.types)
+            && (!o.slots || self.slots)
+            && self.state.le(o.state)
     }
 
     pub fn join(&self, o: &LayoutClaim) -> LayoutClaim {
         LayoutClaim {
             keys: self.keys.hull(&o.keys),
             types: self.types && o.types,
+            slots: self.slots && o.slots,
             state: self.state.join(o.state),
         }
     }
@@ -974,6 +982,7 @@ mod tests {
                 hi: lk(hi),
             },
             types,
+            slots: false,
             state,
         }
     }

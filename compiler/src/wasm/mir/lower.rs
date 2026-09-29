@@ -156,9 +156,6 @@ pub(crate) fn native_math_index(name: &str) -> Option<u32> {
     })
 }
 
-/// `guard.layout` also requires SLOTS, and field ops under a claim do
-/// not test it again.
-const GUARD_SLOTS: bool = true;
 
 /// A generator's resume dispatch over at most this many yields is a chain
 /// of compares; past it, a `br_table`.
@@ -350,6 +347,11 @@ struct Lower<'a> {
     /// same callee, keyed by the block that guard is in (the first's
     /// `fail`, its only way in).
     script_memo: BTreeMap<mir::Block, (mir::Value, Value)>,
+    /// Whether the function makes an arguments object (`args.object`):
+    /// then its element reads try bbv's `arguments[i]` arm.
+    makes_args: bool,
+    /// A `check.binding`'s fact, with its value-fuse test (`load_gname`'s).
+    binding_armed: BTreeMap<mir::Value, Value>,
     /// Whether the function has onramp roots, and (if so) the entry's
     /// test of `ARGC_ONRAMP_BIT`, which says how this activation began.
     has_onramps: bool,
@@ -516,6 +518,8 @@ pub fn lower<'a>(
         stress: o.stress,
         guard_word: None,
         script_memo: BTreeMap::new(),
+        makes_args: f.insts.iter().any(|(_, d)| d.op == Opcode::ArgsObject),
+        binding_armed: BTreeMap::new(),
         guard_obj: None,
         has_onramps: f.roots.iter().any(|r| r.kind != RootKind::Entry),
         onramp_flag: argc,
@@ -2474,7 +2478,6 @@ impl<'a> Lower<'a> {
                 // shared probe `night_ic_get` (own and holder ways, then
                 // the megamorphic table) takes `ok_clean` on a hit; a miss
                 // runs the generic get and fills the site's ways.
-                let at = self.atom(name);
                 let cache = self.atoms.next_prop_cache();
                 let way_base = self.i32c(IC_WAY_ADDR_PLACEHOLDER);
                 self.prop_ic_patches.push((way_base, cache * INLINE_IC_STRIDE));
@@ -2509,51 +2512,9 @@ impl<'a> Lower<'a> {
                     self.length_arms(inst, a[0], ic)?;
                     self.cur = ic;
                 }
-                let probe = self.body.add_block();
-                self.get_ic_ways(inst, a[0], way_base, cache * INLINE_IC_STRIDE, probe)?;
-                self.cur = probe;
-                let r = self.call(self.h.ic_get_poly, &[a[0], at, way_base], &[Type::I64]);
-                let tag = self.tag_of(r);
-                let miss = self.tag_is(tag, TAG_MAGIC as u32);
-                let slow = self.body.add_block();
-                let t = self.edge(inst, 0, &[r])?;
-                self.cond_br(miss, Self::to(slow), t);
-                self.cur = slow;
-                if let Some(census) = self.exit_census {
-                    static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-                    let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    crate::diag_line!(
-                        "night: mir getmiss {id} sid#{} {}",
-                        self.f.script,
-                        String::from_utf16_lossy(self.mm.atoms[name].chars())
-                    );
-                    let (k, i) = (
-                        self.i32c(crate::options::MIR_GET_MISS_CENSUS_KIND),
-                        self.i32c(id),
-                    );
-                    self.call1(census, &[k, i], Type::I32);
-                }
-                let c = self.i32c(cache);
-                self.js_call(inst, self.h.get_prop_ic_miss, &[a[0], at, c], false)?;
+                self.get_ic(inst, name, a[0], way_base, cache)?;
             }
-            Opcode::JsSetProp(name, strict) => {
-                // The site's inline cache, way 0 only: an overwrite of the
-                // own slot the way describes, taking `ok_clean`. A miss
-                // runs the generic set and fills the way.
-                let at = self.atom(name);
-                let cache = self.atoms.next_prop_cache();
-                let way = self.i32c(IC_WAY_ADDR_PLACEHOLDER);
-                self.prop_ic_patches.push((way, cache * INLINE_IC_STRIDE));
-                let (trans, slow) = (self.body.add_block(), self.body.add_block());
-                self.set_ic_way0(inst, a[0], a[1], way, trans)?;
-                self.cur = trans;
-                self.set_ic_trans(inst, name, a[0], a[1], way, slow)?;
-                self.cur = slow;
-                let vouch = self.vouch_types(inst, a[0], a[1]);
-                let (c, sv) = (self.i32c(cache), self.i32c(u32::from(strict)));
-                let sv = self.bin(Operator::I32Or, sv, vouch, Type::I32);
-                self.js_call(inst, self.h.set_prop_ic_miss, &[a[0], at, a[1], c, sv], false)?;
-            }
+            Opcode::JsSetProp(name, strict) => self.set_ic(inst, name, a[0], a[1], strict)?,
             Opcode::JsGetElem => {
                 // An in-bounds, non-hole dense element of a native object
                 // inline (as baseline does), taking `ok_clean`; everything
@@ -2590,6 +2551,15 @@ impl<'a> Lower<'a> {
                     self.cond_br(miss, Self::to(other), Self::to(hit));
                     self.cur = hit;
                     let t = self.edge(inst, 0, &[r])?;
+                    self.terminate(Terminator::Br { target: t });
+                    self.cur = other;
+                }
+                // An arguments object's element (bbv's `arguments[i]` arm),
+                // in a function that makes one.
+                if self.makes_args && !rt.intersect(TagSet::OBJECT).is_empty() && !kt.intersect(TagSet::INT32).is_empty() {
+                    let other = self.body.add_block();
+                    let v = self.args_element(a[0], a[1], other);
+                    let t = self.edge(inst, 0, &[v])?;
                     self.terminate(Terminator::Br { target: t });
                     self.cur = other;
                 }
@@ -3424,7 +3394,7 @@ impl<'a> Lower<'a> {
                 let same = self.bin(Operator::I32Eq, construct_pre, post, Type::I32);
                 self.clean_or_dirty(inst, ok_p, same, &[res_p])?;
             }
-            Opcode::GuardLayout { keys, types } => {
+            Opcode::GuardLayout { keys, types, slots } => {
                 // The stamp word (`JSObject*+4`): identity is layout key + 1
                 // in the low 16 bits; TYPES is the SHALLOW bit (§4.3). The
                 // SLOTS bit too, as bbv's class guard: a claim then holds
@@ -3434,7 +3404,7 @@ impl<'a> Lower<'a> {
                 let w = self.load_i32(a[0], OBJ_CLASS_IDX_OFFSET);
                 let m = self.i32c(0xFFFF);
                 let id = self.bin(Operator::I32And, w, m, Type::I32);
-                let want = if GUARD_SLOTS { CLASS_WORD_SLOTS } else { 0 } | if types { CLASS_WORD_SHALLOW } else { 0 };
+                let want = if types { CLASS_WORD_SHALLOW } else { 0 } | if slots { CLASS_WORD_SLOTS } else { 0 };
                 // One masked compare, as bbv's class guard: identity and
                 // the bits at once. Over a range, the masked word less the
                 // lowest wanted word is at most the span only with every
@@ -3505,11 +3475,16 @@ impl<'a> Lower<'a> {
                 if !write {
                     // A read of a binding whose value fuse is armed
                     // (`gGlobalVals`) needs no slot: `load_gname` takes the
-                    // value there. Straight to `ok`.
+                    // value there. Straight to `ok`, the test kept for the
+                    // loads its fact reaches (they dominate them).
                     let vals = self.i32c(self.h.global_vals_base + 16 * slot);
                     let fw = self.load_i32(vals, 8);
                     let one = self.i32c(1);
                     let armed = self.bin(Operator::I32Eq, fw, one, Type::I32);
+                    if let Some(&EdgeArg::Out(0)) = d.succs[0].args.first() {
+                        let fact = self.f.blocks[d.succs[0].block].params[0];
+                        self.binding_armed.insert(fact, armed);
+                    }
                     let chk = self.body.add_block();
                     let t = self.edge(inst, 0, &[])?;
                     self.cond_br(armed, t, Self::to(chk));
@@ -3519,12 +3494,30 @@ impl<'a> Lower<'a> {
                 self.guard(inst, ok, &[])?;
             }
             Opcode::LoadGName(b) => {
-                // The value fuse's copy while armed, else the slot.
+                // The value fuse's copy while armed, else the slot. The
+                // check that made the fact tested the fuse: its test, where
+                // the fact is that check's (the fuse only disarms through
+                // a write, which kills the fact).
                 let slot = self.mm.bindings[b].slot;
                 let vals = self.i32c(self.h.global_vals_base + 16 * slot);
-                let fw = self.load_i32(vals, 8);
-                let one = self.i32c(1);
-                let armed = self.bin(Operator::I32Eq, fw, one, Type::I32);
+                // (A write to a global disarms its fuse but keeps the
+                // fact: only a load in the check's `ok` block, before any
+                // write there.)
+                let fact = d.args[0];
+                let fresh = matches!(self.f.values[fact].def, mir::func::ValueDef::Param(b, _) if b == self.cur_mblock)
+                    && !self.f.blocks[self.cur_mblock]
+                        .insts
+                        .iter()
+                        .take_while(|&&i| i != inst)
+                        .any(|&i| matches!(self.f.insts[i].op, Opcode::StoreGName(_)));
+                let armed = match self.binding_armed.get(&fact).filter(|_| fresh) {
+                    Some(&a) => a,
+                    None => {
+                        let fw = self.load_i32(vals, 8);
+                        let one = self.i32c(1);
+                        self.bin(Operator::I32Eq, fw, one, Type::I32)
+                    }
+                };
                 let (hit, miss, join) = (self.body.add_block(), self.body.add_block(), self.body.add_block());
                 let r = self.body.add_blockparam(join, Type::I64);
                 self.cond_br(armed, Self::to(hit), Self::to(miss));
@@ -4458,12 +4451,70 @@ impl<'a> Lower<'a> {
         self.clean_or_dirty(inst, ok, same, &[out])
     }
 
-    /// `load_field`/`store_field` (§4.3): with the stamp's SLOTS bit set,
-    /// the field is in its predicted fixed slot, accessed directly (the
-    /// `ok_clean` edge). Otherwise the generic property helper does it,
-    /// staying in MIR (`ok_dirty`, or `err`). A store takes the fixed slot
-    /// only where it keeps the stamp's bits true (see below), with GC
-    /// barriers unless the value is a number.
+    /// A property read's inline cache past its special arms (bbv's
+    /// fact-free read): the ways, then the shared probe `night_ic_get`
+    /// (own and holder ways, the megamorphic table), taking `ok_clean` on
+    /// a hit; a miss runs the generic get and fills the site's ways.
+    fn get_ic(&mut self, inst: mir::Inst, name: mir::entity::AtomId, recv: Value, way_base: Value, cache: u32) -> R<()> {
+        let at = self.atom(name);
+        let probe = self.body.add_block();
+        self.get_ic_ways(inst, recv, way_base, cache * INLINE_IC_STRIDE, probe)?;
+        self.cur = probe;
+        let r = self.call(self.h.ic_get_poly, &[recv, at, way_base], &[Type::I64]);
+        let tag = self.tag_of(r);
+        let miss = self.tag_is(tag, TAG_MAGIC as u32);
+        let slow = self.body.add_block();
+        let t = self.edge(inst, 0, &[r])?;
+        self.cond_br(miss, Self::to(slow), t);
+        self.cur = slow;
+        if let Some(census) = self.exit_census {
+            static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            crate::diag_line!(
+                "night: mir getmiss {id} sid#{} {}",
+                self.f.script,
+                String::from_utf16_lossy(self.mm.atoms[name].chars())
+            );
+            let (k, i) = (
+                self.i32c(crate::options::MIR_GET_MISS_CENSUS_KIND),
+                self.i32c(id),
+            );
+            self.call1(census, &[k, i], Type::I32);
+        }
+        let c = self.i32c(cache);
+        self.js_call(inst, self.h.get_prop_ic_miss, &[recv, at, c], false)
+    }
+
+    /// A property store's inline cache: way 0 (an overwrite of the own slot
+    /// the way describes) and the add-transition replay, taking `ok_clean`;
+    /// a miss runs the generic set (vouched where the value keeps the
+    /// object's TYPES) and fills the way.
+    fn set_ic(&mut self, inst: mir::Inst, name: mir::entity::AtomId, recv: Value, val: Value, strict: bool) -> R<()> {
+        let at = self.atom(name);
+        let cache = self.atoms.next_prop_cache();
+        let way = self.i32c(IC_WAY_ADDR_PLACEHOLDER);
+        self.prop_ic_patches.push((way, cache * INLINE_IC_STRIDE));
+        let (trans, slow) = (self.body.add_block(), self.body.add_block());
+        self.set_ic_way0(inst, recv, val, way, trans)?;
+        self.cur = trans;
+        self.set_ic_trans(inst, name, recv, val, way, slow)?;
+        self.cur = slow;
+        let vouch = self.vouch_types(inst, recv, val);
+        let (c, sv) = (self.i32c(cache), self.i32c(u32::from(strict)));
+        let sv = self.bin(Operator::I32Or, sv, vouch, Type::I32);
+        self.js_call(inst, self.h.set_prop_ic_miss, &[recv, at, val, c, sv], false)
+    }
+
+    /// `load_field`/`store_field` (§4.3). Under a SLOTS claim (a guard
+    /// proved it, or the object is under construction), a field with a
+    /// slot prediction is at its slot, read or written directly. Any other
+    /// access (a field with no slot prediction, or a claim of TYPES
+    /// alone) finds the slot through the site's inline cache: the field,
+    /// by name, is still of its claim's type. A store keeps TYPES only with
+    /// a value of the field's predicted type (`store_types`); at a known
+    /// slot another demotes the word inline (bbv's store choke: the bits
+    /// cleared, the epoch bumped) and takes `ok_dirty`. GC barriers unless
+    /// the value is a number.
     fn field_op(
         &mut self,
         inst: mir::Inst,
@@ -4476,75 +4527,54 @@ impl<'a> Lower<'a> {
             .obj_info()
             .and_then(|o| o.layout)
             .ok_or("lowering: a field op without a layout claim")?;
-        let keys = claim.keys;
-        // A published claim was guarded with SLOTS (`guard.layout`).
-        let slots_proven = GUARD_SLOTS && claim.state == mir::types::LayoutState::Published;
         let slot = self
             .mm
             .layouts
-            .get(&keys.lo)
+            .get(&claim.keys.lo)
             .and_then(|l| l.field(name))
-            .ok_or("lowering: a field op on an undescribed field")?
-            .0;
-        let slot = u32::try_from(slot).unwrap();
+            .map(|(s, _)| u32::try_from(s).unwrap());
+        let Some(slot) = slot.filter(|_| claim.slots) else {
+            let boxed = self.box_tagged(TAG_OBJECT, obj);
+            return match val {
+                None => {
+                    let cache = self.atoms.next_prop_cache();
+                    let way_base = self.i32c(IC_WAY_ADDR_PLACEHOLDER);
+                    self.prop_ic_patches.push((way_base, cache * INLINE_IC_STRIDE));
+                    self.get_ic(inst, name, boxed, way_base, cache)
+                }
+                Some(v) => self.set_ic(inst, name, boxed, v, self.strict),
+            };
+        };
         let off = FIXED_SLOTS_BASE + 8 * slot;
-        // A store of anything but a number: may overwrite or write a GC
-        // thing (barriers), and would falsify a TYPES claim.
-        let num = val.is_some()
-            && matches!(self.ty(self.f.insts[inst].args[1]), MType::Val(s) if s.tags.subset_of(TagSet::NUMBER));
-        let w = self.load_i32(obj, OBJ_CLASS_IDX_OFFSET);
-        if slots_proven && val.is_none() {
-            // A load under the claim: no test.
+        let Some(v) = val else {
             let r = self.load_i64(obj, off);
             let t = self.edge(inst, 0, &[r])?;
             self.terminate(Terminator::Br { target: t });
             return Ok(());
-        }
-        let (fast, slow) = (self.body.add_block(), self.body.add_block());
-        if slots_proven {
-            self.terminate(Terminator::Br { target: Self::to(fast) });
-        } else {
-            let bit = self.i32c(CLASS_WORD_SLOTS);
-            let has = self.bin(Operator::I32And, w, bit, Type::I32);
-            self.cond_br(has, Self::to(fast), Self::to(slow));
-        }
-        self.cur = fast;
-        let outs = match val {
-            None => vec![self.load_i64(obj, off)],
-            Some(v) => {
-                // TYPES survives only a value of the field's predicted type.
-                self.store_types(inst, obj, w, v, slow);
-                if !num {
-                    self.pre_barrier(obj, off);
-                }
-                self.store_i64(obj, off, v);
-                if !num {
-                    let s = self.i32c(slot);
-                    self.post_barrier(self.h.post_write_barrier, obj, s, v);
-                }
-                vec![]
-            }
         };
-        let t = self.edge(inst, 0, &outs)?;
-        self.terminate(Terminator::Br { target: t });
-
-        self.cur = slow;
-        let boxed = self.box_tagged(TAG_OBJECT, obj);
-        let at = self.atom(name);
-        let live = self.live_across(inst);
-        let (ok, r) = match val {
-            None => self.gc_call(self.h.get_property, &[boxed, at], &live)?,
-            Some(v) => {
-                let strict = self.i32c(u32::from(self.strict));
-                self.gc_call(self.h.set_property, &[boxed, at, v, strict], &live)?
+        let num = matches!(self.ty(self.f.insts[inst].args[1]), MType::Val(s) if s.tags.subset_of(TagSet::NUMBER));
+        let w = self.load_i32(obj, OBJ_CLASS_IDX_OFFSET);
+        let demote = self.body.add_block();
+        self.store_types(inst, obj, w, v, demote);
+        for dirty in [false, true] {
+            if dirty {
+                self.cur = demote;
+                self.clear_bits(obj, w, CLASS_WORD_RANGES | CLASS_WORD_SHALLOW);
             }
-        };
-        let outs = if val.is_none() { vec![r] } else { vec![] };
-        let t = self.edge(inst, 1, &outs)?;
-        let e = self.edge(inst, 2, &[])?;
-        self.cond_br(ok, t, e);
+            if !num {
+                self.pre_barrier(obj, off);
+            }
+            self.store_i64(obj, off, v);
+            if !num {
+                let s = self.i32c(slot);
+                self.post_barrier(self.h.post_write_barrier, obj, s, v);
+            }
+            let t = self.edge(inst, usize::from(dirty), &[])?;
+            self.terminate(Terminator::Br { target: t });
+        }
         Ok(())
     }
+
 
     /// The incremental pre-write barrier on the slot at `obj + off`: while
     /// the zone is marking, mark the value about to be overwritten.
@@ -5627,6 +5657,57 @@ impl<'a> Lower<'a> {
     /// `key` an int32, and the element an initialized, non-hole dense one;
     /// else branches to `fail`. Pure reads: a typed array's dense
     /// initializedLength is 0, and a proxy fails the native check first.
+    /// Element `key` (a boxed int32) of `recv` (boxed), an arguments
+    /// object whose element is neither overridden nor forwarded to a call
+    /// object (bbv's arm, `ArgumentsObject::element`): its data's slot;
+    /// anything else branches to `fail`.
+    fn args_element(&mut self, recv: Value, key: Value, fail: Block) -> Value {
+        let tag = self.tag_of(recv);
+        let is_obj = self.tag_is(tag, TAG_OBJECT as u32);
+        let ktag = self.tag_of(key);
+        let is_int = self.tag_is(ktag, TAG_INT32 as u32);
+        let both = self.bin(Operator::I32And, is_obj, is_int, Type::I32);
+        self.check(both, fail);
+        let obj = self.un(Operator::I32WrapI64, recv, Type::I32);
+        let shape = self.load_i32(obj, SHAPE_OFFSET);
+        let base = self.load_i32(shape, SHAPE_BASESHAPE_OFFSET);
+        let clasp = self.load_i32(base, BASESHAPE_CLASP_OFFSET);
+        let acbase = self.i32c(self.h.args_class_base);
+        let mapped = self.load_i32(acbase, 0);
+        let unmapped = self.load_i32(acbase, 4);
+        let m = self.bin(Operator::I32Eq, clasp, mapped, Type::I32);
+        let u = self.bin(Operator::I32Eq, clasp, unmapped, Type::I32);
+        let is_args = self.bin(Operator::I32Or, m, u, Type::I32);
+        self.check(is_args, fail);
+        // Packed in fixed slot 0: the length above bit 5; bit 2, an
+        // element overridden.
+        let packed = self.load_i32(obj, FIXED_SLOTS_BASE);
+        let four = self.i32c(4);
+        let over = self.bin(Operator::I32And, packed, four, Type::I32);
+        let kept = self.un(Operator::I32Eqz, over, Type::I32);
+        let five = self.i32c(5);
+        let len = self.bin(Operator::I32ShrU, packed, five, Type::I32);
+        let idx = self.un(Operator::I32WrapI64, key, Type::I32);
+        let inb = self.bin(Operator::I32LtU, idx, len, Type::I32);
+        let ok = self.bin(Operator::I32And, kept, inb, Type::I32);
+        self.check(ok, fail);
+        // The data (fixed slot 1's private pointer), its args at the
+        // engine's offset.
+        let data = self.load_i32(obj, FIXED_SLOTS_BASE + 8);
+        let eoff = self.load_i32(acbase, 8);
+        let elems = self.bin(Operator::I32Add, data, eoff, Type::I32);
+        let eight = self.i32c(8);
+        let off = self.bin(Operator::I32Mul, idx, eight, Type::I32);
+        let addr = self.bin(Operator::I32Add, elems, off, Type::I32);
+        let v = self.load_i64(addr, 0);
+        // A forwarded (mapped, aliased) element is magic.
+        let vt = self.tag_of(v);
+        let magic = self.tag_is(vt, TAG_MAGIC as u32);
+        let plain = self.un(Operator::I32Eqz, magic, Type::I32);
+        self.check(plain, fail);
+        v
+    }
+
     /// `s[i]` of a linear latin1 string (boxed) and an in-bounds int32
     /// index (boxed): the unit string from the static strings table
     /// (bbv's `emit_string_elem_arm`); anything else branches to `fail`.

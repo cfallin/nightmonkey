@@ -23,12 +23,19 @@ pub struct FieldDef {
 #[derive(Clone, PartialEq, Eq, Debug, Default)]
 pub struct Layout {
     pub fields: Vec<Option<FieldDef>>,
+    /// Typed fields with no slot prediction (`named` in the text format):
+    /// a `TYPES` claim by name, whose accesses find the slot by IC.
+    pub named: Vec<FieldDef>,
     /// For array layouts: the class region the stamp proves, which names
     /// the `Elements`/`ArrayLength` alias regions of its accesses.
     pub elements: Option<RegionRoot>,
 }
 
 impl Layout {
+    pub fn named_field(&self, name: AtomId) -> Option<&FieldDef> {
+        self.named.iter().find(|f| f.name == name)
+    }
+
     pub fn field(&self, name: AtomId) -> Option<(usize, &FieldDef)> {
         self.fields
             .iter()

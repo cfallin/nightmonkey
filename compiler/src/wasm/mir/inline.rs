@@ -214,6 +214,20 @@ fn merge_module(mm: &mut Module, k: &Module) -> Result<Maps, String> {
                 Some(_) => return Err("inline: layouts disagree on a field".into()),
             }
         }
+        for fd in &lay.named {
+            let def = FieldDef {
+                name: maps.atom(fd.name),
+                claim: maps.ty(fd.claim)?,
+            };
+            if mine.field(def.name).is_some() {
+                return Err("inline: a field both slotted and named".into());
+            }
+            match mine.named_field(def.name) {
+                None => mine.named.push(def),
+                Some(x) if *x == def => {}
+                Some(_) => return Err("inline: layouts disagree on a field".into()),
+            }
+        }
     }
     mm.script_addrs.extend(k.script_addrs.iter().map(|(&s, &a)| (s, a)));
     Ok(maps)

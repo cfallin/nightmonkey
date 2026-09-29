@@ -52,10 +52,12 @@ enum Ty {
     Bool,
     Val(TagSet),
     /// An object of one of `keys`' layouts, with its TYPES bit if the
-    /// flag says so: the raw object (`obj{L…}`), proven by a guard that
-    /// dominates (§4.3). The slot keeps the proof across joins and loops,
-    /// so the field accesses through it take no guard of their own.
-    Obj(KeyRange, bool),
+    /// first flag says so and its SLOTS bit if the second does: the raw
+    /// object (`obj{L…}`), proven by a guard that dominates (§4.3). The
+    /// slot keeps the proof across joins and loops, so the field accesses
+    /// through it take no guard of their own (an access with a slot
+    /// prediction guards SLOTS where it is not yet proven).
+    Obj(KeyRange, bool, bool),
     /// An object proven of `keys`' layouts before a fence that may have
     /// changed that (a call, a generic op): the raw object (`obj`). A
     /// field access through it guards the layout again, exiting on a miss
@@ -101,10 +103,11 @@ impl Ty {
             Ty::Bool => MType::Bool,
             Ty::Val(t) => MType::val(t),
             Ty::Fn(_) => MType::val(TagSet::OBJECT),
-            Ty::Obj(keys, types) => MType::Obj(ObjInfo {
+            Ty::Obj(keys, types, slots) => MType::Obj(ObjInfo {
                 layout: Some(LayoutClaim {
                     keys,
                     types,
+                    slots,
                     state: LayoutState::Published,
                 }),
                 ..ObjInfo::TOP
@@ -114,6 +117,7 @@ impl Ty {
                 layout: Some(LayoutClaim {
                     keys: KeyRange::one(crate::ids::LayoutKey::new(key)),
                     types,
+                    slots: true,
                     state: LayoutState::Constructing(n),
                 }),
                 ..ObjInfo::TOP
@@ -140,9 +144,9 @@ impl Ty {
             (a, b) if a == b => a,
             (Ty::Dead, x) | (x, Ty::Dead) => x,
             (Ty::I32, Ty::F64) | (Ty::F64, Ty::I32) => Ty::F64,
-            (Ty::Obj(k1, t1), Ty::Obj(k2, t2)) => Ty::Obj(k1.hull(&k2), t1 && t2),
+            (Ty::Obj(k1, t1, s1), Ty::Obj(k2, t2, s2)) => Ty::Obj(k1.hull(&k2), t1 && t2, s1 && s2),
             (Ty::Ctor(k1, n1, t1), Ty::Ctor(k2, n2, t2)) if k1 == k2 && n1 == n2 => Ty::Ctor(k1, n1, t1 && t2),
-            (Ty::Obj(k1, _) | Ty::ObjHint(k1), Ty::Obj(k2, _) | Ty::ObjHint(k2)) => {
+            (Ty::Obj(k1, ..) | Ty::ObjHint(k1), Ty::Obj(k2, ..) | Ty::ObjHint(k2)) => {
                 Ty::ObjHint(k1.hull(&k2))
             }
             (a, b) => Ty::Val(a.tags().union(b.tags())),
@@ -375,6 +379,10 @@ struct TypedSite {
     /// them (their intersection).
     load_tags: TagSet,
     store_tags: TagSet,
+    /// Whether the field has a slot prediction (its layouts' rows place
+    /// it): its access then needs SLOTS proven, and reads the slot; one
+    /// without finds the slot through an IC, under TYPES alone.
+    slotted: bool,
 }
 
 impl TypedSite {
@@ -1350,7 +1358,7 @@ impl<'s, 'a> Run<'s, 'a> {
     /// is unknown, and a published-layout hint would be wrong).
     fn demote(&mut self, x: Slot) -> Slot {
         match x.ty {
-            Ty::Obj(k, _) => Slot {
+            Ty::Obj(k, ..) => Slot {
                 v: self.weaken(x.v, MType::OBJ_TOP),
                 ty: Ty::ObjHint(k),
             },
@@ -2169,7 +2177,7 @@ impl<'s, 'a> Run<'s, 'a> {
             // kills the claims on the object under construction, as its
             // prediction witness says (§4.5); every copy of it is
             // replaced by the published one.
-            let pty = Ty::Obj(KeyRange::one(crate::ids::LayoutKey::new(key)), t);
+            let pty = Ty::Obj(KeyRange::one(crate::ids::LayoutKey::new(key)), t, true);
             let (inst, rs) = self.f.add_inst(self.cur, Opcode::PublishLayout, vec![o], &[pty.mir()], vec![]);
             self.f.witnesses[inst] = Some(mir::func::Witness {
                 may_kill: mir::types::KillPattern::of(mir::types::KillSet::CONSTRUCTING),
@@ -2257,7 +2265,7 @@ impl<'s, 'a> Run<'s, 'a> {
     fn replace_slot(&mut self, old: mir::Value, new: Slot) {
         let key = match new.ty {
             Ty::Ctor(k, ..) => Some(k),
-            Ty::Obj(keys, _) if keys.lo == keys.hi => Some(keys.lo.get()),
+            Ty::Obj(keys, ..) if keys.lo == keys.hi => Some(keys.lo.get()),
             _ => None,
         };
         let mut olds = vec![old];
@@ -2332,10 +2340,15 @@ impl<'s, 'a> Run<'s, 'a> {
             return;
         };
         // A constructor's `this` is still being built: known so where the
-        // inlining `new` passed it (`Ctor`), else left unguarded.
+        // inlining `new` passed it (`Ctor`), else left unguarded; so is a
+        // method a constructor calls on it (`ctor_publish`: early
+        // publication stamps it only once every field is there), whose
+        // accesses guard it each, reading through the IC on a miss, as
+        // bbv's lazy class facts do.
         if matches!(self.top().ty, Ty::Ctor(..))
             || ctx.stamp_ctors_in.contains_key(&sid)
             || ctx.deleg_restamps_in.contains_key(&sid)
+            || ctx.facts.ctor_publish.contains_key(&sid)
             || ctx.this_layouts_in.get(&sid).is_some_and(|l| l.init_home)
         {
             return;
@@ -2348,8 +2361,9 @@ impl<'s, 'a> Run<'s, 'a> {
         // type their fields, the guard proves TYPES too, and `this`'s
         // field reads are of their predicted types unchecked.
         let types = (lo.get()..=hi.get()).all(|k| self.s.types_bit(k) != 0);
-        let ty = Ty::Obj(keys, types);
-        let g = self.guard(Opcode::GuardLayout { keys, types }, vec![o], ty.mir());
+        // SLOTS too: `this`'s accesses have slot predictions.
+        let ty = Ty::Obj(keys, types, true);
+        let g = self.guard(Opcode::GuardLayout { keys, types, slots: true }, vec![o], ty.mir());
         self.st.pop();
         self.push(g, ty);
     }
@@ -2478,9 +2492,9 @@ impl<'s, 'a> Run<'s, 'a> {
     /// bit proven (a site that would guard for the bit reads under
     /// identity alone, and its claim is guarded at the def).
     fn proven_recv(&mut self, recv: Slot, site: &TypedSite) -> Option<(mir::Value, TypedSite)> {
-        let (keys, types) = match recv.ty {
-            Ty::Obj(keys, types) => (keys, Some(types)),
-            Ty::ObjHint(keys) => (keys, None),
+        let (keys, types, slots) = match recv.ty {
+            Ty::Obj(keys, types, slots) => (keys, Some(types), slots),
+            Ty::ObjHint(keys) => (keys, None, false),
             _ => return None,
         };
         let want = KeyRange {
@@ -2494,11 +2508,15 @@ impl<'s, 'a> Run<'s, 'a> {
             types: site.types && types == Some(true),
             ..*site
         };
+        // A field with a slot prediction needs SLOTS proven: a receiver
+        // proven without it (or only hinted) is guarded (again) with it.
         let o = match types {
-            Some(_) => recv.v,
-            None => {
-                let ty = Ty::Obj(keys, false);
-                let g = self.guard(Opcode::GuardLayout { keys, types: false }, vec![recv.v], ty.mir());
+            Some(_) if slots || !site.slotted => recv.v,
+            _ => {
+                let t = types.unwrap_or(false);
+                let s = site.slotted;
+                let ty = Ty::Obj(keys, t, s);
+                let g = self.guard(Opcode::GuardLayout { keys, types: t, slots: s }, vec![recv.v], ty.mir());
                 for x in self.st.iter_mut() {
                     if x.v == recv.v {
                         *x = Slot { v: g, ty };
@@ -2648,6 +2666,51 @@ impl<'s, 'a> Run<'s, 'a> {
         self.site_for(cls, cls, slot, claim, true, name)
     }
 
+    /// A field of a receiver proven with TYPES whose layouts all type it
+    /// but predict no slot for it (added outside the constructors): read
+    /// or written through an IC for the slot, of its predicted type.
+    /// Registered in the module's layouts as a named field.
+    fn named_site(&mut self, recv: Slot, name: mir::entity::AtomId) -> Option<TypedSite> {
+        let Ty::Obj(keys, true, _) = recv.ty else { return None };
+        let n = self.s.names?.lookup(self.mm.atoms[name].chars())?;
+        let (lo, hi) = (keys.lo.get(), keys.hi.get());
+        let mut masks = vec![];
+        for k in lo..=hi {
+            if self.s.layout_field(k, n).is_some() {
+                return None;
+            }
+            let c = *self.s.ctx.layout_field_types_in.get(&crate::ids::LayoutKey::new(k).stamp())?.get(&n)?;
+            if c.is_none() {
+                return None;
+            }
+            masks.push(claim_tags(c));
+        }
+        for (i, k) in (lo..=hi).enumerate() {
+            let def = mir::module::FieldDef {
+                name,
+                claim: MType::val(masks[i]),
+            };
+            let l = self.mm.layouts.entry(crate::ids::LayoutKey::new(k)).or_default();
+            if l.field(name).is_some() {
+                return None;
+            }
+            match l.named_field(name) {
+                None => l.named.push(def),
+                Some(f) if *f == def => {}
+                Some(_) => return None,
+            }
+        }
+        Some(TypedSite {
+            lo,
+            hi,
+            types: true,
+            claim: crate::facts::Claim::NONE,
+            load_tags: masks.iter().fold(TagSet::NONE, |a, &m| a.union(m)),
+            store_tags: masks.iter().fold(TagSet::ALL, |a, &m| a.intersect(m)),
+            slotted: false,
+        })
+    }
+
     fn site_for(
         &mut self,
         lo: u32,
@@ -2676,6 +2739,7 @@ impl<'s, 'a> Run<'s, 'a> {
             claim: claim_in,
             load_tags,
             store_tags,
+            slotted: true,
         };
         let slot = usize::try_from(slot).unwrap();
         for (i, k) in (site.lo..=site.hi).enumerate() {
@@ -2725,6 +2789,7 @@ impl<'s, 'a> Run<'s, 'a> {
             layout: Some(LayoutClaim {
                 keys,
                 types: site.types,
+                slots: site.slotted,
                 state: LayoutState::Published,
             }),
             ..ObjInfo::TOP
@@ -2735,6 +2800,7 @@ impl<'s, 'a> Run<'s, 'a> {
             Opcode::GuardLayout {
                 keys,
                 types: site.types,
+                slots: site.slotted,
             },
             vec![o],
             vec![
@@ -2924,7 +2990,7 @@ impl<'s, 'a> Run<'s, 'a> {
         }
         self.at(b);
         let weaker = |x: Slot, objs: &[(mir::Value, mir::Value)]| match (x.ty, objs.iter().find(|&&(v, _)| v == x.v)) {
-            (Ty::Obj(k, _), Some(&(_, p))) => Slot {
+            (Ty::Obj(k, ..), Some(&(_, p))) => Slot {
                 v: p,
                 ty: Ty::ObjHint(k),
             },
@@ -3614,6 +3680,10 @@ impl<'s, 'a> Run<'s, 'a> {
                     Some(MType::Bool),
                 )
             }
+            // A boolean (a generic compare's or `instanceof`'s): its bit.
+            Ty::Val(t) if t.is_nonempty_subset_of(TagSet::BOOLEAN) => {
+                self.inst(Opcode::Unbox(UnboxKind::Bool), vec![x.v], Some(MType::Bool))
+            }
             Ty::Val(_) => self.inst(Opcode::JsToBool, vec![x.v], Some(MType::Bool)),
         }
     }
@@ -4026,7 +4096,7 @@ impl<'s, 'a> Run<'s, 'a> {
                     args.push(o);
                     continue;
                 }
-                Ty::Obj(keys, types) => {
+                Ty::Obj(keys, types, slots) => {
                     // Unbox, then the layout.
                     let ok = self.new_block();
                     let o = self.f.add_param(ok, MType::OBJ_TOP);
@@ -4045,7 +4115,7 @@ impl<'s, 'a> Run<'s, 'a> {
                     let ok = self.new_block();
                     let out = self.f.add_param(ok, t.mir());
                     self.term(
-                        Opcode::GuardLayout { keys, types },
+                        Opcode::GuardLayout { keys, types, slots },
                         vec![o],
                         vec![
                             Edge {
@@ -5195,7 +5265,10 @@ impl<'s, 'a> Run<'s, 'a> {
                 if self.ctor_get(pc + op.len(), a, recv) {
                     return Ok(());
                 }
-                let site = self.typed_site(pc, a).or_else(|| self.hinted_site(recv.v, a));
+                let site = self
+                    .typed_site(pc, a)
+                    .or_else(|| self.hinted_site(recv.v, a))
+                    .or_else(|| self.named_site(recv, a));
                 if let Some((o, site)) = site.and_then(|site| self.proven_recv(recv, &site)) {
                     let r = self
                         .js_dirty_exits(Opcode::LoadField(a), vec![o], Some(site.claim_ty()), pc + op.len(), None)
@@ -5277,7 +5350,11 @@ impl<'s, 'a> Run<'s, 'a> {
                 // lowering keeps the bit by the value's tag, or leaves the
                 // store to the engine, which clears it.
                 let vtags = v.ty.tags();
-                let site = self.typed_site(pc, a).or_else(|| self.hinted_site(recv.v, a)).map(|mut s| {
+                let site = self
+                    .typed_site(pc, a)
+                    .or_else(|| self.hinted_site(recv.v, a))
+                    .or_else(|| self.named_site(recv, a))
+                    .map(|mut s| {
                     s.types &= vtags.is_nonempty_subset_of(s.store_tags);
                     s
                 });

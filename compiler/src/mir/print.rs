@@ -73,7 +73,7 @@ pub fn atom_str(s: &JsString) -> String {
 
 /// Words the parser gives meaning in an atom's position.
 fn is_reserved_word(s: &str) -> bool {
-    matches!(s, "types" | "hole")
+    matches!(s, "types" | "slots" | "hole" | "named")
 }
 
 pub fn tags_str(t: TagSet) -> String {
@@ -128,6 +128,10 @@ fn claim_str(c: &LayoutClaim) -> String {
     let mut s = keys_str(&c.keys);
     if c.types {
         s.push_str(" types");
+    }
+    // A constructing state implies its slots.
+    if c.slots && c.state == LayoutState::Published {
+        s.push_str(" slots");
     }
     match c.state {
         LayoutState::Published => {}
@@ -533,10 +537,13 @@ fn immediates(m: &Module, op: &Opcode) -> Option<String> {
         | InitField(a) => atom(Some(m), *a),
         GuardTags(t) => tags_str(*t),
         GuardKind(k) => kind_str(*k),
-        GuardLayout { keys, types } => {
+        GuardLayout { keys, types, slots } => {
             let mut s = keys_str(keys);
             if *types {
                 s.push_str(" types");
+            }
+            if *slots {
+                s.push_str(" slots");
             }
             s
         }
@@ -647,6 +654,9 @@ pub fn print_module(m: &Module) -> String {
                     ),
                     None => "hole".into(),
                 })
+                .chain(l.named.iter().map(|f| {
+                    format!("named {}: {}", atom(Some(m), f.name), type_str_in(Some(m), &f.claim))
+                }))
                 .collect();
             if fields.is_empty() {
                 write!(out, "  layout L{k} = {{}}").unwrap();

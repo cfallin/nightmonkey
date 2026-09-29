@@ -41,3 +41,16 @@ for (var r = 0; r < 300; r++) {
   assertEq(readGone(), r >= 250 && r < 260 ? "u" : r >= 260 ? 2 : 1);
 }
 assertEq(scale, 4);
+
+// A read, a write and a read of one global in a row: the second read's
+// check folds into the first, and its value is the write's, not the one
+// the first read's (then armed) value fuse held.
+var steady = { k: 1 };
+function rewrite(i) {
+  var a = steady;
+  steady = { k: i };
+  var b = steady;
+  return a.k * 1000 + b.k;
+}
+for (var r = 2; r < 300; r++)
+  assertEq(rewrite(r), (r - 1) * 1000 + r);

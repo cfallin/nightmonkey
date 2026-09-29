@@ -459,6 +459,7 @@ pub enum Opcode {
     GuardLayout {
         keys: KeyRange,
         types: bool,
+        slots: bool,
     },
     /// An object under construction for layout `key` (MIR.md §2.3): its
     /// word carries the CONSTRUCTING sentinel with `key`'s early key, and
@@ -1023,18 +1024,30 @@ fn field_claims(
             .layouts
             .get(&k)
             .ok_or_else(|| format!("{what}: layout L{k} is not in the module"))?;
-        let (slot, f) = layout
-            .field(name)
-            .ok_or_else(|| format!("{what}: layout L{k} has no field {}", m.atoms[name]))?;
-        if let Some(n) = c.state.slots() {
-            want(slot < n as usize, || {
-                format!(
-                    "{what}: field {} is slot {slot}, beyond the {n}-slot prefix",
-                    m.atoms[name]
-                )
-            })?;
+        // A predicted field (at its slot), or a typed field with no slot
+        // prediction (an access finds it through an IC).
+        match layout.field(name) {
+            Some((slot, f)) => {
+                if let Some(n) = c.state.slots() {
+                    want(slot < n as usize, || {
+                        format!(
+                            "{what}: field {} is slot {slot}, beyond the {n}-slot prefix",
+                            m.atoms[name]
+                        )
+                    })?;
+                }
+                claims.push(f.claim);
+            }
+            None => {
+                let f = layout
+                    .named_field(name)
+                    .ok_or_else(|| format!("{what}: layout L{k} has no field {}", m.atoms[name]))?;
+                want(c.state == LayoutState::Published, || {
+                    format!("{what}: slotless field {} under construction", m.atoms[name])
+                })?;
+                claims.push(f.claim);
+            }
         }
-        claims.push(f.claim);
     }
     Ok((c, claims))
 }
@@ -1136,12 +1149,13 @@ pub fn signature(op: &Opcode, args: &[Type], m: &Module) -> SigResult {
             let kind = if o.kind.le(*k) { o.kind } else { *k };
             Sig::output(Type::Obj(ObjInfo { kind, ..o }))
         }
-        GuardLayout { keys, types } => {
+        GuardLayout { keys, types, slots } => {
             arity(args, 1)?;
             let o = obj(&args[0], "guard.layout")?;
             let new = LayoutClaim {
                 keys: *keys,
                 types: *types,
+                slots: *slots,
                 state: LayoutState::Published,
             };
             let layout = match o.layout {
@@ -1160,6 +1174,7 @@ pub fn signature(op: &Opcode, args: &[Type], m: &Module) -> SigResult {
                 layout: Some(LayoutClaim {
                     keys: KeyRange::one(*key),
                     types: *types,
+                    slots: true,
                     state: LayoutState::Constructing(*n),
                 }),
                 ..o
@@ -1762,6 +1777,7 @@ pub fn signature(op: &Opcode, args: &[Type], m: &Module) -> SigResult {
                 layout: Some(LayoutClaim {
                     keys: KeyRange::one(*k),
                     types: true,
+                    slots: true,
                     state: LayoutState::Constructing(0),
                 }),
             }))
@@ -2243,6 +2259,7 @@ mod tests {
                                 layout: Some(LayoutClaim {
                                     keys: KeyRange::one(LayoutKey::new(4)),
                                     types: true,
+                                    slots: true,
                                     state: LayoutState::Published,
                                 }),
                             },
@@ -2250,6 +2267,7 @@ mod tests {
                         )),
                     }),
                 ],
+                named: vec![],
                 elements: None,
             },
         );
@@ -2263,6 +2281,7 @@ mod tests {
             layout: Some(LayoutClaim {
                 keys: KeyRange::one(LayoutKey::new(3)),
                 types,
+                slots: true,
                 state: LayoutState::Published,
             }),
         })

@@ -517,14 +517,16 @@ impl Parser {
             {
                 let keys = self.keys()?;
                 let types = self.eat_word("types");
+                let mut slots = self.eat_word("slots");
                 let state = if self.eat_word("prefix") {
                     LayoutState::Prefix(self.paren_u32()?)
                 } else if self.eat_word("constructing") {
+                    slots = true;
                     LayoutState::Constructing(self.paren_u32()?)
                 } else {
                     LayoutState::Published
                 };
-                o.layout = Some(LayoutClaim { keys, types, state });
+                o.layout = Some(LayoutClaim { keys, types, slots, state });
             } else {
                 o.kind = self.kind()?;
             }
@@ -755,9 +757,15 @@ impl Parser {
                     self.expect_punct("=")?;
                     self.expect_punct("{")?;
                     let mut fields = vec![];
+                    let mut named = vec![];
                     while !self.eat_punct("}") {
                         if self.eat_word("hole") {
                             fields.push(None);
+                        } else if self.eat_word("named") {
+                            let name = self.atom()?;
+                            self.expect_punct(":")?;
+                            let claim = self.ty()?;
+                            named.push(FieldDef { name, claim });
                         } else {
                             let name = self.atom()?;
                             self.expect_punct(":")?;
@@ -777,7 +785,7 @@ impl Parser {
                     if self
                         .m
                         .layouts
-                        .insert(k, Layout { fields, elements })
+                        .insert(k, Layout { fields, named, elements })
                         .is_some()
                     {
                         return self.err(format!("layout L{k} declared twice"));
@@ -1267,7 +1275,8 @@ impl Parser {
             GuardLayout { .. } => {
                 let keys = self.keys()?;
                 let types = self.eat_word("types");
-                GuardLayout { keys, types }
+                let slots = self.eat_word("slots");
+                GuardLayout { keys, types, slots }
             }
             GuardCtor { .. } => {
                 let key = self.layout_key()?;
@@ -1506,6 +1515,7 @@ fn template(mn: &str) -> Option<Opcode> {
         GuardLayout {
             keys: KeyRange::one(LayoutKey::new(0)),
             types: false,
+            slots: false,
         },
         GuardCtor {
             key: LayoutKey::new(0),
