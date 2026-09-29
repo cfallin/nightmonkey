@@ -49,6 +49,17 @@ pub const ARGC_FLAGS: u32 = 0x8000_0000 | ARGC_RESUME_BIT | ARGC_ONRAMP_BIT;
 /// ok and 1 an exception, as for every body).
 pub const ERR_DEOPT: u32 = 2;
 
+/// The onramp backoff an exit leaves in the frame (`FrameLayout::backoff`):
+/// loop-header visits baseline makes before it tries the onramp again.
+pub const ONRAMP_BACKOFF: u32 = 32;
+/// The backoff slot's payload: the countdown in the low bits, and above
+/// `ONRAMP_LEVEL_SHIFT` how many onramp attempts in a row made no progress
+/// (the countdown after such an attempt is `ONRAMP_BACKOFF << level`).
+pub const ONRAMP_COUNT_MASK: u32 = 0xffff;
+pub const ONRAMP_LEVEL_SHIFT: u32 = 16;
+/// The most doublings: a wait of `ONRAMP_BACKOFF << 10` still fits the mask.
+pub const ONRAMP_LEVEL_MAX: u32 = 10;
+
 /// What a resume does once it reaches its pc.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub enum ResumeMode {

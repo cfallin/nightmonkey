@@ -24,7 +24,8 @@ use waffle::{
 
 use super::layout::{
     self, FrameLayout, ResumeMode, ResumeWord, StackDepths, ARGC_FLAGS, ARGC_ONRAMP_BIT,
-    ARGC_RESUME_BIT, ERR_DEOPT,
+    ARGC_RESUME_BIT, ERR_DEOPT, ONRAMP_BACKOFF, ONRAMP_COUNT_MASK, ONRAMP_LEVEL_MAX,
+    ONRAMP_LEVEL_SHIFT,
 };
 use crate::bytecode::{BytecodeParser, JSOp, Script, TryNoteKind};
 use crate::ids::{Pc, ScriptId, Site};
@@ -1160,10 +1161,16 @@ impl<'a> Gen<'a> {
     /// and a resume word set (baseline resumes through its dispatch). MIR
     /// exits set the backoff, so baseline runs some iterations before it
     /// tries again.
+    ///
+    /// The backoff's low 16 bits count down; the bits above are how many
+    /// attempts in a row made no progress, which doubles the wait (see
+    /// `ONRAMP_LEVEL_SHIFT`).
     fn onramp(&mut self, h: Pc) {
         let backoff = self.load_i32(self.vp, self.layout.backoff());
+        let mask = self.i32c(ONRAMP_COUNT_MASK);
+        let count = self.binop(Operator::I32And, backoff, mask, Type::I32);
         let z = self.i32c(0);
-        let ready = self.binop(Operator::I32Eq, backoff, z, Type::I32);
+        let ready = self.binop(Operator::I32Eq, count, z, Type::I32);
         let (try_blk, wait_blk, cont) = (
             self.body.add_block(),
             self.body.add_block(),
@@ -1240,6 +1247,7 @@ impl<'a> Gen<'a> {
         self.cur = deopt;
         self.live = true;
         let word = self.resume_word();
+        self.escalate_backoff(h, word, backoff);
         let bad = self.body.add_block();
         self.dispatch_on(word, hops, Self::goto(bad));
         self.cur = bad;
@@ -1247,6 +1255,41 @@ impl<'a> Gen<'a> {
         self.terminate(Terminator::Unreachable);
         self.cur = cont;
         self.live = true;
+    }
+
+    /// After a DEOPT from the onramp at `h`: when the MIR body exited at
+    /// the very header it was entered at, the attempt made no progress --
+    /// typically the root's own entry guards refused this frame (a local
+    /// that has become a double where the loop was built for int32), and
+    /// the frame will not change back. Waiting the exit's fixed backoff
+    /// and retrying would pay a call, a frame write-back and a dispatch
+    /// every 32 iterations for the rest of the loop, so each such attempt
+    /// doubles the wait instead, up to `ONRAMP_LEVEL_MAX` doublings. Any
+    /// exit elsewhere made progress, and keeps the exit's own (level-0)
+    /// backoff. `before` is the backoff read before the attempt: its count
+    /// was zero, so it holds just the level.
+    fn escalate_backoff(&mut self, h: Pc, word: Value, before: Value) {
+        let at_h = ResumeWord {
+            pc: h,
+            mode: ResumeMode::Continue,
+        };
+        let hw = self.i32c(at_h.encode() as u32);
+        let stuck = self.binop(Operator::I32Eq, word, hw, Type::I32);
+        let shift = self.i32c(ONRAMP_LEVEL_SHIFT);
+        let level = self.binop(Operator::I32ShrU, before, shift, Type::I32);
+        let one = self.i32c(1);
+        let up = self.binop(Operator::I32Add, level, one, Type::I32);
+        let max = self.i32c(ONRAMP_LEVEL_MAX);
+        let over = self.binop(Operator::I32GtU, up, max, Type::I32);
+        let level = self.select(Type::I32, max, up, over);
+        let base = self.i32c(ONRAMP_BACKOFF);
+        let count = self.binop(Operator::I32Shl, base, level, Type::I32);
+        let tag = self.binop(Operator::I32Shl, level, shift, Type::I32);
+        let raised = self.binop(Operator::I32Or, tag, count, Type::I32);
+        let left = self.load_i32(self.vp, self.layout.backoff());
+        let next = self.select(Type::I32, raised, left, stuck);
+        let boxed = self.boxed_int32(next);
+        self.store_i64(self.vp, self.layout.backoff(), boxed);
     }
 
     /// Where an onramp at header `h` sends a DEOPT for resume word `w`,

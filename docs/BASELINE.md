@@ -616,6 +616,12 @@ Deviations from the plan above, and details it did not settle:
     exit at pc 0.
   - Every MIR exit sets the backoff (32), so baseline makes progress
     between attempts: MIR.md §5.2's no-livelock rule.
+  - An attempt that exits at the header it entered (the root's entry
+    guards refused the frame, say a local that is now a double where the
+    loop was built for int32) made no progress, and the frame is unlikely
+    to change back. Baseline then doubles the wait instead, up to 1024
+    times the base: the slot's low 16 bits count down, and the bits
+    above count the consecutive attempts that made no progress.
 - **Then MIR, revised (§9):**
   - M0b: the small M0 follow-ups of §9 (the `magic` tag, the rval
     operand, declared loops);

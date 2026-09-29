@@ -55,6 +55,7 @@ use crate::opsem::{
 };
 use crate::wasm::baseline::layout::{
     FrameLayout, ResumeMode, ResumeWord, ARGC_FLAGS, ARGC_ONRAMP_BIT, ARGC_RESUME_BIT, ERR_DEOPT,
+    ONRAMP_BACKOFF,
 };
 use crate::wasm::bbv::abi::{
     BINOP_BITAND, BINOP_BITNOT, BINOP_BITOR, BINOP_BITXOR, BINOP_DEC, BINOP_DIV, BINOP_INC,
@@ -94,9 +95,6 @@ const DIRECT_CONSTRUCT: bool = true;
 const INLINE_GNAME_SETS: bool = true;
 
 const UNDEF: u64 = TAG_UNDEFINED << 32;
-
-/// The onramp backoff an exit leaves in the frame (`FrameLayout::backoff`).
-const ONRAMP_BACKOFF: u32 = 32;
 
 /// `JS::GenericNaN()`'s bits.
 const CANONICAL_NAN_BITS: u64 = 0x7FF8_0000_0000_0000;
