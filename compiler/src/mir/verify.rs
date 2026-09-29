@@ -747,6 +747,7 @@ impl<'a> Verifier<'a> {
                     matches!(
                         op,
                         Opcode::Box
+                            | Opcode::BoxDouble
                             | Opcode::Weaken
                             | Opcode::ConstVal(_)
                             | Opcode::ConstI32(_)

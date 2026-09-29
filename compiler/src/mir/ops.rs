@@ -443,6 +443,10 @@ pub enum Opcode {
 
     // Conversions.
     Box,
+    /// An f64 boxed as the double it is (NaN made canonical), not as an
+    /// int32 where it is one: for a store whose readers all admit the
+    /// double tag (bbv's `elem_write_sites` rule).
+    BoxDouble,
     Unbox(UnboxKind),
     I32ToInt,
     I32ToF64,
@@ -1106,6 +1110,13 @@ pub fn signature(op: &Opcode, args: &[Type], m: &Module) -> SigResult {
         Box => {
             arity(args, 1)?;
             Sig::result(box_type(&args[0])?)
+        }
+        BoxDouble => {
+            arity(args, 1)?;
+            let Type::F64(n) = args[0] else {
+                return Err("box.double: operand is not f64".into());
+            };
+            Sig::result(Type::Val(VSet::new(TagSet::DOUBLE, n, ObjInfo::TOP, StrInfo::TOP)))
         }
         Unbox(k) => {
             arity(args, 1)?;

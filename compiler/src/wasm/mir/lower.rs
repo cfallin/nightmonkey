@@ -2018,6 +2018,13 @@ impl<'a> Lower<'a> {
                 let v = self.boxed(&at(0), a[0])?;
                 self.def(inst, v);
             }
+            Opcode::BoxDouble => {
+                let bits = self.un(Operator::I64ReinterpretF64, a[0], Type::I64);
+                let nan = self.bin(Operator::F64Ne, a[0], a[0], Type::I32);
+                let canon = self.i64c(CANONICAL_NAN_BITS);
+                let v = self.select(Type::I64, canon, bits, nan);
+                self.def(inst, v);
+            }
             Opcode::Unbox(k) => {
                 let v = match k {
                     UnboxKind::F64Num => self.to_f64(a[0]),

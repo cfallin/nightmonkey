@@ -3466,6 +3466,48 @@ impl<'s, 'a> Run<'s, 'a> {
         result
     }
 
+    /// `hasOwnProperty.call(o, k)` where the analysis resolved the site's
+    /// target to the builtin (`apply_natives`), as legacy's native arm.
+    fn hasown_site(&self) -> bool {
+        let site = self.site(self.pc);
+        let facts = &self.s.ctx.facts;
+        facts.apply_sites.get(&site) == Some(&crate::facts::CallForm::Call)
+            && facts.apply_natives.get(&site) == Some(&crate::facts::ApplyNative::HasOwnProperty)
+    }
+
+    /// The native forward, operands `call, target, o, k`: with the `.call`
+    /// and the target the pristine builtins, the `HasOwn` op on `k, o`;
+    /// otherwise the generic call.
+    fn hasown_call(&mut self, vals: &[mir::Value]) -> mir::Value {
+        use crate::wasm::translate::{BC_FUN_CALL, BC_OBJ_HASOWN};
+        let join = self.new_block();
+        let result = self.f.add_param(join, MType::VAL_TOP);
+        let (check, fast, slow) = (self.new_block(), self.new_block(), self.new_block());
+        let is_call = self.inst(Opcode::JsIsBuiltin(BC_FUN_CALL), vec![vals[0]], Some(MType::Bool));
+        self.term(Opcode::Br, vec![is_call], vec![Self::goto(check), Self::goto(slow)]);
+        self.at(check);
+        let is_hasown = self.inst(Opcode::JsIsBuiltin(BC_OBJ_HASOWN), vec![vals[1]], Some(MType::Bool));
+        self.term(Opcode::Br, vec![is_hasown], vec![Self::goto(fast), Self::goto(slow)]);
+        for (b, r) in [(fast, true), (slow, false)] {
+            self.at(b);
+            let r = if r {
+                self.js(Opcode::JsRt(RtOp::HasOwn), vec![vals[3], vals[2]], MType::val(TagSet::BOOLEAN))
+            } else {
+                self.js(Opcode::Call, vals.to_vec(), MType::VAL_TOP)
+            };
+            self.term(
+                Opcode::Jump,
+                vec![],
+                vec![Edge {
+                    block: join,
+                    args: vec![EdgeArg::Value(r)],
+                }],
+            );
+        }
+        self.at(join);
+        result
+    }
+
     /// `target.call(thisArg, args…)` at a site whose target the analysis
     /// resolved (`apply_targets`, `apply_target_sets`), operands `call,
     /// target, thisArg, args…`: with the `.call` the pristine builtin, the
@@ -5723,7 +5765,23 @@ impl<'s, 'a> Run<'s, 'a> {
                             self.demote_objs();
                             self.demote(v)
                         };
-                        let y = self.boxed(v);
+                        // A double under a write claim that admits Double
+                        // goes in as the double it is (bbv's rule): every
+                        // read of the element admits the tag.
+                        let y = if v.ty == Ty::F64
+                            && self
+                                .s
+                                .ctx
+                                .facts
+                                .elem_write_sites
+                                .get(&self.site(pc))
+                                .is_some_and(|m| m.prims().intersects(crate::opsem::PRIM_DOUBLE))
+                        {
+                            let t = MType::val(TagSet::DOUBLE);
+                            self.inst(Opcode::BoxDouble, vec![v.v], Some(t))
+                        } else {
+                            self.boxed(v)
+                        };
                         let (ok, generic, join) = (self.new_block(), self.new_block(), self.new_block());
                         self.term(
                             Opcode::StoreElem(duty),
@@ -6521,7 +6579,9 @@ impl<'s, 'a> Run<'s, 'a> {
                 let known_sids: Vec<ScriptId> = known.into_iter().collect();
                 let sids: &[ScriptId] = if known.is_some() { &known_sids } else { facts_sids };
                 let sids: Vec<ScriptId> = sids.to_vec();
-                let forward = if argc >= 1 {
+                let forward = if argc == 2 && self.hasown_site() {
+                    Some(self.hasown_call(&vals))
+                } else if argc >= 1 {
                     self.call_forward(&vals, &fns[1..], fwd_ctor.map(|(c, x)| (c, x, vals[2])))
                 } else {
                     None

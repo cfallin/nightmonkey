@@ -300,6 +300,7 @@ pub fn mnemonic(op: &Opcode) -> String {
         ConstObj(_) => "const.obj".into(),
         ConstStr(_) => "const.str".into(),
         Box => "box".into(),
+        BoxDouble => "box.double".into(),
         Unbox(k) => format!("unbox.{}", k.name()),
         I32ToInt => "i32.to_int".into(),
         I32ToF64 => "i32.to_f64".into(),

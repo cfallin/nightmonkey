@@ -1511,6 +1511,7 @@ fn template(mn: &str) -> Option<Opcode> {
         ConstObj(SnapObj::from_u32(0)),
         ConstStr(placeholder_atom),
         Box,
+        BoxDouble,
         I32ToInt,
         I32ToF64,
         IntToF64,
