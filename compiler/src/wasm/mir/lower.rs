@@ -572,6 +572,7 @@ pub fn lower<'a>(
         add_preds,
     };
     l.run()?;
+    crate::wasm::pad_body(&mut l.body, u64::from(l.f.script.get()));
     Ok(Lowered {
         body: l.body,
         body_off_patches: l.body_off_patches,

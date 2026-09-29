@@ -22,7 +22,12 @@ NightStack::NightStack()
 
 NightStack::~NightStack() { js_free(base_); }
 
+uint64_t gNightStackTraces = 0;
+uint64_t gNightStackTracedSlots = 0;
+
 void NightStack::trace(JSTracer* trc) {
+  gNightStackTraces++;
+  gNightStackTracedSlots += uint64_t(top_ - base_);
   // Every live slot is a boxed JS::Value root. JS::TraceRoot handles non-GC
   // Values (numbers, undefined, ...) and forwards moved pointers in place.
   for (JS::Value* slot = base_; slot < top_; slot++) {

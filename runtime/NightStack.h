@@ -33,6 +33,7 @@
 #include "mozilla/Attributes.h"  // MOZ_RAII
 
 #include <stddef.h>
+#include <stdint.h>
 
 #include "js/TypeDecls.h"  // JSContext, JSTracer (correct public-API visibility)
 #include "js/Value.h"      // JS::Value
@@ -46,6 +47,10 @@ namespace nightrt {
 // stays below the limit, and the engine-side entry paths must reserve the
 // same, or a body entered near the limit writes past the stack.
 static constexpr size_t kNightStackHeadroomSlots = (64 * 1024) / sizeof(JS::Value);
+
+// `NIGHT_GC_STATS`: the traces of the stack, and the slots they covered.
+extern uint64_t gNightStackTraces;
+extern uint64_t gNightStackTracedSlots;
 
 class NightStack {
  public:

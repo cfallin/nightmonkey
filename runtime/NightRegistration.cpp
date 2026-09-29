@@ -3,6 +3,8 @@
 
 #include "runtime/NightRegistration.h"
 
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <vector>
 
@@ -13,6 +15,7 @@
 #include "js/shadow/String.h"
 #include "runtime/Night.h"
 #include "runtime/NightEnv.h"
+#include "runtime/NightStack.h"
 #include "vm/ArrayObject.h"
 #include "vm/JSContext.h"
 #include "vm/JSFunction.h"
@@ -296,8 +299,40 @@ JS_PUBLIC_API bool JS::NightRegisterRoot(JSContext* cx,
 // nightFuncIndex_ in the image.
 extern "C" void NightCensusTraceRearm();
 
+// `NIGHT_GC_STATS`: at exit, the minor GCs, the bytes they promoted (the
+// tenured heap's growth across each), the major GCs, and how many NightStack
+// slots the GCs traced as roots (the stack's depth at each, summed).
+static JSContext* gStatsCx = nullptr;
+static uint64_t gStatsMinor = 0, gStatsPromoted = 0, gStatsStart = 0;
+static void NightStatsNursery(JSContext* cx, JS::GCNurseryProgress p,
+                              JS::GCReason, void*) {
+  uint64_t b = JS_GetGCParameter(cx, JSGC_BYTES);
+  if (p == JS::GCNurseryProgress::GC_NURSERY_COLLECTION_START) {
+    gStatsStart = b;
+  } else {
+    gStatsMinor++;
+    if (b > gStatsStart) {
+      gStatsPromoted += b - gStatsStart;
+    }
+  }
+}
+static void NightStatsDump() {
+  fprintf(stderr,
+          "night: gcstats minor %llu promoted %llu major %u stack-traces "
+          "%llu stack-slots %llu\n",
+          (unsigned long long)gStatsMinor, (unsigned long long)gStatsPromoted,
+          unsigned(JS_GetGCParameter(gStatsCx, JSGC_MAJOR_GC_NUMBER)),
+          (unsigned long long)js::nightrt::gNightStackTraces,
+          (unsigned long long)js::nightrt::gNightStackTracedSlots);
+}
+
 JS_PUBLIC_API bool JS::NightActivate(JSContext* cx) {
   NightCensusTraceRearm();
+  if (getenv("NIGHT_GC_STATS") && !gStatsCx) {
+    gStatsCx = cx;
+    JS::AddGCNurseryCollectionCallback(cx, NightStatsNursery, nullptr);
+    atexit(NightStatsDump);
+  }
   if (gNightActivated) {
     return true;
   }

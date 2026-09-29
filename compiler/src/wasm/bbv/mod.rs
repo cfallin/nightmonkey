@@ -1239,6 +1239,7 @@ pub fn translate_script(
                         crate::diag_line!("night: viz thislocal sid#{source_id} loc {l}");
                     }
                 }
+                crate::wasm::pad_body(&mut t.body, u64::from(source_id.get()));
                 return Ok(Outcome::Compiled {
                     sig,
                     body: t.body,

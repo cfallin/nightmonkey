@@ -2607,3 +2607,47 @@ pub fn translate_all(
         ctor_nslots_size,
     })
 }
+
+/// Measurement aid (`NIGHT_PAD_SEED=s`): give `body` a never-taken entry
+/// arm of a seed-dependent number of byte stores, so a build's functions
+/// land at different addresses (code placement moves Octane scores by up
+/// to 15% with byte-identical hot code). `argc` is param 2 of the shared
+/// signature; no call passes the value tested.
+pub(crate) fn pad_body(body: &mut waffle::FunctionBody, key: u64) {
+    use waffle::entity::EntityRef;
+    use waffle::{BlockTarget, MemoryArg, Terminator};
+    let Some(seed) = std::env::var("NIGHT_PAD_SEED").ok().and_then(|s| s.parse::<u64>().ok()) else {
+        return;
+    };
+    let mut h = seed ^ key.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    h ^= h >> 29;
+    h = h.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    h ^= h >> 32;
+    let n = h % 97;
+    let old = body.entry;
+    let params: Vec<Type> = body.blocks[old].params.iter().map(|&(t, _)| t).collect();
+    if n == 0 || params.len() < 3 || params[2] != Type::I32 {
+        return;
+    }
+    let entry = body.add_block();
+    let args: Vec<waffle::Value> = params.iter().map(|&t| body.add_blockparam(entry, t)).collect();
+    let magic = body.add_op(entry, Operator::I32Const { value: 0x7fff_fff3 }, &[], &[Type::I32]);
+    let cond = body.add_op(entry, Operator::I32Eq, &[args[2], magic], &[Type::I32]);
+    let pad = body.add_block();
+    for i in 0..n as u32 {
+        let a = body.add_op(pad, Operator::I32Const { value: 16 + 8 * i }, &[], &[Type::I32]);
+        let v = body.add_op(pad, Operator::I32Const { value: i }, &[], &[Type::I32]);
+        let memory = MemoryArg { align: 0, offset: 0, memory: waffle::Memory::new(0) };
+        body.add_op(pad, Operator::I32Store8 { memory }, &[a, v], &[]);
+    }
+    body.set_terminator(pad, Terminator::Br { target: BlockTarget { block: old, args: args.clone() } });
+    body.set_terminator(
+        entry,
+        Terminator::CondBr {
+            cond,
+            if_true: BlockTarget { block: pad, args: vec![] },
+            if_false: BlockTarget { block: old, args },
+        },
+    );
+    body.entry = entry;
+}
