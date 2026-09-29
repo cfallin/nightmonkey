@@ -316,7 +316,7 @@ pub(crate) const IC_WAY_HOLDERPTR: u32 = 8;
 pub(crate) const IC_SET_RECVSHAPE: u32 = 0;
 pub(crate) const IC_SET_SLOTENC: u32 = 8;
 pub(crate) const IC_SET_ABSSLOT: u32 = 12;
-pub(super) const IC_POLY_SENTINEL: u32 = 1;
+pub(crate) const IC_POLY_SENTINEL: u32 = 1;
 
 pub(crate) const IC_TRANS_OLDSHAPE: u32 = 0;
 pub(crate) const IC_TRANS_NEWSHAPE: u32 = 4;

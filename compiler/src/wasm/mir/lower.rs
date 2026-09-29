@@ -4623,11 +4623,35 @@ impl<'a> Lower<'a> {
         let cache = self.atoms.next_prop_cache();
         let way = self.i32c(IC_WAY_ADDR_PLACEHOLDER);
         self.prop_ic_patches.push((way, cache * INLINE_IC_STRIDE));
-        let (trans, slow) = (self.body.add_block(), self.body.add_block());
-        self.set_ic_way0(inst, recv, val, way, trans)?;
+        let (poly, trans, slow) = (self.body.add_block(), self.body.add_block(), self.body.add_block());
+        self.set_ic_way0(inst, recv, val, way, poly)?;
+        // A site past one shape (way 0 sentineled) stores through the mega
+        // table, probed by the module's `night_ic_set_cold` (bbv's arm).
+        self.cur = poly;
+        let cs = self.load_i32(way, IC_SET_RECVSHAPE);
+        let sentinel = self.i32c(crate::wasm::bbv::abi::IC_POLY_SENTINEL);
+        let is_poly = self.bin(Operator::I32Eq, cs, sentinel, Type::I32);
+        let mega = self.body.add_block();
+        self.cond_br(is_poly, Self::to(mega), Self::to(trans));
+        self.cur = mega;
+        self.set_ic_mega(inst, at, recv, val, way, slow)?;
         self.cur = trans;
         self.set_ic_trans(inst, name, recv, val, way, slow)?;
         self.cur = slow;
+        if let Some(census) = self.exit_census {
+            static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let site = self.f.insts[inst].attach.and_then(|a| self.f.attachments[a].site);
+            crate::diag_line!(
+                "night: mir setmiss {id} sid#{} frame {} {:?} {}",
+                self.f.script,
+                self.cur_frame,
+                site,
+                std::string::String::from_utf16_lossy(self.mm.atoms[name].chars())
+            );
+            let (k, i) = (self.i32c(crate::options::MIR_GUARD_CENSUS_KIND + 3), self.i32c(id));
+            self.call1(census, &[k, i], Type::I32);
+        }
         let vouch = self.vouch_types(inst, recv, val);
         let (c, sv) = (self.i32c(cache), self.i32c(u32::from(strict)));
         let sv = self.bin(Operator::I32Or, sv, vouch, Type::I32);
@@ -4814,6 +4838,55 @@ impl<'a> Lower<'a> {
     /// `ok_clean`; else branch to `slow`. The store bypasses the engine's
     /// choke, so it also requires the object's word to carry no bit it
     /// could falsify: RANGES never, TYPES unless `val` is a number.
+    /// A set IC's mega arm: the (shape, atom) row `night_ic_set_cold`
+    /// finds in the mega-set table names the slot, stored as way 0's is;
+    /// no row takes `slow`.
+    fn set_ic_mega(&mut self, inst: mir::Inst, atom: Value, recv: Value, val: Value, way: Value, slow: Block) -> R<()> {
+        use crate::region_shape::{MEGA_SET_ABS_SLOT_OFF, MEGA_SET_SLOT_ENC_OFF};
+        let num = matches!(self.ty(self.f.insts[inst].args[1]), MType::Val(s) if s.tags.subset_of(TagSet::NUMBER));
+        let tag = self.tag_of(recv);
+        let is_obj = self.tag_is(tag, TAG_OBJECT as u32);
+        self.check(is_obj, slow);
+        let obj = self.un(Operator::I32WrapI64, recv, Type::I32);
+        let shape = self.load_i32(obj, SHAPE_OFFSET);
+        let cold = self.call1(self.h.ic_set_cold, &[shape, way, atom], Type::I64);
+        let found = self.un(Operator::I64Eqz, cold, Type::I32);
+        let hit = self.un(Operator::I32Eqz, found, Type::I32);
+        if let Some(census) = self.exit_census {
+            static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let site = self.f.insts[inst].attach.and_then(|a| self.f.attachments[a].site);
+            crate::diag_line!("night: mir megaset {id} sid#{} {:?}", self.f.script, site);
+            let k = self.i32c(crate::options::MIR_GUARD_CENSUS_KIND + 4);
+            let base = self.i32c(id * 2);
+            let i = self.bin(Operator::I32Add, base, hit, Type::I32);
+            self.call1(census, &[k, i], Type::I32);
+        }
+        self.check(hit, slow);
+        let entry = self.un(Operator::I32WrapI64, cold, Type::I32);
+        let w = self.load_i32(obj, OBJ_CLASS_IDX_OFFSET);
+        self.check_store_bits(inst, obj, w, val, num, slow);
+        let enc = self.load_i32(entry, MEGA_SET_SLOT_ENC_OFF);
+        let one = self.i32c(1);
+        let dynamic = self.bin(Operator::I32And, enc, one, Type::I32);
+        let not1 = self.i32c(!1);
+        let off = self.bin(Operator::I32And, enc, not1, Type::I32);
+        let slots = self.load_i32(obj, NATIVE_SLOTS_OFFSET);
+        let base = self.op(Operator::Select, &[slots, obj, dynamic], Some(Type::I32));
+        let addr = self.bin(Operator::I32Add, base, off, Type::I32);
+        if !num {
+            self.pre_barrier(addr, 0);
+        }
+        self.store_i64(addr, 0, val);
+        if !num {
+            let abs = self.load_i32(entry, MEGA_SET_ABS_SLOT_OFF);
+            self.post_barrier(self.h.post_write_barrier, obj, abs, val);
+        }
+        let t = self.edge(inst, 0, &[])?;
+        self.terminate(Terminator::Br { target: t });
+        Ok(())
+    }
+
     fn set_ic_way0(&mut self, inst: mir::Inst, recv: Value, val: Value, way: Value, slow: Block) -> R<()> {
         let num = matches!(self.ty(self.f.insts[inst].args[1]), MType::Val(s) if s.tags.subset_of(TagSet::NUMBER));
         let tag = self.tag_of(recv);
@@ -4937,30 +5010,40 @@ impl<'a> Lower<'a> {
         let (keyed, go) = (self.body.add_block(), self.body.add_block());
         self.cond_br(slots, Self::to(keyed), Self::to(go));
         self.cur = keyed;
+        // The live layout key: the early key under the CONSTRUCTING
+        // sentinel, else the stamped identity (they are disjoint).
+        let ksh = self.i32c(EARLY_KEY_SHIFT);
+        let kraw = self.bin(Operator::I32ShrU, w, ksh, Type::I32);
+        let km = self.i32c(EARLY_KEY_MAX);
+        let k_sent = self.bin(Operator::I32And, kraw, km, Type::I32);
+        let m16 = self.i32c(0xFFFF);
+        let k_idx = self.bin(Operator::I32And, w, m16, Type::I32);
+        let k = self.bin(Operator::I32Or, k_sent, k_idx, Type::I32);
+        // An add past the layout's extent (its bound in the this-cells
+        // table; 0 = unknown) leaves every predicted slot where it was:
+        // SLOTS holds (bbv's runtime add check).
+        let three = self.i32c(3);
+        let koff = self.bin(Operator::I32Shl, k, three, Type::I32);
+        let tbase = self.i32c(self.h.this_cells_base.wrapping_sub(8));
+        let taddr = self.bin(Operator::I32Add, tbase, koff, Type::I32);
+        let bound = self.load_i32(taddr, 0);
+        let z = self.i32c(0);
+        let known = self.bin(Operator::I32Ne, bound, z, Type::I32);
+        let keyed_k = self.bin(Operator::I32Ne, k, z, Type::I32);
+        let past = self.bin(Operator::I32GeU, slot_off, bound, Type::I32);
+        let past = self.bin(Operator::I32And, past, known, Type::I32);
+        let past = self.bin(Operator::I32And, past, keyed_k, Type::I32);
         let preds = self.add_preds.get(&name).cloned().unwrap_or_default();
-        if preds.is_empty() {
-            self.terminate(Terminator::Br { target: Self::to(slow) });
-        } else {
-            // The live layout key: the early key under the CONSTRUCTING
-            // sentinel, else the stamped identity (they are disjoint).
-            let ksh = self.i32c(EARLY_KEY_SHIFT);
-            let kraw = self.bin(Operator::I32ShrU, w, ksh, Type::I32);
-            let km = self.i32c(EARLY_KEY_MAX);
-            let k_sent = self.bin(Operator::I32And, kraw, km, Type::I32);
-            let m16 = self.i32c(0xFFFF);
-            let k_idx = self.bin(Operator::I32And, w, m16, Type::I32);
-            let k = self.bin(Operator::I32Or, k_sent, k_idx, Type::I32);
-            let mut hit = self.i32c(0);
-            for (key, off) in preds {
-                let kv = self.i32c(key);
-                let ke = self.bin(Operator::I32Eq, k, kv, Type::I32);
-                let ov = self.i32c(off);
-                let oe = self.bin(Operator::I32Eq, slot_off, ov, Type::I32);
-                let both = self.bin(Operator::I32And, ke, oe, Type::I32);
-                hit = self.bin(Operator::I32Or, hit, both, Type::I32);
-            }
-            self.cond_br(hit, Self::to(go), Self::to(slow));
+        let mut hit = past;
+        for (key, off) in preds {
+            let kv = self.i32c(key);
+            let ke = self.bin(Operator::I32Eq, k, kv, Type::I32);
+            let ov = self.i32c(off);
+            let oe = self.bin(Operator::I32Eq, slot_off, ov, Type::I32);
+            let both = self.bin(Operator::I32And, ke, oe, Type::I32);
+            hit = self.bin(Operator::I32Or, hit, both, Type::I32);
         }
+        self.cond_br(hit, Self::to(go), Self::to(slow));
         self.cur = go;
         let addr = self.bin(Operator::I32Add, obj, slot_off, Type::I32);
         self.store_i64(addr, 0, val);
