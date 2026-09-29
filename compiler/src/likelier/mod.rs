@@ -422,6 +422,10 @@ impl<'a> Solver<'a> {
         for sid in sorted_keys(&self.engine.script_cons) {
             self.engine.instantiate(sid, CTX0);
         }
+        self.drain();
+    }
+
+    fn drain(&mut self) {
         while let Some((c, ctx)) = self.engine.pop() {
             if self.engine.eval_core(c, ctx) {
                 continue;
@@ -432,6 +436,39 @@ impl<'a> Solver<'a> {
             let handled = self.eval_call(c, ctx);
             debug_assert!(handled, "unhandled constraint kind");
         }
+    }
+
+    /// Check that the solve reached a fixpoint: re-evaluate every live
+    /// constraint once and count the cells that grow. A cell that grows
+    /// here was waiting on state its readers never subscribed to (region
+    /// membership, dispatch tables), so the answer depended on evaluation
+    /// order -- and a debug build said so only through the lattice-height
+    /// bound, much later and far from the cause. Returns the number of
+    /// cells that changed; zero at a true fixpoint.
+    fn verify_fixpoint(&mut self) -> usize {
+        let before: Vec<TypeSet> = self.engine.cells.iter().map(|c| c.ts.clone()).collect();
+        for sid in sorted_keys(&self.engine.script_cons) {
+            let ctxs = self.engine.live_ctxs.get(&sid).cloned().unwrap_or_default();
+            let cons = self.engine.script_cons.get(&sid).cloned().unwrap_or_default();
+            for &ctx in &ctxs {
+                for &c in &cons {
+                    self.engine.enqueue(c, ctx);
+                }
+            }
+        }
+        self.drain();
+        let changed: Vec<usize> = (0..before.len())
+            .filter(|&i| self.engine.cells[i].ts != before[i])
+            .collect();
+        for &i in changed.iter().take(10) {
+            crate::diag_line!(
+                "likelier: not a fixpoint: {:?}: {:?} -> {:?}",
+                self.engine.cells[i].key,
+                before[i],
+                self.engine.cells[i].ts
+            );
+        }
+        changed.len()
     }
 
     /// Phase counts and timings, plus the escape / AnyObject-transition
@@ -574,6 +611,13 @@ pub fn analyze(
     sv.seed();
     sv.resolve_shared_ctor_sites();
     sv.solve();
+    if cfg!(debug_assertions) || opts.diagnostics.verify_fixpoint {
+        let n = sv.verify_fixpoint();
+        if opts.diagnostics.verify_fixpoint {
+            crate::diag_line!("likelier: fixpoint check: {n} cells changed");
+        }
+        debug_assert_eq!(n, 0, "likelier: the solve did not reach a fixpoint");
+    }
     sv.settle_unresolved_recv_sites();
     sv.trace_site_dump();
     // The census runs last so it can report what the emission phase

@@ -85,6 +85,8 @@ Diagnostics
   --trace-cell <c>         trace every raise into one analysis cell,
                            arg:<sid>:<n> or local:<sid>:<n>
   --trace-field <name>     trace every heap read/write of one property name
+  --verify-fixpoint        re-evaluate every constraint after the analysis
+                           fixpoint and report cells that still grow
   --trace-site <sid>:<pc>  trace the per-context evaluation of one read site
   --dump-propgap           per-site census of why a property access got no
                            class-fact row (the coverage half of code size)

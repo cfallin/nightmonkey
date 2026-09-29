@@ -44,7 +44,9 @@
 //! Field *values* have no such rule: they always join.
 
 use super::builtins::{self, NativeKind};
-use super::engine::{AllocKind, CellId, CellKey, ConId, Constraint, ElemBuiltinKind, SEED};
+use super::engine::{
+    AllocKind, CellId, CellKey, ConId, Constraint, ElemBuiltinKind, SideKey, SEED,
+};
 use super::types::{observe, Agreed};
 use super::types::{AbsId, AbsLabels, ClassId, CtxId, FnId, NameId, ObjType, TypeSet, CTX0};
 use super::{RecvKind, SharedCtorSite, Solver};
@@ -1040,6 +1042,17 @@ impl Solver<'_> {
         let _ = self.engine.join_ts(out, &v);
     }
 
+    /// Subscribe an access whose cells depend on region membership: an
+    /// `AnyOf` receiver (the region's views and method tables) and an
+    /// element access through `ClassAny` (the region root's view).
+    fn subscribe_region_recv(&mut self, rts: &TypeSet, is_elems: bool, user: (ConId, CtxId)) {
+        match rts.obj {
+            ObjType::AnyOf(r) => self.engine.subscribe_region(r, user),
+            ObjType::ClassAny(c) if is_elems => self.engine.subscribe_region(c, user),
+            _ => {}
+        }
+    }
+
     /// The class of the view a receiver of class `c` reads `name` through.
     /// Elements are read through the region root, so a merged array
     /// population shares one element node; every other name reads its own
@@ -1420,7 +1433,9 @@ impl Solver<'_> {
                 let region_contributed = self.read_into(&rts, name, callee_pos, user, &mut out);
                 if callee_pos && region_contributed {
                     if let super::engine::CKey::Var(v) = dst {
-                        self.region_calls.insert((sid, v));
+                        if self.region_calls.insert((sid, v)) {
+                            self.engine.fire_side(SideKey::CallVar(sid, v));
+                        }
                     }
                 }
                 // Recorded for every elems read, not just callee position:
@@ -1429,7 +1444,9 @@ impl Solver<'_> {
                 // fallback needs the same provenance there.
                 if name == self.names_of.elems {
                     if let super::engine::CKey::Var(v) = dst {
-                        self.elems_callee_vars.insert((sid, v), recv);
+                        if self.elems_callee_vars.insert((sid, v), recv) != Some(recv) {
+                            self.engine.fire_side(SideKey::CallVar(sid, v));
+                        }
                     }
                 }
                 self.note_site_recv(sid, pc, &rts);
@@ -1520,6 +1537,7 @@ impl Solver<'_> {
         self.trace_field("read", name, rts, None, user);
         let mut region_contributed = false;
         let is_elems = name == self.names_of.elems;
+        self.subscribe_region_recv(rts, is_elems, user);
         let chain_ok = !is_elems;
         // Prim-receiver method resolution: a call off a known-string or
         // known-numeric receiver resolves modeled String/Number.prototype
@@ -1870,6 +1888,7 @@ impl Solver<'_> {
     ) {
         self.trace_field("write", name, rts, Some(v), user);
         let is_elems = name == self.names_of.elems;
+        self.subscribe_region_recv(rts, is_elems, user);
         if rts.fns.is_multi() {
             self.do_escape(v, user);
         } else {

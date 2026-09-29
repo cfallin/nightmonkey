@@ -98,6 +98,10 @@ pub struct Diagnostics {
     pub trace_cell: Option<String>,
     /// Trace every heap read and write of one property name.
     pub trace_field: Option<String>,
+    /// After the analysis fixpoint, re-evaluate every live constraint once
+    /// and report any cell that still grows: a dependency the solver does
+    /// not re-fire on. Always on (and fatal) in debug-assertion builds.
+    pub verify_fixpoint: bool,
     /// Trace the per-context evaluation of one read site, `<sid>:<pc>`.
     pub trace_site: Option<String>,
     /// Tier coverage: one `night: tier <sid> <tier>` line per translated
@@ -129,6 +133,7 @@ impl Diagnostics {
             || self.redundant
             || self.trace_cell.is_some()
             || self.trace_field.is_some()
+            || self.verify_fixpoint
             || self.trace_site.is_some()
             || self.tiers
             || self.mir
@@ -286,6 +291,7 @@ impl Options {
             "--dump-mir" => d.mir = true,
             "--trace-cell" => d.trace_cell = Some(arg(flag)?),
             "--trace-field" => d.trace_field = Some(arg(flag)?),
+            "--verify-fixpoint" => d.verify_fixpoint = true,
             "--trace-site" => d.trace_site = Some(arg(flag)?),
             "--dump-bytecode" => d.disasm = Some(Vec::new()),
             "--dump-bbv" => d.bbv = true,

@@ -694,6 +694,20 @@ impl TypeSet {
     /// predictions see the loser's writes (dropped fn ids are recorded
     /// too but currently unconsumed). Returns whether `self` grew.
     pub fn join_from(&mut self, o: &TypeSet, meta: &[AbsLabels], sink: &mut JoinSink) -> bool {
+        let (rest, obj) = self.join_parts_from(o, meta, sink);
+        rest || obj
+    }
+
+    /// [`TypeSet::join_from`], reporting separately whether the object part
+    /// and whether anything else grew. The engine's join overrides the
+    /// object part afterwards (region meets), so only it can tell whether
+    /// that part really changed.
+    pub fn join_parts_from(
+        &mut self,
+        o: &TypeSet,
+        meta: &[AbsLabels],
+        sink: &mut JoinSink,
+    ) -> (bool, bool) {
         let mut changed = false;
         if !o.prims.subset_of(self.prims) {
             self.prims |= o.prims;
@@ -712,10 +726,8 @@ impl TypeSet {
                 }
             }
         }
-        if joined != self.obj {
-            self.obj = joined;
-            changed = true;
-        }
+        let obj_changed = joined != self.obj;
+        self.obj = joined;
         if o.range > self.range {
             self.range = o.range;
             changed = true;
@@ -725,7 +737,7 @@ impl TypeSet {
             self.interval = h;
             changed = true;
         }
-        changed
+        (changed, obj_changed)
     }
 
     /// The purely-numeric projection: the primitive set, when every value

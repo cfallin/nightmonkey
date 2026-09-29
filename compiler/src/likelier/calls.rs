@@ -8,7 +8,7 @@
 //! depth cap, callee cap, recursion collapse, global budget -- all bind
 //! into the callee's generic context instead.
 
-use super::engine::{CellKey, ConId, Constraint, SEED};
+use super::engine::{CellKey, ConId, Constraint, SideKey, SEED};
 use super::stats::Stats;
 use super::types::{BoundedFnSet, CtxId, FnId, ObjType, TypeSet, CTX0};
 use super::Solver;
@@ -78,6 +78,14 @@ impl Ctxs {
             }
             cur = f.parent;
         }
+        // A context minted earlier stays this edge's context: the budget
+        // gates minting, not re-evaluation. Checking the budget first would
+        // send a call re-evaluated after it ran out (an input grew) to
+        // CTX0, joining that caller's arguments into the callee's generic
+        // row, for every caller, while its own row sat unchanged.
+        if let Some(&c) = self.ids.get(&(ctx, site, callee)) {
+            return c;
+        }
         let depth = self.frames[ctx.0 as usize].depth;
         if depth >= self.depth_cap {
             stats.call_ctx_degraded_depth += 1;
@@ -86,9 +94,6 @@ impl Ctxs {
         if stats.ctxs_spent >= self.budget {
             stats.call_ctx_degraded_budget += 1;
             return CTX0;
-        }
-        if let Some(&c) = self.ids.get(&(ctx, site, callee)) {
-            return c;
         }
         let c = CtxId(u32::try_from(self.frames.len()).unwrap());
         self.frames.push(CtxFrame {
@@ -312,6 +317,9 @@ impl Solver<'_> {
                 } else {
                     self.note_site_native(script, pc, &cts.fns);
                 }
+                if let super::engine::CKey::Var(v) = callee {
+                    self.engine.subscribe_side(SideKey::CallVar(script, v), user);
+                }
                 let region_fed = matches!(callee, super::engine::CKey::Var(v)
                     if self.region_calls.contains(&(script, v)));
                 if region_fed {
@@ -406,6 +414,7 @@ impl Solver<'_> {
                                 let rcell = self.engine.resolve(script, ctx, rk);
                                 let rts = self.engine.read(rcell, user);
                                 if let ObjType::One(a) = rts.obj {
+                                    self.engine.subscribe_side(SideKey::Table(a), user);
                                     if self.table_members.contains_key(&a) {
                                         self.bind_table_args(a, script, ctx, &args, user);
                                     }
@@ -544,18 +553,23 @@ impl Solver<'_> {
                     // caller-chained contexts fan out past the budget).
                     if tts.fns.is_multi() && form == CallForm::Call {
                         if let super::engine::CKey::Var(v) = target {
+                            self.engine.subscribe_side(SideKey::CallVar(script, v), user);
                             if let Some(&rk) = self.elems_callee_vars.get(&(script, v)) {
                                 let rcell = self.engine.resolve(script, ctx, rk);
                                 let rts = self.engine.read(rcell, user);
                                 let members: Vec<FnId> = match rts.obj {
-                                    ObjType::One(a) => self
-                                        .table_members
-                                        .get(&a)
-                                        .map_or_else(Vec::new, |m| m.iter().copied().collect()),
-                                    ObjType::ClassAny(c) => self
-                                        .class_table_members
-                                        .get(&c)
-                                        .map_or_else(Vec::new, |m| m.iter().copied().collect()),
+                                    ObjType::One(a) => {
+                                        self.engine.subscribe_side(SideKey::Table(a), user);
+                                        self.table_members
+                                            .get(&a)
+                                            .map_or_else(Vec::new, |m| m.iter().copied().collect())
+                                    }
+                                    ObjType::ClassAny(c) => {
+                                        self.engine.subscribe_side(SideKey::ClassTable(c), user);
+                                        self.class_table_members
+                                            .get(&c)
+                                            .map_or_else(Vec::new, |m| m.iter().copied().collect())
+                                    }
                                     _ => Vec::new(),
                                 };
                                 let mut members = members;
@@ -831,7 +845,9 @@ impl Solver<'_> {
     /// Insert members into a table's list (capped, censused) and extend
     /// the standing links if the table already has dispatch sites.
     pub(super) fn add_table_members(&mut self, a: super::types::AbsId, ids: &[FnId]) {
+        let fresh = !self.table_members.contains_key(&a);
         let e = self.table_members.entry(a).or_default();
+        let mut grew = fresh;
         for &f in ids {
             if e.len() >= TABLE_MEMBER_CAP {
                 if !e.contains(&f) {
@@ -839,15 +855,22 @@ impl Solver<'_> {
                 }
                 continue;
             }
-            e.insert(f);
+            grew |= e.insert(f);
+        }
+        if grew {
+            self.engine.fire_side(SideKey::Table(a));
         }
         if let Some(c) = self.heap[a].class {
             let ce = self.class_table_members.entry(c).or_default();
+            let mut grew = false;
             for &f in ids {
                 if ce.len() >= TABLE_MEMBER_CAP {
                     break;
                 }
-                ce.insert(f);
+                grew |= ce.insert(f);
+            }
+            if grew {
+                self.engine.fire_side(SideKey::ClassTable(c));
             }
         }
         self.install_table_links(a);

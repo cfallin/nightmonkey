@@ -278,6 +278,19 @@ pub enum AllocKind {
     Snapshot(SourceObjectId),
 }
 
+/// Solver state outside the cell graph that a constraint's evaluation
+/// consults (and so must re-fire on): see [`Engine::subscribe_side`].
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum SideKey {
+    /// `region_calls` / `elems_callee_vars` at `(script, var)`: whether a
+    /// call through that local dispatches as a region or fn-table call.
+    CallVar(ScriptId, VarId),
+    /// `table_members` of one fn-table abstraction.
+    Table(AbsId),
+    /// `class_table_members` of one class.
+    ClassTable(ClassId),
+}
+
 pub struct Cell {
     pub key: CellKey,
     pub ts: TypeSet,
@@ -335,6 +348,16 @@ pub struct Engine {
     region_parent: HashMap<ClassId, ClassId>,
     /// Region root -> member classes (root included). Absent = singleton.
     pub region_members: HashMap<ClassId, Vec<ClassId>>,
+    /// Region root -> the constraint evaluations that read the region's
+    /// membership (a region view or method union, an element access
+    /// through the root). A merge changes what they would compute without
+    /// changing the receiver cell they subscribed to, so `union_regions`
+    /// re-fires them.
+    region_subs: HashMap<ClassId, Vec<(ConId, CtxId)>>,
+    region_sub_set: HashSet<(ClassId, ConId, CtxId)>,
+    /// Subscribers of side state, by key (see [`SideKey`]).
+    side_subs: HashMap<SideKey, Vec<(ConId, CtxId)>>,
+    side_sub_set: HashSet<(SideKey, ConId, CtxId)>,
     /// Classes whose instances are arrays: the site classes minted for
     /// plain-array allocations. Membership decides which meet rule two
     /// classed objects take (see `join_ts`).
@@ -469,6 +492,34 @@ impl Engine {
         cur
     }
 
+    /// Subscribe `user` to a piece of side state it consulted, so a later
+    /// change to it re-fires `user` the way a cell's growth would. The
+    /// consumer subscribes on every lookup, found or not: an absent entry
+    /// that appears later changes the answer too.
+    pub fn subscribe_side(&mut self, k: SideKey, user: (ConId, CtxId)) {
+        if self.side_sub_set.insert((k, user.0, user.1)) {
+            self.side_subs.entry(k).or_default().push(user);
+        }
+    }
+
+    /// The side state under `k` changed: re-fire its subscribers.
+    pub fn fire_side(&mut self, k: SideKey) {
+        for &(c, ctx) in self.side_subs.get(&k).map_or(&[][..], |v| &v[..]) {
+            if self.inq.insert((c, ctx)) {
+                self.worklist.push_back((c, ctx));
+            }
+        }
+    }
+
+    /// Subscribe `user` to the membership of `c`'s region: it re-fires
+    /// when the region merges with another.
+    pub fn subscribe_region(&mut self, c: ClassId, user: (ConId, CtxId)) {
+        let root = self.region_root(c);
+        if self.region_sub_set.insert((root, user.0, user.1)) {
+            self.region_subs.entry(root).or_default().push(user);
+        }
+    }
+
     /// Merge two classes' regions (min root wins, deterministically) and
     /// chain the loser's elems view into the winner's, so a read through
     /// the merged root sees both populations' elements. Merging a class
@@ -483,6 +534,17 @@ impl Engine {
         }
         let (win, lose) = if rc < rd { (rc, rd) } else { (rd, rc) };
         self.region_parent.insert(lose, win);
+        let moved = self.region_subs.remove(&lose).unwrap_or_default();
+        for &(c, ctx) in &moved {
+            if self.region_sub_set.insert((win, c, ctx)) {
+                self.region_subs.entry(win).or_default().push((c, ctx));
+            }
+        }
+        for &(c, ctx) in self.region_subs.get(&win).map_or(&[][..], |v| &v[..]) {
+            if self.inq.insert((c, ctx)) {
+                self.worklist.push_back((c, ctx));
+            }
+        }
         let lm = self
             .region_members
             .remove(&lose)
@@ -501,6 +563,18 @@ impl Engine {
                 name: en,
             });
             self.link(from, to);
+            // And down: an element write through the merged region lands
+            // in the root's ClassField, which a `One` reader of a member
+            // never reads (it reads its own class's). Linking the root's
+            // into the loser's (and so, transitively, into every member
+            // merged into it before) lets those readers see the write.
+            let fields = [win, lose].map(|class| {
+                let f = self.cell(CellKey::ClassField { class, name: en });
+                let v = self.cell(CellKey::ClassView { class, name: en });
+                self.link(f, v);
+                f
+            });
+            self.link(fields[0], fields[1]);
         }
         win
     }
@@ -549,6 +623,36 @@ impl Engine {
         }
     }
 
+    /// The engine's object meet for two different object parts, when it
+    /// differs from the pure `join_obj`: two array populations meet as the
+    /// union of their regions, two classed non-array parts as `AnyOf` the
+    /// union (see [`Engine::join_ts`]). `None` leaves the pure join.
+    fn region_meet(
+        &mut self,
+        a: super::types::ObjType,
+        b: super::types::ObjType,
+    ) -> Option<super::types::ObjType> {
+        use super::types::ObjType;
+        match (self.array_region_of(a), self.array_region_of(b)) {
+            (Some(c), Some(d)) => Some(ObjType::ClassAny(self.union_regions(c, d))),
+            _ => {
+                let pure = super::types::join_obj(a, b, &self.abs_labels);
+                if pure == ObjType::AnyObject {
+                    let (ca, aa) = self.class_and_arrayness(a);
+                    let (cb, ab) = self.class_and_arrayness(b);
+                    match (ca, cb) {
+                        (Some(c), Some(d)) if !aa && !ab => {
+                            Some(ObjType::AnyOf(self.union_regions(c, d)))
+                        }
+                        _ => None,
+                    }
+                } else {
+                    None
+                }
+            }
+        }
+    }
+
     /// Engine-aware typeset join: `TypeSet::join_from` plus the two cases
     /// where two classed object parts, instead of collapsing to AnyObject,
     /// merge their classes into one region and meet as that region.
@@ -574,32 +678,42 @@ impl Engine {
     /// longer tell them apart.
     pub fn join_ts(&mut self, dst: &mut TypeSet, src: &TypeSet) -> bool {
         use super::types::ObjType;
-        let jo = match (self.array_region_of(dst.obj), self.array_region_of(src.obj)) {
-            (Some(c), Some(d)) => Some(ObjType::ClassAny(self.union_regions(c, d))),
-            _ => {
-                let pure = super::types::join_obj(dst.obj, src.obj, &self.abs_labels);
-                if pure == ObjType::AnyObject {
-                    let (ca, aa) = self.class_and_arrayness(dst.obj);
-                    let (cb, ab) = self.class_and_arrayness(src.obj);
-                    match (ca, cb) {
-                        (Some(c), Some(d)) if !aa && !ab => {
-                            Some(ObjType::AnyOf(self.union_regions(c, d)))
-                        }
-                        _ => None,
-                    }
-                } else {
-                    None
-                }
-            }
+        // Identical object parts meet as themselves: the join must be
+        // idempotent. A region meet here would turn an array `One(a)` into
+        // `ClassAny` on the second raise of the same value, so whether a
+        // cell kept its abstraction depended on how often the scheduler
+        // happened to re-raise it.
+        let jo = if dst.obj == src.obj {
+            None
+        } else {
+            self.region_meet(dst.obj, src.obj)
         };
-        let changed = dst.join_from(src, &self.abs_labels, &mut self.sink);
+        // Decide the object part's change from its final label: the pure
+        // join may widen what the region meet then sets back (a stale,
+        // already-merged class meeting its root), and counting that as
+        // growth re-fires the cell for nothing.
+        let obj = dst.obj;
+        let (rest, obj_changed) = dst.join_parts_from(src, &self.abs_labels, &mut self.sink);
         match jo {
-            Some(j) if dst.obj != j => {
-                dst.obj = j;
-                true
+            // The same region under its current root: a relabel, not
+            // growth. Region accesses resolve the root themselves (and
+            // re-fire on merges), so a label that has gone stale since the
+            // cell was last raised still names the whole region.
+            Some(ObjType::AnyOf(r)) if matches!(obj, ObjType::AnyOf(o) if self.region_root(o) == r) => {
+                dst.obj = obj;
+                rest
             }
-            Some(_) => changed,
-            None => changed,
+            Some(ObjType::ClassAny(r))
+                if matches!(obj, ObjType::ClassAny(o) if self.region_root(o) == r) =>
+            {
+                dst.obj = obj;
+                rest
+            }
+            Some(j) => {
+                dst.obj = j;
+                rest || j != obj
+            }
+            None => rest || obj_changed,
         }
     }
 
@@ -651,15 +765,13 @@ impl Engine {
         {
             // No-growth fast path: cells change O(1) times but are raised
             // constantly, and the clone + engine join per raise is
-            // allocation-heavy. Conservatively limited to raises that
-            // cannot trigger a region merge or relabel: prim/fn/range/
-            // interval subset with an Empty or identical non-array obj
-            // part.
+            // allocation-heavy. Limited to raises that cannot trigger a
+            // region merge or relabel: prim/fn/range/interval subset with
+            // an Empty or identical obj part (identical parts never meet).
             let cur = &self.cells[id.0 as usize].ts;
             if ts.prims | cur.prims == cur.prims
                 && ts.fns.is_subset_of(&cur.fns)
-                && (ts.obj == super::types::ObjType::Empty
-                    || (ts.obj == cur.obj && self.array_region_of(ts.obj).is_none()))
+                && (ts.obj == super::types::ObjType::Empty || ts.obj == cur.obj)
                 && ts.range <= cur.range
                 && cur.interval.subsumes(ts.interval)
             {
