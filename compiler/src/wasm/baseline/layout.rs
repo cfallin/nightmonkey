@@ -15,14 +15,18 @@
 //! vp              = sp + 8*max(0, argc-nargs) if the script reads actuals past
 //!                   its formals (arguments, rest, GetActualArg, mapped args), else sp
 //! vp+L+8j         locals, j < nlocals             L = 16 + 8*nargs
-//! vp+E            env chain
-//! vp+E+8          arguments object
-//! vp+E+16         new.target
-//! vp+E+24         rval
-//! vp+E+32         resume word                     (int32 Value, see `ResumeWord`)
-//! vp+E+40         onramp backoff                  (int32 Value, see `backoff`)
-//! vp+O+8k         operand stack, k < depth(pc)    O = E + 48
+//! vp+E            env chain                       (only with `has_env`)
+//!   then          arguments object                (only with `has_args_obj`)
+//!   then          new.target                      (only with `has_new_target`)
+//! vp+R            rval                            R = E + 8*(slots above)
+//! vp+R+8          resume word                     (int32 Value, see `ResumeWord`)
+//! vp+R+16         onramp backoff                  (int32 Value, see `backoff`)
+//! vp+O+8k         operand stack, k < depth(pc)    O = R + 24
 //! ```
+//!
+//! The optional slots exist only where the script uses them, as bbv's
+//! frame has it: a slot nothing reads would cost every entry a store (the
+//! GC scans the whole frame, so each slot must hold a valid Value).
 
 use std::collections::BTreeMap;
 
@@ -96,21 +100,42 @@ pub struct FrameLayout {
     pub nlocals: u32,
     /// Whether `vp` is rebased past the actuals beyond the formals.
     pub rebase_vp: bool,
+    /// Whether the frame has an environment slot (`needs_env`).
+    pub has_env: bool,
+    /// Whether the frame has an arguments-object slot (the bytecode's
+    /// `Arguments`, or a mapped object the prologue makes).
+    pub has_args_obj: bool,
+    /// Whether the frame has a new.target slot (`uses_new_target`).
+    pub has_new_target: bool,
 }
 
 impl FrameLayout {
     pub const CALLEE: u32 = 0;
     pub const THIS: u32 = 8;
     pub const ARGS: u32 = 16;
-    /// Fixed slots after the locals: env, arguments object, new.target,
-    /// rval, resume word, onramp backoff.
-    const FIXED_SLOTS: u32 = 6;
-
+    /// Fixed slots after the locals: env, arguments object and new.target
+    /// where the script uses them (bbv's compact frame), then rval, resume
+    /// word and onramp backoff, always.
     pub fn of(script: &Script) -> FrameLayout {
         FrameLayout {
             nargs: u32::from(script.nargs),
             nlocals: nlocals(script),
             rebase_vp: reads_actuals(script),
+            has_env: super::codegen::needs_env(script),
+            has_args_obj: crate::wasm::translate::uses_arguments(script) || script.has_mapped_args,
+            has_new_target: crate::wasm::translate::uses_new_target(script),
+        }
+    }
+
+    /// A layout with every optional slot (tests and hand-written MIR).
+    pub fn full(nargs: u32, nlocals: u32) -> FrameLayout {
+        FrameLayout {
+            nargs,
+            nlocals,
+            rebase_vp: false,
+            has_env: true,
+            has_args_obj: true,
+            has_new_target: true,
         }
     }
 
@@ -129,35 +154,60 @@ impl FrameLayout {
         self.local_base() + 8 * j
     }
 
-    pub fn env(&self) -> u32 {
+    /// Where the fixed slots start.
+    pub fn fixed_base(&self) -> u32 {
         self.local_base() + 8 * self.nlocals
     }
 
+    pub fn env(&self) -> u32 {
+        debug_assert!(self.has_env, "a frame without an env slot");
+        self.fixed_base()
+    }
+
     pub fn args_obj(&self) -> u32 {
-        self.env() + 8
+        debug_assert!(self.has_args_obj, "a frame without an arguments-object slot");
+        self.fixed_base() + 8 * u32::from(self.has_env)
     }
 
     pub fn new_target(&self) -> u32 {
-        self.env() + 16
+        debug_assert!(self.has_new_target, "a frame without a new.target slot");
+        self.fixed_base() + 8 * (u32::from(self.has_env) + u32::from(self.has_args_obj))
     }
 
     pub fn rval(&self) -> u32 {
-        self.env() + 24
+        self.fixed_base()
+            + 8 * (u32::from(self.has_env) + u32::from(self.has_args_obj) + u32::from(self.has_new_target))
+    }
+
+    /// The optional fixed slots this frame has (env, arguments object,
+    /// new.target), for code that initializes them all.
+    pub fn optional_slots(&self) -> Vec<u32> {
+        let mut v = vec![];
+        if self.has_env {
+            v.push(self.env());
+        }
+        if self.has_args_obj {
+            v.push(self.args_obj());
+        }
+        if self.has_new_target {
+            v.push(self.new_target());
+        }
+        v
     }
 
     pub fn resume(&self) -> u32 {
-        self.env() + 32
+        self.rval() + 8
     }
 
     /// The onramp backoff: how many more loop-header visits baseline makes
     /// before it next tries a MIR onramp (`docs/BASELINE.md` §7). A MIR
     /// exit sets it, so baseline makes progress before re-entering.
     pub fn backoff(&self) -> u32 {
-        self.env() + 40
+        self.rval() + 16
     }
 
     pub fn operand_base(&self) -> u32 {
-        self.env() + 8 * Self::FIXED_SLOTS
+        self.rval() + 24
     }
 
     /// `vp`-relative offset of operand-stack slot `k`.
@@ -507,14 +557,18 @@ mod tests {
         assert_eq!(l.arg(1), 24);
         assert_eq!(l.local_base(), 32);
         assert_eq!(l.local(1), 40);
-        assert_eq!(l.env(), 48);
-        assert_eq!(l.args_obj(), 56);
-        assert_eq!(l.new_target(), 64);
-        assert_eq!(l.rval(), 72);
-        assert_eq!(l.resume(), 80);
-        assert_eq!(l.backoff(), 88);
-        assert_eq!(l.operand_base(), 96);
-        assert_eq!(l.operand(2), 112);
+        assert!(!l.has_env && !l.has_args_obj && !l.has_new_target);
+        assert_eq!(l.rval(), 48);
+        assert_eq!(l.resume(), 56);
+        assert_eq!(l.backoff(), 64);
+        assert_eq!(l.operand_base(), 72);
+        assert_eq!(l.operand(2), 88);
+        let f = FrameLayout::full(2, 2);
+        assert_eq!(f.env(), 48);
+        assert_eq!(f.args_obj(), 56);
+        assert_eq!(f.new_target(), 64);
+        assert_eq!(f.rval(), 72);
+        assert_eq!(f.operand_base(), 96);
     }
 
     #[test]

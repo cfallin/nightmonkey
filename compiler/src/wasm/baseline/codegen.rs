@@ -956,9 +956,15 @@ impl<'a> Gen<'a> {
         for j in 0..self.layout.nlocals {
             self.store_i64(self.vp, self.layout.local(j), undef);
         }
-        self.store_i64(self.vp, self.layout.env(), undef);
-        self.store_i64(self.vp, self.layout.args_obj(), undef);
-        self.store_i64(self.vp, self.layout.new_target(), self.new_target);
+        if self.layout.has_env {
+            self.store_i64(self.vp, self.layout.env(), undef);
+        }
+        if self.layout.has_args_obj {
+            self.store_i64(self.vp, self.layout.args_obj(), undef);
+        }
+        if self.layout.has_new_target {
+            self.store_i64(self.vp, self.layout.new_target(), self.new_target);
+        }
         self.store_i64(self.vp, self.layout.rval(), undef);
         let resume = self.i64c(TAG_INT32 << 32);
         self.store_i64(self.vp, self.layout.resume(), resume);
@@ -1392,12 +1398,9 @@ impl<'a> Gen<'a> {
         let rarg = self.unop(Operator::I64Load { memory: m }, desc, Type::I64);
         // The fixed slots the skipped prologue would have set.
         let undef = self.i64c(UNDEF);
-        for off in [
-            self.layout.env(),
-            self.layout.args_obj(),
-            self.layout.new_target(),
-            self.layout.rval(),
-        ] {
+        let mut fixed = self.layout.optional_slots();
+        fixed.push(self.layout.rval());
+        for off in fixed {
             self.store_i64(self.vp, off, undef);
         }
         let zero = self.i64c(TAG_INT32 << 32);

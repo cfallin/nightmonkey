@@ -6316,11 +6316,7 @@ mod tests {
             let mm = crate::mir::parse(src).expect("parse");
             let (mut m, helpers) = module_with_helpers();
             for f in &mm.funcs {
-                let layout = FrameLayout {
-                    nargs: f.frame.formals,
-                    nlocals: f.frame.locals,
-                    rebase_vp: false,
-                };
+                let layout = FrameLayout::full(f.frame.formals, f.frame.locals);
                 let mut atoms = AtomTable::new(Names::default());
                 let lowered = crate::wasm::mir::lower::lower(
                     &mut m,

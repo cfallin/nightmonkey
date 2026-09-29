@@ -148,6 +148,14 @@ pub fn translate_script(
             forward_resume: inline_eligible(ctx, script),
             is_gen: script.is_generator_or_async,
             mapped_formals: script.has_mapped_args && script.nargs > 0,
+            inline_layouts: f
+                .inline_frames
+                .iter()
+                .map(|fr| match ctx.source.object(crate::source::SourceObjectId::new(fr.script.get())) {
+                    crate::source::SourceObject::Script(ks) => baseline::layout::FrameLayout::of(ks),
+                    _ => unreachable!("an inline frame's callee is a script"),
+                })
+                .collect(),
         },
         gname_bids,
         gname_fused,

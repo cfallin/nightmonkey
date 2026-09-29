@@ -412,6 +412,7 @@ struct Lower<'a> {
     forward_resume: bool,
     is_gen: bool,
     mapped_formals: bool,
+    inline_layouts: Vec<FrameLayout>,
     /// The syntactic global binding (`TranslateCtx::syn_gnames`) each
     /// global name read names, for its inline arms.
     gname_bids: BTreeMap<mir::entity::AtomId, u32>,
@@ -448,7 +449,7 @@ enum Loc {
 }
 
 /// Per-script lowering choices besides the function itself.
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Default)]
 pub struct LowerOpts {
     /// The stress mode's period (`Options::mir_stress`); 0 = off.
     pub stress: u32,
@@ -472,6 +473,9 @@ pub struct LowerOpts {
     /// The script's formals are a mapped `arguments`'s, which may write
     /// them behind MIR's back: their frame stores are never dropped.
     pub mapped_formals: bool,
+    /// Each inline frame's callee layout (`FrameLayout::of`); empty for
+    /// hand-written MIR, whose inline frames take the full layout.
+    pub inline_layouts: Vec<FrameLayout>,
 }
 
 /// Lower `f` (a function of `mm`, whose baseline frame is `layout`) into a
@@ -569,6 +573,7 @@ pub fn lower<'a>(
         forward_resume: o.forward_resume,
         is_gen: o.is_gen,
         mapped_formals: o.mapped_formals,
+        inline_layouts: o.inline_layouts.clone(),
         gname_bids,
         gname_fused,
         add_preds,
@@ -1560,9 +1565,10 @@ impl<'a> Lower<'a> {
         for j in 0..l.nlocals {
             self.store_i64(vp, l.local(j), undef);
         }
-        for off in [l.args_obj(), l.rval()] {
-            self.store_i64(vp, off, undef);
+        if l.has_args_obj {
+            self.store_i64(vp, l.args_obj(), undef);
         }
+        self.store_i64(vp, l.rval(), undef);
         // The environment: the callee's own, or none (§5.1).
         let env = if self.plain_env {
             let callee = self.load_i64(self.sp, 0);
@@ -1571,8 +1577,12 @@ impl<'a> Lower<'a> {
         } else {
             undef
         };
-        self.store_i64(vp, l.env(), env);
-        self.store_i64(vp, l.new_target(), self.new_target);
+        if l.has_env {
+            self.store_i64(vp, l.env(), env);
+        }
+        if l.has_new_target {
+            self.store_i64(vp, l.new_target(), self.new_target);
+        }
         let zero = self.i64c(TAG_INT32 << 32);
         self.store_i64(vp, l.resume(), zero);
         self.store_i64(vp, l.backoff(), zero);
@@ -1663,7 +1673,9 @@ impl<'a> Lower<'a> {
             let rgen = self.load_i64(desc, 8);
             let rarg = self.load_i64(desc, 16);
             let undef = self.i64c(UNDEF);
-            for off in [l.env(), l.args_obj(), l.new_target(), l.rval()] {
+            let mut fixed = l.optional_slots();
+            fixed.push(l.rval());
+            for off in fixed {
                 self.store_i64(vp, off, undef);
             }
             let zero = self.i64c(TAG_INT32 << 32);
@@ -1843,12 +1855,14 @@ impl<'a> Lower<'a> {
     /// Lay out the inline frames (§5.5): each at its parent's end, the
     /// function's own frame ending past the rooting area.
     fn inline_layout(&mut self) {
-        for fr in &self.f.inline_frames {
-            let lay = FrameLayout {
-                nargs: fr.shape.formals,
-                nlocals: fr.shape.locals,
-                rebase_vp: false,
+        for (i, fr) in self.f.inline_frames.iter().enumerate() {
+            // The callee's own layout (its baseline body resumes on the
+            // frame), with the actuals placed by `voff` rather than a rebase.
+            let lay = match self.inline_layouts.get(i) {
+                Some(&l) => FrameLayout { rebase_vp: false, ..l },
+                None => FrameLayout::full(fr.shape.formals, fr.shape.locals),
             };
+            debug_assert!(lay.nargs == fr.shape.formals && lay.nlocals == fr.shape.locals);
             let off = self.frame_top[fr.parent as usize];
             let voff = off + 8 * fr.argc.map_or(0, |n| n.saturating_sub(fr.shape.formals));
             let fid = u32::try_from(self.frame_off.len()).unwrap();
@@ -1871,7 +1885,7 @@ impl<'a> Lower<'a> {
             self.frame_top.push(match fixed {
                 Fixed::All => voff + lay.operand_base(),
                 Fixed::Env => voff + lay.env() + 8,
-                Fixed::None => voff + lay.env(),
+                Fixed::None => voff + lay.fixed_base(),
             });
             self.fixed.push(fixed);
             self.frame_layouts.push(lay);
@@ -1950,6 +1964,11 @@ impl<'a> Lower<'a> {
                 k if k <= nargs + nlocals => self.frame_voff[f] + l.local(k - 1 - nargs),
                 _ => self.frame_voff[f] + l.rval(),
             };
+            // A slot past the frame's GC scan (a lean inline frame's rval)
+            // retains nothing, and a nested inline frame may occupy it.
+            if f > 0 && off >= self.frame_top[f] {
+                continue;
+            }
             let w = self.value_here(v)?;
             let t = self.ty(v);
             let b = self.boxed(&t, w)?;
@@ -7082,13 +7101,19 @@ impl<'a> Lower<'a> {
         // inlined).
         let fun = self.un(Operator::I32WrapI64, boxed[0], Type::I32);
         let env = self.load_i64(fun, FUNC_ENV_SLOT_OFFSET);
-        self.store_i64(sp, vbase + l.env(), env);
+        if l.has_env {
+            self.store_i64(sp, vbase + l.env(), env);
+        }
         if self.fixed[fid] == Fixed::Env {
             return Ok(());
         }
-        self.store_i64(sp, vbase + l.args_obj(), undef);
-        let nt = if construct { boxed[boxed.len() - 1] } else { undef };
-        self.store_i64(sp, vbase + l.new_target(), nt);
+        if l.has_args_obj {
+            self.store_i64(sp, vbase + l.args_obj(), undef);
+        }
+        if l.has_new_target {
+            let nt = if construct { boxed[boxed.len() - 1] } else { undef };
+            self.store_i64(sp, vbase + l.new_target(), nt);
+        }
         self.store_i64(sp, vbase + l.rval(), undef);
         let zero = self.i64c(TAG_INT32 << 32);
         self.store_i64(sp, vbase + l.resume(), zero);
@@ -7246,7 +7271,7 @@ impl<'a> Lower<'a> {
         let backoff = self.i64c((TAG_INT32 << 32) | u64::from(ONRAMP_BACKOFF));
         self.store_i64(sp, vbase + l.backoff(), backoff);
         // The fixed slots the frame's entry left out (`Fixed`).
-        if self.fixed[f] == Fixed::None {
+        if self.fixed[f] == Fixed::None && l.has_env {
             let callee = self.load_i64(sp, base + FrameLayout::CALLEE);
             let fun = self.un(Operator::I32WrapI64, callee, Type::I32);
             let env = self.load_i64(fun, FUNC_ENV_SLOT_OFFSET);
@@ -7254,8 +7279,12 @@ impl<'a> Lower<'a> {
         }
         if self.fixed[f] != Fixed::All {
             let undef = self.i64c(UNDEF);
-            self.store_i64(sp, vbase + l.args_obj(), undef);
-            self.store_i64(sp, vbase + l.new_target(), undef);
+            if l.has_args_obj {
+                self.store_i64(sp, vbase + l.args_obj(), undef);
+            }
+            if l.has_new_target {
+                self.store_i64(sp, vbase + l.new_target(), undef);
+            }
         }
         let callee = self.load_i64(sp, base + FrameLayout::CALLEE);
         let (funcidx, script) = self.classify(callee);
@@ -7361,7 +7390,9 @@ impl<'a> Lower<'a> {
         // The fixed slots MIR does not keep current. The env slot is
         // written through (scopes), and the arguments-object slot holds the
         // one `args.object` made, if any (the fresh entry cleared it).
-        self.store_i64(vp, l.new_target(), self.new_target);
+        if l.has_new_target {
+            self.store_i64(vp, l.new_target(), self.new_target);
+        }
         let w64 = self.un(Operator::I64ExtendI32U, word, Type::I64);
         let tag = self.i64c(TAG_INT32 << 32);
         let wv = self.bin(Operator::I64Or, w64, tag, Type::I64);
