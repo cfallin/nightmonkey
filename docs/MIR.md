@@ -380,9 +380,11 @@ Fences kill them like any other type (§4).
     Each edge gets its own waffle block to reconcile locations; the
     empty ones are removed.
   - Every may-GC op's GC scan covers the whole rooting area, which the
-    entry initializes. A slot that may hold a dead value is cleared at
-    the next may-GC op, so the GC does not keep it alive (a `WeakRef`
-    target must die once unreachable).
+    entry initializes. A slot that holds a dead value is not cleared: the
+    value stays alive until the slot is reused or the activation returns.
+    GC timing is unobservable, and `WeakRef` targets may be kept alive
+    longer; that retention is bounded by the frame. (Amended 2026-09-29:
+    clearing dead slots cost richards 2.8% and bought nothing.)
 
 ### 4.5 Fences versus predictions
 

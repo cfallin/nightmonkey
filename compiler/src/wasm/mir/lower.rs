@@ -307,9 +307,11 @@ struct Lower<'a> {
     home: BTreeMap<mir::Value, u32>,
     nslots: u32,
     slotted: BTreeSet<mir::Value>,
-    /// Home slots that may hold a value no longer live: cleared at the
-    /// next may-GC call, which must not keep it alive (a `WeakRef`'s
-    /// target, say).
+    /// Home slots that may hold a stale frame's bits (not written since
+    /// entry): cleared at the next may-GC call, whose scan must see only
+    /// valid Values. A slot once written stays valid (the GC updates it),
+    /// so a value that dies is not cleared: it stays alive until its slot
+    /// is reused or the activation returns (§4.4).
     dirty: BTreeSet<u32>,
     /// Per (frame, slot): the value a `frame.store` put there, along the
     /// emission path; a store of the same value again is dropped.
@@ -1977,8 +1979,8 @@ impl<'a> Lower<'a> {
             self.store_i64(self.vp, off, b);
             self.slotted.insert(v);
         }
-        // Slots holding what is live now; any other written slot may hold
-        // a dead value, which the GC must not see.
+        // Slots holding what is live now; any other slot not written since
+        // entry may hold a stale frame's bits, which the GC must not see.
         let holding: BTreeSet<u32> = live.iter().filter_map(|v| self.home.get(v).copied()).collect();
         let stale: Vec<u32> = self.dirty.difference(&holding).copied().collect();
         if !stale.is_empty() {
@@ -1988,7 +1990,8 @@ impl<'a> Lower<'a> {
             }
             stores += u32::try_from(stale.len()).unwrap();
         }
-        self.dirty = holding;
+        // Every slot is valid now; a dead value may stay in its slot.
+        self.dirty.clear();
         self.slotted.retain(|v| live.contains(v));
         let e = self.opsize.entry("(root sites / stores)".into()).or_default();
         e.0 += 1;
