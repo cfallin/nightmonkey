@@ -4623,18 +4623,8 @@ impl<'a> Lower<'a> {
         let cache = self.atoms.next_prop_cache();
         let way = self.i32c(IC_WAY_ADDR_PLACEHOLDER);
         self.prop_ic_patches.push((way, cache * INLINE_IC_STRIDE));
-        let (poly, trans, slow) = (self.body.add_block(), self.body.add_block(), self.body.add_block());
-        self.set_ic_way0(inst, recv, val, way, poly)?;
-        // A site past one shape (way 0 sentineled) stores through the mega
-        // table, probed by the module's `night_ic_set_cold` (bbv's arm).
-        self.cur = poly;
-        let cs = self.load_i32(way, IC_SET_RECVSHAPE);
-        let sentinel = self.i32c(crate::wasm::bbv::abi::IC_POLY_SENTINEL);
-        let is_poly = self.bin(Operator::I32Eq, cs, sentinel, Type::I32);
-        let mega = self.body.add_block();
-        self.cond_br(is_poly, Self::to(mega), Self::to(trans));
-        self.cur = mega;
-        self.set_ic_mega(inst, at, recv, val, way, slow)?;
+        let (trans, slow) = (self.body.add_block(), self.body.add_block());
+        self.set_ic_ways(inst, at, recv, val, way, trans, slow)?;
         self.cur = trans;
         self.set_ic_trans(inst, name, recv, val, way, slow)?;
         self.cur = slow;
@@ -4838,10 +4828,22 @@ impl<'a> Lower<'a> {
     /// `ok_clean`; else branch to `slow`. The store bypasses the engine's
     /// choke, so it also requires the object's word to carry no bit it
     /// could falsify: RANGES never, TYPES unless `val` is a number.
-    /// A set IC's mega arm: the (shape, atom) row `night_ic_set_cold`
-    /// finds in the mega-set table names the slot, stored as way 0's is;
-    /// no row takes `slow`.
-    fn set_ic_mega(&mut self, inst: mir::Inst, atom: Value, recv: Value, val: Value, way: Value, slow: Block) -> R<()> {
+    /// A set IC's overwrite arms: way 0 (the site's one shape), or past
+    /// one shape (way 0 sentineled) the (shape, atom) row the module's
+    /// `night_ic_set_cold` finds in the mega-set table (bbv's arm). Both
+    /// name the slot for one shared store; a mono miss takes `trans`, no
+    /// mega row or a non-object `slow`.
+    #[allow(clippy::too_many_arguments)]
+    fn set_ic_ways(
+        &mut self,
+        inst: mir::Inst,
+        atom: Value,
+        recv: Value,
+        val: Value,
+        way: Value,
+        trans: Block,
+        slow: Block,
+    ) -> R<()> {
         use crate::region_shape::{MEGA_SET_ABS_SLOT_OFF, MEGA_SET_SLOT_ENC_OFF};
         let num = matches!(self.ty(self.f.insts[inst].args[1]), MType::Val(s) if s.tags.subset_of(TagSet::NUMBER));
         let tag = self.tag_of(recv);
@@ -4849,9 +4851,34 @@ impl<'a> Lower<'a> {
         self.check(is_obj, slow);
         let obj = self.un(Operator::I32WrapI64, recv, Type::I32);
         let shape = self.load_i32(obj, SHAPE_OFFSET);
+        let store = self.body.add_block();
+        let enc = self.body.add_blockparam(store, Type::I32);
+        let abs = self.body.add_blockparam(store, Type::I32);
+        let to_store = |s: &mut Self, src: Value, enc_off: u32, abs_off: u32| {
+            let e = s.load_i32(src, enc_off);
+            let a = if num { e } else { s.load_i32(src, abs_off) };
+            s.terminate(Terminator::Br {
+                target: BlockTarget {
+                    block: store,
+                    args: vec![e, a],
+                },
+            });
+        };
+        let cached = self.load_i32(way, IC_SET_RECVSHAPE);
+        let hit = self.bin(Operator::I32Eq, shape, cached, Type::I32);
+        let (w0, poly) = (self.body.add_block(), self.body.add_block());
+        self.cond_br(hit, Self::to(w0), Self::to(poly));
+        self.cur = w0;
+        to_store(self, way, IC_SET_SLOTENC, IC_SET_ABSSLOT);
+        self.cur = poly;
+        let sentinel = self.i32c(crate::wasm::bbv::abi::IC_POLY_SENTINEL);
+        let is_poly = self.bin(Operator::I32Eq, cached, sentinel, Type::I32);
+        let mega = self.body.add_block();
+        self.cond_br(is_poly, Self::to(mega), Self::to(trans));
+        self.cur = mega;
         let cold = self.call1(self.h.ic_set_cold, &[shape, way, atom], Type::I64);
         let found = self.un(Operator::I64Eqz, cold, Type::I32);
-        let hit = self.un(Operator::I32Eqz, found, Type::I32);
+        let mhit = self.un(Operator::I32Eqz, found, Type::I32);
         if let Some(census) = self.exit_census {
             static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -4859,14 +4886,17 @@ impl<'a> Lower<'a> {
             crate::diag_line!("night: mir megaset {id} sid#{} {:?}", self.f.script, site);
             let k = self.i32c(crate::options::MIR_GUARD_CENSUS_KIND + 4);
             let base = self.i32c(id * 2);
-            let i = self.bin(Operator::I32Add, base, hit, Type::I32);
+            let i = self.bin(Operator::I32Add, base, mhit, Type::I32);
             self.call1(census, &[k, i], Type::I32);
         }
-        self.check(hit, slow);
+        self.check(mhit, slow);
         let entry = self.un(Operator::I32WrapI64, cold, Type::I32);
+        to_store(self, entry, MEGA_SET_SLOT_ENC_OFF, MEGA_SET_ABS_SLOT_OFF);
+        // The store: the slot `enc & 1` selects the dynamic slots over the
+        // object, `enc & !1` is the byte offset from that base.
+        self.cur = store;
         let w = self.load_i32(obj, OBJ_CLASS_IDX_OFFSET);
         self.check_store_bits(inst, obj, w, val, num, slow);
-        let enc = self.load_i32(entry, MEGA_SET_SLOT_ENC_OFF);
         let one = self.i32c(1);
         let dynamic = self.bin(Operator::I32And, enc, one, Type::I32);
         let not1 = self.i32c(!1);
@@ -4879,42 +4909,6 @@ impl<'a> Lower<'a> {
         }
         self.store_i64(addr, 0, val);
         if !num {
-            let abs = self.load_i32(entry, MEGA_SET_ABS_SLOT_OFF);
-            self.post_barrier(self.h.post_write_barrier, obj, abs, val);
-        }
-        let t = self.edge(inst, 0, &[])?;
-        self.terminate(Terminator::Br { target: t });
-        Ok(())
-    }
-
-    fn set_ic_way0(&mut self, inst: mir::Inst, recv: Value, val: Value, way: Value, slow: Block) -> R<()> {
-        let num = matches!(self.ty(self.f.insts[inst].args[1]), MType::Val(s) if s.tags.subset_of(TagSet::NUMBER));
-        let tag = self.tag_of(recv);
-        let is_obj = self.tag_is(tag, TAG_OBJECT as u32);
-        self.check(is_obj, slow);
-        let obj = self.un(Operator::I32WrapI64, recv, Type::I32);
-        let shape = self.load_i32(obj, SHAPE_OFFSET);
-        let cached = self.load_i32(way, IC_SET_RECVSHAPE);
-        let hit = self.bin(Operator::I32Eq, shape, cached, Type::I32);
-        self.check(hit, slow);
-        let w = self.load_i32(obj, OBJ_CLASS_IDX_OFFSET);
-        self.check_store_bits(inst, obj, w, val, num, slow);
-        // The slot: `enc & 1` selects the dynamic slots over the object,
-        // `enc & !1` is the byte offset from that base.
-        let enc = self.load_i32(way, IC_SET_SLOTENC);
-        let one = self.i32c(1);
-        let dynamic = self.bin(Operator::I32And, enc, one, Type::I32);
-        let not1 = self.i32c(!1);
-        let off = self.bin(Operator::I32And, enc, not1, Type::I32);
-        let slots = self.load_i32(obj, NATIVE_SLOTS_OFFSET);
-        let base = self.op(Operator::Select, &[slots, obj, dynamic], Some(Type::I32));
-        let addr = self.bin(Operator::I32Add, base, off, Type::I32);
-        if !num {
-            self.pre_barrier(addr, 0);
-        }
-        self.store_i64(addr, 0, val);
-        if !num {
-            let abs = self.load_i32(way, IC_SET_ABSSLOT);
             self.post_barrier(self.h.post_write_barrier, obj, abs, val);
         }
         let t = self.edge(inst, 0, &[])?;
