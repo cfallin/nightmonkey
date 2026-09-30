@@ -538,6 +538,9 @@ struct SetAddRow {
   uint32_t numProtos = 0;
   uint32_t protoPtrs[4] = {};
   uint32_t protoShapes[4] = {};
+  // The transition skips slots (NightPopulateAddTransition): C++ replay
+  // only, never copied into a site row.
+  bool skip = false;
 };
 static const uint32_t kSetAddSize = 4096;
 static SetAddRow gSetAdd[kSetAddSize];
@@ -555,6 +558,7 @@ struct InitAddRow {
   uint32_t atomId = 0;
   uint32_t newShape = 0;
   uint32_t slot = 0;
+  bool skip = false;  // as SetAddRow's
 };
 static const uint32_t kInitAddSize = 4096;
 static InitAddRow gInitAdd[kInitAddSize];
@@ -2609,7 +2613,7 @@ static uint32_t SetPropIcMiss(JSContext* cx, uint32_t top, uint64_t recv,
       // so nearly every execution of the inline add arm finds an empty row
       // and lands here instead. The site row replays two proto hops; deeper
       // chains stay on the table alone.
-      if (trow.numProtos <= 4) {
+      if (trow.numProtos <= 4 && !trow.skip) {
         uint32_t* srow = InlineTransRow(cacheIdx);
         uint32_t nfixed = JS::Value::fromRawBits(recv)
                               .toObject()
@@ -2685,16 +2689,19 @@ static uint32_t SetPropIcMiss(JSContext* cx, uint32_t top, uint64_t recv,
     // region on major GC.)
     uint32_t newShape, slot, protoPtrs[4], protoShapes[4], numProtos;
     bool nurseryProto = false;
+    bool skip = false;
     if (js::night::NightPopulateAddTransition(
             cx, obj, id, spanBefore, &newShape, &slot, protoPtrs, protoShapes,
-            &numProtos, &nurseryProto)) {
+            &numProtos, &nurseryProto, &skip)) {
       populated = true;
       if (nurseryProto) {
         gState.transRowsHoldNursery = true;
       }
       // The site row replays two proto hops at most; deeper chains are
-      // served by the global table alone (its rows carry four hops).
-      if (numProtos <= 4) {
+      // served by the global table alone (its rows carry four hops), and so
+      // is a transition that skips slots (the compiled replays do not
+      // initialize them).
+      if (numProtos <= 4 && !skip) {
         uint32_t* row = InlineTransRow(cacheIdx);
         uint32_t nfixed = obj->as<js::NativeObject>().numFixedSlots();
         FillTransRow(row, shapeBefore, newShape, slot, nfixed, protoPtrs,
@@ -2706,6 +2713,7 @@ static uint32_t SetPropIcMiss(JSContext* cx, uint32_t top, uint64_t recv,
       trow.atomId = atomId;
       trow.newShape = newShape;
       trow.slot = slot;
+      trow.skip = skip;
       trow.numProtos = numProtos;
       for (uint32_t i = 0; i < 4; i++) {
         trow.protoPtrs[i] = i < numProtos ? protoPtrs[i] : 0;
@@ -3564,7 +3572,7 @@ bool night_runtime_init_prop(JSContext* cx, uint32_t top, uint64_t obj,
                                              row.slot, val)) {
       // Seed the SITE row too so subsequent inits replay inline (the early
       // return would otherwise starve it forever).
-      if (cacheIdx != UINT32_MAX) {
+      if (cacheIdx != UINT32_MAX && !row.skip) {
         uint32_t* srow = InlineTransRow(cacheIdx);
         uint32_t nfixed =
             objv.toObject().as<js::NativeObject>().numFixedSlots();
@@ -3587,14 +3595,15 @@ bool night_runtime_init_prop(JSContext* cx, uint32_t top, uint64_t obj,
     bool nurseryProto = false;
     if (js::night::NightPopulateAddTransition(
             cx, o, id, spanBefore, &row.newShape, &row.slot, protoPtrs,
-            protoShapes, &numProtos, &nurseryProto)) {
+            protoShapes, &numProtos, &nurseryProto, &row.skip)) {
       row.gen = InlineGen();
       row.oldShape = shapeBefore;
       row.atomId = atomId;
       InitAddAt(shapeBefore, atomId) = row;
       // Site row for the inline replay arm (defines never consult the proto
-      // chain, so the proto-guard pairs stay zero == always-pass).
-      if (cacheIdx != UINT32_MAX) {
+      // chain, so the proto-guard pairs stay zero == always-pass); not for a
+      // transition that skips slots, which the inline arm cannot replay.
+      if (cacheIdx != UINT32_MAX && !row.skip) {
         uint32_t* srow = InlineTransRow(cacheIdx);
         uint32_t nfixed = o->as<js::NativeObject>().numFixedSlots();
         FillTransRow(srow, shapeBefore, row.newShape, row.slot, nfixed, nullptr,

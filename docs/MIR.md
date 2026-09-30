@@ -1881,8 +1881,14 @@ row field goes in its row slot whatever the order:
   key, slot) -> shape, purged at every major GC. `NightAddPropCheck` is
   unchanged: a placed field lands at its predicted slot, and a generic add
   onto a permuted shape inside the clump's bound clears SLOTS as before.
-  The add-transition rows record only transitions that add one slot at the
-  span, so a permuted transition always takes the helper.
+  The add-transition caches replay a permuted transition too: a hole fill
+  (the span unchanged, the slot allocated and holding undefined) like an
+  append, in the site rows the compiled arms replay; a skip (the span
+  raised past the slot's own) only from the runtime's tables, whose C++
+  replay initializes the skipped slots, since the compiled arms do not.
+  splay adds a node's `left` and `right` in either order: before this every
+  permuted add took the generic path (MIR -2.2%, legacy -4.7% against the
+  sequential layouts; after it -1.2% and +0.6%).
 - **Stamps**: a span covering the row no longer proves every row field is
   present (holes). Every stamp gate (MIR's `ctor.stamp`/`ctor.publish`
   inline, MIR's `restamp`, bbv's `emit_class_idx_stamp_impl`, the runtime's
@@ -1921,6 +1927,17 @@ row field goes in its row slot whatever the order:
   unresolved `page`): the dispatch's methods no longer read Empty formals,
   so `textHScale` and friends stop claiming int32. MIR exits 140k -> 52k.
   Every Octane source is still an exact fixpoint.
+
+**M5m. Literal allocation size (2026-09-30).** `night_runtime_new_object`
+(every tier's object literal) allocated the engine's NewInit kind, four
+fixed slots, whatever the literal's size: a literal of five or more fields
+put the rest in dynamic slots, where the add check clears SLOTS, on every
+allocation, and each clear bumps the stamp epoch, which sends every
+epoch-guarded keep in the program down its dirty path. The helper now takes
+the literal's layout row length (`lit_nslots_in`, capped at 16) and
+allocates a kind with a slot for each field. react cleared SLOTS 1.19M
+times a run (six-field elements): +4.9% MIR, +15% legacy (placement
+medians), every react exit gone; pdfjs +3% (its glyph literals).
 
 **M6. The rest of §10**: box/unbox cleanup, memory optimizations, and
 numeric optimizations, each with its guard-count and instruction-count

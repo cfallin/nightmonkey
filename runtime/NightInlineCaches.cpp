@@ -72,7 +72,8 @@ bool NightPopulateAddTransition(JSContext* cx, JSObject* obj, jsid id,
                                 uint32_t oldSpan, uint32_t* newShapeOut,
                                 uint32_t* slotOut, uint32_t protoPtrsOut[4],
                                 uint32_t protoShapesOut[4],
-                                uint32_t* numProtosOut, bool* nurseryOut) {
+                                uint32_t* numProtosOut, bool* nurseryOut,
+                                bool* skipOut) {
   if (!obj->is<NativeObject>()) {
     return false;
   }
@@ -100,13 +101,27 @@ bool NightPopulateAddTransition(JSContext* cx, JSObject* obj, jsid id,
   // it is the shape's last): replaying the transition initializes only that
   // slot, so any other same-set mutation would leave garbage slots.
   SharedShape& ns = nobj->shape()->asShared();
-  if (oldSpan == UINT32_MAX || ns.slotSpan() != oldSpan + 1) {
+  // A reshape that added no property (a prototype change) leaves no last
+  // property to read, and its span no larger.
+  uint32_t newSpan = ns.slotSpan();
+  if (oldSpan == UINT32_MAX || ns.propMapLength() == 0 || newSpan < oldSpan) {
     return false;
   }
   PropertyInfoWithKey last = ns.lastProperty();
-  if (last.key() != id || !last.isDataProperty()) {
+  if (last.key() != id || !last.isDataProperty() || !last.hasSlot()) {
     return false;
   }
+  // With the engine's custom-slot shapes the new slot is the old span (the
+  // plain append), a hole below it (span unchanged: the slot is allocated
+  // and holds undefined), or past it (span raised to the slot's; the slots
+  // between are holes the replay must initialize).
+  bool append = newSpan == oldSpan + 1 && last.slot() == oldSpan;
+  bool fill = newSpan == oldSpan && last.slot() < oldSpan;
+  bool skip = newSpan > oldSpan + 1 && last.slot() == newSpan - 1;
+  if (!append && !fill && !skip) {
+    return false;
+  }
+  *skipOut = skip;
   mozilla::Maybe<PropertyInfo> prop = nobj->lookupPure(id);
   if (prop.isNothing() || !prop->isDataProperty() || !prop->hasSlot() ||
       !prop->writable() || !prop->enumerable() || !prop->configurable()) {
@@ -129,6 +144,34 @@ bool NightPopulateAddTransition(JSContext* cx, JSObject* obj, jsid id,
   *numProtosOut = n;
   *newShapeOut = uint32_t(reinterpret_cast<uintptr_t>(nobj->shape()));
   *slotOut = prop->slot();
+  return true;
+}
+
+// The slots of an add-transition replay onto `nobj` (still of the old
+// shape): dynamic slots grown to the new span, and any slot the new span
+// skips (a hole of the engine's custom-slot shapes) other than `slot`
+// initialized to undefined, as the engine's `setShapeAndAddNewSlots` does,
+// since the GC traces the whole span. Raw inits: no store-mask check (they
+// store no value of the program's). Leaf (growSlotsPure: no GC).
+static bool ReplaySlots(JSContext* cx, NativeObject* nobj, SharedShape* newShape,
+                        uint32_t slot) {
+  uint32_t oldSpan = nobj->shape()->asShared().slotSpan();
+  uint32_t newSpan = newShape->slotSpan();
+  uint32_t nfixed = nobj->numFixedSlots();
+  if (newSpan > nfixed) {
+    uint32_t dynCount =
+        NativeObject::calculateDynamicSlots(nfixed, newSpan, nobj->getClass());
+    if (dynCount > nobj->numDynamicSlots()) {
+      if (!NativeObject::growSlotsPure(cx, nobj, dynCount)) {
+        return false;
+      }
+    }
+  }
+  for (uint32_t s = oldSpan; s < newSpan; s++) {
+    if (s != slot) {
+      nobj->getSlotAddressUnchecked(s)->initAsUndefined();
+    }
+  }
   return true;
 }
 
@@ -172,15 +215,8 @@ bool NightTryAddPropTransition(JSContext* cx, uint64_t recvBits,
   NativeObject* nobj = &obj->as<NativeObject>();
   SharedShape* newShape =
       reinterpret_cast<SharedShape*>(static_cast<uintptr_t>(newShapeW));
-  uint32_t nfixed = nobj->numFixedSlots();
-  if (slot >= nfixed) {
-    uint32_t dynCount = NativeObject::calculateDynamicSlots(
-        nfixed, newShape->slotSpan(), nobj->getClass());
-    if (dynCount > nobj->numDynamicSlots()) {
-      if (!NativeObject::growSlotsPure(cx, nobj, dynCount)) {
-        return false;  // OOM: the generic path reports properly
-      }
-    }
+  if (!ReplaySlots(cx, nobj, newShape, slot)) {
+    return false;  // OOM: the generic path reports properly
   }
   nobj->setShape(newShape);
   nobj->initSlot(slot, JS::Value::fromRawBits(valBits));
@@ -211,15 +247,8 @@ bool NightTryInitAddTransition(JSContext* cx, uint64_t objBits,
   NativeObject* nobj = &obj->as<NativeObject>();
   SharedShape* newShape =
       reinterpret_cast<SharedShape*>(static_cast<uintptr_t>(newShapeW));
-  uint32_t nfixed = nobj->numFixedSlots();
-  if (slot >= nfixed) {
-    uint32_t dynCount = NativeObject::calculateDynamicSlots(
-        nfixed, newShape->slotSpan(), nobj->getClass());
-    if (dynCount > nobj->numDynamicSlots()) {
-      if (!NativeObject::growSlotsPure(cx, nobj, dynCount)) {
-        return false;
-      }
-    }
+  if (!ReplaySlots(cx, nobj, newShape, slot)) {
+    return false;
   }
   nobj->setShape(newShape);
   nobj->initSlot(slot, JS::Value::fromRawBits(valBits));

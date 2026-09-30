@@ -47,11 +47,17 @@ uint32_t NightObjectSlotSpanIfShared(JSObject* obj);
 // receiver's shape; the replays apply the cached (oldShape, id) -> newShape
 // transition to another object of oldShape. `nurseryOut` asks the caller to
 // zero the row at the next minor-GC end.
+// `*skipOut`: the transition raises the span past the new slot's own
+// (analysis-chosen slot layouts leave the slots between as holes), so a
+// replay must also initialize those; only the C++ replays below do, so such
+// a transition goes in the runtime's tables and never in a site row, which
+// the compiled add arms replay.
 bool NightPopulateAddTransition(JSContext* cx, JSObject* obj, jsid id,
                                 uint32_t oldSpan, uint32_t* newShapeOut,
                                 uint32_t* slotOut, uint32_t protoPtrsOut[4],
                                 uint32_t protoShapesOut[4],
-                                uint32_t* numProtosOut, bool* nurseryOut);
+                                uint32_t* numProtosOut, bool* nurseryOut,
+                                bool* skipOut);
 bool NightTryAddPropTransition(JSContext* cx, uint64_t recvBits,
                                uint32_t oldShapeW, uint32_t newShapeW,
                                uint32_t slot, const uint32_t* protoPtrs,
