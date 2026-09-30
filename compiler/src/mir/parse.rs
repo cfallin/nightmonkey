@@ -1708,7 +1708,7 @@ fn template(mn: &str) -> Option<Opcode> {
         all.push(Unbox(k));
         all.push(GuardUnbox(k));
     }
-    for a in [ArithOp::Add, ArithOp::Sub, ArithOp::Mul] {
+    for a in [ArithOp::Add, ArithOp::Sub, ArithOp::Mul, ArithOp::Rem] {
         all.extend([I32Ovf(a), I32Wrap(a), IntArith(a)]);
     }
     for o in [F64Op::Add, F64Op::Sub, F64Op::Mul, F64Op::Div, F64Op::Mod] {

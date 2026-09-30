@@ -111,6 +111,10 @@ pub enum ArithOp {
     Add,
     Sub,
     Mul,
+    /// JS `%` on integers (the dividend's sign). Checked (`.ovf`), it
+    /// fails on a zero divisor and on a -0 result (a negative dividend
+    /// with remainder 0); `.wrap` and `int` need both ruled out by type.
+    Rem,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -956,6 +960,58 @@ fn arith_range(op: ArithOp, a: IRange, b: IRange) -> (i128, i128) {
             let p = [al * bl, al * bh, ah * bl, ah * bh];
             (*p.iter().min().unwrap(), *p.iter().max().unwrap())
         }
+        ArithOp::Rem => {
+            // |r| < |divisor| and |r| <= |dividend|, with the dividend's
+            // sign.
+            let m = bl.abs().max(bh.abs()) - 1;
+            let m = m.max(0);
+            (al.max(-m).min(0), ah.min(m).max(0))
+        }
+    }
+}
+
+/// Whether range `r` contains 0.
+fn has_zero(r: IRange) -> bool {
+    r.lo <= 0 && 0 <= r.hi
+}
+
+/// Whether an integer `op` on operands in `x` and `y` may give -0 (as a
+/// double), which no integer representation holds: a zero product with a
+/// negative factor, or a zero remainder of a negative dividend.
+pub fn may_neg_zero(op: ArithOp, x: IRange, y: IRange) -> bool {
+    match op {
+        ArithOp::Add | ArithOp::Sub => false,
+        ArithOp::Mul => (has_zero(x) && y.lo < 0) || (has_zero(y) && x.lo < 0),
+        ArithOp::Rem => x.lo < 0,
+    }
+}
+
+/// The result range of integer `op` on operands in `x` and `y`, if every
+/// result is an int32 other than -0 (and, for `%`, the divisor is never
+/// 0): the op then needs no check.
+pub fn i32_exact(op: ArithOp, x: IRange, y: IRange) -> Option<IRange> {
+    if may_neg_zero(op, x, y) || (op == ArithOp::Rem && has_zero(y)) {
+        return None;
+    }
+    let (lo, hi) = arith_range(op, x, y);
+    (lo >= I32_MIN as i128 && hi <= I32_MAX as i128).then(|| IRange::new(lo as i64, hi as i64))
+}
+
+/// The result range of an int32 bit op: `&` with a non-negative operand
+/// is at most it; `>>` by a constant count scales; `|` and `^` of
+/// non-negative operands stay below the next power of two.
+fn bit_range(b: BitOp, x: IRange, y: IRange) -> IRange {
+    let pow2 = |h: i64| if h <= 0 { 0 } else { (1i64 << (64 - h.leading_zeros())) - 1 };
+    match b {
+        BitOp::And if x.lo >= 0 && y.lo >= 0 => IRange::new(0, x.hi.min(y.hi)),
+        BitOp::And if x.lo >= 0 => IRange::new(0, x.hi),
+        BitOp::And if y.lo >= 0 => IRange::new(0, y.hi),
+        BitOp::Or | BitOp::Xor if x.lo >= 0 && y.lo >= 0 => IRange::new(0, pow2(x.hi.max(y.hi))),
+        BitOp::Shr if y.lo == y.hi => {
+            let k = y.lo & 31;
+            IRange::new(x.lo >> k, x.hi >> k)
+        }
+        _ => IRange::new(I32_MIN, I32_MAX),
     }
 }
 
@@ -1323,6 +1379,8 @@ pub fn signature(op: &Opcode, args: &[Type], m: &Module) -> SigResult {
         I32Wrap(a) => {
             arity(args, 2)?;
             let (x, y) = (i32r(&args[0], "i32 arith")?, i32r(&args[1], "i32 arith")?);
+            // Wasm's `rem_s` traps on 0.
+            want(*a != ArithOp::Rem || !has_zero(y), || "i32.rem.wrap: the divisor may be 0".into())?;
             let (lo, hi) = arith_range(*a, x, y);
             let fits = lo >= I32_MIN as i128 && hi <= I32_MAX as i128;
             Sig::result(if fits {
@@ -1337,7 +1395,11 @@ pub fn signature(op: &Opcode, args: &[Type], m: &Module) -> SigResult {
                 Type::Int(r) => Ok(*r),
                 _ => Err("int arith: expected int operands".to_string()),
             };
-            let (lo, hi) = arith_range(*a, r(&args[0])?, r(&args[1])?);
+            let (x, y) = (r(&args[0])?, r(&args[1])?);
+            want(!may_neg_zero(*a, x, y) && (*a != ArithOp::Rem || !has_zero(y)), || {
+                "int arith: may give -0 or divide by 0".into()
+            })?;
+            let (lo, hi) = arith_range(*a, x, y);
             // `Int` arithmetic is only for interval proofs: an op that may
             // leave the exact-double domain is ill-typed, not a wraparound.
             want(lo >= -(INT_LIM as i128) && hi <= INT_LIM as i128, || {
@@ -1361,11 +1423,11 @@ pub fn signature(op: &Opcode, args: &[Type], m: &Module) -> SigResult {
             })?;
             Sig::result(Type::F64_TOP)
         }
-        I32Bit(_) => {
+        I32Bit(b) => {
             arity(args, 2)?;
-            i32r(&args[0], "i32 bitop")?;
-            i32r(&args[1], "i32 bitop")?;
-            Sig::result(Type::I32_TOP)
+            let x = i32r(&args[0], "i32 bitop")?;
+            let y = i32r(&args[1], "i32 bitop")?;
+            Sig::result(Type::I32(bit_range(*b, x, y)))
         }
         I32Ushr => {
             arity(args, 2)?;

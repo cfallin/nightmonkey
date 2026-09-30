@@ -2113,6 +2113,8 @@ impl<'a> Lower<'a> {
                     ArithOp::Add => Operator::I32Add,
                     ArithOp::Sub => Operator::I32Sub,
                     ArithOp::Mul => Operator::I32Mul,
+                    // Its type rules out a zero divisor.
+                    ArithOp::Rem => Operator::I32RemS,
                 };
                 let v = self.bin(o, a[0], a[1], Type::I32);
                 self.def(inst, v);
@@ -2122,6 +2124,7 @@ impl<'a> Lower<'a> {
                     ArithOp::Add => Operator::I64Add,
                     ArithOp::Sub => Operator::I64Sub,
                     ArithOp::Mul => Operator::I64Mul,
+                    ArithOp::Rem => Operator::I64RemS,
                 };
                 let v = self.bin(o, a[0], a[1], Type::I64);
                 self.def(inst, v);
@@ -2132,7 +2135,12 @@ impl<'a> Lower<'a> {
                     F64Op::Sub => Operator::F64Sub,
                     F64Op::Mul => Operator::F64Mul,
                     F64Op::Div => Operator::F64Div,
-                    F64Op::Mod => return Err("lowering: f64.mod".into()),
+                    // Wasm has no fmod: the leaf helper (`js::NumberMod`).
+                    F64Op::Mod => {
+                        let v = self.call1(self.h.fmod, &[a[0], a[1]], Type::F64);
+                        self.def(inst, v);
+                        return Ok(());
+                    }
                 };
                 let v = self.bin(o, a[0], a[1], Type::F64);
                 self.def(inst, v);
@@ -2405,6 +2413,22 @@ impl<'a> Lower<'a> {
                         self.terminate(Terminator::Br { target: f });
                         self.cur = ok_b;
                         (r, self.i32c(1))
+                    }
+                    ArithOp::Rem => {
+                        // A zero divisor fails (NaN), and so does a zero
+                        // remainder of a negative dividend (-0). `rem_s`
+                        // traps on 0, so it divides by 1 there instead;
+                        // INT_MIN % -1 is 0 in Wasm, and fails as -0.
+                        let z = self.i32c(0);
+                        let nz = self.bin(Operator::I32Ne, y, z, Type::I32);
+                        let one = self.i32c(1);
+                        let d = self.select(Type::I32, y, one, nz);
+                        let r = self.bin(Operator::I32RemS, x, d, Type::I32);
+                        let neg = self.bin(Operator::I32LtS, x, z, Type::I32);
+                        let rz = self.un(Operator::I32Eqz, r, Type::I32);
+                        let negz = self.bin(Operator::I32And, neg, rz, Type::I32);
+                        let pos = self.un(Operator::I32Eqz, negz, Type::I32);
+                        (r, self.bin(Operator::I32And, nz, pos, Type::I32))
                     }
                 };
                 self.guard(inst, ok, &[r])?;

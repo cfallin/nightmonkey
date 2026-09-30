@@ -36,7 +36,7 @@ use crate::mir::ops::{
     UnboxKind,
 };
 use crate::mir::types::{
-    KeyRange, LayoutClaim, LayoutState, ObjInfo, ObjKind, TagSet, Type as MType,
+    IRange, KeyRange, LayoutClaim, LayoutState, ObjInfo, ObjKind, TagSet, Type as MType, I32_MAX, I32_MIN,
 };
 use crate::opsem::{PRIM_BIGINT, PRIM_INT32, PRIM_NULL, PRIM_UNDEFINED};
 use crate::wasm::baseline::layout::{self, FrameLayout, StackDepths};
@@ -1881,6 +1881,31 @@ impl<'s, 'a> Run<'s, 'a> {
             }
             (a, b) => unreachable!("convert {a:?} to {b:?}"),
         }
+    }
+
+    /// The type `op`'s rule gives its result on operands `args`: ranges
+    /// and all, where the builder would otherwise declare the top of the
+    /// representation.
+    fn sig_result(&self, op: &Opcode, args: &[mir::Value]) -> MType {
+        let tys: Vec<MType> = args.iter().map(|&v| self.f.ty(v)).collect();
+        let sig = mir::ops::signature(op, &tys, &self.mm).expect("well-typed operands");
+        sig.results.into_iter().chain(sig.outputs).next().expect("a result")
+    }
+
+    /// Integer `x op y` (`%` too) on int32s, for an int32 result: unchecked
+    /// where the operands' ranges prove the result an int32 other than -0
+    /// (a nonzero divisor for `%`: MIR.md §10.6), else checked, exiting on
+    /// failure. Either way the result carries its range.
+    fn int_arith(&mut self, op: ArithOp, x: mir::Value, y: mir::Value) -> mir::Value {
+        let range = |v: mir::Value| match self.f.ty(v) {
+            MType::I32(r) => r,
+            _ => IRange::new(I32_MIN, I32_MAX),
+        };
+        if let Some(r) = mir::ops::i32_exact(op, range(x), range(y)) {
+            return self.inst(Opcode::I32Wrap(op), vec![x, y], Some(MType::I32(r)));
+        }
+        let out = self.sig_result(&Opcode::I32Ovf(op), &[x, y]);
+        self.guard(Opcode::I32Ovf(op), vec![x, y], out)
     }
 
     fn as_i32(&mut self, x: Slot) -> mir::Value {
@@ -4983,7 +5008,7 @@ impl<'s, 'a> Run<'s, 'a> {
                     }
                     (Some(Num::I32), Some(Num::I32)) => {
                         let (x, y) = (self.as_i32(a), self.as_i32(b));
-                        let r = self.guard(Opcode::I32Ovf(arith), vec![x, y], MType::I32_TOP);
+                        let r = self.int_arith(arith, x, y);
                         self.push(r, Ty::I32);
                     }
                     (Some(_), Some(_)) => {
@@ -4992,6 +5017,7 @@ impl<'s, 'a> Run<'s, 'a> {
                             ArithOp::Add => F64Op::Add,
                             ArithOp::Sub => F64Op::Sub,
                             ArithOp::Mul => F64Op::Mul,
+                            ArithOp::Rem => unreachable!("`%` has its own arm"),
                         };
                         let r = self.inst(Opcode::F64Arith(fop), vec![x, y], Some(MType::F64_TOP));
                         self.push(r, Ty::F64);
@@ -5034,15 +5060,27 @@ impl<'s, 'a> Run<'s, 'a> {
                     self.js_binop(JsBinop::Div, a, b);
                 }
             }
-            Mod | Pow => {
+            Mod => {
                 let b = self.pop();
                 let a = self.pop();
-                let k = if op == Mod {
-                    JsBinop::Mod
-                } else {
-                    JsBinop::Pow
-                };
-                self.js_binop(k, a, b);
+                match (a.ty.num(), b.ty.num()) {
+                    (Some(Num::I32), Some(Num::I32)) => {
+                        let (x, y) = (self.as_i32(a), self.as_i32(b));
+                        let r = self.int_arith(ArithOp::Rem, x, y);
+                        self.push(r, Ty::I32);
+                    }
+                    (Some(_), Some(_)) => {
+                        let (x, y) = (self.as_f64(a), self.as_f64(b));
+                        let r = self.inst(Opcode::F64Arith(F64Op::Mod), vec![x, y], Some(MType::F64_TOP));
+                        self.push(r, Ty::F64);
+                    }
+                    _ => self.js_binop(JsBinop::Mod, a, b),
+                }
+            }
+            Pow => {
+                let b = self.pop();
+                let a = self.pop();
+                self.js_binop(JsBinop::Pow, a, b);
             }
             BitAnd | BitOr | BitXor | Lsh | Rsh => {
                 let b = self.pop();
@@ -5056,7 +5094,8 @@ impl<'s, 'a> Run<'s, 'a> {
                         Lsh => BitOp::Shl,
                         _ => BitOp::Shr,
                     };
-                    let r = self.inst(Opcode::I32Bit(bop), vec![x, y], Some(MType::I32_TOP));
+                    let t = self.sig_result(&Opcode::I32Bit(bop), &[x, y]);
+                    let r = self.inst(Opcode::I32Bit(bop), vec![x, y], Some(t));
                     self.push(r, Ty::I32);
                 } else {
                     let k = match op {

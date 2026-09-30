@@ -239,6 +239,7 @@ fn arith_name(a: ArithOp) -> &'static str {
         ArithOp::Add => "add",
         ArithOp::Sub => "sub",
         ArithOp::Mul => "mul",
+        ArithOp::Rem => "rem",
     }
 }
 
