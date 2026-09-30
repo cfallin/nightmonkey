@@ -2123,6 +2123,73 @@ static bool PlainStore(JSObject* obj, JS::HandleId id) {
   return !nobj->getClass()->getAddProperty();
 }
 
+// Whether `Object.defineProperty(obj, id, desc)` may run under
+// AutoVouchedStore: the define touches no field the object's TYPES claim
+// covers, and runs no JS (the vouch is process-wide while it is up, so a
+// store made by a getter it ran would be vouched too).
+//
+// - `id` is not in the stamped layout's row: the masked fields are
+//   untouched. (Redefining a masked field as an accessor is a structural
+//   change the engine reports anyway.)
+// - `obj` is an ordinary native object: no proxy trap, resolve or
+//   addProperty hook.
+// - `desc` is a plain object whose descriptor fields are absent or own
+//   data properties, none of them inherited: ToPropertyDescriptor then
+//   calls no getter.
+//
+// pdfjs's `addContextCurrentTransform` defines two accessors on the canvas
+// context once per context; through the engine each cleared the context's
+// TYPES, and every method call on it after that failed its entry guard.
+static bool DefineKeepsTypes(JSContext* cx, JSObject* obj, JS::PropertyKey id,
+                             JS::Value desc) {
+  if (!gLayouts.anyTypes || !gNames.ids || !desc.isObject()) {
+    return false;
+  }
+  uint32_t w = obj->externalWord();
+  if (!(w & js::night::kWordTypes)) {
+    return false;
+  }
+  uint32_t k = (w & js::night::kWordConstructing) ? (w >> 18) & 0x0FFF
+                                                  : w & 0xFFFF;
+  if (k == 0 || k - 1 >= gLayouts.rows.size()) {
+    return false;
+  }
+  for (uint32_t atom : gLayouts.rows[k - 1]) {
+    if (atom < gNames.ids->size() && (*gNames.ids)[atom].get() == id) {
+      return false;
+    }
+  }
+  if (!obj->is<js::NativeObject>() || obj->getOpsDefineProperty() ||
+      obj->getClass()->getResolve() || obj->getClass()->getAddProperty()) {
+    return false;
+  }
+  JSObject* d = &desc.toObject();
+  if (!d->is<js::PlainObject>()) {
+    return false;
+  }
+  js::NativeObject* nd = &d->as<js::NativeObject>();
+  const js::ImmutableTenuredPtr<js::PropertyName*>* kFields[] = {
+      &cx->names().enumerable, &cx->names().configurable, &cx->names().value,
+      &cx->names().writable,   &cx->names().get,          &cx->names().set};
+  for (auto* f : kFields) {
+    JS::PropertyKey fid = js::NameToId(*f);
+    mozilla::Maybe<js::PropertyInfo> own = nd->lookupPure(fid);
+    if (own.isSome()) {
+      if (!own->isDataProperty()) {
+        return false;
+      }
+      continue;
+    }
+    for (JSObject* p = nd->staticPrototype(); p; p = p->staticPrototype()) {
+      if (!p->is<js::NativeObject>() || p->getClass()->getResolve() ||
+          p->as<js::NativeObject>().lookupPure(fid).isSome()) {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
 // `flags`: bit 0 strict; bit 1 the compiled caller vouches that `val` is of
 // the field's predicted type for the object's class (the baseline tier's
 // stores, `night_runtime_set_prop_ic_miss`'s rule): a plain slot write or
@@ -5623,6 +5690,28 @@ bool night_runtime_call(JSContext* cx, uint32_t top, uint32_t sp,
           JS_ClearPendingException(cx);
           BlowAllBindingFuses();
           BlowAllGnameFuses();
+        }
+      } else if (argc >= 3 && frame[2].isObject() && frame[3].isString() &&
+                 frame[3].toString()->isAtom() &&
+                 frame[0].asRawBits() ==
+                     gFns.defineProperty->get().asRawBits()) {
+        // A define on a stamped object that leaves its TYPES true keeps
+        // the bit (`DefineKeepsTypes`), as a vouched set does.
+        JSObject* target = &frame[2].toObject();
+        JS::PropertyKey key =
+            js::AtomToId(&frame[3].toString()->asAtom());
+        if (DefineKeepsTypes(cx, target, key, frame[4])) {
+          AutoVouchedStore v(true);
+          JS::RootedValue rval(cx);
+          JS::HandleValueArray args =
+              JS::HandleValueArray::fromMarkedLocation(argc, frame + 2);
+          JS::RootedValue fval(cx, frame[0]);
+          JS::RootedValue thisv(cx, frame[1]);
+          if (!JS::Call(cx, thisv, fval, args, &rval)) {
+            return false;
+          }
+          WriteNightOut(top, rval.get().asRawBits());
+          return true;
         }
       }
     } else if (MOZ_UNLIKELY(gFns.defineProperties &&
