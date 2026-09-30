@@ -976,6 +976,7 @@ impl Solver<'_> {
             return;
         }
         self.heap[c].sources.push(src);
+        self.engine.fire_side(SideKey::Sources(c));
         if let AbsKey::Alloc { script, pc, .. } = self.heap[src].key {
             self.heap.site_is_proto.insert(Site::new(script, pc));
         }
@@ -1075,6 +1076,7 @@ impl Solver<'_> {
         }
         let cell = self.engine.cell(key);
         self.heap.fields_of.entry(abs).or_default().push(name);
+        self.engine.fire_side(SideKey::Fields(abs));
         let info = &self.heap[abs];
         let proto_of = info.proto_of;
         let owner = info.owner_class;
@@ -1285,6 +1287,78 @@ impl Solver<'_> {
         }
     }
 
+    /// Every named field a computed-key read of `rts` may return: the
+    /// fields of each object the receiver may be, and of its prototype
+    /// chain (elements excepted: the `Read` beside it has those), joined
+    /// into `out`, subscribing the reader. Returns the scripted functions
+    /// among them. An `AnyOf` receiver contributes its region's classes'
+    /// prototype chains; arrays, `AnyObject` and unresolved receivers
+    /// contribute nothing here (the elements read, and escape, cover them).
+    fn named_fields_join(&mut self, rts: &TypeSet, user: (ConId, CtxId), out: &mut TypeSet) -> Vec<ScriptId> {
+        let mut holders: Vec<AbsId> = vec![];
+        match rts.obj {
+            ObjType::One(a) if !self.heap[a].is_array => holders.push(a),
+            ObjType::ClassAny(c) if !self.heap[c].is_array => holders.push(self.heap[c].proto_abs),
+            ObjType::AnyOf(r) => {
+                let root = self.engine.region_root(r);
+                let members = self
+                    .engine
+                    .region_members
+                    .get(&root)
+                    .cloned()
+                    .unwrap_or_else(|| vec![root]);
+                if members.len() <= crate::constants::REGION_VIEW_CAP {
+                    holders.extend(members.iter().map(|&m| self.heap[m].proto_abs));
+                }
+            }
+            _ => {}
+        }
+        let elems = self.names_of.elems;
+        let mut seen: std::collections::BTreeSet<AbsId> = std::collections::BTreeSet::new();
+        let mut fns: Vec<ScriptId> = vec![];
+        while let Some(h) = holders.pop() {
+            let mut cur = h;
+            for _ in 0..CHAIN_DEPTH {
+                if !seen.insert(cur) {
+                    break;
+                }
+                // A class's synthetic method table holds only the names
+                // some site has read by name; the concrete prototypes that
+                // feed it hold them all.
+                if let Some(c) = self.heap[cur].proto_of {
+                    self.engine.subscribe_side(SideKey::Sources(c), user);
+                    holders.extend(self.heap[c].sources.iter().copied());
+                }
+                self.ensure_seeded(cur);
+                self.engine.subscribe_side(SideKey::Fields(cur), user);
+                let names = self.heap.fields_of.get(&cur).cloned().unwrap_or_default();
+                for n in names {
+                    if n == elems {
+                        continue;
+                    }
+                    let cell = self.field_cell(cur, n);
+                    let v = self.engine.read(cell, user);
+                    for f in v.fns.scripted() {
+                        if !fns.contains(&f) {
+                            fns.push(f);
+                        }
+                    }
+                    let _ = self.engine.join_ts(out, &v);
+                }
+                match self.heap[cur].proto {
+                    ProtoLink::Abs(p) => cur = p,
+                    ProtoLink::None => {
+                        // A later prototype install extends the chain.
+                        let sent = self.engine.cell(CellKey::ProtoSentinel(cur));
+                        let _ = self.engine.read(sent, user);
+                        break;
+                    }
+                }
+            }
+        }
+        fns
+    }
+
     /// Monotone chain join from `holder`'s proto upward: joins each level's
     /// own field cell, subscribing the reader along the way; a dead end
     /// subscribes the holder's proto sentinel so a later install re-fires.
@@ -1478,6 +1552,28 @@ impl Solver<'_> {
                     self.this_field_raise(sid, name, &v, user);
                 }
                 self.write_into(&rts, name, &v, this_recv, user);
+                true
+            }
+            Constraint::KeyedRead { recv, key, dst, .. } => {
+                let k = self.engine.resolve(sid, ctx, key);
+                let kts = self.engine.read(k, user);
+                let named = kts.unknown
+                    || kts.prims.intersects(PRIM_STRING | PRIM_SYMBOL)
+                    || kts.obj != ObjType::Empty;
+                if !named {
+                    return true;
+                }
+                let r = self.engine.resolve(sid, ctx, recv);
+                let rts = self.engine.read(r, user);
+                let mut out = TypeSet::default();
+                let fns = self.named_fields_join(&rts, user, &mut out);
+                for f in fns {
+                    self.escape_args(f);
+                }
+                if !out.is_empty() {
+                    let d = self.engine.resolve(sid, ctx, dst);
+                    self.engine.raise(d, &out, user);
+                }
                 true
             }
             Constraint::Alloc { dst, pc, kind } => {

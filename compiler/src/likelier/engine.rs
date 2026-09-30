@@ -177,6 +177,20 @@ pub enum Constraint {
         pc: Pc,
         kind: ElemBuiltinKind,
     },
+    /// The named half of a computed-key read `recv[key]`, beside its
+    /// `Read` of the elements: when the key may be a name (a string, a
+    /// symbol, an object's ToPropertyKey, or unresolved), the read may
+    /// return any named property of the receiver or its prototype chain.
+    /// dst <- the join of those fields; and every scripted function among
+    /// them escapes its arguments (unresolved formals at CTX0, `this`
+    /// kept): `this[name].apply(this, args)` dispatch calls them with
+    /// arguments no call edge binds.
+    KeyedRead {
+        recv: CKey,
+        key: CKey,
+        dst: CKey,
+        pc: Pc,
+    },
     /// Allocation site: dst <- One(Alloc(sid, pc, ctx)) (heap semantics).
     /// `Snap` yields the ctx-free snapshot abstraction instead.
     Alloc { dst: CKey, pc: Pc, kind: AllocKind },
@@ -206,12 +220,13 @@ pub enum ConstraintKind {
     Call,
     Apply,
     ElemBuiltin,
+    KeyedRead,
     Alloc,
     Arith,
 }
 
 impl ConstraintKind {
-    pub const ALL: [ConstraintKind; 9] = [
+    pub const ALL: [ConstraintKind; 10] = [
         ConstraintKind::Move,
         ConstraintKind::Const,
         ConstraintKind::Read,
@@ -219,6 +234,7 @@ impl ConstraintKind {
         ConstraintKind::Call,
         ConstraintKind::Apply,
         ConstraintKind::ElemBuiltin,
+        ConstraintKind::KeyedRead,
         ConstraintKind::Alloc,
         ConstraintKind::Arith,
     ];
@@ -232,6 +248,7 @@ impl ConstraintKind {
             ConstraintKind::Call => "call",
             ConstraintKind::Apply => "apply",
             ConstraintKind::ElemBuiltin => "elem",
+            ConstraintKind::KeyedRead => "keyed",
             ConstraintKind::Alloc => "alloc",
             ConstraintKind::Arith => "arith",
         }
@@ -248,6 +265,7 @@ impl Constraint {
             Constraint::Call { .. } => ConstraintKind::Call,
             Constraint::Apply { .. } => ConstraintKind::Apply,
             Constraint::ElemBuiltin { .. } => ConstraintKind::ElemBuiltin,
+            Constraint::KeyedRead { .. } => ConstraintKind::KeyedRead,
             Constraint::Alloc { .. } => ConstraintKind::Alloc,
             Constraint::Arith { .. } => ConstraintKind::Arith,
         }
@@ -289,6 +307,11 @@ pub enum SideKey {
     Table(AbsId),
     /// `class_table_members` of one class.
     ClassTable(ClassId),
+    /// The field names interned on one abstraction (`fields_of`).
+    Fields(AbsId),
+    /// The concrete prototypes registered as one class's method-table
+    /// sources.
+    Sources(ClassId),
 }
 
 pub struct Cell {

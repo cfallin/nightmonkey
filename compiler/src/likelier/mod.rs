@@ -123,6 +123,8 @@ pub struct Solver<'a> {
     /// Diagnostic counters for this run (see [`stats::Stats`]).
     pub stats: stats::Stats,
     pub escaped: calls::Escaped,
+    /// Scripts whose arguments escaped (`Solver::escape_args`).
+    pub args_escaped: rustc_hash::FxHashSet<ScriptId>,
     /// Formals some analyzed call leaves out (`facts::omitted_formals`).
     pub omitted_formals: rustc_hash::FxHashSet<(ScriptId, u32)>,
     /// Receiver-kind census per property-read site: the least precise
@@ -296,6 +298,7 @@ impl<'a> Solver<'a> {
             ctxs: calls::Ctxs::new(),
             stats: stats::Stats::default(),
             escaped: calls::Escaped::default(),
+            args_escaped: rustc_hash::FxHashSet::default(),
             omitted_formals: Default::default(),
             site_recv: HashMap::default(),
             site_calls: HashMap::default(),
@@ -549,6 +552,11 @@ impl<'a> Solver<'a> {
                 biggest
             );
         }
+        crate::diag_line!(
+            "likelier: {} escaped scripts, {} with arguments escaped by computed-name reads",
+            self.escaped.len(),
+            self.args_escaped.len()
+        );
         for &(f, c) in &self.escape_log {
             if c == engine::SEED {
                 crate::diag_line!("likelier: escape fn#{f} via SEED");

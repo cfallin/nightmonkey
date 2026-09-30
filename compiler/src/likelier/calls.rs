@@ -946,6 +946,26 @@ impl Solver<'_> {
         !(self.this_pin.contains_key(&f) && matches!(v.obj, ObjType::AnyObject | ObjType::AnyOf(_)))
     }
 
+    /// A function called with arguments no call edge binds (computed-name
+    /// dispatch, `KeyedRead`): unresolved evidence into its formals at the
+    /// generic context, once. Unlike `do_escape`, `this` is kept: the
+    /// dispatch's receiver is the object the method was read from, and the
+    /// body's entry guards `this` to its class.
+    pub(super) fn escape_args(&mut self, script: ScriptId) {
+        if !self.args_escaped.insert(script) {
+            return;
+        }
+        let any = TypeSet::unresolved();
+        for i in 0..MAX_TRACKED_FORMALS {
+            let c = self.engine.cell(CellKey::Arg {
+                script,
+                arg: FormalIndex::new(i),
+                ctx: CTX0,
+            });
+            self.engine.raise(c, &any, (SEED, CTX0));
+        }
+    }
+
     /// Escape: function values reaching an untracked sink get Any joined
     /// into their generic-context args and this, once.
     pub(super) fn do_escape(&mut self, v: &TypeSet, user: (ConId, CtxId)) {

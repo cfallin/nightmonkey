@@ -1358,7 +1358,7 @@ impl OpcodeVisitor for Scan<'_, '_> {
     }
     fn get_elem(&mut self) {
         // [obj, key] -> [val]
-        self.pop_e();
+        let key = self.pop_e();
         let obj = self.pop_e();
         let recv = self.key_of(&obj);
         let v = self.fresh_var();
@@ -1374,6 +1374,20 @@ impl OpcodeVisitor for Scan<'_, '_> {
                 callee_pos: false,
             },
         );
+        // A key that may be a name also reads named properties. A numeric
+        // literal key cannot.
+        if !matches!(key.val, Val::Imm(p) if p.subset_of(crate::opsem::NUM)) {
+            let k = self.key_of(&key);
+            self.engine.add_con(
+                self.script_id,
+                Constraint::KeyedRead {
+                    recv,
+                    key: k,
+                    dst: CKey::Var(v),
+                    pc,
+                },
+            );
+        }
         let mut e = Entry::key(CKey::Var(v));
         e.read_con = Some(cid);
         self.push_e(e);
