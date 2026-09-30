@@ -15,7 +15,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use crate::mir::entity::{Block, Inst, Value};
 use crate::mir::func::{Edge, EdgeArg, Func, ValueDef};
 use crate::mir::module::Module;
-use crate::mir::ops::{effects, signature, KillSite, Opcode, SuccRole};
+use crate::mir::ops::{effects, signature, ArithOp, KillSite, Opcode, SuccRole};
 use crate::mir::types::{is_subtype, Type};
 
 /// A guard's identity: its op (with its static params) and its operand.
@@ -209,11 +209,311 @@ fn ok_output(f: &Func, ok: &Edge) -> Option<Value> {
     Some(f.blocks[ok.block].params[k])
 }
 
+/// Whether `trunc_demand` runs.
+const TRUNC_DEMAND: bool = true;
+
+/// The most a truncation-demanded chain may add up, in units of 2^31:
+/// past 2^53 a double sum rounds before ToInt32 sees it, and the wrapped
+/// int32 sum would no longer be its ToInt32.
+const TRUNC_UNITS_CAP: u64 = 1 << 22;
+
+/// Truncation demand over SSA (§10.6: rewrite `.ovf` to `.wrap` under
+/// ToInt32 demand). An int32 add or sub whose result only ever reaches
+/// ToInt32 -- a bit op or shift operand (a shift count is masked to five
+/// bits, so it too sees only low bits), another such add or sub, or a
+/// block param whose own uses are all of these -- cannot have its
+/// overflow observed: ToInt32 of the exact double sum is the wrapping
+/// int32 sum. Such an `i32.add.ovf` becomes `i32.add.wrap` and a jump,
+/// and its overflow exit goes away.
+///
+/// Unlike the builder's `int32_demand`, which follows the operand stack
+/// within one block, this follows values through locals and block
+/// params, so `h += h << 10; h ^= h >> 6` (a hash mix, where the sum
+/// passes through the local) wraps too.
+///
+/// Exact only while the double sum is: each value carries a bound on its
+/// spec magnitude in units of 2^31 (an int32 is 1, a sum the sum of its
+/// operands', a param the max over its incoming values), and a chain past
+/// `TRUNC_UNITS_CAP` -- any add carried around a loop -- keeps its check.
+///
+/// Returns how many ops it rewrote.
+pub fn trunc_demand(m: &Module, f: &mut Func) -> usize {
+    // Each rewrite drops an overflow exit, and an exit holds the sums live
+    // at it: another round may find them demanded.
+    let mut total = 0;
+    loop {
+        let n = trunc_demand_once(m, f);
+        if n == 0 {
+            if total > 0 {
+                retype_ints(m, f);
+            }
+            return total;
+        }
+        total += n;
+    }
+}
+
+fn trunc_demand_once(m: &Module, f: &mut Func) -> usize {
+    use crate::mir::func::InstData;
+    // Reachable blocks only: a rewritten check's exit block stays in the
+    // layout, unreached, with the values it would have written.
+    let live = Cfg::new(f).rpo;
+    let is_int = |f: &Func, v: Value| matches!(f.values[v].ty, Type::I32(_));
+    let add_sub = |op: &Opcode| {
+        matches!(
+            op,
+            Opcode::I32Ovf(ArithOp::Add | ArithOp::Sub) | Opcode::I32Wrap(ArithOp::Add | ArithOp::Sub)
+        )
+    };
+    // The value an add or sub produces: a wrap's result, an ovf's `ok`
+    // output param (`None` when the ok edge drops it).
+    let produced = |f: &Func, d: &InstData| -> Option<Value> {
+        match d.op {
+            Opcode::I32Wrap(_) => d.results.first().copied(),
+            Opcode::I32Ovf(_) => ok_output(f, &d.succs[0]),
+            _ => None,
+        }
+    };
+    #[derive(Clone, Copy)]
+    enum Use {
+        Arg(Inst),
+        Param(Value),
+        Full,
+    }
+    let mut uses: HashMap<Value, Vec<Use>> = HashMap::new();
+    for &b in &live {
+        for &i in &f.blocks[b].insts {
+            let d = &f.insts[i];
+            for &a in &d.args {
+                uses.entry(a).or_default().push(Use::Arg(i));
+            }
+            for e in &d.succs {
+                for (k, a) in e.args.iter().enumerate() {
+                    if let EdgeArg::Value(v) = a {
+                        let p = f.blocks[e.block].params[k];
+                        uses.entry(*v).or_default().push(Use::Param(p));
+                    }
+                }
+            }
+        }
+    }
+    for l in &f.loops {
+        if let Some(en) = &l.entry {
+            for &v in &en.state {
+                uses.entry(v).or_default().push(Use::Full);
+            }
+        }
+    }
+    // Greatest fixpoint, by worklist: every int32 value is demanded until
+    // a use says otherwise. A value's standing depends on the values its
+    // demanded uses produce (an add's result, an edge's param), so losing
+    // one re-examines the values that feed it.
+    let mut feeds: HashMap<Value, Vec<Value>> = HashMap::new();
+    for (&v, us) in &uses {
+        for u in us {
+            let dep = match *u {
+                Use::Arg(i) if add_sub(&f.insts[i].op) => produced(f, &f.insts[i]),
+                Use::Param(p) => Some(p),
+                _ => None,
+            };
+            if let Some(d) = dep {
+                feeds.entry(d).or_default().push(v);
+            }
+        }
+    }
+    let mut trunc: BTreeSet<Value> = f.values.keys().filter(|&v| is_int(f, v)).collect();
+    let use_ok = |trunc: &BTreeSet<Value>, u: &Use| match *u {
+        Use::Arg(i) => {
+            let d = &f.insts[i];
+            match d.op {
+                Opcode::I32Bit(_) | Opcode::I32Ushr => true,
+                ref op if add_sub(op) => produced(f, d).map_or(true, |r| trunc.contains(&r)),
+                _ => false,
+            }
+        }
+        Use::Param(p) => trunc.contains(&p),
+        Use::Full => false,
+    };
+    let mut work: Vec<Value> = trunc.iter().copied().collect();
+    while let Some(v) = work.pop() {
+        if !trunc.contains(&v) {
+            continue;
+        }
+        let ok = uses.get(&v).map_or(true, |us| us.iter().all(|u| use_ok(&trunc, u)));
+        if !ok {
+            trunc.remove(&v);
+            if let Some(fs) = feeds.get(&v) {
+                work.extend(fs.iter().copied().filter(|x| trunc.contains(x)));
+            }
+        }
+    }
+    // Magnitude bounds, by forward worklist over the adds and params. A
+    // bound still growing after a few updates is carried around a loop:
+    // unbounded.
+    const MAX_UPDATES: u32 = 8;
+    let unbounded = TRUNC_UNITS_CAP + 1;
+    let mut units: HashMap<Value, u64> = HashMap::new();
+    let mut updates: HashMap<Value, u32> = HashMap::new();
+    let unit = |units: &HashMap<Value, u64>, f: &Func, v: Value| -> u64 {
+        match units.get(&v) {
+            Some(&u) => u,
+            None if is_int(f, v) => 1,
+            None => TRUNC_UNITS_CAP + 1,
+        }
+    };
+    // Seeded with every add's result and int32 param; a raised bound
+    // re-examines the adds and params it flows into.
+    let mut work: Vec<Value> = vec![];
+    for &b in &live {
+        for &i in &f.blocks[b].insts {
+            let d = &f.insts[i];
+            if add_sub(&d.op) {
+                if let Some(r) = produced(f, d) {
+                    work.push(r);
+                }
+            }
+        }
+    }
+    let mut params_in: HashMap<Value, Vec<Value>> = HashMap::new();
+    for &b in &live {
+        for &i in &f.blocks[b].insts {
+            for e in &f.insts[i].succs {
+                for (k, a) in e.args.iter().enumerate() {
+                    if let EdgeArg::Value(v) = a {
+                        let p = f.blocks[e.block].params[k];
+                        if is_int(f, p) {
+                            params_in.entry(p).or_default().push(*v);
+                            work.push(p);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let mut producer: HashMap<Value, Inst> = HashMap::new();
+    for &b in &live {
+        for &i in &f.blocks[b].insts {
+            if add_sub(&f.insts[i].op) {
+                if let Some(r) = produced(f, &f.insts[i]) {
+                    producer.insert(r, i);
+                }
+            }
+        }
+    }
+    while let Some(v) = work.pop() {
+        let u = if let Some(&i) = producer.get(&v) {
+            let d = &f.insts[i];
+            (unit(&units, f, d.args[0]) + unit(&units, f, d.args[1])).min(unbounded)
+        } else if let Some(ins) = params_in.get(&v) {
+            ins.iter().map(|&x| unit(&units, f, x)).max().unwrap_or(1)
+        } else {
+            continue;
+        };
+        if units.get(&v).is_some_and(|&o| u <= o) {
+            continue;
+        }
+        let n = updates.entry(v).or_insert(0);
+        *n += 1;
+        let u = if *n > MAX_UPDATES { unbounded } else { u };
+        units.insert(v, u);
+        if let Some(us) = uses.get(&v) {
+            for use_ in us {
+                match *use_ {
+                    Use::Arg(i) if add_sub(&f.insts[i].op) => {
+                        if let Some(r) = produced(f, &f.insts[i]) {
+                            work.push(r);
+                        }
+                    }
+                    Use::Param(p) => work.push(p),
+                    _ => {}
+                }
+            }
+        }
+    }
+    // Rewrite.
+    let mut n = 0;
+    for b in live {
+        let Some(t) = f.terminator(b) else { continue };
+        let d = f.insts[t].clone();
+        let Opcode::I32Ovf(a @ (ArithOp::Add | ArithOp::Sub)) = d.op else {
+            continue;
+        };
+        let out = ok_output(f, &d.succs[0]);
+        if let Some(r) = out {
+            if !trunc.contains(&r) || unit(&units, f, r) > TRUNC_UNITS_CAP {
+                continue;
+            }
+        }
+        let op = Opcode::I32Wrap(a);
+        let tys: Vec<Type> = d.args.iter().map(|&v| f.values[v].ty).collect();
+        let Ok(sig) = signature(&op, &tys, m) else { continue };
+        f.blocks[b].insts.pop();
+        let (_, rs) = f.add_inst(b, op, d.args.clone(), &[sig.results[0]], vec![]);
+        let ok = &d.succs[0];
+        let args = ok
+            .args
+            .iter()
+            .map(|x| match x {
+                EdgeArg::Out(0) => EdgeArg::Value(rs[0]),
+                x => *x,
+            })
+            .collect();
+        f.add_inst(b, Opcode::Jump, vec![], &[], vec![Edge { block: ok.block, args }]);
+        n += 1;
+    }
+    n
+}
+
+/// Widen int32 types after `trunc_demand`: a wrapped sum may take any
+/// int32 value where the checked one had a range, and every value it
+/// reaches is demanded (bit ops, adds, params), so only those widen: an
+/// add's result or output to its rule, a param to what its edges pass.
+fn retype_ints(m: &Module, f: &mut Func) {
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for b in f.layout.clone() {
+            for i in f.blocks[b].insts.clone() {
+                let d = f.insts[i].clone();
+                if matches!(d.op, Opcode::I32Ovf(_) | Opcode::I32Wrap(_) | Opcode::I32Bit(_)) {
+                    let tys: Vec<Type> = d.args.iter().map(|&v| f.values[v].ty).collect();
+                    if let Ok(sig) = signature(&d.op, &tys, m) {
+                        let got = match d.op {
+                            Opcode::I32Ovf(_) => ok_output(f, &d.succs[0]).zip(sig.outputs.first().copied()),
+                            _ => d.results.first().copied().zip(sig.results.first().copied()),
+                        };
+                        if let Some((v, t)) = got {
+                            if !is_subtype(&t, &f.values[v].ty) {
+                                f.values[v].ty = Type::I32_TOP;
+                                changed = true;
+                            }
+                        }
+                    }
+                }
+                for e in &d.succs {
+                    for (k, a) in e.args.iter().enumerate() {
+                        if let EdgeArg::Value(v) = a {
+                            let p = f.blocks[e.block].params[k];
+                            let (vt, pt) = (f.values[*v].ty, f.values[p].ty);
+                            if matches!((vt, pt), (Type::I32(_), Type::I32(_))) && !is_subtype(&vt, &pt) {
+                                f.values[p].ty = Type::I32_TOP;
+                                changed = true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Run the passes to a fixpoint: each folded guard leaves its `ok`
 /// block's param a copy of a known value, which exposes the next guard
 /// on it to folding. Returns how many guards folded.
 pub fn optimize(m: &Module, f: &mut Func) -> usize {
-    let mut total = 0;
+    // Once, first: an overflow check it removes is a guard the rest
+    // then need not keep in their dataflow.
+    let mut total = if TRUNC_DEMAND { trunc_demand(m, f) } else { 0 };
     loop {
         // First: a loop's invariant values reach its body through params
         // until forwarded, and `hoist_guards` needs them as they are.
