@@ -853,10 +853,13 @@ impl Engine {
             .get(why.0 .0 as usize)
             .map_or_else(|| "?".to_string(), |c| format!("{c:?}"));
         crate::diag_line!(
-            "night: tracecell {got} <- obj {:?} unknown {} from sid {:?} con {}",
+            "night: tracecell {got} <- obj {:?} prims {:?} range {:?} unknown {} from sid {:?} ctx {} con {}",
             ts.obj,
+            ts.prims,
+            ts.range,
             u8::from(ts.unknown),
             src.map(|s| s.get()),
+            why.1 .0,
             con
         );
     }

@@ -63,13 +63,30 @@ memory note; the tooling is `~/work/nm-mir-scratch/prof6/ab2.sh` and
    restamp); the analysis would need per-path rows from the
    constructor's CFG (`CtorRowExpander` walks a linear event list
    today).
-3. **pdfjs transform wrappers: int32-only argument claims with doubles
-   arriving.** `arg_types` for the context's `translate`/`scale`
-   (sids 15927, 15931) and pdfjs's `ctx*` wrappers (100663, ...) say
-   `0x1` (int32 only), and about 15k calls each exit at the int32 unbox
-   with a double. The claims are guarded, so this is a missed source in
-   the analysis (the operator-list dispatch applies arrays of parsed
-   numbers), not a soundness problem. Find the source it misses.
+3. **pdfjs: methods reached only by computed-name dispatch get no
+   argument evidence.** About 15k calls each of the context's `scale`/
+   `translate` and pdfjs's `ctx*` wrappers exit at an int32 unbox with a
+   double; their `arg_types` say `0x1`. Traced back
+   (`--trace-cell`/`--trace-field`, which now print prims and range):
+   CanvasGraphics' `executeOperatorList` dispatches
+   `this[fnName].apply(this, argsArray[i])`. The scan models `this[k]`
+   as a read of the instance's `ELEMS` cell (integer elements and
+   string-keyed properties are one name), which is Empty, so the apply
+   has no targets and no operator method's formals are ever bound.
+   `setHScale(scale)` then writes `textHScale = scale / 100` with Empty
+   evidence, and `textHScale` is claimed int32 from the constructor's
+   `1`; `applyTextTransforms` passes it to `scale`. Two parts, and a
+   trade-off for the owner:
+   - a computed read whose key may be a string should yield the
+     receiver chain's method union (as `region_methods` does for an
+     `AnyOf` receiver), plus unresolved evidence;
+   - that union saturates here, and a saturated set drops its members:
+     `JoinSink::dropped_fns` records them for exactly this ("may run
+     through the saturated set with unbound arguments") but nothing
+     consumes it. Escaping them (unresolved formals and `this` at CTX0)
+     is the sound completion; it also widens every script any saturated
+     set dropped (earley-boyer drops 708), so measure it across the
+     suite.
 4. **`instanceof` narrowing.** Neither backend narrows an operand to
    object on the true branch; only the ordinary-function arm of
    `instanceof_arms` could (a custom `Symbol.hasInstance` may answer
