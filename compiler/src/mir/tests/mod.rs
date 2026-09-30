@@ -786,3 +786,70 @@ b10:\n  exit.throw pc=0 this=v1 args=[v2] locals=[] rval=v1 stack=[]\n}\n";
     assert!(ops.iter().any(|o| o == "i32.cmp.lt"), "{ops:?}\n{text}");
 }
 
+#[test]
+fn literal_is_scalar_replaced() {
+    // `o = {x: 7}; <guard that may exit with o on the stack>; return o.x`:
+    // the load is the init's value, and the object exists only on the
+    // exit's path, rebuilt there.
+    let text = optimized(
+        "module {\n  layout L3 = { x: val{int32} }\n}\n\
+func @s1 (formals=1, locals=0, depths={0:0, 5:1}) {\n  root entry b0\n\
+b0(v0: obj{Function(s1)}, v1: val, v2: val):\n  lit.new 2 -> ok b1(v5: val{object}), err b10\n\
+b1(v5: val{object}):\n  stamp.fresh v5 0x20004\n  v6 = const.i32 7\n  v7 = box v6\n  v8: val{int32} = weaken v7\n\
+  lit.init v5, v8 x, L3 -> ok b2, err b10\n\
+b2:\n  guard.unbox.i32 v2 -> ok b3(v9: i32), fail b11\n\
+b3(v9: i32):\n  guard.unbox.obj v5 -> ok b4(v10: obj), fail b9\n\
+b4(v10: obj):\n  guard.layout v10 L3 slots -> ok b5(v11: obj{L3 slots}), fail b9\n\
+b5(v11: obj{L3 slots}):\n  v12 = load_slot v11 x\n  return v12\n\
+b9:\n  exit pc=0 this=v1 args=[v2] locals=[] rval=v1 stack=[]\n\
+b10:\n  exit.throw pc=0 this=v1 args=[v2] locals=[] rval=v1 stack=[]\n\
+b11:\n  exit pc=5 this=v1 args=[v2] locals=[] rval=v1 stack=[v5]\n}\n",
+    );
+    assert_eq!(text.matches("lit.new").count(), 1, "{text}");
+    assert_eq!(text.matches("load_slot").count(), 0, "{text}");
+    assert_eq!(text.matches("guard.layout").count(), 0, "{text}");
+    // The one allocation left is on the exit's path, before the exit.
+    let exit_path = text.split("\n\n").filter(|b| b.contains("lit.new") || b.contains("lit.init") || b.contains("pc=5")).count();
+    assert!(exit_path >= 2, "{text}");
+    assert!(text.contains("return v8") || text.contains("return v7"), "{text}");
+}
+
+#[test]
+fn owners_example_folds_to_a_constant() {
+    // `let o = {x: 123}; return o.x + 2;` (the owner's example, with the
+    // field in the literal: MIR-MEMORY.md §3.4): no object, no guard, no
+    // unboxing, and the sum a constant.
+    let text = optimized(
+        "module {\n  layout L3 = { x: val{int32} }\n}\n\
+func @s1 (formals=0, locals=0, depths={0:0}) {\n  root entry b0\n\
+b0(v0: obj{Function(s1)}, v1: val):\n  lit.new 1 -> ok b1(v5: val{object}), err b10\n\
+b1(v5: val{object}):\n  stamp.fresh v5 0x20004\n  v6 = const.i32 123\n  v7 = box v6\n  v8: val{int32} = weaken v7\n\
+  lit.init v5, v8 x, L3 -> ok b2, err b10\n\
+b2:\n  guard.unbox.obj v5 -> ok b4(v10: obj), fail b9\n\
+b4(v10: obj):\n  guard.layout v10 L3 slots -> ok b5(v11: obj{L3 slots}), fail b9\n\
+b5(v11: obj{L3 slots}):\n  v12 = load_slot v11 x\n  guard.unbox.i32 v12 -> ok b6(v13: i32), fail b9\n\
+b6(v13: i32):\n  v14 = const.i32 2\n  i32.add.ovf v13, v14 -> ok b7(v15: i32), fail b9\n\
+b7(v15: i32):\n  v16 = box v15\n  return v16\n\
+b9:\n  exit pc=0 this=v1 args=[] locals=[] rval=v1 stack=[]\n\
+b10:\n  exit.throw pc=0 this=v1 args=[] locals=[] rval=v1 stack=[]\n}\n",
+    );
+    for op in ["lit.new", "load_slot", "guard.", "unbox", "i32.add"] {
+        assert!(!text.contains(op), "{op} left:\n{text}");
+    }
+    assert!(text.contains("const.i32 125"), "{text}");
+}
+
+#[test]
+fn unbox_of_box_keeps_fences() {
+    // `v4` (a layout claim) is boxed before a call that may change its
+    // class; the unbox after the call is not `v4` (which the validator
+    // would reject past the fence), only `unbox`es with no such claim fold.
+    let text = optimized(&two_receivers(
+        "  v30 = box v4\n  v34: val{object} = weaken v30\n  v39 = const.val undefined\n\
+  call v1, v39 -> ok_clean b11(v40: val), ok_dirty b11(v40: val), err b10\n\
+b11(v40: val):\n  v31 = unbox.obj v34\n\
+  guard.layout v31 L3 types slots -> ok b12(v32: obj{L3 types slots}), fail b9\n\
+b12(v32: obj{L3 types slots}):\n  v33 = load_slot v32 x\n  return v33\n",
+    ));
+    assert!(text.contains("guard.layout"), "{text}");
+}

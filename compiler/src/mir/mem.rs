@@ -4,7 +4,7 @@
 //!   every path to a point), value numbering of heap reads by the version
 //!   they read, and store-to-load forwarding (§3.1, §3.2).
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use crate::mir::entity::{Block, Inst, Value};
 use crate::mir::func::{Edge, EdgeArg, Func, ValueDef};
@@ -340,3 +340,451 @@ pub fn mem_vn(m: &Module, f: &mut Func) -> usize {
     removed
 }
 
+/// A use of a value: operand `idx` of an instruction, or argument `arg`
+/// of successor edge `succ` of a terminator.
+#[derive(Clone, Copy, Debug)]
+enum Use {
+    Arg(Inst, usize),
+    Edge(Inst, usize, usize),
+}
+
+/// Every use of every value in the reachable blocks.
+fn uses_of(f: &Func, cfg: &Cfg) -> HashMap<Value, Vec<Use>> {
+    let mut uses: HashMap<Value, Vec<Use>> = HashMap::new();
+    for &b in &cfg.rpo {
+        for &i in &f.blocks[b].insts {
+            let d = &f.insts[i];
+            for (k, &a) in d.args.iter().enumerate() {
+                uses.entry(a).or_default().push(Use::Arg(i, k));
+            }
+            for (s, e) in d.succs.iter().enumerate() {
+                for (k, a) in e.args.iter().enumerate() {
+                    if let EdgeArg::Value(v) = a {
+                        uses.entry(*v).or_default().push(Use::Edge(i, s, k));
+                    }
+                }
+            }
+        }
+    }
+    uses
+}
+
+/// Remove param `k` of block `b`, and the argument each edge into `b`
+/// passes for it.
+fn drop_param(f: &mut Func, b: Block, k: usize) {
+    let p = f.blocks[b].params.remove(k);
+    f.values[p].def = ValueDef::Unused;
+    for (n, &q) in f.blocks[b].params.clone().iter().enumerate() {
+        f.values[q].def = ValueDef::Param(b, u32::try_from(n).unwrap());
+    }
+    for bb in f.layout.clone() {
+        if let Some(t) = f.terminator(bb) {
+            for e in &mut f.insts[t].succs {
+                if e.block == b {
+                    e.args.remove(k);
+                }
+            }
+        }
+    }
+}
+
+/// A field of a virtual object at a point: not yet added, one value on
+/// every path, or different values on different paths.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum FieldState {
+    Absent,
+    Val(Value),
+    Conflict,
+}
+
+/// The fields of one virtual object at a point, in row order.
+fn meet_fields(a: &[FieldState], b: &[FieldState]) -> Vec<FieldState> {
+    a.iter().zip(b).map(|(&x, &y)| if x == y { x } else { FieldState::Conflict }).collect()
+}
+
+/// Scalar replacement of literal objects that do not escape
+/// (MIR-MEMORY.md §5). An object `lit.new` made, all of whose uses are its
+/// inits and stamp, slot loads and slotted stores through it, guards its
+/// allocation proves, conversions, retaining frame stores and the operands
+/// of exits (in any frame), and block params that only
+/// it reaches, does not exist at run time: each field is the value last
+/// stored, each load that value, and each exit that has it as an operand
+/// rebuilds it first from the fields added so far. (A `frame.store` only
+/// retains a local for the GC; an exit carries the frame's live locals.)
+/// Returns how many objects it replaced.
+pub fn sroa(m: &Module, f: &mut Func) -> usize {
+    let mut n = 0;
+    loop {
+        let cfg = Cfg::new(f);
+        let allocs: Vec<Inst> = cfg
+            .rpo
+            .iter()
+            .filter_map(|&b| f.terminator(b))
+            .filter(|&t| matches!(f.insts[t].op, Opcode::LitNew(_)))
+            .collect();
+        let mut any = false;
+        for t in allocs {
+            if replace_one(m, f, &cfg, t) {
+                n += 1;
+                any = true;
+                // The CFG changed under the rest.
+                break;
+            }
+        }
+        if !any {
+            return n;
+        }
+    }
+}
+
+/// `sroa` for the object allocation `t` makes, if it does not escape.
+fn replace_one(m: &Module, f: &mut Func, cfg: &Cfg, t: Inst) -> bool {
+    use crate::mir::ops::UnboxKind;
+    use crate::mir::types::{ObjKind, TagSet};
+    let d = f.insts[t].clone();
+    let Opcode::LitNew(nslots) = d.op else { return false };
+    let ok = d.succs[0].clone();
+    let Some(k0) = ok.args.iter().position(|a| *a == EdgeArg::Out(0)) else { return false };
+    let obj = f.blocks[ok.block].params[k0];
+    let mut preds: BTreeMap<Block, Vec<Inst>> = BTreeMap::new();
+    for &b in &cfg.rpo {
+        if let Some(tt) = f.terminator(b) {
+            for e in &f.insts[tt].succs {
+                preds.entry(e.block).or_default().push(tt);
+            }
+        }
+    }
+    if preds.get(&ok.block).map(Vec::as_slice) != Some(&[t]) {
+        return false;
+    }
+    // An allocation on an exit's path (one this pass rebuilt) is where it
+    // is needed already: every path from it only inits and leaves.
+    let mut tail = BTreeSet::new();
+    let mut work = vec![ok.block];
+    let mut exit_only = true;
+    while let Some(b) = work.pop() {
+        if !tail.insert(b) {
+            continue;
+        }
+        match f.terminator(b).map(|x| f.insts[x].op) {
+            // (Another object's rebuild may precede the same exit.)
+            Some(Opcode::LitNew(_) | Opcode::LitInit(..) | Opcode::Jump) => work.extend(f.succs(b)),
+            Some(Opcode::Exit { .. } | Opcode::ExitThrow { .. } | Opcode::Unreachable) => {}
+            _ => {
+                exit_only = false;
+                break;
+            }
+        }
+    }
+    if exit_only {
+        return false;
+    }
+    let uses = uses_of(f, cfg);
+    // The object's values and uses, classified; any other use escapes it.
+    let mut vals: BTreeSet<Value> = BTreeSet::from([obj]);
+    let mut work = vec![obj];
+    let mut word: Option<u32> = None;
+    let mut key: Option<crate::ids::LayoutKey> = None;
+    let (mut stamps, mut inits, mut stores, mut loads, mut guards, mut convs, mut fstores) =
+        (vec![], vec![], vec![], vec![], vec![], vec![], vec![]);
+    let mut exits: BTreeSet<Inst> = BTreeSet::new();
+    let mut layout_guards: Vec<(Inst, crate::mir::types::KeyRange)> = vec![];
+    // Uses that would expose the object: they escape it where they can
+    // run (below).
+    let mut escapes: Vec<Inst> = vec![];
+    while let Some(u) = work.pop() {
+        for &us in uses.get(&u).map(Vec::as_slice).unwrap_or(&[]) {
+            match us {
+                Use::Arg(i, idx) => {
+                    let di = &f.insts[i];
+                    let formals = f.frame_shape(f.inst_frame[i]).formals;
+                    let add = |v: Value, vals: &mut BTreeSet<Value>, work: &mut Vec<Value>| {
+                        if vals.insert(v) {
+                            work.push(v);
+                        }
+                    };
+                    match di.op {
+                        Opcode::Unbox(UnboxKind::Obj) | Opcode::Box | Opcode::Weaken => {
+                            convs.push(i);
+                            add(di.results[0], &mut vals, &mut work);
+                        }
+                        Opcode::GuardUnbox(UnboxKind::Obj) | Opcode::GuardTags(_) | Opcode::GuardKind(_) | Opcode::GuardLayout { .. } => {
+                            let passes = match di.op {
+                                Opcode::GuardTags(tags) => TagSet::OBJECT.subset_of(tags),
+                                Opcode::GuardKind(k) => matches!(k, ObjKind::Plain | ObjKind::Native | ObjKind::Any),
+                                Opcode::GuardLayout { keys, types, .. } => {
+                                    layout_guards.push((i, keys));
+                                    !types
+                                }
+                                _ => true,
+                            };
+                            if !passes {
+                                escapes.push(i);
+                                continue;
+                            }
+                            guards.push(i);
+                            if let Some(v) = ok_output(f, &di.succs[0]) {
+                                add(v, &mut vals, &mut work);
+                            }
+                        }
+                        Opcode::StampFresh(w) => {
+                            word = Some(w);
+                            stamps.push(i);
+                        }
+                        Opcode::LitInit(_, k) if idx == 0 => {
+                            key = Some(k);
+                            inits.push(i);
+                        }
+                        Opcode::StoreField(name)
+                            if idx == 0
+                                && f.values[di.args[0]].ty.obj_info().is_some_and(|o| slot_of(o, name, m).is_some()) =>
+                        {
+                            stores.push(i)
+                        }
+                        Opcode::LoadSlot(_) => loads.push(i),
+                        // A retaining store (in its frame; a mapped formal's
+                        // is the `arguments` object's slot, which is real).
+                        Opcode::FrameStore(k) if k > formals => fstores.push(i),
+                        // Exits of any frame: an inlined callee's writes its
+                        // frame, and finishes it in baseline.
+                        Opcode::Exit { .. } | Opcode::ExitThrow { .. } | Opcode::ExitInline { .. } => {
+                            exits.insert(i);
+                        }
+                        _ => escapes.push(i),
+                    }
+                }
+                Use::Edge(i, s, a) => {
+                    let p = f.blocks[f.insts[i].succs[s].block].params[a];
+                    if vals.insert(p) {
+                        work.push(p);
+                    }
+                }
+            }
+        }
+    }
+    let (Some(word), Some(key)) = (word, key) else { return false };
+    if layout_guards.iter().any(|(_, keys)| !keys.contains(&crate::mir::types::KeyRange::one(key))) {
+        return false;
+    }
+    // Where the code can go if the object does not escape: its guards
+    // pass (the class word its allocation wrote is the one they test, and
+    // nothing else can reach the object to change it). Uses only their
+    // failures reach do not count; if none of the rest escapes it, the
+    // assumption holds.
+    let mut inst_block: BTreeMap<Inst, Block> = BTreeMap::new();
+    for &b in &cfg.rpo {
+        for &i in &f.blocks[b].insts {
+            inst_block.insert(i, b);
+        }
+    }
+    let mut reach: BTreeSet<Block> = BTreeSet::new();
+    let mut work: Vec<Block> = f.roots.iter().map(|r| r.block).collect();
+    while let Some(b) = work.pop() {
+        if !reach.insert(b) {
+            continue;
+        }
+        match f.terminator(b) {
+            Some(tt) if guards.contains(&tt) => work.push(f.insts[tt].succs[0].block),
+            _ => work.extend(f.succs(b)),
+        }
+    }
+    let live = |i: &Inst| reach.contains(&inst_block[i]);
+    if escapes.iter().any(live) {
+        return false;
+    }
+    for v in [&mut stamps, &mut inits, &mut stores, &mut loads, &mut guards, &mut convs, &mut fstores] {
+        v.retain(live);
+    }
+    exits.retain(live);
+    // A param is the object only where every edge into it passes it; a
+    // root's params come from the frame.
+    for &v in &vals {
+        if let ValueDef::Param(b, k) = f.values[v].def {
+            if v == obj {
+                continue;
+            }
+            if f.roots.iter().any(|r| r.block == b) {
+                return false;
+            }
+            for &p in preds.get(&b).map(Vec::as_slice).unwrap_or(&[]) {
+                if !live(&p) {
+                    continue;
+                }
+                for e in f.insts[p].succs.iter().filter(|e| e.block == b) {
+                    match e.args[k as usize] {
+                        EdgeArg::Value(x) if vals.contains(&x) => {}
+                        EdgeArg::Out(_) if is_guard(&f.insts[p].op) && guards.contains(&p) => {}
+                        _ => return false,
+                    }
+                }
+            }
+        }
+    }
+    if f.loops.iter().any(|l| l.entry.as_ref().is_some_and(|e| e.state.iter().any(|v| vals.contains(v)))) {
+        return false;
+    }
+    // The row: the inits' names, in order; each once.
+    let mut row: Vec<crate::mir::entity::AtomId> = vec![];
+    let rpo_pos: BTreeMap<Block, usize> = cfg.rpo.iter().enumerate().map(|(i, &b)| (b, i)).collect();
+    let mut ordered_inits = inits.clone();
+    ordered_inits.sort_by_key(|i| rpo_pos[&inst_block[i]]);
+    for &i in &ordered_inits {
+        let Opcode::LitInit(name, _) = f.insts[i].op else { unreachable!() };
+        if row.contains(&name) {
+            return false;
+        }
+        row.push(name);
+    }
+    let field_ix = |name| row.iter().position(|&r| r == name);
+    // Field states, forward over the blocks the allocation dominates.
+    // What a terminator's edge `s` adds: an init's or store's value.
+    let edge_def = |f: &Func, i: Inst, s: usize| -> Option<(usize, Value)> {
+        let di = &f.insts[i];
+        match di.op {
+            Opcode::LitInit(name, _) if s == 0 && inits.contains(&i) => field_ix(name).map(|x| (x, di.args[1])),
+            Opcode::StoreField(name) if s < 2 && stores.contains(&i) => field_ix(name).map(|x| (x, di.args[1])),
+            _ => None,
+        }
+    };
+    let mut ins: BTreeMap<Block, Vec<FieldState>> = BTreeMap::new();
+    ins.insert(ok.block, vec![FieldState::Absent; row.len()]);
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for &b in &cfg.rpo {
+            if !cfg.dominates(ok.block, b) || !reach.contains(&b) {
+                continue;
+            }
+            let Some(st) = ins.get(&b).cloned() else { continue };
+            for &i in &f.blocks[b].insts {
+                for (s, e) in f.insts[i].succs.iter().enumerate() {
+                    let mut s2 = st.clone();
+                    if let Some((x, v)) = edge_def(f, i, s) {
+                        s2[x] = FieldState::Val(v);
+                    }
+                    let merged = match ins.get(&e.block) {
+                        None => s2,
+                        Some(old) => meet_fields(old, &s2),
+                    };
+                    if ins.get(&e.block) != Some(&merged) {
+                        ins.insert(e.block, merged);
+                        changed = true;
+                    }
+                }
+            }
+        }
+    }
+    // Check every load and exit against the states, and plan.
+    let mut subst: BTreeMap<Value, Value> = BTreeMap::new();
+    let mut mats: Vec<(Inst, Vec<Value>)> = vec![];
+    for &b in &cfg.rpo {
+        if !cfg.dominates(ok.block, b) || !reach.contains(&b) {
+            continue;
+        }
+        let Some(st) = ins.get(&b) else { continue };
+        for &i in &f.blocks[b].insts {
+            let di = &f.insts[i];
+            if loads.contains(&i) {
+                let Opcode::LoadSlot(name) = di.op else { unreachable!() };
+                let Some(FieldState::Val(v)) = field_ix(name).map(|x| st[x]) else { return false };
+                let r = di.results[0];
+                if !(is_subtype(&f.values[v].ty, &f.values[r].ty) || f.values[v].ty == f.values[r].ty) {
+                    return false;
+                }
+                subst.insert(r, v);
+            }
+            if exits.contains(&i) {
+                // The fields added so far: a prefix of the row.
+                let fv: Vec<Value> = st
+                    .iter()
+                    .map_while(|s| match *s {
+                        FieldState::Val(v) => Some(v),
+                        _ => None,
+                    })
+                    .collect();
+                if st[fv.len()..].iter().any(|s| *s != FieldState::Absent) {
+                    return false;
+                }
+                mats.push((i, fv));
+            }
+        }
+    }
+    // Rewrite. Exits first: they read the fields.
+    let unreachable = f.add_block();
+    f.add_inst(unreachable, Opcode::Unreachable, vec![], &[], vec![]);
+    for (e, fv) in mats {
+        let b = inst_block[&e];
+        let pos = f.blocks[b].insts.iter().position(|&x| x == e).unwrap();
+        let tail: Vec<Inst> = f.blocks[b].insts.split_off(pos);
+        debug_assert_eq!(tail, vec![e]);
+        let frame = f.inst_frame[e];
+        let first = f.insts.len();
+        let mut cur = b;
+        let nb = f.add_block();
+        let mv = f.add_param(nb, Type::val(TagSet::OBJECT));
+        f.add_inst(cur, Opcode::LitNew(nslots), vec![], &[], vec![
+            Edge { block: nb, args: vec![EdgeArg::Out(0)] },
+            Edge { block: unreachable, args: vec![] },
+        ]);
+        cur = nb;
+        f.add_inst(cur, Opcode::StampFresh(word), vec![mv], &[], vec![]);
+        for (x, &v) in fv.iter().enumerate() {
+            let next = f.add_block();
+            f.add_inst(cur, Opcode::LitInit(row[x], key), vec![mv, v], &[], vec![
+                Edge { block: next, args: vec![] },
+                Edge { block: unreachable, args: vec![] },
+            ]);
+            cur = next;
+        }
+        for a in &mut f.insts[e].args {
+            if vals.contains(a) {
+                *a = mv;
+            }
+        }
+        f.blocks[cur].insts.push(e);
+        for k in first..f.insts.len() {
+            f.inst_frame[Inst::from_u32(u32::try_from(k).unwrap())] = frame;
+        }
+    }
+    // The object's params go (and the arguments edges pass them).
+    let params: Vec<(Block, Value)> = vals
+        .iter()
+        .filter_map(|&v| match f.values[v].def {
+            ValueDef::Param(b, _) => Some((b, v)),
+            _ => None,
+        })
+        .collect();
+    for (b, v) in params {
+        if let Some(k) = f.blocks[b].params.iter().position(|&p| p == v) {
+            drop_param(f, b, k);
+        }
+    }
+    // Terminators through the object become jumps to their success edge.
+    for &i in inits.iter().chain(&stores).chain(&guards).chain(std::iter::once(&t)) {
+        let b = inst_block[&i];
+        let e = f.insts[i].succs[0].clone();
+        let frame = f.inst_frame[i];
+        let pos = f.blocks[b].insts.iter().position(|&x| x == i).unwrap();
+        f.blocks[b].insts.remove(pos);
+        let (j, _) = f.add_inst(b, Opcode::Jump, vec![], &[], vec![e]);
+        f.inst_frame[j] = frame;
+    }
+    // And the rest of its uses go.
+    let dead: BTreeSet<Inst> = stamps.iter().chain(&convs).chain(&fstores).chain(&loads).copied().collect();
+    for b in f.layout.clone() {
+        f.blocks[b].insts.retain(|i| !dead.contains(i));
+    }
+    replace_values(f, &subst);
+    for &v in &vals {
+        f.values[v].def = ValueDef::Unused;
+    }
+    // What only the guards' failures reached is dead, and may still name
+    // the object's values: nothing left in it.
+    for b in f.layout.clone() {
+        if cfg.reachable(b) && !reach.contains(&b) {
+            f.blocks[b].insts.clear();
+            f.add_inst(b, Opcode::Unreachable, vec![], &[], vec![]);
+        }
+    }
+    true
+}

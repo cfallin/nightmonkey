@@ -542,6 +542,9 @@ pub fn optimize(m: &Module, f: &mut Func) -> usize {
         forward_params(m, f);
         let n = fold_guards(m, f)
             + if MEM_VN { crate::mir::mem::mem_vn(m, f) } else { 0 }
+            + if SROA { crate::mir::mem::sroa(m, f) } else { 0 }
+            + fold_unbox(f)
+            + fold_ints(m, f)
             + if GVN { gvn(m, f) } else { 0 }
             + if LICM { licm(m, f) } else { 0 }
             + if HOIST_GUARDS { hoist_guards(m, f) } else { 0 };
@@ -604,6 +607,104 @@ pub fn canon_loads(m: &Module, f: &mut Func) -> usize {
 
 /// Whether `mem::mem_vn` runs.
 const MEM_VN: bool = true;
+
+/// Whether `mem::sroa` runs.
+const SROA: bool = true;
+
+/// `unbox` of a `box` (through `weaken`s) is the boxed value itself,
+/// where its type is the unbox's result or stronger and has no killable
+/// component (MIR-MEMORY.md §3.4):
+/// what forwarding and scalar replacement leave where a stored field was
+/// boxed and a load of it unboxed. Returns how many it removed.
+pub fn fold_unbox(f: &mut Func) -> usize {
+    let mut subst: BTreeMap<Value, Value> = BTreeMap::new();
+    for &b in &f.layout {
+        for &i in &f.blocks[b].insts {
+            let d = &f.insts[i];
+            if !matches!(d.op, Opcode::Unbox(_)) {
+                continue;
+            }
+            let mut a = d.args[0];
+            for _ in 0..8 {
+                match f.values[a].def {
+                    ValueDef::Result(j, 0) if f.insts[j].op == Opcode::Weaken => a = f.insts[j].args[0],
+                    _ => break,
+                }
+            }
+            let ValueDef::Result(j, 0) = f.values[a].def else { continue };
+            if f.insts[j].op != Opcode::Box {
+                continue;
+            }
+            let x = f.insts[j].args[0];
+            let (xt, rt) = (f.values[x].ty, f.values[d.results[0]].ty);
+            // Not a value with a killable component (a layout claim): a
+            // fence between the box and the unbox may have ended it, and
+            // boxing it is how the builder drops it across one.
+            if (xt == rt || is_subtype(&xt, &rt)) && xt.killable_components().is_empty() {
+                subst.insert(d.results[0], x);
+            }
+        }
+    }
+    replace_values(f, &subst)
+}
+
+/// Integer ops whose operands' types (sharpened since the builder, by
+/// forwarding and scalar replacement) decide them (§10.6): a checked
+/// `i32.*.ovf` that cannot fail is the unchecked `.wrap`, and a pure int32
+/// op whose result's range is one value is that constant. Returns how
+/// many it rewrote.
+pub fn fold_ints(m: &Module, f: &mut Func) -> usize {
+    let mut n = 0;
+    for b in f.layout.clone() {
+        for i in f.blocks[b].insts.clone() {
+            let d = f.insts[i].clone();
+            let range = |v: Value| match f.values[v].ty {
+                Type::I32(r) => Some(r),
+                _ => None,
+            };
+            match d.op {
+                Opcode::I32Ovf(op) => {
+                    let (Some(x), Some(y)) = (range(d.args[0]), range(d.args[1])) else { continue };
+                    let Some(r) = crate::mir::ops::i32_exact(op, x, y) else { continue };
+                    let frame = f.inst_frame[i];
+                    f.blocks[b].insts.pop();
+                    let (w, rs) = f.add_inst(b, Opcode::I32Wrap(op), d.args.clone(), &[Type::I32(r)], vec![]);
+                    let ok = &d.succs[0];
+                    let args = ok
+                        .args
+                        .iter()
+                        .map(|a| match a {
+                            EdgeArg::Out(0) => EdgeArg::Value(rs[0]),
+                            a => *a,
+                        })
+                        .collect();
+                    let (j, _) = f.add_inst(b, Opcode::Jump, vec![], &[], vec![Edge { block: ok.block, args }]);
+                    f.inst_frame[w] = frame;
+                    f.inst_frame[j] = frame;
+                    n += 1;
+                }
+                Opcode::I32Wrap(_) | Opcode::I32Bit(_) => {
+                    let r = d.results[0];
+                    // A result declared wider than its rule gives: the
+                    // rule's (sharper) type.
+                    let tys: Vec<Type> = d.args.iter().map(|&v| f.values[v].ty).collect();
+                    let Ok(sig) = signature(&d.op, &tys, m) else { continue };
+                    let Type::I32(rr) = sig.results[0] else { continue };
+                    if rr.lo == rr.hi {
+                        f.insts[i].op = Opcode::ConstI32(i32::try_from(rr.lo).unwrap());
+                        f.insts[i].args.clear();
+                        f.values[r].ty = Type::I32(rr);
+                        n += 1;
+                    } else if is_subtype(&Type::I32(rr), &f.values[r].ty) && Type::I32(rr) != f.values[r].ty {
+                        f.values[r].ty = Type::I32(rr);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    n
+}
 
 /// Whether `thread_jumps` runs.
 const THREAD_JUMPS: bool = true;
