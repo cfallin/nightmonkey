@@ -218,7 +218,7 @@ Everything after `--` goes to the JS shell. Omitting `--night-inprocess` runs
 the same binary as a plain interpreter -- the interpreter-only ("interp")
 lane, the differential reference for the compiled lanes.
 
-The jit-test suite in the default (legacy BBV) lane and the interp lane, from
+The jit-test suite in the default (MIR) lane and the interp lane, from
 the SpiderMonkey checkout's harness:
 
 ```
@@ -228,7 +228,8 @@ NIGHT_INPROCESS_OFF=1 scripts/run-jit-tests.sh /path/to/firefox build -- -j16
 
 Compiler flags for the in-process batch (the same ones `nightmonkey`
 takes) go in `NIGHT_OPTIONS`, which the wrapper passes to the shell as
-`--night-options`. For example, the baseline-tier lane, failing any test
+`--night-options`. `--pipeline legacy` selects the BBV lane, kept for
+comparison. For example, the baseline-tier lane, failing any test
 whose script ends up interpreted:
 
 ```

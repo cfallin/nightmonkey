@@ -7,9 +7,10 @@
 # shell cannot run at all). The compiled lanes (the default) compile every
 # test in-process and also skips tests/jit-test-excludes.txt; NIGHT_INPROCESS_OFF=1
 # runs the same shell with the tier off (the interpreter-only lane).
-# NIGHT_OPTIONS passes compiler flags; with `--pipeline baseline` or `mir` the
-# lane also skips tests/jit-test-excludes-baseline.txt, and with `mir`
-# tests/jit-test-excludes-mir.txt.
+# NIGHT_OPTIONS passes compiler flags; with `--pipeline baseline` or `mir` (the
+# default: no `--pipeline`) the lane also skips
+# tests/jit-test-excludes-baseline.txt, and with `mir`
+# tests/jit-test-excludes-mir.txt. `--pipeline legacy` is the BBV lane.
 set -euo pipefail
 
 if [ $# -lt 1 ]; then
@@ -34,15 +35,19 @@ trap 'rm -f "$combined"' EXIT
 cat "$here/tests/wasi-jit-test-excludes.txt" > "$combined"
 if [ "${NIGHT_INPROCESS_OFF:-0}" != 1 ]; then
   cat "$here/tests/jit-test-excludes.txt" >> "$combined"
-  # The baseline-tier lane: see tests/jit-test-excludes-baseline.txt.
+  # The pipeline the lane runs: mir unless NIGHT_OPTIONS picks another.
+  pipeline=mir
   case " ${NIGHT_OPTIONS:-} " in
-    *" --pipeline baseline "* | *" --pipeline mir "*)
-      cat "$here/tests/jit-test-excludes-baseline.txt" >> "$combined" ;;
+    *" --pipeline baseline "*) pipeline=baseline ;;
+    *" --pipeline legacy "*) pipeline=legacy ;;
   esac
-  case " ${NIGHT_OPTIONS:-} " in
-    *" --pipeline mir "*)
-      cat "$here/tests/jit-test-excludes-mir.txt" >> "$combined" ;;
+  # The baseline-tier lanes: see tests/jit-test-excludes-baseline.txt.
+  case $pipeline in
+    baseline | mir) cat "$here/tests/jit-test-excludes-baseline.txt" >> "$combined" ;;
   esac
+  if [ $pipeline = mir ]; then
+    cat "$here/tests/jit-test-excludes-mir.txt" >> "$combined"
+  fi
 fi
 
 # jit_test.py does not count a `|jit-test| error:` test whose uncaught error

@@ -195,13 +195,14 @@ pub const MIR_BLOCK_CENSUS_KIND: u32 = 92;
 /// Which compiled tiers a script may use (`docs/BASELINE.md` §5).
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum Pipeline {
-    /// The legacy BBV lowering (OPT+GEN tracks).
-    #[default]
+    /// The legacy BBV lowering (OPT+GEN tracks), kept for comparison.
     Legacy,
     /// The baseline tier only. A script baseline declines is interpreted.
     Baseline,
     /// MIR where the builder accepts, over baseline; baseline alone where
-    /// it declines; the interpreter where baseline declines too.
+    /// it declines; the interpreter where baseline declines too. The
+    /// default.
+    #[default]
     Mir,
 }
 
@@ -351,7 +352,7 @@ mod tests {
         let o = Options::parse_str("--dump-bytecode=3,4 --trace-site 1:2").unwrap();
         assert_eq!(o.diagnostics.disasm, Some(vec![3, 4]));
         assert_eq!(o.diagnostics.trace_site.as_deref(), Some("1:2"));
-        assert_eq!(Options::parse_str("").unwrap().pipeline, Pipeline::Legacy);
+        assert_eq!(Options::parse_str("").unwrap().pipeline, Pipeline::Mir);
         assert!(Options::parse_str("--pipeline")
             .unwrap_err()
             .contains("needs an argument"));

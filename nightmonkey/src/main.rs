@@ -71,9 +71,9 @@ Output
 
 Compilation
   --force-interp           leave every script interpreted
-  --pipeline <p>           which tiers compile scripts: legacy (default; BBV),
-                           baseline (baseline only), or mir (MIR over
-                           baseline); a script no tier takes is interpreted
+  --pipeline <p>           which tiers compile scripts: mir (default; MIR
+                           over baseline), baseline (baseline only), or
+                           legacy (BBV); a script no tier takes is interpreted
   --strict-coverage        fail if any script ends up interpreted for a
                            reason other than ForceInterpreter
 
