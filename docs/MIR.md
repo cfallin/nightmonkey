@@ -1939,6 +1939,20 @@ allocates a kind with a slot for each field. react cleared SLOTS 1.19M
 times a run (six-field elements): +4.9% MIR, +15% legacy (placement
 medians), every react exit gone; pdfjs +3% (its glyph literals).
 
+**M5n. Diamonds with a generic arm (2026-09-30).** Two constructors were
+declined as invalid MIR (crypto's `Montgomery`, pdfjs's
+`ArithmeticDecoder`): a typed field or element read is a diamond, the fast
+arm a `load_field`/`load_ta`, the other the generic op, and with no `Obj`
+slot live `js_keep` declines, so that op fences, and the fence demotes the
+`Ctor` slot (the object under construction) on its arm alone, renaming it
+there; the use after the join was then not dominated. Every such diamond
+(field and element reads and stores, accessor calls, sloppy `this`,
+`hasOwnProperty.call`) now demotes up front what its generic arm's fence
+would (`demote_for_generic_arm`): every `Obj` and `Ctor` slot where the arm
+cannot keep, else the `Ctor` slots when no `Obj` slot is live. MIR now
+compiles every Octane script but the global scripts and four of mandreel's
+(too large).
+
 **M6. The rest of §10**: box/unbox cleanup, memory optimizations, and
 numeric optimizations, each with its guard-count and instruction-count
 tests.

@@ -1724,6 +1724,67 @@ impl<'s, 'a> Run<'s, 'a> {
         self.throw_blk = None;
     }
 
+    /// Before a diamond one of whose arms is a generic op (`js`), with
+    /// `results` values on top at the next pc: the slots that op's fence
+    /// would demote on its own arm, demoted here for every arm, so the arms
+    /// meet with one state (a fence on one arm alone renames its slots
+    /// there, and a use after the join is then not dominated by the new
+    /// name). Where the arm cannot keep (no dirty exit), every `Obj` and
+    /// `Ctor` slot; where it can, `js_keep` still declines, and so fences,
+    /// with no `Obj` slot live at the top level, demoting the `Ctor` slots.
+    fn demote_for_generic_arm(&mut self, results: usize) {
+        if !self.keepable(results) {
+            self.demote_objs();
+        } else if self.s.inline_depth == 0 && !self.st.iter().chain(&self.pre).any(|x| matches!(x.ty, Ty::Obj(..))) {
+            self.demote_ctors();
+        }
+    }
+
+    /// As `demote_for_generic_arm`, for an op that pops `v` and pushes it
+    /// back (a store): `v` too, as it is demoted.
+    fn demote_value_for_generic_arm(&mut self, v: Slot) -> Slot {
+        let objs = self.st.iter().chain(&self.pre).any(|x| matches!(x.ty, Ty::Obj(..)));
+        if !self.keepable(1) {
+            self.demote_objs();
+            self.demote(v)
+        } else if self.s.inline_depth == 0 && !objs {
+            self.demote_ctors();
+            if matches!(v.ty, Ty::Ctor(..)) {
+                self.demote(v)
+            } else {
+                v
+            }
+        } else {
+            v
+        }
+    }
+
+    /// Every `Ctor` slot (an object under construction), as a boxed
+    /// object, in the state and in this op's pre-state
+    /// (`demote_for_generic_arm`).
+    fn demote_ctors(&mut self) {
+        let mut done: Vec<(mir::Value, Slot)> = vec![];
+        let olds: Vec<Slot> = self.st.iter().chain(&self.pre).copied().collect();
+        for x in olds {
+            if !matches!(x.ty, Ty::Ctor(..)) || done.iter().any(|&(v, _)| v == x.v) {
+                continue;
+            }
+            let y = self.demote(x);
+            done.push((x.v, y));
+        }
+        if done.is_empty() {
+            return;
+        }
+        for (v, y) in done {
+            for x in self.st.iter_mut().chain(self.pre.iter_mut()).filter(|x| x.v == v) {
+                *x = y;
+            }
+            self.renames.push((v, y));
+        }
+        self.exit_blk = None;
+        self.throw_blk = None;
+    }
+
     fn goto(block: mir::Block) -> Edge {
         Edge {
             block,
@@ -2775,9 +2836,7 @@ impl<'s, 'a> Run<'s, 'a> {
         generic: Opcode,
     ) -> mir::Value {
         // Arms that fence meet at `join`: `Obj` slots go in as `ObjHint`.
-        if !self.keepable(1) {
-            self.demote_objs();
-        }
+        self.demote_for_generic_arm(1);
         let join = self.new_block();
         let jr = self.f.add_param(join, out);
         let (hit, miss) = (self.new_block(), self.new_block());
@@ -3533,6 +3592,7 @@ impl<'s, 'a> Run<'s, 'a> {
     /// otherwise the generic call.
     fn hasown_call(&mut self, vals: &[mir::Value]) -> mir::Value {
         use crate::wasm::translate::{BC_FUN_CALL, BC_OBJ_HASOWN};
+        self.demote_for_generic_arm(1);
         let join = self.new_block();
         let result = self.f.add_param(join, MType::VAL_TOP);
         let (check, fast, slow) = (self.new_block(), self.new_block(), self.new_block());
@@ -5222,9 +5282,7 @@ impl<'s, 'a> Run<'s, 'a> {
                 } else {
                     // Sloppy: an object `this` is itself; anything else is
                     // boxed (null and undefined become the global `this`).
-                    if !self.keepable(1) {
-                        self.demote_objs();
-                    }
+                    self.demote_for_generic_arm(1);
                     let obj = TagSet::OBJECT;
                     let (t, e, j) = (self.new_block(), self.new_block(), self.new_block());
                     let p = self.f.add_param(t, MType::val(obj));
@@ -5579,9 +5637,7 @@ impl<'s, 'a> Run<'s, 'a> {
                     // every time. The claim is guarded after the join. The
                     // IC arm keeps facts, a kill exiting; where it cannot,
                     // it is a fence, and `Obj` slots meet as `ObjHint`.
-                    if !self.keepable(1) {
-                        self.demote_objs();
-                    }
+                    self.demote_for_generic_arm(1);
                     let x = self.boxed(recv);
                     let join = self.new_block();
                     let jr = self.f.add_param(join, MType::VAL_TOP);
@@ -5661,9 +5717,8 @@ impl<'s, 'a> Run<'s, 'a> {
                 // exiting; where it cannot, it is a fence the two arms meet
                 // after: `Obj` slots (and the value, pushed back after it)
                 // go in as `ObjHint`.
-                let v = if site.is_some() && proven.is_none() && !self.keepable(1) {
-                    self.demote_objs();
-                    self.demote(v)
+                let v = if site.is_some() && proven.is_none() {
+                    self.demote_value_for_generic_arm(v)
                 } else {
                     v
                 };
@@ -5746,9 +5801,7 @@ impl<'s, 'a> Run<'s, 'a> {
                 let r = if let Some((o, i, k)) = ta {
                     // The element inline, as a boxed number; out of
                     // bounds, the generic op (a fence unless it keeps).
-                    if !self.keepable(1) {
-                        self.demote_objs();
-                    }
+                    self.demote_for_generic_arm(1);
                     let (ok, generic, join) = (self.new_block(), self.new_block(), self.new_block());
                     let raw = if k.is_float() { MType::F64_TOP } else { MType::I32_TOP };
                     let p = self.f.add_param(ok, raw);
@@ -5799,9 +5852,7 @@ impl<'s, 'a> Run<'s, 'a> {
                     Some((o, i)) => {
                         // A dense element inline; out of bounds or a
                         // hole, the generic op (a fence unless it keeps).
-                        if !self.keepable(1) {
-                            self.demote_objs();
-                        }
+                        self.demote_for_generic_arm(1);
                         let (ok, generic, join) = (self.new_block(), self.new_block(), self.new_block());
                         let p = self.f.add_param(ok, MType::VAL_TOP);
                         let jr = self.f.add_param(join, MType::VAL_TOP);
@@ -5868,12 +5919,7 @@ impl<'s, 'a> Run<'s, 'a> {
                     _ => None,
                 });
                 if let Some((o, i, k, raw)) = ta {
-                    let v = if self.keepable(1) {
-                        v
-                    } else {
-                        self.demote_objs();
-                        self.demote(v)
-                    };
+                    let v = self.demote_value_for_generic_arm(v);
                     let (ok, generic, join) = (self.new_block(), self.new_block(), self.new_block());
                     let raw = match raw {
                         Some(r) => r,
@@ -5918,12 +5964,7 @@ impl<'s, 'a> Run<'s, 'a> {
                 match self.native_elem(pc, recv, key) {
                     Some((o, i)) => {
                         // A dense overwrite inline; else the generic op.
-                        let v = if self.keepable(1) {
-                            v
-                        } else {
-                            self.demote_objs();
-                            self.demote(v)
-                        };
+                        let v = self.demote_value_for_generic_arm(v);
                         // A double under a write claim that admits Double
                         // goes in as the double it is (bbv's rule): every
                         // read of the element admits the tag.
