@@ -3856,6 +3856,74 @@ impl<'s, 'a> Run<'s, 'a> {
         true
     }
 
+    /// Narrowing from `x instanceof C` (§4.4), whose boolean is on top of
+    /// the stack, where the next op branches on it: the true side knows
+    /// `x` is an object (an ordinary function's `instanceof` walks a
+    /// prototype chain, which a primitive has none of), so there `x` is
+    /// `guard.tags object`ed and replaced in every slot. A primitive can
+    /// answer true only through a custom `Symbol.hasInstance`; that exits
+    /// at the branch with the result on the stack (the op has happened).
+    /// Nothing is emitted unless the next op is a `JumpIfTrue` or
+    /// `JumpIfFalse` that no other edge reaches and `x` is a boxed value
+    /// that may be an object and may be something else.
+    fn narrow_instanceof(&mut self, x: Slot) {
+        let Ty::Val(have) = x.ty else { return };
+        let obj = TagSet::OBJECT;
+        if !NARROW_TESTS || have.intersect(obj).is_empty() || have.subset_of(obj) {
+            return;
+        }
+        let Some(bpc) = self.next_pc else { return };
+        if self.s.leaders.contains(&bpc) {
+            return;
+        }
+        let Some(bop) = self.s.op_at(bpc) else { return };
+        if !matches!(bop, JSOp::JumpIfTrue | JSOp::JumpIfFalse) {
+            return;
+        }
+        let depth = self.st.len() - self.frame_len();
+        if self.s.depths.at(bpc) != Some(u32::try_from(depth).unwrap()) {
+            return;
+        }
+        let off = self.s.imms(bpc).next_int32().unwrap();
+        let (taken, fall) = (bpc.branch(off), bpc + bop.len());
+        let (cond_true, cond_false) = if bop == JSOp::JumpIfTrue { (taken, fall) } else { (fall, taken) };
+        let st = self.st.clone();
+        let saved = (self.cur, self.live);
+        let fail = self.new_block();
+        self.at(fail);
+        let ops = self.exit_operands(bpc, &st);
+        let eop = self.exit_op(bpc, false);
+        self.term(eop, ops, vec![]);
+        (self.cur, self.live) = saved;
+        let r = self.pop();
+        let c = self.truthy(r);
+        let (tb, fb) = (self.new_block(), self.new_block());
+        self.term(Opcode::Br, vec![c], vec![Self::goto(tb), Self::goto(fb)]);
+        self.at(tb);
+        let nb = self.new_block();
+        let nv = self.f.add_param(nb, MType::val(obj));
+        self.term(
+            Opcode::GuardTags(obj),
+            vec![x.v],
+            vec![
+                Edge {
+                    block: nb,
+                    args: vec![EdgeArg::Out(0)],
+                },
+                Self::goto(fail),
+            ],
+        );
+        self.at(nb);
+        let saved = self.st.clone();
+        for y in self.st.iter_mut().filter(|y| y.v == x.v) {
+            *y = Slot { v: nv, ty: Ty::Val(obj) };
+        }
+        self.jump_to(cond_true, Some(bpc));
+        self.st = saved;
+        self.at(fb);
+        self.jump_to(cond_false, Some(bpc));
+    }
+
     /// Branch on raw bool `c` to leaders `then` and `els`.
     fn branch(&mut self, c: mir::Value, then: Pc, els: Pc) {
         let from = Some(self.pc);
@@ -5908,6 +5976,9 @@ impl<'s, 'a> Run<'s, 'a> {
                 };
                 let v = self.js(Opcode::JsRt(r), vec![x, y], MType::val(TagSet::BOOLEAN));
                 self.push(v, Ty::Val(TagSet::BOOLEAN));
+                if op == Instanceof {
+                    self.narrow_instanceof(a);
+                }
             }
             DelProp | StrictDelProp if RT_OPS => {
                 let a = self.atom(p.next_uint32().unwrap())?;
