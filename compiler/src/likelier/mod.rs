@@ -210,6 +210,19 @@ pub struct Solver<'a> {
     /// dispatch) but are emitted -- the set is flow-scoped, not a name
     /// guess.
     pub region_calls: rustc_hash::FxHashSet<(ScriptId, VarId)>,
+    /// Callee vars read by name off a receiver the analysis could not
+    /// resolve (`recv.name(...)` with `recv` unknown): the call still runs,
+    /// and its target is one of the functions some object holds under that
+    /// name. Where those are few (`named_fns`), the call binds its
+    /// arguments into them (`Solver::bind_by_name`), so a method reached
+    /// only through such calls does not read its formals as Empty.
+    pub name_calls: HashMap<(ScriptId, VarId), NameId>,
+    /// The snapshot's function-valued properties, by name: the candidates of
+    /// a by-name call. Built on first use.
+    pub named_fns: Option<HashMap<NameId, Vec<ScriptId>>>,
+    /// The scripted functions some analyzed write stored under a name:
+    /// with `named_fns`, a by-name call's candidates.
+    pub dyn_named_fns: HashMap<NameId, Vec<ScriptId>>,
     /// Per-call-site named-native resolution, while every evaluation
     /// agrees on one native callee. Anything else -- scripted, multi, a
     /// different native -- conflicts it. Source of the native call fact.
@@ -323,6 +336,9 @@ impl<'a> Solver<'a> {
             site_native: HashMap::default(),
             site_ctor_native: HashMap::default(),
             region_calls: rustc_hash::FxHashSet::default(),
+            name_calls: HashMap::default(),
+            named_fns: None,
+            dyn_named_fns: HashMap::default(),
             table_members: HashMap::default(),
             class_table_members: HashMap::default(),
             arg_fn_members: HashMap::default(),

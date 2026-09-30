@@ -312,6 +312,8 @@ pub enum SideKey {
     /// The concrete prototypes registered as one class's method-table
     /// sources.
     Sources(ClassId),
+    /// The functions written under one property name (`dyn_named_fns`).
+    NamedFns(NameId),
 }
 
 pub struct Cell {

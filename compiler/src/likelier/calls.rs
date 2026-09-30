@@ -10,7 +10,7 @@
 
 use super::engine::{CellKey, ConId, Constraint, SideKey, SEED};
 use super::stats::Stats;
-use super::types::{BoundedFnSet, CtxId, FnId, ObjType, TypeSet, CTX0};
+use super::types::{BoundedFnSet, CtxId, FnId, NameId, ObjType, TypeSet, CTX0};
 use super::Solver;
 use crate::constants::{
     CALLEE_CAP, CTX_BUDGET, CTX_DEPTH_CAP, MAX_TRACKED_FORMALS, TABLE_MEMBER_CAP,
@@ -401,7 +401,18 @@ impl Solver<'_> {
                 // result reads as "no value ever arrived here", so a
                 // consumer would claim whatever its other, numeric-only
                 // writers said and miss on every call result.
-                if cts.fns.is_multi() || (cts.fns.is_empty() && cts.obj == ObjType::AnyObject) {
+                // The unknown bit with no object or function part is as
+                // unusable as AnyObject: something is called, not nothing.
+                let unresolved = cts.fns.is_empty()
+                    && (cts.obj == ObjType::AnyObject || (cts.obj == ObjType::Empty && cts.unknown));
+                if cts.fns.is_multi() || unresolved {
+                    if unresolved && !construct {
+                        if let super::engine::CKey::Var(v) = callee {
+                            if let Some(&name) = self.name_calls.get(&(script, v)) {
+                                self.bind_by_name(at, pc, name, &args, this_);
+                            }
+                        }
+                    }
                     // Fn-table dispatch: a multi callee read
                     // off a snapshot fn-table's elems still binds the join
                     // of the site's arg profiles into every member's Arg
@@ -910,6 +921,45 @@ impl Solver<'_> {
 
     /// An executed-but-unresolved call result: raise the unknown evidence
     /// bit into the return destination (see `TypeSet::unknown`).
+    /// A method call off a receiver the analysis could not resolve
+    /// (`name_calls`): its target is one of the functions some object holds
+    /// under `name`. Where the snapshot holds at most `callee_cap` of them,
+    /// the arguments (and `this`) bind into each, at a depth-1 context per
+    /// (site, target) parented at the generic one, as a region dispatch's
+    /// guess does: a method reached only through such calls then sees the
+    /// values passed, not Empty formals, and no other caller's context sees
+    /// the guess. The result stays the unknown evidence the caller raised.
+    fn bind_by_name(
+        &mut self,
+        at: CallAt,
+        pc: Pc,
+        name: NameId,
+        args: &[super::engine::CKey],
+        this_: Option<super::engine::CKey>,
+    ) {
+        self.engine.subscribe_side(SideKey::NamedFns(name), at.user);
+        let cands = self.named_fns_for(name);
+        if cands.is_empty() || cands.len() > self.ctxs.callee_cap {
+            return;
+        }
+        for f in cands {
+            let cx = self.ctxs.push(CTX0, Site::new(at.script, pc), f, &mut self.stats);
+            if cx == CTX0 {
+                // No context for the guess: the formals take the unknown
+                // evidence instead, as a computed-name dispatch's do.
+                self.escape_args(f);
+                continue;
+            }
+            if self.engine.instantiate(f, cx) {
+                self.stats.ctxs_spent += 1;
+            }
+            self.bind_args(at, f, cx, args, 0);
+            if let Some(tk) = this_ {
+                self.bind_this(at, f, cx, tk, true);
+            }
+        }
+    }
+
     fn raise_unknown_ret(
         &mut self,
         script: ScriptId,

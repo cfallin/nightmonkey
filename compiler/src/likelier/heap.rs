@@ -1119,6 +1119,48 @@ impl Solver<'_> {
 
     /// Pre-fill a snapshot abstraction's field cells from the transcribed
     /// heap, once, on first field access.
+    /// The scripted functions the snapshot holds as the value of a property
+    /// named `name`, on any object (`name_calls`' candidates).
+    pub(super) fn named_fns_for(&mut self, name: NameId) -> Vec<ScriptId> {
+        if self.named_fns.is_none() {
+            let mut m: HashMap<NameId, Vec<ScriptId>> = HashMap::default();
+            for (_, obj) in self.source.objects() {
+                let SourceObject::Object(ObjectData {
+                    non_native: false,
+                    properties,
+                    ..
+                }) = obj
+                else {
+                    continue;
+                };
+                for (k, v) in properties.iter() {
+                    if k.is_other() {
+                        continue;
+                    }
+                    let Some(SVal::Fn(s)) = sval(self.source, *v) else {
+                        continue;
+                    };
+                    let SourceObject::String(key) = self.source.object(*k) else {
+                        continue;
+                    };
+                    let n = self.names.intern(key.chars());
+                    let fs = m.entry(n).or_default();
+                    if !fs.contains(&s) {
+                        fs.push(s);
+                    }
+                }
+            }
+            self.named_fns = Some(m);
+        }
+        let mut fs = self.named_fns.as_ref().unwrap().get(&name).cloned().unwrap_or_default();
+        for &f in self.dyn_named_fns.get(&name).map_or(&[][..], |v| &v[..]) {
+            if !fs.contains(&f) {
+                fs.push(f);
+            }
+        }
+        fs
+    }
+
     pub(super) fn ensure_seeded(&mut self, abs: AbsId) {
         if self.heap[abs].seeded {
             return;
@@ -1508,6 +1550,17 @@ impl Solver<'_> {
                 if callee_pos && region_contributed {
                     if let super::engine::CKey::Var(v) = dst {
                         if self.region_calls.insert((sid, v)) {
+                            self.engine.fire_side(SideKey::CallVar(sid, v));
+                        }
+                    }
+                }
+                // A method read off an unresolved receiver: the call's
+                // target is some function held under `name` (bind_by_name).
+                let unresolved_recv = rts.obj == ObjType::AnyObject
+                    || (rts.obj == ObjType::Empty && rts.unknown);
+                if callee_pos && unresolved_recv && name != self.names_of.elems {
+                    if let super::engine::CKey::Var(v) = dst {
+                        if self.name_calls.insert((sid, v), name).is_none() {
                             self.engine.fire_side(SideKey::CallVar(sid, v));
                         }
                     }
@@ -1985,6 +2038,19 @@ impl Solver<'_> {
         self.trace_field("write", name, rts, Some(v), user);
         let is_elems = name == self.names_of.elems;
         self.subscribe_region_recv(rts, is_elems, user);
+        if !is_elems && !v.fns.is_multi() {
+            let mut grew = false;
+            for f in v.fns.scripted() {
+                let fs = self.dyn_named_fns.entry(name).or_default();
+                if !fs.contains(&f) {
+                    fs.push(f);
+                    grew = true;
+                }
+            }
+            if grew {
+                self.engine.fire_side(SideKey::NamedFns(name));
+            }
+        }
         if rts.fns.is_multi() {
             self.do_escape(v, user);
         } else {

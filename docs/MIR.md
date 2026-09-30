@@ -1895,6 +1895,33 @@ row field goes in its row slot whatever the order:
 - Night tests: permuted-slots.js (the engine mechanism, through the shell's
   `addPropertyAtSlot`), slot-layouts.js.
 
+**M5l. `instanceof` narrowing; by-name dispatch in the analysis
+(2026-09-29; KICKOFF-6 open items 2 and 1).**
+- **`instanceof`** (§4.4): where the next op branches on `x instanceof C`,
+  the true side `guard.tags object`s `x` and replaces it in every slot, so
+  its field reads there skip the receiver tag test. Only a custom
+  `Symbol.hasInstance` answers true for a primitive; that exits at the
+  branch with the result on the stack. A list walk: 70 -> 63 ms (legacy 77).
+- **By-name dispatch** (likelier): a method read off a receiver the
+  analysis could not resolve (`recv.m(...)`, `recv` unknown or AnyObject)
+  is recorded (`name_calls`); the call's target is one of the functions
+  some object holds under `m`: the snapshot's function-valued properties
+  and every analyzed write of a function under that name
+  (`dyn_named_fns`, `SideKey::NamedFns`). Where there are at most
+  `callee_cap` of them, the arguments and `this` bind into each at a
+  depth-1 context per (site, target), as a region dispatch's guess does;
+  where the context budget refuses one, its arguments escape (the formals
+  read unknown), as a computed-name dispatch's do. The call's result stays
+  unknown, and it is not a call-target fact. Also: a callee that is only
+  the unknown bit (no object or function part) is now as unusable as
+  AnyObject: the arguments escape and the result is unknown, as the
+  comment there always said.
+  pdfjs, where the operator lists reach `CanvasGraphics` through its
+  message handler (`page.startRenderingFromOperatorList(...)` off an
+  unresolved `page`): the dispatch's methods no longer read Empty formals,
+  so `textHScale` and friends stop claiming int32. MIR exits 140k -> 52k.
+  Every Octane source is still an exact fixpoint.
+
 **M6. The rest of §10**: box/unbox cleanup, memory optimizations, and
 numeric optimizations, each with its guard-count and instruction-count
 tests.
