@@ -387,6 +387,12 @@ bool night_runtime_set_fun_name(JSContext* cx, uint32_t top, uint64_t fun,
 NIGHT_RUNTIME_EXPORT(night_runtime_no_extra_indexed)
 int32_t night_runtime_no_extra_indexed(uint32_t obj);
 
+// `1` iff every slot of native object `obj` below `n` holds a property: the
+// stamp gates' coverage test for a shape with permuted slots, whose span
+// alone does not say it (holes). Leaf (a walk of the shape, no GC).
+NIGHT_RUNTIME_EXPORT(night_runtime_slots_covered)
+int32_t night_runtime_slots_covered(uint32_t obj, uint32_t n);
+
 // Peek-only generator-closing check (the pending magic is NOT cleared):
 // the catch-pad closing split. Leaf.
 NIGHT_RUNTIME_EXPORT(night_runtime_gen_is_closing)

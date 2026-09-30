@@ -700,6 +700,10 @@ pub struct Helpers {
     pub mir_stress: Func,
     /// `night_runtime_ctor_stamp(this i64, layout i32, nfields i32, keep i32)`
     /// (leaf): the baseline and MIR tiers' ctor-exit stamp.
+    /// `night_runtime_slots_covered(obj, n) -> i32`: every slot below `n`
+    /// holds a property (the stamp gates' test for a permuted shape, whose
+    /// span does not say it). Leaf.
+    pub slots_covered: Func,
     pub ctor_stamp: Func,
     /// `night_runtime_ctor_restamp(this i64, layout, nfields, keep, p0..p3)`
     /// (leaf): the baseline and MIR tiers' init-delegate restamp.
@@ -3780,6 +3784,12 @@ mod tests {
         let no_extra_indexed = stub(&mut m, nei_sig, true, "night_runtime_no_extra_indexed");
         let gen_is_closing = stub(&mut m, nei_sig, true, "night_runtime_gen_is_closing");
         let mir_stress = stub(&mut m, nei_sig, true, "night_runtime_mir_stress");
+        // slots_covered: (obj i32, n i32) -> i32 (leaf).
+        let sc_sig = m.signatures.push(SignatureData {
+            params: vec![Type::I32, Type::I32],
+            returns: vec![Type::I32],
+        });
+        let slots_covered = stub(&mut m, sc_sig, true, "night_runtime_slots_covered");
         let cs_sig = m.signatures.push(SignatureData {
             params: vec![Type::I64, Type::I32, Type::I32, Type::I32],
             returns: vec![],
@@ -4130,6 +4140,7 @@ mod tests {
                 no_extra_indexed,
                 gen_is_closing,
                 mir_stress,
+                slots_covered,
                 ctor_stamp,
                 ctor_restamp,
                 init_field,

@@ -171,6 +171,7 @@
   NIGHT_RUNTIME_HELPER(night_runtime_no_extra_indexed)            \
   NIGHT_RUNTIME_HELPER(night_runtime_gen_is_closing)              \
   NIGHT_RUNTIME_HELPER(night_runtime_mir_stress)                  \
+  NIGHT_RUNTIME_HELPER(night_runtime_slots_covered)               \
   NIGHT_RUNTIME_HELPER(night_runtime_ctor_stamp)                  \
   NIGHT_RUNTIME_HELPER(night_runtime_ctor_restamp)                \
   NIGHT_RUNTIME_HELPER(night_runtime_init_field)                  \

@@ -692,6 +692,7 @@ mod tests {
         "night_runtime_no_extra_indexed",
         "night_runtime_gen_is_closing",
         "night_runtime_mir_stress",
+        "night_runtime_slots_covered",
         "night_runtime_ctor_stamp",
         "night_runtime_ctor_restamp",
         "night_runtime_init_field",

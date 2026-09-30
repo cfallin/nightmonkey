@@ -1028,6 +1028,7 @@ pub fn resolve_helpers(
         no_extra_indexed: resolve(m, "night_runtime_no_extra_indexed")?,
         gen_is_closing: resolve(m, "night_runtime_gen_is_closing")?,
         mir_stress: resolve(m, "night_runtime_mir_stress")?,
+        slots_covered: resolve(m, "night_runtime_slots_covered")?,
         ctor_stamp: resolve(m, "night_runtime_ctor_stamp")?,
         ctor_restamp: resolve(m, "night_runtime_ctor_restamp")?,
         init_field: resolve(m, "night_runtime_init_field")?,

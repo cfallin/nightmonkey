@@ -1854,6 +1854,47 @@ guard hoisting (2026-09-28).**
 - Night tests: mir-generators.js, mir-length.js, mir-globals.js,
   mir-hoist-guards.js.
 
+**M5k. Analysis-chosen slot layouts (2026-09-29; KICKOFF-6).** A layout
+row lists a class's fields in bytecode first-write order, the union over
+the constructor's paths. An object whose path wrote them in another order,
+or skipped some (pdfjs's `Font`: an early return after `type`, a `Type3`
+return before `loadedName`), put later fields in lower slots than the row
+said and lost SLOTS, and every `{types, slots}` guard on it exited. Now each
+row field goes in its row slot whatever the order:
+- **Engine** (the firefox fork, generic mechanism usable by any external
+  tier): `SharedShape::getShapeWithPropertyAtSlot` makes the shape adding a
+  property in a chosen slot (a hole or past the span; skipped slots become
+  holes holding undefined), `NativeObject::addPropertyWithShape` installs
+  it, and the `shapeForAdd` hook lets the tier place a property the engine
+  adds (interpreter, IC misses, baseline's helpers). A slot other than the
+  span sets `ObjectFlag::PermutedSlots`, inherited by derived shapes and
+  mirrored into the shape's immutable flags (bit 21); such a shape's span is
+  its highest slot plus one, computed when the shape is made. Engine paths
+  that assume slot i holds property i refuse it (Object.assign's fast path,
+  the JSON/`NewPlainObjectWithProps` cache, the megamorphic set cache, add
+  stubs, remove-last-property). The visible property order is unchanged.
+- **Runtime** (policy): `NightShapeForAdd` places a plain data property
+  named by the object's layout (the early key while constructing, else the
+  stamped idx) in its row position, or for a name the row lacks, its
+  position in the rows extending it where they agree, if that is a fixed
+  slot other than the span and SLOTS still holds. It memoizes (parent shape,
+  key, slot) -> shape, purged at every major GC. `NightAddPropCheck` is
+  unchanged: a placed field lands at its predicted slot, and a generic add
+  onto a permuted shape inside the clump's bound clears SLOTS as before.
+  The add-transition rows record only transitions that add one slot at the
+  span, so a permuted transition always takes the helper.
+- **Stamps**: a span covering the row no longer proves every row field is
+  present (holes). Every stamp gate (MIR's `ctor.stamp`/`ctor.publish`
+  inline, MIR's `restamp`, bbv's `emit_class_idx_stamp_impl`, the runtime's
+  `ctor_stamp`/`ctor_restamp`) counts the properties below the row length
+  on a permuted shape (`night_runtime_slots_covered`), and `guard.ctor`'s
+  span compare includes the permuted bit (`constructing(n)` is the first n
+  fields in order).
+- pdfjs: the `Font` methods' entry exits (55.6k) are gone, 187k -> 140k
+  exits. The rest are mostly int32-unbox guards (KICKOFF-6 open item 1).
+- Night tests: permuted-slots.js (the engine mechanism, through the shell's
+  `addPropertyAtSlot`), slot-layouts.js.
+
 **M6. The rest of §10**: box/unbox cleanup, memory optimizations, and
 numeric optimizations, each with its guard-count and instruction-count
 tests.

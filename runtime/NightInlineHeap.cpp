@@ -96,6 +96,13 @@ static_assert((JS::shadow::Shape::FIXED_SLOTS_MASK >>
                JS::shadow::Shape::FIXED_SLOTS_SHIFT) == 0x1f,
               "SHAPE_FIXED_SLOTS_MASK_BITS");
 static_assert(Shape::isNativeBit() == (1u << 4), "SHAPE_IS_NATIVE_BIT");
+static_assert(NativeShape::smallSlotSpanShift() == 11,
+              "SHAPE_SMALL_SLOTSPAN_SHIFT");
+static_assert((NativeShape::smallSlotSpanMask() >>
+               NativeShape::smallSlotSpanShift()) == 0x3ff,
+              "SHAPE_SMALL_SLOTSPAN_MASK_BITS");
+static_assert(NativeShape::permutedSlotsBit() == (1u << 21),
+              "SHAPE_PERMUTED_SLOTS_BIT");
 static_assert(js::Shape::offsetOfBaseShape() == 0, "SHAPE_BASESHAPE_OFFSET");
 static_assert(js::BaseShape::offsetOfClasp() == 0, "BASESHAPE_CLASP_OFFSET");
 

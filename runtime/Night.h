@@ -33,12 +33,24 @@ bool NightSnapshotCaptureExtras(JSContext* cx, JS::Handle<JSScript*> root);
 // consults them and every consumer still guards at runtime.
 bool NightSnapshotCaptureHeap(JSContext* cx);
 
+class NativeObject;
+class SharedShape;
+
 namespace night {
 // Two-bit-stamp per-add SLOTS maintenance: check a property add against the
 // receiver's predicted layout and clear the SLOTS bit on deviation. Call
 // after the slot is assigned. `nfixed` is the receiver's numFixedSlots().
 void NightAddPropCheck(JSObject* obj, JS::PropertyKey id, uint32_t slot,
                        uint32_t nfixed);
+
+// Analysis-chosen slot layouts: the engine's slot-placement hook
+// (JS::ExternalCompilerHooks::shapeForAdd), its memo's purge (at every major
+// GC), and the stamp gates' coverage test (every slot below n holds a
+// property, which with permuted slots the span alone does not say).
+bool NightShapeForAdd(JSContext* cx, JS::Handle<NativeObject*> obj,
+                      JS::HandleId id, uint8_t flags, SharedShape** result);
+void NightPurgeAddMemo();
+bool NightSlotsCovered(NativeObject* obj, uint32_t n);
 
 // Global-object write hooks, called from the engine's own property paths so
 // that an INTERPRETED global write (a declined script, a generator, eval)

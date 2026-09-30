@@ -100,6 +100,10 @@ pub(crate) const SHAPE_FIXED_SLOTS_SHIFT: u32 = 6;
 pub(crate) const SHAPE_FIXED_SLOTS_MASK_BITS: u32 = 0x1f;
 pub(crate) const SHAPE_SMALL_SLOTSPAN_SHIFT: u32 = 11;
 pub(crate) const SHAPE_SMALL_SLOTSPAN_MASK_BITS: u32 = 0x3ff;
+/// Set on a shape whose slots may not follow property insertion order (the
+/// engine's `ObjectFlag::PermutedSlots`, mirrored into the immutable flags):
+/// its span no longer says the slots below it all hold properties.
+pub(crate) const SHAPE_PERMUTED_SLOTS_BIT: u32 = 1 << 21;
 pub(crate) const BASESHAPE_CLASP_OFFSET: u32 = 0;
 pub(crate) const BASESHAPE_PROTO_OFFSET: u32 = 8;
 pub(super) const CLASP_FLAGS_OFFSET: u32 = 4;

@@ -61,7 +61,7 @@ use crate::wasm::bbv::abi::{
     BINOP_BITAND, BINOP_BITNOT, BINOP_BITOR, BINOP_BITXOR, BINOP_DEC, BINOP_DIV, BINOP_INC,
     BINOP_LSH, BINOP_MOD, BINOP_MUL, BINOP_RSH, BINOP_SUB, BINOP_URSH, CLASS_WORD_SHALLOW,
     CLASS_WORD_RANGES, CLASS_WORD_SENTINEL, CLASS_WORD_SLOTS, SHAPE_SMALL_SLOTSPAN_MASK_BITS,
-    SHAPE_SMALL_SLOTSPAN_SHIFT, TA_DATA_PAYLOAD_OFFSET, TA_LENGTH_PAYLOAD_OFFSET, ELEMENTS_LENGTH_BACK,
+    SHAPE_PERMUTED_SLOTS_BIT, SHAPE_SMALL_SLOTSPAN_SHIFT, TA_DATA_PAYLOAD_OFFSET, TA_LENGTH_PAYLOAD_OFFSET, ELEMENTS_LENGTH_BACK,
     ELEMENTS_CAPACITY_BACK, ELEMENTS_PUSH_BAIL_MASK, ELEMENTS_HEADER_BYTES, ALLOC_CELL_ADDR_PLACEHOLDER,
     STRING_LENGTH_OFFSET, STRING_FLAGS_OFFSET, STRING_CHARS_OFFSET, STRING_LINEAR_BIT,
     STRING_INLINE_CHARS_BIT, STRING_LATIN1_CHARS_BIT, CALL_CELL_ADDR_PLACEHOLDER, CALL_CELL_FUNCIDX,
@@ -3545,15 +3545,20 @@ impl<'a> Lower<'a> {
             }
             Opcode::GuardCtor { key, n, types } => {
                 // Under construction for `key` (§2.3): the sentinel with
-                // its early key, SLOTS (and TYPES), and exactly `n` slots.
+                // its early key, SLOTS (and TYPES), and exactly `n` slots,
+                // in insertion order (a permuted shape's span may cover
+                // holes), so the first `n` fields.
                 let w = self.load_i32(a[0], OBJ_CLASS_IDX_OFFSET);
                 let bits = CLASS_WORD_SLOTS | if types { CLASS_WORD_SHALLOW } else { 0 };
                 let m = self.i32c(CLASS_WORD_SENTINEL | (EARLY_KEY_MAX << EARLY_KEY_SHIFT) | bits);
                 let want = self.i32c(CLASS_WORD_SENTINEL | ((key.get() + 1) << EARLY_KEY_SHIFT) | bits);
                 let wm = self.bin(Operator::I32And, w, m, Type::I32);
                 let ok = self.bin(Operator::I32Eq, wm, want, Type::I32);
-                let span = self.slot_span(a[0]);
-                let nv = self.i32c(n);
+                let shape = self.load_i32(a[0], SHAPE_OFFSET);
+                let imm = self.load_i32(shape, SHAPE_IMMUTABLE_FLAGS_OFFSET);
+                let sm = self.i32c((SHAPE_SMALL_SLOTSPAN_MASK_BITS << SHAPE_SMALL_SLOTSPAN_SHIFT) | SHAPE_PERMUTED_SLOTS_BIT);
+                let span = self.bin(Operator::I32And, imm, sm, Type::I32);
+                let nv = self.i32c(n << SHAPE_SMALL_SLOTSPAN_SHIFT);
                 let s_ok = self.bin(Operator::I32Eq, span, nv, Type::I32);
                 let ok = self.bin(Operator::I32And, ok, s_ok, Type::I32);
                 self.guard(inst, ok, &[a[0]])?;
@@ -5324,6 +5329,15 @@ impl<'a> Lower<'a> {
         let n = self.i32c(nfields);
         let covers = self.bin(Operator::I32GeU, span, n, Type::I32);
         self.check(covers, done);
+        // A permuted shape's span may cover holes: count its properties.
+        let pb = self.i32c(SHAPE_PERMUTED_SLOTS_BIT);
+        let perm = self.bin(Operator::I32And, imm, pb, Type::I32);
+        let (holes, covered) = (self.body.add_block(), self.body.add_block());
+        self.cond_br(perm, Self::to(holes), Self::to(covered));
+        self.cur = holes;
+        let r = self.call1(self.h.slots_covered, &[obj, n], Type::I32);
+        self.cond_br(r, Self::to(covered), Self::to(done));
+        self.cur = covered;
         if let Some(census) = self.exit_census.filter(|_| keep & CLASS_WORD_SHALLOW != 0) {
             // `--mir-exit-census`: a stamp publishing without the TYPES
             // its layout claims (lost during construction), by layout.
@@ -5595,16 +5609,6 @@ impl<'a> Lower<'a> {
             self.terminate(Terminator::Br { target: Self::to(join) });
             self.cur = join;
         }
-    }
-
-    /// The number of slots native object `obj`'s shape spans.
-    fn slot_span(&mut self, obj: Value) -> Value {
-        let shape = self.load_i32(obj, SHAPE_OFFSET);
-        let imm = self.load_i32(shape, SHAPE_IMMUTABLE_FLAGS_OFFSET);
-        let sh = self.i32c(SHAPE_SMALL_SLOTSPAN_SHIFT);
-        let span = self.bin(Operator::I32ShrU, imm, sh, Type::I32);
-        let sm = self.i32c(SHAPE_SMALL_SLOTSPAN_MASK_BITS);
-        self.bin(Operator::I32And, span, sm, Type::I32)
     }
 
     /// `init_field` (§2.3): add field `n` of the receiver's
@@ -6868,6 +6872,11 @@ impl<'a> Lower<'a> {
         let full = self.bin(Operator::I32GeU, span, n, Type::I32);
         let ok = self.bin(Operator::I32And, ok, native, Type::I32);
         let ok = self.bin(Operator::I32And, ok, full, Type::I32);
+        // A permuted shape's span may cover holes: the helper counts.
+        let pb = self.i32c(SHAPE_PERMUTED_SLOTS_BIT);
+        let perm = self.bin(Operator::I32And, imm, pb, Type::I32);
+        let seq = self.bin(Operator::I32Eq, perm, z, Type::I32);
+        let ok = self.bin(Operator::I32And, ok, seq, Type::I32);
         let stamp = self.body.add_block();
         self.cond_br(ok, Self::to(stamp), Self::to(slow));
         self.cur = stamp;

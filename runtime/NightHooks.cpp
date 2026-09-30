@@ -124,6 +124,7 @@ JS::ExternalCompilerHooks js::night::gNightHooks = {
     /* storeClearMask */ kStoreClearMask,
     /* storeNonNumberClearMask */ kStoreNonNumberClearMask,
     /* propertyAdded */ PropertyAdded,
+    /* shapeForAdd */ NightShapeForAdd,
     /* globalKeyChanged */ GlobalKeyChanged,
     /* globalDataStored */ GlobalDataStored,
     /* globalLexicalShadowAdded */ GlobalLexicalShadowAdded,

@@ -1283,7 +1283,18 @@ impl<'a> Bbv<'a> {
         let m = self.binop(Operator::I32GeU, span, n_v, Type::I32);
         let stamp_blk = self.body.add_block();
         let short = self.stamp_census_blk(done, cbase + census::STAMP_SHORT_SPAN, zero_arg);
-        self.cond_br(m, stamp_blk, short);
+        // A permuted shape's span may cover holes (the engine's custom-slot
+        // shapes): there the helper counts the properties below N.
+        let (spans, holes) = (self.body.add_block(), self.body.add_block());
+        self.cond_br(m, spans, short);
+        self.cur = spans;
+        let pb = self.i32_const(SHAPE_PERMUTED_SLOTS_BIT);
+        let perm = self.binop(Operator::I32And, imm, pb, Type::I32);
+        self.cond_br(perm, holes, stamp_blk);
+        self.cur = holes;
+        let sc = self.helpers.slots_covered;
+        let covered = self.call_i32(sc, &[objptr, n_v]);
+        self.cond_br(covered, stamp_blk, short);
         self.cur = stamp_blk;
         self.emit_guard_census(cbase + census::STAMP_OK, self.cur_pc);
         if self.guard_census_on() {

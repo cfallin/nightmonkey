@@ -14,6 +14,7 @@
 #include <stdlib.h>  // malloc/free (regex matcher table)
 #include <string>    // std::string, std::u16string
 #include <string.h>  // memcpy
+#include <unordered_map>  // the add-placement memo
 #include <vector>    // std::vector
 
 #include "jsapi.h"   // JS_NewPlainObject, JS_DefineFunction
@@ -2875,6 +2876,7 @@ static void NightPurgeMovableCaches() {
   // epoch addresses in the tail: zeroing through the block end would take
   // the stamp-epoch address with it, making the compiled epoch compare
   // read address 0 on both sides and admit every keep arm.
+  js::night::NightPurgeAddMemo();
   if (gState.strLitBase) {
     ZeroRegion(gState.strLitBase + js::night::Night_strlitEmptyStringOff + 4,
                js::night::Night_strlitTriplesEnd -
@@ -4591,7 +4593,7 @@ void night_runtime_ctor_stamp(uint64_t thisBits, uint32_t layoutId,
   if (key != 0 && key != layoutId + 1) {
     return;
   }
-  if (obj->slotSpan() < nFields) {
+  if (!js::night::NightSlotsCovered(obj, nFields)) {
     return;
   }
   NightCensusTraceStamp("ctor", layoutId, w0, keepBits);
@@ -4631,7 +4633,7 @@ void night_runtime_ctor_restamp(uint64_t thisBits, uint32_t layoutId,
   } else {
     ok = isPrefix(idx) && !(w0 & js::night::kWordAdvIneligible);
   }
-  if (!ok || obj->slotSpan() < nFields) {
+  if (!ok || !js::night::NightSlotsCovered(obj, nFields)) {
     return;
   }
   NightCensusTraceStamp("restamp", layoutId, w0, keepBits);
@@ -5291,6 +5293,11 @@ bool night_runtime_set_fun_name(JSContext* cx, uint32_t top, uint64_t fun,
 int32_t night_runtime_no_extra_indexed(uint32_t obj) {
   JSObject* o = reinterpret_cast<JSObject*>(uintptr_t(obj));
   return NoExtraIndexedFast(o) ? 1 : 0;
+}
+
+int32_t night_runtime_slots_covered(uint32_t obj, uint32_t n) {
+  JSObject* o = reinterpret_cast<JSObject*>(uintptr_t(obj));
+  return js::night::NightSlotsCovered(&o->as<js::NativeObject>(), n) ? 1 : 0;
 }
 
 // Mapped-arguments formal access: once a mapped args object exists it is the
@@ -6206,6 +6213,171 @@ void js::night::NightRearmDynamicCodeFuse() {
   if (gState.dynCodeFuseAddr) {
     *LinMem<uint32_t>(gState.dynCodeFuseAddr) = 0;
   }
+}
+
+// Analysis-chosen slot layouts (docs/MIR-KICKOFF-6.md). A layout row names a
+// class's fields in slot order: the union of the constructor's fields over
+// its paths, so an object whose path writes them in another order, or skips
+// some, would put later fields in lower slots than the row says and lose
+// SLOTS. Instead each row field goes in its row slot whatever the insertion
+// order (the engine's custom-slot shapes: skipped slots become holes, a
+// later add fills one). The property order the program sees is unchanged.
+//
+// The slot of a name for a layout: its row position, or, for a name the row
+// lacks, its position in the rows extending the row (a two-phase
+// constructor's delegate fills the suffix), when they agree.
+struct NightSlotTable {
+  bool built = false;
+  std::vector<std::pair<uint64_t, uint32_t>> slots;  // (jsid bits, slot)
+};
+static std::vector<NightSlotTable> gSlotTables;
+
+static const NightSlotTable& NightSlotTableFor(uint32_t layout) {
+  if (gSlotTables.size() < gLayouts.rows.size()) {
+    gSlotTables.resize(gLayouts.rows.size());
+  }
+  NightSlotTable& t = gSlotTables[layout];
+  if (t.built) {
+    return t;
+  }
+  t.built = true;
+  const std::vector<uint32_t>& atoms = gLayouts.rows[layout];
+  auto key = [](uint32_t atom) { return (*gNames.ids)[atom].get().asRawBits(); };
+  for (uint32_t i = 0; i < atoms.size(); i++) {
+    t.slots.emplace_back(key(atoms[i]), i);
+  }
+  // Extensions: (jsid, slot), with UINT32_MAX where two rows disagree.
+  std::vector<std::pair<uint64_t, uint32_t>> ext;
+  for (const auto& cand : gLayouts.rows) {
+    if (cand.size() <= atoms.size() ||
+        !std::equal(atoms.begin(), atoms.end(), cand.begin())) {
+      continue;
+    }
+    for (uint32_t i = uint32_t(atoms.size()); i < uint32_t(cand.size()); i++) {
+      uint64_t k = key(cand[i]);
+      auto it = std::find_if(ext.begin(), ext.end(),
+                             [k](const auto& e) { return e.first == k; });
+      if (it == ext.end()) {
+        ext.emplace_back(k, i);
+      } else if (it->second != i) {
+        it->second = UINT32_MAX;
+      }
+    }
+  }
+  for (const auto& e : ext) {
+    if (e.second != UINT32_MAX) {
+      t.slots.push_back(e);
+    }
+  }
+  return t;
+}
+
+// The layout a class word names: the early key while constructing, else the
+// stamped idx; UINT32_MAX for none.
+static uint32_t NightWordLayout(uint32_t w) {
+  uint32_t half = w >> 16;
+  uint32_t k = (half & 0x8000) ? (half >> 2) & 0xfff : w & 0xffff;
+  if (k == 0 || k - 1 >= gLayouts.rows.size()) {
+    return UINT32_MAX;
+  }
+  return k - 1;
+}
+
+// (parent shape, key, slot) -> the custom-slot shape, or null where the
+// engine refused the placement. Holds raw shape pointers: purged with the
+// other movable caches at every major GC.
+struct NightAddMemoKey {
+  uintptr_t shape;
+  uint64_t id;
+  uint32_t slot;
+  bool operator==(const NightAddMemoKey& o) const {
+    return shape == o.shape && id == o.id && slot == o.slot;
+  }
+};
+struct NightAddMemoHash {
+  size_t operator()(const NightAddMemoKey& k) const {
+    uint64_t h = uint64_t(k.shape) * 0x9E3779B97F4A7C15ull;
+    h ^= k.id + 0x7F4A7C15ull + (h << 6) + (h >> 2);
+    h ^= uint64_t(k.slot) * 0xC2B2AE3D27D4EB4Full;
+    return size_t(h ^ (h >> 29));
+  }
+};
+static std::unordered_map<NightAddMemoKey, js::SharedShape*, NightAddMemoHash>
+    gAddMemo;
+
+void js::night::NightPurgeAddMemo() { gAddMemo.clear(); }
+
+// The engine's slot-placement hook (JS::ExternalCompilerHooks::shapeForAdd):
+// a plain data property named by the object's layout goes in its row slot,
+// if that is a fixed slot (predictions are fixed slots) and not already the
+// span (where the engine's own add puts it). Only while SLOTS holds: once it
+// is clear no consumer reads the placement.
+bool js::night::NightShapeForAdd(JSContext* cx,
+                                 JS::Handle<js::NativeObject*> obj,
+                                 JS::HandleId id, uint8_t flags,
+                                 js::SharedShape** result) {
+  *result = nullptr;
+  uint32_t w = obj->externalWord();
+  if (!(w & kWordSlots) || !gNames.ids ||
+      flags != js::PropertyFlags::defaultDataPropFlags.toRaw()) {
+    return true;
+  }
+  uint32_t layout = NightWordLayout(w);
+  if (layout == UINT32_MAX) {
+    return true;
+  }
+  uint64_t idBits = id.get().asRawBits();
+  uint32_t slot = UINT32_MAX;
+  for (const auto& e : NightSlotTableFor(layout).slots) {
+    if (e.first == idBits) {
+      slot = e.second;
+      break;
+    }
+  }
+  js::SharedShape* shape = obj->sharedShape();
+  if (slot == UINT32_MAX || slot >= obj->numFixedSlots() ||
+      slot == shape->slotSpan()) {
+    return true;
+  }
+  NightAddMemoKey key{uintptr_t(shape), idBits, slot};
+  auto it = gAddMemo.find(key);
+  if (it != gAddMemo.end()) {
+    *result = it->second;
+    return true;
+  }
+  JS::Rooted<js::SharedShape*> parent(cx, shape);
+  js::SharedShape* chosen = nullptr;
+  if (!js::ExternalShapeWithPropertyAtSlot(cx, parent, id, flags, slot,
+                                           &chosen)) {
+    return false;
+  }
+  // The allocation may have run a GC (which purges the memo and may move
+  // the parent): key by where the parent is now.
+  key.shape = uintptr_t(parent.get());
+  gAddMemo.emplace(key, chosen);
+  *result = chosen;
+  return true;
+}
+
+// Whether every slot below `n` holds a property (none is a hole). With
+// sequential slots that is span >= n; with permuted slots the properties
+// below n are counted.
+bool js::night::NightSlotsCovered(js::NativeObject* obj, uint32_t n) {
+  if (obj->inDictionaryMode() || obj->slotSpan() < n) {
+    return false;
+  }
+  js::Shape* shape = obj->shape();
+  if (!shape->hasPermutedSlots()) {
+    return true;
+  }
+  uint32_t count = 0;
+  for (js::ShapePropertyIter<js::NoGC> iter(&shape->asNative()); !iter.done();
+       iter++) {
+    if (iter->hasSlot() && iter->slot() < n) {
+      count++;
+    }
+  }
+  return count == n;
 }
 
 // Two-bit-stamp per-add SLOTS maintenance (Night.h; called from the
