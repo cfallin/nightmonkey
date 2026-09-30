@@ -183,6 +183,10 @@ impl Ty {
 /// costs far more than the ToInt32s int-first saves.
 const SPECULATE_INT_FIRST: bool = true;
 
+/// Whether stamped literal sites build `lit.new` and `lit.init`
+/// (MIR-MEMORY.md §4) rather than `js.rt.newobject` and `js.rt.initprop`.
+const LIT_OPS: bool = true;
+
 /// Whether the generic runtime ops (`js.rt`, `js.throw`, `js.typeof`)
 /// are built.
 const RT_OPS: bool = true;
@@ -1112,6 +1116,9 @@ struct Run<'s, 'a> {
     /// Advisory classes (`hinted_site`): of values, and of the frame
     /// slots whose writes carry them.
     val_cls: BTreeMap<mir::Value, u32>,
+    /// Literals of a stamped site under construction: the object (as
+    /// `lit.new` made it) -> its row's layout key, for its `lit.init`s.
+    lit_rows: BTreeMap<mir::Value, u32>,
     /// Boxed objects known to have been under construction for a layout
     /// (key, fields added, TYPES) when a fence demoted them from `Ctor`
     /// (§2.3), or as an inlined callee left them: a field add or a method
@@ -1179,6 +1186,7 @@ impl<'s, 'a> Run<'s, 'a> {
             ta_poly_site: false,
             store_mask: None,
             val_cls: BTreeMap::new(),
+            lit_rows: BTreeMap::new(),
             ctor_hint: BTreeMap::new(),
             ctor_layouts: BTreeMap::new(),
             this_out: None,
@@ -6078,13 +6086,22 @@ impl<'s, 'a> Run<'s, 'a> {
             }
             NewInit | NewObject if RT_OPS => {
                 let n = self.s.ctx.lit_nslots_in.get(&self.site(self.pc)).copied().unwrap_or(0);
-                let v = self.js(Opcode::JsRt(RtOp::NewObject(n)), vec![], MType::val(TagSet::OBJECT));
+                let lid = self.s.ctx.lit_stamps_in.get(&self.site(self.pc)).copied();
+                // A stamped site's allocation is typed (`lit.new`, no
+                // fence: MIR-MEMORY.md §4); another's, the generic op.
+                let v = match lid {
+                    Some(_) if LIT_OPS => self.js_static(Opcode::LitNew(n), vec![], MType::val(TagSet::OBJECT)),
+                    _ => self.js(Opcode::JsRt(RtOp::NewObject(n)), vec![], MType::val(TagSet::OBJECT)),
+                };
                 // An object-literal stamp site: the layout idx with SLOTS
                 // (the inits land at the row's slots by construction).
-                if let Some(&lid) = self.s.ctx.lit_stamps_in.get(&self.site(self.pc)) {
+                if let Some(lid) = lid {
                     let w = (lid + 1) | crate::wasm::bbv::abi::CLASS_WORD_SLOTS;
                     self.inst(Opcode::StampFresh(w), vec![v], None);
                     self.val_cls.insert(v, lid);
+                    if LIT_OPS {
+                        self.lit_rows.insert(v, lid);
+                    }
                 }
                 self.push(v, Ty::Val(TagSet::OBJECT));
             }
@@ -6111,7 +6128,16 @@ impl<'s, 'a> Run<'s, 'a> {
                 let v = self.pop();
                 let o = self.top();
                 let (x, y) = (self.boxed(o), self.boxed(v));
-                self.js_void(Opcode::JsRt(RtOp::InitProp(a, attrs)), vec![x, y]);
+                match self.lit_rows.get(&x) {
+                    Some(&lid) if attrs == INIT_ATTR_ENUMERATE => {
+                        let ok = self.new_block();
+                        let err = self.exit_block(true);
+                        let key = crate::ids::LayoutKey::new(lid);
+                        self.term(Opcode::LitInit(a, key), vec![x, y], vec![Self::goto(ok), Self::goto(err)]);
+                        self.at(ok);
+                    }
+                    _ => self.js_void(Opcode::JsRt(RtOp::InitProp(a, attrs)), vec![x, y]),
+                }
             }
             InitElem | InitHiddenElem | InitLockedElem if RT_OPS => {
                 // [obj, key, v] -> [obj]

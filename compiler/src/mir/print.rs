@@ -465,10 +465,13 @@ pub fn mnemonic(op: &Opcode) -> String {
         JsSetName(_, false) => "js.setname".into(),
         JsSetName(_, true) => "js.setname.strict".into(),
         LoadField(_) => "load_field".into(),
+        LoadSlot(_) => "load_slot".into(),
         StoreField(_) => "store_field".into(),
         InitField(_) => "init_field".into(),
         PublishLayout => "publish_layout".into(),
         NewObject(_) => "new_object".into(),
+        LitNew(_) => "lit.new".into(),
+        LitInit(..) => "lit.init".into(),
         NewArray => "new_array".into(),
         LoadElem => "load_elem".into(),
         StoreElem(false) => "store_elem".into(),
@@ -536,6 +539,7 @@ fn immediates(m: &Module, op: &Opcode) -> Option<String> {
         | JsBindGName(a)
         | JsSetName(a, _)
         | LoadField(a)
+        | LoadSlot(a)
         | StoreField(a)
         | InitField(a) => atom(Some(m), *a),
         GuardTags(t) => tags_str(*t),
@@ -569,6 +573,8 @@ fn immediates(m: &Module, op: &Opcode) -> Option<String> {
             s
         }
         NewObject(k) => format!("L{k}"),
+        LitNew(n) => n.to_string(),
+        LitInit(a, k) => format!("{}, L{k}", atom(Some(m), *a)),
         EnvLoad(s) | EnvStore(s) => s.to_string(),
         JsLambda(k) | FrameStore(k) | RestArray(k) | ActualArgOr(k) | JsIsBuiltin(k) => {
             k.to_string()

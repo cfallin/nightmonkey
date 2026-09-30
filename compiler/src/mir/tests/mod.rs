@@ -608,3 +608,181 @@ b10:\n  exit.throw pc=0 this=v1 args=[v2] locals=[] rval=v1 stack=[]\n}\n";
     assert_eq!(text.matches("guard.layout").count(), 2, "{text}");
     assert_eq!(text.matches("guard.unbox.obj").count(), 1, "{text}");
 }
+
+#[test]
+fn slot_loads_number_and_hoist() {
+    // Two loads of `v4.x` in a loop, through a receiver proven before it
+    // with SLOTS: both become `load_slot`, the second is the first, and
+    // the one left hoists into the preheader (nothing in the loop writes
+    // `x`).
+    let src = "module {\n  layout L3 = { x: val{int32} }\n}\n\
+func @s1 (formals=1, locals=0, depths={0:0}) {\n  root entry b0\n  loop b2 preheader=b1\n\
+b0(v0: obj{Function(s1)}, v1: val, v2: val):\n  guard.unbox.obj v2 -> ok b5(v3: obj), fail b9\n\
+b5(v3: obj):\n  guard.layout v3 L3 types slots -> ok b6(v4: obj{L3 types slots}), fail b9\n\
+b6(v4: obj{L3 types slots}):\n  v5 = const.i32 0\n  jump b1(v5)\n\
+b1(v6: i32):\n  jump b2(v6)\n\
+b2(v7: i32):\n  load_field v4 x -> ok_clean b3(v8: val{int32}), ok_dirty b9, err b10\n\
+b3(v8: val{int32}):\n  load_field v4 x -> ok_clean b4(v9: val{int32}), ok_dirty b9, err b10\n\
+b4(v9: val{int32}):\n  v10 = unbox.i32 v8\n  v14 = unbox.i32 v9\n  i32.add.ovf v10, v14 -> ok b7(v11: i32), fail b9\n\
+b7(v11: i32):\n  v12 = const.i32 100\n  v13 = i32.cmp.lt v11, v12\n  br v13 -> then b2(v11), else b8\n\
+b8:\n  return v1\n\
+b9:\n  exit pc=0 this=v1 args=[v2] locals=[] rval=v1 stack=[]\n\
+b10:\n  exit.throw pc=0 this=v1 args=[v2] locals=[] rval=v1 stack=[]\n}\n";
+    let mut m = parse_ok(src);
+    verify_module(&m).expect("valid before");
+    let mut f = m.funcs.pop().unwrap();
+    crate::mir::opt::optimize(&m, &mut f);
+    m.funcs.push(f);
+    let text = print_module(&m);
+    if let Err(es) = verify_module(&m) {
+        panic!("invalid after optimizing: {:?}\n{text}", es);
+    }
+    assert_eq!(text.matches("load_field").count(), 0, "{text}");
+    assert_eq!(text.matches("load_slot").count(), 1, "{text}");
+    let pre = text
+        .split("\n\n")
+        .find(|blk| blk.starts_with("b1:") || blk.starts_with("b1("))
+        .unwrap_or("");
+    assert!(pre.contains("load_slot"), "not hoisted into the preheader:\n{text}");
+}
+
+/// Run `optimize` on the module's one function, check it still
+/// validates, and return its text.
+fn optimized(src: &str) -> String {
+    let mut m = parse_ok(src);
+    verify_module(&m).expect("valid before");
+    let mut f = m.funcs.pop().unwrap();
+    crate::mir::opt::optimize(&m, &mut f);
+    m.funcs.push(f);
+    let text = print_module(&m);
+    if let Err(es) = verify_module(&m) {
+        panic!("invalid after optimizing: {:?}\n{text}", es);
+    }
+    text
+}
+
+/// A function over two receivers `v4: obj{L3 types slots}` and
+/// `v6: obj{L4 types slots}` (both with a field `x`), with `body` in b2
+/// (which ends by returning or branching to b9/b10).
+fn two_receivers(body: &str) -> String {
+    format!(
+        "module {{\n  layout L3 = {{ x: val{{int32}} }}\n  layout L4 = {{ x: val{{int32}} }}\n}}\n\
+func @s1 (formals=2, locals=0, depths={{0:0}}) {{\n  root entry b0\n\
+b0(v0: obj{{Function(s1)}}, v1: val, v2: val, v3: val):\n  guard.unbox.obj v2 -> ok b5(v20: obj), fail b9\n\
+b5(v20: obj):\n  guard.layout v20 L3 types slots -> ok b6(v4: obj{{L3 types slots}}), fail b9\n\
+b6(v4: obj{{L3 types slots}}):\n  guard.unbox.obj v3 -> ok b7(v21: obj), fail b9\n\
+b7(v21: obj):\n  guard.layout v21 L4 types slots -> ok b2(v6: obj{{L4 types slots}}), fail b9\n\
+b2(v6: obj{{L4 types slots}}):\n{body}\
+b9:\n  exit pc=0 this=v1 args=[v2, v3] locals=[] rval=v1 stack=[]\n\
+b10:\n  exit.throw pc=0 this=v1 args=[v2, v3] locals=[] rval=v1 stack=[]\n}}\n"
+    )
+}
+
+#[test]
+fn store_forwards_to_load() {
+    // `v4.x = 7; return v4.x`: the load is the stored value.
+    let text = optimized(&two_receivers(
+        "  v30 = const.i32 7\n  v31 = box v30\n  v32: val{int32} = weaken v31\n\
+  store_field v4, v32 x -> ok_clean b11, ok_dirty b9, err b10\n\
+b11:\n  load_field v4 x -> ok_clean b12(v33: val{int32}), ok_dirty b9, err b10\n\
+b12(v33: val{int32}):\n  return v33\n",
+    ));
+    assert_eq!(text.matches("load_").count(), 0, "{text}");
+    assert!(text.contains("return v32"), "{text}");
+}
+
+#[test]
+fn loads_number_across_another_class_store() {
+    // `a = v4.x; v6.x = 7; b = v4.x`: L4's `x` is not L3's, so the second
+    // load of `v4.x` is the first.
+    let text = optimized(&two_receivers(
+        "  load_field v4 x -> ok_clean b11(v33: val{int32}), ok_dirty b9, err b10\n\
+b11(v33: val{int32}):\n  v30 = const.i32 7\n  v31 = box v30\n  v32: val{int32} = weaken v31\n\
+  store_field v6, v32 x -> ok_clean b12, ok_dirty b9, err b10\n\
+b12:\n  load_field v4 x -> ok_clean b13(v34: val{int32}), ok_dirty b9, err b10\n\
+b13(v34: val{int32}):\n  v35 = unbox.i32 v33\n  v36 = unbox.i32 v34\n  i32.add.ovf v35, v36 -> ok b14(v37: i32), fail b9\n\
+b14(v37: i32):\n  v38 = box v37\n  return v38\n",
+    ));
+    assert_eq!(text.matches("load_slot").count(), 1, "{text}");
+}
+
+#[test]
+fn loads_do_not_number_across_a_call() {
+    let text = optimized(&two_receivers(
+        "  load_field v4 x -> ok_clean b11(v33: val{int32}), ok_dirty b9, err b10\n\
+b11(v33: val{int32}):\n  v39 = const.val undefined\n  call v1, v39 -> ok_clean b12(v40: val), ok_dirty b9, err b10\n\
+b12(v40: val):\n  load_field v4 x -> ok_clean b13(v34: val{int32}), ok_dirty b9, err b10\n\
+b13(v34: val{int32}):\n  v35 = unbox.i32 v33\n  v36 = unbox.i32 v34\n  i32.add.ovf v35, v36 -> ok b14(v37: i32), fail b9\n\
+b14(v37: i32):\n  v38 = box v37\n  return v38\n",
+    ));
+    assert_eq!(text.matches("load_slot").count(), 2, "{text}");
+}
+
+#[test]
+fn length_of_a_field_hoists() {
+    // `for (i = 0; i < this.arr.length; i++)`, with `this` proven before
+    // the loop: the field load (an object: a managed result), its unbox
+    // and kind guards, the length and its int32 guard all leave the loop.
+    let src = "module {\n  layout L3 = { arr: val{object} }\n}\n\
+func @s1 (formals=1, locals=0, depths={0:0}) {\n  root entry b0\n  loop b2 preheader=b1\n\
+b0(v0: obj{Function(s1)}, v1: val, v2: val):\n  guard.unbox.obj v1 -> ok b12(v3: obj), fail b9\n\
+b12(v3: obj):\n  guard.layout v3 L3 types slots -> ok b13(v4: obj{L3 types slots}), fail b9\n\
+b13(v4: obj{L3 types slots}):\n  v5 = const.val undefined\n  jump b1(v1, v2, v5)\n\
+b1(v10: val, v11: val, v12: val):\n  v13 = const.i32 0\n  jump b2(v13)\n\
+b2(v14: i32):\n  load_field v4 arr -> ok_clean b3(v15: val{object}), ok_dirty b9, err b10\n\
+b3(v15: val{object}):\n  guard.unbox.obj v15 -> ok b4(v16: obj), fail b9\n\
+b4(v16: obj):\n  guard.kind v16 Array -> ok b5(v17: obj{Array}), fail b9\n\
+b5(v17: obj{Array}):\n  v18 = length.array v17\n  int.to_i32 v18 -> ok b6(v19: i32), fail b9\n\
+b6(v19: i32):\n  v20 = i32.cmp.lt v14, v19\n  br v20 -> then b7, else b8\n\
+b7:\n  v21 = const.i32 1\n  i32.add.ovf v14, v21 -> ok b11(v22: i32), fail b9\n\
+b11(v22: i32):\n  jump b2(v22)\n\
+b8:\n  return v5\n\
+b9:\n  exit pc=0 this=v1 args=[v2] locals=[] rval=v1 stack=[]\n\
+b10:\n  exit.throw pc=0 this=v1 args=[v2] locals=[] rval=v1 stack=[]\n}\n";
+    let mut m = parse_ok(src);
+    verify_module(&m).expect("valid before");
+    let mut f = m.funcs.pop().unwrap();
+    f.loops[0].entry = Some(crate::mir::func::LoopEntry {
+        pc: crate::ids::Pc::new(0),
+        slots: vec![true, true, true],
+        state: vec![],
+    });
+    crate::mir::opt::optimize(&m, &mut f);
+    // The loop: the blocks that reach its latch from its header.
+    let h = f.loops[0].header;
+    let mut preds: std::collections::BTreeMap<crate::mir::entity::Block, Vec<crate::mir::entity::Block>> =
+        Default::default();
+    for &b in &f.layout {
+        for s in f.succs(b) {
+            preds.entry(s).or_default().push(b);
+        }
+    }
+    let mut reach = std::collections::BTreeSet::new();
+    let mut work = vec![h];
+    while let Some(b) = work.pop() {
+        if reach.insert(b) {
+            work.extend(f.succs(b));
+        }
+    }
+    let mut body = std::collections::BTreeSet::from([h]);
+    let mut work: Vec<_> = preds[&h].iter().copied().filter(|b| reach.contains(b)).collect();
+    while let Some(b) = work.pop() {
+        if b != h && reach.contains(&b) && body.insert(b) {
+            work.extend(preds.get(&b).into_iter().flatten().copied());
+        }
+    }
+    let ops: Vec<String> = body
+        .iter()
+        .flat_map(|&b| f.blocks[b].insts.iter().map(|&i| crate::mir::print::mnemonic(&f.insts[i].op)).collect::<Vec<_>>())
+        .collect();
+    m.funcs.push(f);
+    let text = print_module(&m);
+    if let Err(es) = verify_module(&m) {
+        panic!("invalid after optimizing: {:?}\n{text}", es);
+    }
+    for op in ["load_slot", "guard.unbox.obj", "guard.kind", "length.array", "int.to_i32"] {
+        assert!(!ops.iter().any(|o| o == op), "{op} left in the loop ({ops:?}):\n{text}");
+    }
+    assert!(ops.iter().any(|o| o == "i32.cmp.lt"), "{ops:?}\n{text}");
+}
+

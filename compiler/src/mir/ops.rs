@@ -641,10 +641,26 @@ pub enum Opcode {
 
     // Objects.
     LoadField(AtomId),
+    /// `load_field` through a receiver whose type proves the field's slot
+    /// (its layout claim with SLOTS, one slot across the claim's keys):
+    /// the slot's value, of the field's claimed type. Not a terminator:
+    /// it cannot miss, GC, throw or run JS (MIR-MEMORY.md §1.1), so
+    /// value numbering and LICM treat it as a pure read of its field.
+    LoadSlot(AtomId),
     StoreField(AtomId),
     InitField(AtomId),
     PublishLayout,
     NewObject(LayoutKey),
+    /// An object literal's allocation (`NewInit`/`NewObject`) at a site
+    /// the analysis stamps: `n` slots from the site's alloc cell (ok: the
+    /// fresh object, boxed; err: the helper's OOM). Not a fence: an
+    /// allocation writes nothing that exists (MIR-MEMORY.md §4).
+    LitNew(u32),
+    /// An `InitProp` of a literal whose row is layout `K` (its site's):
+    /// the value into the property's slot, by the site's add transition
+    /// (ok; err: OOM). It writes `Field(K, name)` of an object nothing
+    /// else can reach yet: not a fence.
+    LitInit(AtomId, LayoutKey),
     NewArray,
     LoadElem,
     /// The RANGES duty (as `InitElem`'s).
@@ -801,7 +817,7 @@ impl Opcode {
             // Clean if the callee's baseline rest demoted nothing.
             ExitInline { .. } => CLEAN_DIRTY_ERR.to_vec(),
             // Allocations: no kill, so no effect report.
-            JsLambda(_) => OK_ERR.to_vec(),
+            JsLambda(_) | LitNew(_) | LitInit(..) => OK_ERR.to_vec(),
             JsRt(_) | ApplyFwd => CLEAN_DIRTY_ERR.to_vec(),
             ArgsObject | RestArray(_) => OK_ERR.to_vec(),
             JsThrow => vec![SuccRole::Err],
@@ -1117,6 +1133,22 @@ fn field_claims(
         }
     }
     Ok((c, claims))
+}
+
+/// The slot of field `name` through a receiver of type `o`, if the type
+/// proves it: a layout claim with SLOTS whose every layout has the field
+/// at one slot (below the prefix, for an object under construction).
+pub fn slot_of(o: &ObjInfo, name: AtomId, m: &Module) -> Option<u32> {
+    let c = o.layout.filter(|c| c.slots)?;
+    let mut slot = None;
+    for k in c.keys.keys() {
+        let (s, _) = m.layouts.get(&k)?.field(name)?;
+        if slot.is_some_and(|x| x != s) || c.state.slots().is_some_and(|n| s >= n as usize) {
+            return None;
+        }
+        slot = Some(s);
+    }
+    slot.map(|s| u32::try_from(s).unwrap())
 }
 
 fn math_result(_f: MathFn) -> Type {
@@ -1767,6 +1799,14 @@ pub fn signature(op: &Opcode, args: &[Type], m: &Module) -> SigResult {
             }
             Sig::output(t.shallow())
         }
+        LoadSlot(name) => {
+            arity(args, 1)?;
+            let o = obj(&args[0], "load_slot")?;
+            want(slot_of(&o, *name, m).is_some(), || {
+                format!("load_slot: the receiver does not prove field {}'s slot", m.atoms[*name])
+            })?;
+            Sig::result(signature(&LoadField(*name), args, m)?.outputs[0])
+        }
         StoreField(name) => {
             arity(args, 2)?;
             let o = obj(&args[0], "store_field")?;
@@ -1850,6 +1890,16 @@ pub fn signature(op: &Opcode, args: &[Type], m: &Module) -> SigResult {
                 }),
                 ..o
             }))
+        }
+        LitNew(_) => {
+            arity(args, 0)?;
+            Sig::output(Type::val(TagSet::OBJECT))
+        }
+        LitInit(..) => {
+            arity(args, 2)?;
+            val(&args[0], "lit.init object")?;
+            val(&args[1], "lit.init value")?;
+            Sig::none()
         }
         NewObject(k) => {
             arity(args, 0)?;
@@ -2248,6 +2298,7 @@ pub fn effects(op: &Opcode, args: &[Type], m: &Module) -> Effects {
             fx.kill = KillPattern::ALL;
             fx.flags = FlagsEffect::Dynamic;
         }
+        LoadSlot(name) => fx.reads = vec![field_region(recv, *name)],
         InitField(name) => {
             fx.writes = vec![field_region(recv, *name)];
             fx.may_gc = true;
@@ -2257,6 +2308,19 @@ pub fn effects(op: &Opcode, args: &[Type], m: &Module) -> Effects {
             fx.kill = KillPattern::of(KillSet::CONSTRUCTING);
         }
         NewObject(_) | NewArray => fx.may_gc = true,
+        LitNew(_) => {
+            fx.may_gc = true;
+            fx.may_throw = true;
+        }
+        LitInit(name, k) => {
+            fx.writes = vec![Region::Field {
+                name: *name,
+                keys: Some(KeyRange::one(*k)),
+            }];
+            fx.may_gc = true;
+            fx.may_throw = true;
+            fx.flags = FlagsEffect::Bits(FlagBits::MUT_OTHER);
+        }
         LoadElem => fx.reads = vec![Region::Elements(elements_root(recv, m))],
         ArgsMapped(_) => fx.reads = vec![Region::Unknown],
         ArgsMappedSet(_) => {

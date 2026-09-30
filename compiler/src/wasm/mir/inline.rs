@@ -128,6 +128,8 @@ impl Maps {
             JsBindGName(a) => JsBindGName(self.atom(a)),
             JsSetName(a, s) => JsSetName(self.atom(a), s),
             LoadField(a) => LoadField(self.atom(a)),
+            LoadSlot(a) => LoadSlot(self.atom(a)),
+            LitInit(a, k) => LitInit(self.atom(a), k),
             StoreField(a) => StoreField(self.atom(a)),
             InitField(a) => InitField(self.atom(a)),
             CheckFuse(f) => CheckFuse(self.fuses[&f]),

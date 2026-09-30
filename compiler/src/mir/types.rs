@@ -688,6 +688,18 @@ impl Repr {
 }
 
 impl Type {
+    /// Whether a value of this type may be a pointer the GC traces (and
+    /// moves): an object or string ref, or a boxed value whose tags admit
+    /// an object, string, symbol or BigInt. Only such values are rooted
+    /// across may-GC ops; a boxed int32 or double is not.
+    pub fn may_hold_gc_thing(&self) -> bool {
+        let gc = TagSet::OBJECT.union(TagSet::STRING).union(TagSet::prims(PRIM_SYMBOL | PRIM_BIGINT));
+        match self {
+            Type::Val(v) => !v.tags.intersect(gc).is_empty(),
+            t => t.repr().is_managed(),
+        }
+    }
+
     pub const VAL_TOP: Type = Type::Val(VSet::TOP);
     pub const I32_TOP: Type = Type::I32(IRange::I32);
     pub const INT_TOP: Type = Type::Int(IRange::INT);

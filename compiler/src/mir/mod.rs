@@ -17,6 +17,7 @@
 
 pub mod entity;
 pub mod func;
+pub mod mem;
 pub mod module;
 pub mod ops;
 pub mod opt;

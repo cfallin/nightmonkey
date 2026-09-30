@@ -3,11 +3,12 @@
 //! - [`fold_guards`]: guard folding (§10.1), by type and by availability.
 //! - [`forward_params`]: a param of a block with one predecessor is the
 //!   value that predecessor passes.
-//! - [`cse_loads`]: a field load of a field already loaded (or stored)
-//!   through the same object, with nothing in between that may write it,
-//!   is that value.
+//! - [`crate::mir::mem::mem_vn`]: heap reads numbered by the memory
+//!   version they read, and store-to-load forwarding (MIR-MEMORY.md §3).
 //! - [`licm`]: loop-invariant code motion of pure ops and of reads no
 //!   op in the loop may write, into the loop's preheader.
+//! - [`canon_loads`]: a `load_field` whose receiver proves its slot is a
+//!   `load_slot`, a pure read (MIR-MEMORY.md §1.1).
 //! - [`optimize`]: all, to a fixpoint.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -39,14 +40,14 @@ fn fence_kills(m: &Module, f: &Func, t: Inst, k: usize, v: Value) -> bool {
 
 /// A guard's operand up to unboxing: `unbox` is a pure function of its
 /// operand, so guards on two unboxings of one value are the same guard.
-fn canon(f: &Func, v: Value) -> Value {
+pub(super) fn canon(f: &Func, v: Value) -> Value {
     match f.values[v].def {
         ValueDef::Result(i, 0) if matches!(f.insts[i].op, Opcode::Unbox(_)) => f.insts[i].args[0],
         _ => v,
     }
 }
 
-fn is_guard(op: &Opcode) -> bool {
+pub(super) fn is_guard(op: &Opcode) -> bool {
     matches!(
         op,
         Opcode::GuardUnbox(_)
@@ -57,6 +58,8 @@ fn is_guard(op: &Opcode) -> bool {
             | Opcode::GuardScript(_)
             | Opcode::CheckFuse(_)
             | Opcode::CheckBinding(..)
+            | Opcode::IntToI32
+            | Opcode::F64ToIntExact
     )
 }
 
@@ -71,14 +74,14 @@ fn guard_arg(f: &Func, d: &crate::mir::func::InstData) -> Value {
 
 /// Predecessors, reverse postorder from the roots, and immediate
 /// dominators (over a virtual root above every root).
-struct Cfg {
-    rpo: Vec<Block>,
+pub(super) struct Cfg {
+    pub(super) rpo: Vec<Block>,
     /// Pre/post numbers in the dominator tree.
     dom: BTreeMap<Block, (u32, u32)>,
 }
 
 impl Cfg {
-    fn new(f: &Func) -> Cfg {
+    pub(super) fn new(f: &Func) -> Cfg {
         let mut preds: BTreeMap<Block, Vec<Block>> = BTreeMap::new();
         for &b in &f.layout {
             preds.entry(b).or_default();
@@ -185,7 +188,12 @@ impl Cfg {
         Cfg { rpo, dom }
     }
 
-    fn dominates(&self, a: Block, b: Block) -> bool {
+    /// Whether `b` is reachable from a root.
+    pub(super) fn reachable(&self, b: Block) -> bool {
+        self.dom.contains_key(&b)
+    }
+
+    pub(super) fn dominates(&self, a: Block, b: Block) -> bool {
         match (self.dom.get(&a), self.dom.get(&b)) {
             (Some(&(ap, aq)), Some(&(bp, bq))) => ap <= bp && bq <= aq,
             _ => false,
@@ -194,7 +202,7 @@ impl Cfg {
 }
 
 /// Where a value is defined: its block.
-fn def_block(f: &Func, v: Value, inst_block: &BTreeMap<Inst, Block>) -> Option<Block> {
+pub(super) fn def_block(f: &Func, v: Value, inst_block: &BTreeMap<Inst, Block>) -> Option<Block> {
     match f.values[v].def {
         ValueDef::Param(b, _) => Some(b),
         ValueDef::Result(i, _) => inst_block.get(&i).copied(),
@@ -204,7 +212,7 @@ fn def_block(f: &Func, v: Value, inst_block: &BTreeMap<Inst, Block>) -> Option<B
 
 /// The value a guard's `ok` edge hands its successor as output 0: the
 /// param receiving it.
-fn ok_output(f: &Func, ok: &Edge) -> Option<Value> {
+pub(super) fn ok_output(f: &Func, ok: &Edge) -> Option<Value> {
     let k = ok.args.iter().position(|a| *a == EdgeArg::Out(0))?;
     Some(f.blocks[ok.block].params[k])
 }
@@ -514,12 +522,26 @@ pub fn optimize(m: &Module, f: &mut Func) -> usize {
     // Once, first: an overflow check it removes is a guard the rest
     // then need not keep in their dataflow.
     let mut total = if TRUNC_DEMAND { trunc_demand(m, f) } else { 0 };
+    // A loop's entry state, as values: its preheader's params now, which
+    // `forward_params` may replace by the values every edge passes (a
+    // preheader with one way in), and value numbering by earlier equals.
+    for l in &mut f.loops {
+        if let Some(e) = l.entry.as_mut() {
+            if e.state.is_empty() {
+                e.state = f.blocks[l.preheader].params.clone();
+            }
+        }
+    }
     loop {
+        // Before the passes that value-number and hoist reads: a receiver
+        // proven by an earlier round's folding makes more loads slot
+        // reads.
+        total += canon_loads(m, f);
         // First: a loop's invariant values reach its body through params
         // until forwarded, and `hoist_guards` needs them as they are.
         forward_params(m, f);
         let n = fold_guards(m, f)
-            + if CSE_LOADS { cse_loads(m, f) } else { 0 }
+            + if MEM_VN { crate::mir::mem::mem_vn(m, f) } else { 0 }
             + if GVN { gvn(m, f) } else { 0 }
             + if LICM { licm(m, f) } else { 0 }
             + if HOIST_GUARDS { hoist_guards(m, f) } else { 0 };
@@ -531,6 +553,57 @@ pub fn optimize(m: &Module, f: &mut Func) -> usize {
         }
     }
 }
+
+/// `load_field` through a receiver whose type proves the field's slot
+/// (`ops::slot_of`) lowers to one load and a branch to `ok_clean`; its
+/// `ok_dirty` and `err` edges are dead, and so are the retaining
+/// `frame.store`s before it. It becomes `load_slot` and a jump
+/// to the clean successor with its value, which the value-numbering and
+/// hoisting passes treat as a pure read (MIR-MEMORY.md §1.1). Returns how
+/// many it rewrote.
+pub fn canon_loads(m: &Module, f: &mut Func) -> usize {
+    let mut n = 0;
+    for b in f.layout.clone() {
+        let Some(t) = f.terminator(b) else { continue };
+        let Opcode::LoadField(name) = f.insts[t].op else { continue };
+        let d = f.insts[t].clone();
+        let Some(o) = f.values[d.args[0]].ty.obj_info().copied() else { continue };
+        if crate::mir::ops::slot_of(&o, name, m).is_none() {
+            continue;
+        }
+        let tys: Vec<Type> = d.args.iter().map(|&v| f.values[v].ty).collect();
+        let Ok(sig) = signature(&Opcode::LoadSlot(name), &tys, m) else { continue };
+        let frame = f.inst_frame[t];
+        f.blocks[b].insts.pop();
+        // The retaining stores the builder put before the load for its GC
+        // point (`retain_locals`): a slot read has none. (The lowering
+        // dropped them unwritten after a load that did not call.)
+        while let Some(&i) = f.blocks[b].insts.last() {
+            if !matches!(f.insts[i].op, Opcode::FrameStore(_)) {
+                break;
+            }
+            f.blocks[b].insts.pop();
+        }
+        let (l, rs) = f.add_inst(b, Opcode::LoadSlot(name), d.args.clone(), &sig.results, vec![]);
+        let clean = &d.succs[0];
+        let args = clean
+            .args
+            .iter()
+            .map(|a| match a {
+                EdgeArg::Out(0) => EdgeArg::Value(rs[0]),
+                a => *a,
+            })
+            .collect();
+        let (j, _) = f.add_inst(b, Opcode::Jump, vec![], &[], vec![Edge { block: clean.block, args }]);
+        f.inst_frame[l] = frame;
+        f.inst_frame[j] = frame;
+        n += 1;
+    }
+    n
+}
+
+/// Whether `mem::mem_vn` runs.
+const MEM_VN: bool = true;
 
 /// Whether `thread_jumps` runs.
 const THREAD_JUMPS: bool = true;
@@ -855,6 +928,13 @@ pub fn forward_params(m: &Module, f: &mut Func) {
             }
         }
     }
+    for l in &mut f.loops {
+        if let Some(e) = l.entry.as_mut() {
+            for v in &mut e.state {
+                *v = resolve(*v);
+            }
+        }
+    }
     for p in subst.keys() {
         f.values[*p].def = ValueDef::Unused;
     }
@@ -1047,137 +1127,53 @@ pub fn fold_guards(m: &Module, f: &mut Func) -> usize {
     folded
 }
 
-/// Whether field loads are made redundant by earlier loads and stores.
-const CSE_LOADS: bool = true;
-
-/// A field's identity for [`cse_loads`]: its name and the object (up to
-/// unboxing) it is reached through.
-type LoadKey = (crate::mir::entity::AtomId, Value);
-
-/// Redundant field loads (§10.1's availability, over the heap): a
-/// `load_field` of a field that a dominating `load_field` read, or a
-/// `store_field` wrote, through the same object, with no instruction in
-/// between whose effects may write that field (any object's: two values
-/// may be one object), is the value read or written. It becomes a `jump`
-/// to its clean successor with that value. The clean edge only: a load's
-/// dirty edge reports the engine ran, and a store's value is the field's
-/// only on its clean edge (a setter may have run on the others).
-pub fn cse_loads(m: &Module, f: &mut Func) -> usize {
-    use crate::mir::module::Region;
-    let cfg = Cfg::new(f);
-    let mut inst_block = BTreeMap::new();
-    for &b in &f.layout {
-        for &i in &f.blocks[b].insts {
-            inst_block.insert(i, b);
+/// Replace each value `subst` maps by its image (to a fixpoint), and
+/// drop the instructions whose results are all replaced. Returns how many
+/// instructions it dropped.
+pub(super) fn replace_values(f: &mut Func, subst: &BTreeMap<Value, Value>) -> usize {
+    if subst.is_empty() {
+        return 0;
+    }
+    let resolve = |mut v: Value| {
+        while let Some(&w) = subst.get(&v) {
+            v = w;
         }
-    }
-    let mut avail_in: BTreeMap<Block, Option<HashMap<LoadKey, Value>>> = BTreeMap::new();
-    for r in &f.roots {
-        avail_in.insert(r.block, Some(HashMap::new()));
-    }
-    let edge_out = |f: &Func, b: Block, avail: &HashMap<LoadKey, Value>| {
-        let mut out: Vec<(Block, HashMap<LoadKey, Value>)> = vec![];
-        let mut cur = avail.clone();
-        let insts = &f.blocks[b].insts;
-        for (idx, &i) in insts.iter().enumerate() {
-            let d = &f.insts[i];
-            let tys: Vec<Type> = d.args.iter().map(|&v| f.values[v].ty).collect();
-            let fx = effects(&d.op, &tys, m);
-            for w in &fx.writes {
-                cur.retain(|(name, _), _| {
-                    !w.overlaps(&Region::Field {
-                        name: *name,
-                        keys: None,
-                    })
-                });
+        v
+    };
+    let mut dropped = 0;
+    for b in f.layout.clone() {
+        let before = f.blocks[b].insts.len();
+        let insts = std::mem::take(&mut f.blocks[b].insts);
+        f.blocks[b].insts = insts
+            .into_iter()
+            .filter(|&i| f.insts[i].results.is_empty() || !f.insts[i].results.iter().all(|r| subst.contains_key(r)))
+            .collect();
+        dropped += before - f.blocks[b].insts.len();
+        for &i in &f.blocks[b].insts.clone() {
+            let d = &mut f.insts[i];
+            for a in &mut d.args {
+                *a = resolve(*a);
             }
-            if idx + 1 != insts.len() {
-                continue;
-            }
-            for (role, e) in f.succ_edges(i) {
-                let mut a = cur.clone();
-                if role == SuccRole::OkClean {
-                    match d.op {
-                        Opcode::LoadField(name) => {
-                            if let Some(v) = ok_output(f, e) {
-                                a.insert((name, canon(f, d.args[0])), v);
-                            }
-                        }
-                        Opcode::StoreField(name) => {
-                            a.insert((name, canon(f, d.args[0])), d.args[1]);
-                        }
-                        _ => {}
+            for e in &mut d.succs {
+                for a in &mut e.args {
+                    if let EdgeArg::Value(v) = a {
+                        *v = resolve(*v);
                     }
                 }
-                out.push((e.block, a));
-            }
-        }
-        out
-    };
-    let mut changed = true;
-    while changed {
-        changed = false;
-        for &b in &cfg.rpo {
-            let Some(Some(inb)) = avail_in.get(&b).cloned() else {
-                continue;
-            };
-            for (s, a) in edge_out(f, b, &inb) {
-                let merged = match avail_in.get(&s).cloned().flatten() {
-                    None if !f.roots.iter().any(|r| r.block == s) => a,
-                    None => HashMap::new(),
-                    Some(old) => old
-                        .into_iter()
-                        .filter(|(k, v)| a.get(k) == Some(v))
-                        .collect(),
-                };
-                if avail_in.get(&s).cloned().flatten().as_ref() != Some(&merged) {
-                    avail_in.insert(s, Some(merged));
-                    changed = true;
-                }
             }
         }
     }
-    let mut folded = 0;
-    for &b in &cfg.rpo.clone() {
-        let Some(t) = f.terminator(b) else { continue };
-        let d = f.insts[t].clone();
-        let Opcode::LoadField(name) = d.op else { continue };
-        let clean = d.succs[0].clone();
-        let Some(outp) = ok_output(f, &clean) else {
-            continue;
-        };
-        let want = f.values[outp].ty;
-        let avail = avail_in.get(&b).cloned().flatten().unwrap_or_default();
-        let Some(&v) = avail.get(&(name, canon(f, d.args[0]))) else {
-            continue;
-        };
-        let dominated = def_block(f, v, &inst_block).is_some_and(|db| db != b && cfg.dominates(db, b));
-        let vt = f.values[v].ty;
-        if !dominated || !(is_subtype(&vt, &want) || vt == want) {
-            continue;
+    for l in &mut f.loops {
+        if let Some(en) = l.entry.as_mut() {
+            for v in &mut en.state {
+                *v = resolve(*v);
+            }
         }
-        f.blocks[b].insts.pop();
-        let args = clean
-            .args
-            .iter()
-            .map(|a| match a {
-                EdgeArg::Out(0) => EdgeArg::Value(v),
-                a => *a,
-            })
-            .collect();
-        f.add_inst(
-            b,
-            Opcode::Jump,
-            vec![],
-            &[],
-            vec![Edge {
-                block: clean.block,
-                args,
-            }],
-        );
-        folded += 1;
     }
-    folded
+    for r in subst.keys() {
+        f.values[*r].def = ValueDef::Unused;
+    }
+    dropped
 }
 
 /// Whether `gvn` runs.
@@ -1195,6 +1191,7 @@ fn gvn_op(op: &Opcode) -> bool {
             | Opcode::EnvParent
             | Opcode::EnvLoad(_)
             | Opcode::LoadGName(_)
+            | Opcode::LoadSlot(_)
             | Opcode::Unbox(UnboxKind::I32 | UnboxKind::Bool | UnboxKind::Obj | UnboxKind::Str | UnboxKind::F64Num)
     )
 }
@@ -1253,7 +1250,7 @@ pub fn gvn(m: &Module, f: &mut Func) -> usize {
             if fx.may_gc {
                 // A managed value kept across a GC point is rooted (a
                 // store, then a reload): dearer than recomputing it.
-                cur.retain(|_, v| !f.values[*v].ty.repr().is_managed());
+                cur.retain(|_, v| !f.values[*v].ty.may_hold_gc_thing());
             }
             if fx.writes.is_empty() {
                 continue;
@@ -1336,6 +1333,13 @@ pub fn gvn(m: &Module, f: &mut Func) -> usize {
             }
         }
     }
+    for l in &mut f.loops {
+        if let Some(e) = l.entry.as_mut() {
+            for v in &mut e.state {
+                *v = resolve(*v);
+            }
+        }
+    }
     for r in subst.keys() {
         f.values[*r].def = ValueDef::Unused;
     }
@@ -1345,13 +1349,15 @@ pub fn gvn(m: &Module, f: &mut Func) -> usize {
 /// Whether loop-invariant ops are hoisted.
 const LICM: bool = true;
 
-/// Loop-invariant code motion (MIR.md §10.2, over effects): a
-/// non-terminator in a loop that writes nothing, cannot GC, throw or kill
-/// facts, reads only regions no instruction in the loop may write, and
-/// whose operands are all defined outside the loop (or hoisted), moves to
-/// the end of the loop's preheader. Such an op is safe to run once before
-/// the loop even where the loop would not have reached it. Constants stay
-/// (nothing to save). Returns how many moved.
+/// Loop-invariant code motion (MIR.md §10.2, MIR-MEMORY.md §2, over
+/// effects): a non-terminator in a loop that writes nothing, cannot GC,
+/// throw or kill facts, reads only regions no instruction in the loop may
+/// write (on an edge that stays in the loop), and whose operands are all
+/// defined outside the loop (or hoisted), moves to the end of the loop's
+/// preheader. Such an op is safe to run once before the loop even where
+/// the loop would not have reached it (a `load_slot`'s receiver type
+/// proves the slot). Constants stay (nothing to save). Returns how many
+/// moved.
 pub fn licm(m: &Module, f: &mut Func) -> usize {
     let cfg = Cfg::new(f);
     let mut preds: BTreeMap<Block, Vec<Block>> = BTreeMap::new();
@@ -1376,9 +1382,11 @@ pub fn licm(m: &Module, f: &mut Func) -> usize {
             .get(&h)
             .map(|ps| ps.iter().copied().filter(|&q| cfg.dominates(h, q)).collect())
             .unwrap_or_default();
+        // Unreachable blocks (a folded guard's former successor) are no
+        // part of it.
         while let Some(b) = work.pop() {
             if body.insert(b) {
-                work.extend(preds.get(&b).into_iter().flatten().copied());
+                work.extend(preds.get(&b).into_iter().flatten().copied().filter(|&q| cfg.reachable(q)));
             }
         }
         // An onramp into a loop nested in this one enters its body past
@@ -1386,12 +1394,22 @@ pub fn licm(m: &Module, f: &mut Func) -> usize {
         if body.contains(&p) || f.terminator(p).is_none() || !body.iter().all(|&b| cfg.dominates(p, b)) {
             continue;
         }
+        // What the loop may write, per edge: a dirty or err edge that
+        // stays in the loop wrote whatever the engine ran.
         let mut writes = vec![];
         for &b in &body {
             for &i in &f.blocks[b].insts {
                 let d = &f.insts[i];
                 let tys: Vec<Type> = d.args.iter().map(|&v| f.values[v].ty).collect();
-                writes.extend(effects(&d.op, &tys, m).writes);
+                let fx = effects(&d.op, &tys, m);
+                if d.succs.is_empty() {
+                    writes.extend(crate::mir::mem::writes_on(f, m, i, &fx, None));
+                }
+                for (role, e) in f.succ_edges(i) {
+                    if body.contains(&e.block) {
+                        writes.extend(crate::mir::mem::writes_on(f, m, i, &fx, Some(role)));
+                    }
+                }
             }
         }
         let mut hoisted: BTreeSet<Value> = BTreeSet::new();
@@ -1411,7 +1429,19 @@ pub fn licm(m: &Module, f: &mut Func) -> usize {
                 if !d.succs.is_empty() || d.op.is_terminator() {
                     continue;
                 }
-                if matches!(d.op, Opcode::ConstVal(_) | Opcode::ConstI32(_) | Opcode::ConstF64(_) | Opcode::ConstBool(_)) {
+                // Constants, and conversions that cost next to nothing
+                // where they are and mostly feed exits and slow paths:
+                // hoisted, they only lengthen live ranges across the loop.
+                if matches!(
+                    d.op,
+                    Opcode::ConstVal(_)
+                        | Opcode::ConstI32(_)
+                        | Opcode::ConstF64(_)
+                        | Opcode::ConstBool(_)
+                        | Opcode::Box
+                        | Opcode::BoxDouble
+                        | Opcode::Weaken
+                ) {
                     continue;
                 }
                 // An inlined callee's frame exists only once entered: its
@@ -1431,13 +1461,11 @@ pub fn licm(m: &Module, f: &mut Func) -> usize {
                 if !d.args.iter().all(|&v| outside(v, &hoisted)) {
                     continue;
                 }
-                // A managed result live across the whole loop is rooted at
-                // each of its GC points: only the environment reads, whose
-                // reload is the saving.
-                let env_read = matches!(d.op, Opcode::EnvCurrent | Opcode::EnvParent | Opcode::EnvLoad(_));
-                if !env_read && d.results.iter().any(|&r| f.values[r].ty.repr().is_managed()) {
-                    continue;
-                }
+                // A managed result live across the loop is rooted at each
+                // of its GC points: a store and a reload there, against the
+                // load hoisting saves on every iteration and the guards and
+                // loads through it that can hoist after it
+                // (MIR-MEMORY.md §2).
                 hoisted.extend(d.results.iter().copied());
                 picks.push((b, i));
             }
@@ -1458,7 +1486,8 @@ const HOIST_GUARDS: bool = true;
 
 /// The guards `hoist_guards` moves: a check of an operand (or of global
 /// state, for `check.fuse` and `check.binding`) whose fact only a kill
-/// can end.
+/// can end, and the numeric range checks (a pure function of their
+/// operand: an invariant one passes or fails every iteration alike).
 fn hoistable_guard(op: &Opcode) -> bool {
     matches!(
         op,
@@ -1469,6 +1498,8 @@ fn hoistable_guard(op: &Opcode) -> bool {
             | Opcode::GuardScript(_)
             | Opcode::CheckFuse(_)
             | Opcode::CheckBinding(..)
+            | Opcode::IntToI32
+            | Opcode::F64ToIntExact
     )
 }
 
@@ -1523,7 +1554,7 @@ pub fn hoist_guards(m: &Module, f: &mut Func) -> usize {
         let mut work = latches.clone();
         while let Some(b) = work.pop() {
             if body.insert(b) {
-                work.extend(preds.get(&b).into_iter().flatten().copied());
+                work.extend(preds.get(&b).into_iter().flatten().copied().filter(|&q| cfg.reachable(q)));
             }
         }
         if latches.is_empty() || body.contains(&p0) || !body.iter().all(|&b| cfg.dominates(p0, b)) {

@@ -271,6 +271,10 @@ impl BoxKind {
 }
 
 fn is_managed(t: &MType) -> bool {
+    // By representation, not by `may_hold_gc_thing`: rooting a boxed
+    // int32 too keeps overwriting home slots whose last GC thing is dead,
+    // and without it a dead object stays pinned there across a GC
+    // (gc/weak-marking-01.js).
     t.repr().is_managed()
 }
 
@@ -2547,6 +2551,30 @@ impl<'a> Lower<'a> {
                 let base = if fid == 0 && k <= nargs { self.sp } else { self.vp };
                 self.store_i64(base, off, v);
             }
+            Opcode::LitNew(n) => {
+                // As `js.rt.newobject`: the inline nursery allocation from
+                // the site's cell, else the helper (which fills the cell).
+                let cell = self.alloc_inline(inst, None)?;
+                let nv = self.i32c(n);
+                let live = self.live_across(inst);
+                let (ok, r) = self.gc_call(self.h.new_object, &[cell, nv], &live)?;
+                let t = self.edge(inst, 0, &[r])?;
+                let e = self.edge(inst, 1, &[])?;
+                self.cond_br(ok, t, e);
+            }
+            Opcode::LitInit(name, _) => {
+                // As `js.rt.initprop`: the site's add transition replayed
+                // inline, else the helper (which fills the row).
+                let site = self.init_prop_inline(inst, a[0], a[1])?;
+                let at = self.atom(name);
+                let av = self.i32c(crate::wasm::bbv::abi::INIT_ATTR_ENUMERATE);
+                let sv = self.i32c(site);
+                let live = self.live_across(inst);
+                let (ok, _) = self.gc_call(self.h.init_prop, &[a[0], at, a[1], av, sv], &live)?;
+                let t = self.edge(inst, 0, &[])?;
+                let e = self.edge(inst, 1, &[])?;
+                self.cond_br(ok, t, e);
+            }
             Opcode::JsLambda(index) => {
                 let env = self.box_tagged(TAG_OBJECT, a[0]);
                 let script = self.script_ptr();
@@ -3690,6 +3718,13 @@ impl<'a> Lower<'a> {
                 self.binding_store(slot, a[1], fused);
             }
             Opcode::LoadField(name) => self.field_op(inst, name, a[0], None)?,
+            Opcode::LoadSlot(name) => {
+                let t = self.ty(self.f.insts[inst].args[0]);
+                let o = t.obj_info().ok_or("lowering: load_slot of a non-object")?;
+                let slot = mir::ops::slot_of(o, name, self.mm).ok_or("lowering: load_slot without a proven slot")?;
+                let v = self.load_i64(a[0], FIXED_SLOTS_BASE + 8 * slot);
+                self.def(inst, v);
+            }
             Opcode::StoreField(name) => self.field_op(inst, name, a[0], Some(a[1]))?,
             Opcode::JsBoxThis => {
                 self.js_call(inst, self.h.box_nonstrict_this, &[a[0]], false)?;

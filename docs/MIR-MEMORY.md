@@ -1,0 +1,276 @@
+# MIR memory optimizations: LICM, alias analysis, DSE, escape analysis, SROA
+
+Status: **design, 2026-09-30.** Extends MIR.md §6 (effects and memory)
+and §10.2/§10.5 (hoisting, forwarding, RLE, DSE), and fills the "virtual
+object recipes" reservation of §5.1. Decisions taken with the owner are
+marked **(decided)**.
+
+## 0. Where MIR stands
+
+- `opt::licm` hoists non-terminator ops that are pure or read only regions
+  nothing in the loop writes. `opt::hoist_guards` hoists guards.
+  `opt::cse_loads` forwards a field load from an earlier load or store
+  through the same SSA object, killed by any write to that field *name*
+  in any class. There is no DSE, escape analysis or scalar replacement.
+- Three things keep those passes from finding much:
+  1. **`load_field` is a terminator** (`ok_clean`/`ok_dirty`/`err`) with
+     effects `may_gc`, `may_throw`, kill ALL, whatever its receiver. With
+     SLOTS proven its lowering is one `i64.load` and a branch to
+     `ok_clean`; the other edges are dead. LICM skips terminators, and the
+     kill blocks value numbering of anything typed past it.
+  2. **Literal allocation is generic.** `NewInit`/`NewObject` build
+     `js.rt.newobject` (+ `stamp.fresh`), and each `InitProp` a
+     `js.rt.initprop`: `Unknown` reads and writes, may run JS, kill ALL.
+     A loop that builds a literal loses every remembered load and guard.
+     The lowering already has the inline paths (`alloc_inline`: nursery
+     bump from the site's alloc cell; `init_prop_inline`: replay of the
+     site's add transition), so this is only a matter of MIR's view.
+  3. **A clean edge protects types, not memory.** A generic op takes
+     `ok_clean` when the stamp epoch is unchanged (`js_keep`); a getter
+     that writes a field conformingly leaves it unchanged. So memory
+     knowledge cannot cross a generic op, clean or not, and the
+     precision has to come from typed ops.
+
+## 1. Abstract locations
+
+An access touches a set of abstract locations (MIR.md §6's regions),
+computed from the op and its operand *types* (never from predictions):
+
+| location | accessed by | notes |
+|---|---|---|
+| `Field(K, name)` | `load_slot`, `load_field`, `store_field`, `init_field` through `Obj{K…}` | one per class per field; `K` a key range, `Field(*, name)` unproven |
+| `Elements(root)` | `load_elem`, `store_elem`, `elements_ptr` | `store_elem` is an in-bounds overwrite: it never changes a length |
+| `ArrayLength(root)` | `length.array` | written only by generic ops and calls (push, `length =`, holes) |
+| `TypedArrayData(kind)`, `TypedArrayLength` | typed-array ops | as today |
+| `Global(binding)` | `load_gname`, `store_gname` | |
+| `Env(slot)`, `FrameEnv` | env ops | as today |
+| `Alloc(a, name)` | fields of a non-escaped allocation `a` (§5) | overlaps nothing reached through any other object |
+| `Unknown` | generic ops, calls, exits' resumed baseline | every location |
+
+Two accesses may alias only if their location sets overlap, and, for
+object locations, their receivers' **points-to sets** intersect (§5.2):
+the fields of an allocation that has not escaped are reached only through
+values derived from it.
+
+Disambiguation by class (`Field(K1,x)` vs `Field(K2,x)`) is sound because
+a receiver's layout claim holds at each access that uses it (the
+validator's fence rule), and an object changes its class word only
+through ops that write `Unknown` or kill the claim.
+
+**Effects per edge.** An op's reads and writes are stated per successor
+role. For a typed op the clean and dirty edges write the same locations
+(a store's dirty edge demotes TYPES: a type kill, not a memory write);
+for a generic op every edge reads and writes `Unknown`. Exits and throws
+**read** `Unknown` (baseline resumes and may read anything). A may-GC op
+reads nothing (a GC moves objects but changes no value a load returns).
+
+### 1.1 Canonical memory ops (step M0)
+
+- `load_slot name` (new, not a terminator): `load_field` through a
+  receiver whose type proves the layout and SLOTS. Reads `Field(K,
+  name)`; no GC, no throw, no kill; result of the field's claimed type.
+  A pass rewrites every such `load_field` into `load_slot` + `jump
+  ok_clean`. This is what lets LICM hoist field loads and GVN merge them.
+- `store_field` keeps its shape (its dirty edge is the TYPES demotion),
+  but its memory effect is precise on every edge.
+- Allocation (`new_object`, §4) and literal init (`init_slot`, §4) are
+  typed, with effects: `new_object` may GC, writes nothing that exists;
+  `init_slot` writes `Alloc(a, name)` or `Field(K, name)` of a fresh
+  object.
+
+## 2. LICM (step M1)
+
+MIR.md §10.2 plus general hoisting over §1's effects. A non-terminator
+op in loop `L` moves to `L`'s preheader when:
+
+1. its operands are defined outside `L` (or already hoisted);
+2. it writes nothing, cannot throw or run JS, and kills nothing;
+3. nothing in `L` writes a location it reads (by §1: location overlap
+   and points-to);
+4. it is safe to execute when `L` would not have: a `load_slot` is
+   (the receiver's type proves the slot exists), as is every pure op.
+
+Chains then hoist link by link through the existing fixpoint: a
+loop-invariant `this` hoists its layout guard (`hoist_guards`), then
+`this.arr` (`load_slot`), then the array's kind guard, then
+`length.array` (only `store_elem`s in the loop: `Elements`, not
+`ArrayLength`), then its `int.to_i32` guard. `i < this.arr.length`
+becomes a compare against a preheader value.
+
+**Managed values.** A hoisted object is live across the loop, so the
+lowering spills and reloads it around every may-GC op in the loop.
+Today `licm` refuses managed results for that reason. The new rule:
+hoist them; the reload replaces the load it hoisted, and what hoisting
+enables past it (guards, further loads) is the point. Measure code size
+and scores both ways once, and record the result; no per-benchmark gate.
+
+## 3. Alias analysis, forwarding, RLE, DSE (steps M2, M3)
+
+### 3.1 Memory versions (last writer)
+
+One forward dataflow over the CFG (in `opt::optimize`'s fixpoint loop),
+per location key the function touches:
+
+- **State:** location key -> version. A version is a writer instruction,
+  a merge (`Phi(block, key)`, stable across iterations), or `Entry`.
+- **Transfer:** a write of location set `W` sets every tracked key
+  overlapping `W` to the writer; `Unknown` sets all keys. Per edge
+  (§1): a generic op's edges all write `Unknown`.
+- **Meet:** equal versions stay; different ones become the block's
+  `Phi(block, key)`.
+- **Clobber walk:** each single-location store records the version it
+  replaced. A load through receiver `r` asks for its location's version
+  and walks back past stores whose receiver is must-not-alias with `r`
+  (disjoint points-to sets, §5.2): `store b.x; load a.x` with `a`, `b`
+  distinct allocations sees the version before the store.
+
+### 3.2 Loads: GVN, forwarding
+
+- **RLE:** a load is keyed by (op, receiver up to unboxing and
+  weakening, name, version). A repeat whose first occurrence dominates it
+  is replaced by it. This subsumes `cse_loads`, and is precise across
+  stores to other classes' fields (class-disjoint locations do not bump
+  the version).
+- **Store-to-load forwarding:** a load whose version is a store (or
+  init) through the same receiver and name takes the stored value, if it
+  dominates. The stored value is boxed where the load's result is boxed;
+  §3.4 then cleans up.
+- A `Phi` version is not forwarded through (no load-phis in v1).
+
+### 3.3 Dead stores, sunk into exits (decided)
+
+An exit resumes baseline, which may read anything, so a guard between two
+stores observes the first. Nearly every store pair in real MIR has a
+guard between them. So DSE *sinks* stores into exits:
+
+- A store `S1` to (`r`, `name`) is **dead on the main path** when a store
+  `S2` to the same receiver and name post-dominates it and, on every path
+  from `S1` to `S2`, the only readers of an overlapping location are
+  exits and throws.
+- `S1` is deleted, and a copy of it is placed on each edge from the
+  `S1`-`S2` region into an exit (a new block before the exit, or the exit
+  block itself when all its predecessors are in the region). The copy's
+  operands dominate the edge because `S1` did.
+- A store with no later overwrite whose only readers are exits (a local
+  object's fields before a return that drops it) is the §5 case.
+
+The same machinery serves MIR.md §5.1's deferred note: `frame.store`s
+of loop-carried locals sunk into the loop's exits.
+
+### 3.4 Cleanups that forwarding exposes
+
+- `unbox(box x) -> x`; `unbox(weaken(box x)) -> x`; guards on a value
+  whose def proves them fold by type (already: `fold_guards`).
+- Constant folding of integer and f64 ops on constants (with §10.6's
+  ranges, a result with a singleton range is a constant).
+
+The owner's example, `let o = {}; o.x = 123; return o.x + 2;`, should
+end as `return 125` once §4 types the add and §5 removes the object:
+the load forwards `box 123`, the unbox of the box folds, the guard on a
+boxed int32 folds by type, `123 + 2` folds.
+
+## 4. Typed literal allocation (step M4, prerequisite of §5) (decided)
+
+- `new_object` *site*: the literal's allocation, the lowering's
+  `alloc_inline` with the site's alloc cell, falling back to
+  `night_runtime_new_object`. Result `Obj{Plain}`, with the site's layout
+  claim `constructing(0)` when the analysis stamps the site
+  (`lit_stamps`). Not a fence.
+- `init_slot name`: an `InitProp` of that literal, as the lowering's
+  `init_prop_inline` (the site's add-transition row), falling back to the
+  helper. Typed: advances `constructing(n)` to `n+1`; the last one's
+  successor holds the published layout (as `stamp.fresh` does today).
+- **Literals filled by later adds** (`var o = {}; o.x = …`): the
+  analysis already gives the add sites a site row. The builder treats a
+  fresh literal like a constructing `this` (MIR.md §2.3): each add of the
+  row's next field is an `init_field`; the object is published when the
+  row is complete; a use before that (a call, an escape) demotes it as a
+  fence demotes a `Ctor`.
+
+## 5. Escape analysis and scalar replacement (step M5)
+
+### 5.1 Allocations
+
+Allocation sites in MIR: `new_object` (§4), and later (§6) a typed
+`create_this` of an inlined construct. Each result is an allocation
+`a`.
+
+### 5.2 Points-to and the escaped bit
+
+A forward dataflow over SSA values, one points-to set per object-typed
+value: allocations it may be, plus `Esc` (anything else). Values derived
+from `v` (guard outputs, `unbox`, `box`, `weaken`, `forward`ed params)
+have `v`'s set; a block param is the union of its incoming values'.
+
+Allocation `a` **escapes** when any of these holds:
+
+- a value that may be `a` is an operand of a call (not inlined), a
+  generic op, `return`, `throw`, a store to a global or environment, or
+  a `store_field`/`store_elem`/`init_*` value operand whose receiver may
+  be `Esc` or an escaped allocation (stores into another local
+  allocation propagate: `a` escapes if that one does);
+- a value that may be `a` meets another allocation or `Esc` at a block
+  param (v1 needs one allocation per value);
+- a field access through a value that may be `a` names a slot outside
+  `a`'s layout, or a generic access reaches it;
+- an identity compare with a value whose set is not exactly `{a}` or
+  disjoint from `a` (then the compare folds).
+
+Loads through `Esc`-only values produce `Esc`. **Exits, throws,
+`exit.inline`, `gen.suspend`, `frame.store` and `inline.enter` do not
+count as escapes** (decided): they rematerialize (§5.4).
+
+### 5.3 Replacement
+
+For each non-escaped allocation `a` (a mem2reg over its fields):
+
+- each field of `a`'s layout becomes an SSA variable: initialized by the
+  `init_slot`s, updated by stores, merged by block params at joins
+  (standard SSA construction over the blocks where `a` is live);
+- loads through `a` become the variable's current value; stores and
+  inits are deleted; guards on `a` fold by type (its layout is known);
+- the allocation is deleted.
+
+### 5.4 Rematerialization at exits (decided)
+
+- An exit (`exit`, `exit.throw`, `exit.inline`, `gen.suspend`) whose
+  operands hold `a`, or whose frame slots hold `a` by a `frame.store`
+  that reaches it, gets `a` rebuilt on its edge: `new_object` of `a`'s
+  site and `init_slot`s of the fields' current values, in a block
+  before the exit, then `frame.store`s of the slots that held it. One
+  rebuild per exit edge serves every slot that holds `a` (identity is
+  kept).
+- `frame.store a k` is deleted; a reaching-frame-stores dataflow per
+  slot finds the exit edges that need `k` rewritten. An exit reached
+  both with `a` in `k` and with another value there gets per-edge
+  blocks.
+- Nested allocations (a field of `a` holding a non-escaped `b`) rebuild
+  `b` first.
+- MIR.md §5.1's validator rule against virtual-object recipes is
+  lifted in this form: no recipe operand kind, just ordinary allocation
+  ops on the exit edge, which the validator already accepts.
+
+## 6. Constructors (step M6)
+
+Inlined constructs allocate through `create_this` (generic: reads the
+callee's `.prototype`). With the callee proven (`guard.script`) and its
+prototype object fixed (a fuse on the `prototype` slot, or the snapshot
+value), `create_this` becomes a typed allocation of the constructor's
+alloc cell, and §5 applies to objects whose construction and every use
+are inlined (raytrace's vectors).
+
+## 7. Order and measurement
+
+| step | content | shows up as |
+|---|---|---|
+| M0 | `load_slot`; precise per-edge effects; allocations not fences | guard/load census |
+| M1 | LICM of reads and managed values | hot-loop MIR; Octane/React |
+| M2 | memory versions, RLE, forwarding, box/unbox and constant folding | `cse_loads` retired |
+| M3 | DSE with sinking into exits; frame-store sinking | earley-boyer frame stores (KICKOFF-5 item 1) |
+| M4 | typed literal allocation and literal-then-add construction | `js.rt.newobject`/`initprop` gone from hot MIR |
+| M5 | escape analysis, SROA, rematerialization | allocations per run (splay, raytrace, react); GC stats |
+| M6 | typed `create_this`; SROA of constructs | raytrace |
+
+Each step lands with textual MIR tests (before/after), a night test for
+the exit paths it creates, both jit-test lanes, and an Octane + React
+A/B over placements with code size (`--stats`) reported next to scores.

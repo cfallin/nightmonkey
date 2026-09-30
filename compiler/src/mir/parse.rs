@@ -1269,6 +1269,7 @@ impl Parser {
             JsBindGName(_) => JsBindGName(self.atom()?),
             JsSetName(_, strict) => JsSetName(self.atom()?, strict),
             LoadField(_) => LoadField(self.atom()?),
+            LoadSlot(_) => LoadSlot(self.atom()?),
             StoreField(_) => StoreField(self.atom()?),
             InitField(_) => InitField(self.atom()?),
             GuardTags(_) => GuardTags(self.tags()?),
@@ -1299,6 +1300,12 @@ impl Parser {
             }
             CallNative(_) => CallNative(NativeId::from_u32(self.prefixed("N", "a native")?)),
             NewObject(_) => NewObject(self.layout_key()?),
+            LitNew(_) => LitNew(self.int()?),
+            LitInit(..) => {
+                let a = self.atom()?;
+                self.expect_punct(",")?;
+                LitInit(a, self.layout_key()?)
+            }
             EnvLoad(_) => EnvLoad(EnvSlot::new(self.int()?)),
             EnvStore(_) => EnvStore(EnvSlot::new(self.int()?)),
             JsLambda(_) => JsLambda(self.int()?),
@@ -1669,10 +1676,13 @@ fn template(mn: &str) -> Option<Opcode> {
         JsSetName(placeholder_atom, false),
         JsSetName(placeholder_atom, true),
         LoadField(placeholder_atom),
+        LoadSlot(placeholder_atom),
         StoreField(placeholder_atom),
         InitField(placeholder_atom),
         PublishLayout,
         NewObject(LayoutKey::new(0)),
+        LitNew(0),
+        LitInit(placeholder_atom, LayoutKey::new(0)),
         NewArray,
         LoadElem,
         StoreElem(false),
