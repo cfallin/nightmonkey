@@ -80,26 +80,40 @@ property order is unchanged (the shape records insertion order); only
 physical slots differ: adding `x y z` and `x z y` both map x->0, y->1,
 z->2.
 
+### Principle
+
+Build the SpiderMonkey side the way the external-compiler hooks were
+built: generic in principle, usable by any external tier that manages
+object layouts itself, with the choices delegated to the embedder's
+runtime and none of NightMonkey's specifics (classes, layout tables,
+stamps) encoded in the engine. Done right, it could go upstream. So the
+engine offers mechanism -- a shape with a chosen slot, a flag that says
+slot order is not insertion order, a correct span -- and NightMonkey's
+runtime supplies the policy.
+
 ### Design (owner's)
 
-- **Slot choice is a function of (parent shape, key)**, per class. The
-  analysis emits a per-class table name -> slot (a field on no path gets
-  no slot). The NightMonkey runtime memoizes (class ID, parent shape, key)
-  -> new shape in its own table; SpiderMonkey does not know about classes.
-- **SpiderMonkey interface** (in the firefox fork, as hooks/APIs):
+- **Slot choice is a function of (parent shape, key).** The analysis
+  emits a per-class table name -> slot (a field on no path gets no slot).
+  The NightMonkey runtime memoizes (parent shape, key) -> new shape in its
+  own table, keyed by class ID too only if the implementation shows two
+  classes can pick different slots from one shared parent (point 7);
+  SpiderMonkey knows nothing about classes.
+- **SpiderMonkey interface** (in the firefox fork, as APIs/hooks):
   - create a "custom-slot shape" from a parent shape, a new property
     (key, flags) and a slot number; then install it on an existing object
     or allocate a new object with it;
   - a **PERMUTED** bit in the shape header, set on every shape so created
-    (and inherited by every shape added on top of one): it turns off
-    runtime fast paths that assume shape order == slot order;
-  - a **PERMUTED_PREFIX** bit: this shape's last property holds the
-    highest slot, though its prefix is permuted.
-- **Generic adds** (SpiderMonkey's own path, not NightMonkey's): on a
-  shape with PERMUTED but not PERMUTED_PREFIX, the new slot is the max
-  slot up the shape tree plus one (O(n), once); that shape gets both bits.
-  From then on either path allocates the next slot in O(1) again, and
-  sets both bits.
+    and inherited by every shape added on top of one: it turns off engine
+    fast paths that assume shape order == slot order;
+  - the shape's true slot span (max slot + 1) stored at creation
+    (point 1).
+- **Generic adds** (SpiderMonkey's own path, not NightMonkey's) on a
+  PERMUTED shape allocate the stored span, O(1). (The owner's first
+  design had a PERMUTED_PREFIX bit to get generic adds back to O(1) after
+  an O(n) walk for the max slot; with the span stored, it is likely
+  unnecessary. Keep it only if some consumer turns out to need "the last
+  property holds the top slot".)
 - **ICs:** SpiderMonkey's own JIT add stubs simply do not attach on a
   PERMUTED shape (no native Baseline/Ion in Wasm, and no plan to run
   Portable Baseline or a native NightMonkey backend alongside other
@@ -114,32 +128,29 @@ z->2.
    trace `[0, slotSpan)` constantly (`gc/Marking.cpp:1412-1417,1655`,
    `gc/Tenuring.cpp:843`), so a PERMUTED shape needs its true span
    (max slot + 1) at creation, in that cache and in `slotSpanSlow`.
-   Then the generic add's "max up the tree" is just the cached span: the
-   O(n) walk happens once per shape at creation, and PERMUTED_PREFIX may
-   only be needed to keep `SharedPropMap::addProperty` (which computes the
-   next slot from the map's last property, `vm/PropMap.cpp:250`) honest --
-   decide whether to pass it the shape's span instead.
-2. **PERMUTED_PREFIX and hole fills.** A NightMonkey add that fills a hole
-   (a slot below the span) leaves its last property below the max, so its
-   shape is PERMUTED without PERMUTED_PREFIX. Only an append (slot ==
-   span) keeps the prefix bit.
-3. **Skipped slots must hold valid values.** Raising the span past
+   The generic add then takes the stored span (the max is computed once
+   per shape, at creation). `SharedPropMap::addProperty` computes the next
+   slot from the map's last property (`vm/PropMap.cpp:250`): give it the
+   shape's span instead. That also covers hole fills, where a NightMonkey
+   add puts a property below the span and the last property is then not
+   the top slot.
+2. **Skipped slots must hold valid values.** Raising the span past
    skipped slots must initialize them to undefined (the GC traces them):
    `setShapeAndAddNewSlots(newShape, oldSpan, newSpan)`
    (`vm/NativeObject-inl.h:541-579`) does exactly that; the single-slot
    `setShapeAndAddNewSlot` asserts span+1 and must not be used. A hole fill
    writes an existing, initialized slot. New objects allocated with a
    permuted shape get every slot below the span initialized.
-4. **A slot must be free before NightMonkey claims it.** The generic path
+3. **A slot must be free before NightMonkey claims it.** The generic path
    appends at the span, which may be a slot the table reserves for a name
-   not yet added. `NightAddPropCheck` today clears only SLOTS, and only
-   when a *predicted* name lands elsewhere; an unpredicted name appended
-   past the row keeps SLOTS (it marks the object advance-ineligible) and
-   **does not clear the class ID**. So: a generic add onto a PERMUTED
-   shape clears SLOTS (TYPES may stay), and NightMonkey's custom add checks
-   that its target slot is a hole in the object's current shape, else it
-   falls back to the generic add (and SLOTS clears).
-5. **Caches keyed by (key, flags) only.** Property maps are already keyed
+   not yet added. A generic add clears only SLOTS (`NightAddPropCheck`,
+   and only when a predicted name lands elsewhere; the class word stays),
+   and that is all that is needed, since the slot correspondence is what
+   breaks. So: a generic add onto a PERMUTED shape clears SLOTS, and
+   NightMonkey's custom add checks that its target slot is a hole in the
+   object's current shape, else falls back to the generic add (SLOTS then
+   clears).
+4. **Caches keyed by (key, flags) only.** Property maps are already keyed
    by the full `PropertyInfo` (slot included: `vm/PropertyInfo.h:173`,
    `SharedChildrenHasher`, `InitialPropMapHasher`), so x->1 and x->2 from
    one parent are distinct maps and shapes. But the per-shape add cache
@@ -148,7 +159,7 @@ z->2.
    (`vm/Caches.h:346-376`) are keyed by key and flags only: custom-slot
    shapes must never be entered in them (NightMonkey memoizes its own), and
    the megamorphic cache must not be filled for a PERMUTED shape.
-6. **Fast paths that copy slot i to slot i, to refuse on PERMUTED** (only
+5. **Fast paths that copy slot i to slot i, to refuse on PERMUTED** (only
    debug asserts guard them today, so a miss corrupts values silently in
    release):
    - `Object.assign`'s fast path and `PlainObjectAssignCache`
@@ -168,7 +179,7 @@ z->2.
    `delete` of a non-last property (goes dictionary), lookups and iteration
    (by `prop.slot()`), swap and object-state recovery (copy `[0, span)`
    with the same map).
-7. **Hook placement.** The natural point is `NativeObject::addProperty`
+6. **Hook placement.** The natural point is `NativeObject::addProperty`
    after `maybeConvertToDictionaryForAdd` (`vm/Shape.cpp:343`), before the
    add-cache lookup; `propertyAdded` already fires after the slot is
    chosen (`Shape.cpp:351-355,406-410`). But NightMonkey's own adds (the
@@ -178,20 +189,21 @@ z->2.
    the same layout. Object literals take template shapes built outside
    `addProperty` (`frontend/ObjLiteral.cpp:328-365`); leave them
    sequential unless the analysis wants literal layouts permuted too.
-8. **Classes that share shapes.** Constructor instances of different
+7. **Classes that share shapes.** Constructor instances of different
    classes differ in prototype, so in BaseShape, so they never share a
    shape; literal sites (same `Object.prototype`) do. NightMonkey's own
    add-transition caches (`gSetAdd`, the site rows, the megamorphic
-   table) are keyed by (old shape, key): check that no two classes'
-   tables choose different slots from one shared parent, or key those
-   caches by class too.
+   table) are keyed by (old shape, key). Let the implementation decide:
+   if no two classes' tables can choose different slots from one shared
+   parent, (parent shape, key) is enough; otherwise key the memo and
+   those caches by class too.
 
 ### Plan
 
-1. SpiderMonkey: the stored span for PERMUTED shapes; the two bits; the
-   custom-slot-shape API (with hole check and undefined-fill); the
-   generic add on PERMUTED; refusals in the fast paths and caches of
-   point 6 and in `tryAttachAddSlotStub` (`jit/CacheIR.cpp:5566-5695`).
+1. SpiderMonkey (generic, per the principle above): the stored span for
+   PERMUTED shapes; the PERMUTED bit; the custom-slot-shape API (with hole
+   check and undefined-fill); the generic add on PERMUTED; refusals in the fast paths and caches of
+   point 5 and in `tryAttachAddSlotStub` (`jit/CacheIR.cpp:5566-5695`).
    Engine-level tests: add orders `x y z` / `x z y` / generic adds on top /
    delete / dictionary conversion / Object.assign / JSON round trips / a
    GC with holes present.
@@ -199,9 +211,9 @@ z->2.
    fields over its paths; a field's slot is fixed for the class), in the
    facts next to the layout rows; the stamping and SLOTS logic read slots
    from it.
-3. Runtime: the (class, shape, key) -> shape memo; NightMonkey's add paths
-   call the custom-shape API; `NightAddPropCheck` checks against the
-   table; point 4's clears.
+3. Runtime: the (parent shape, key) -> shape memo; NightMonkey's add
+   paths call the custom-shape API; `NightAddPropCheck` checks against
+   the table; point 3's SLOTS clears.
 4. Both backends consume the table's slots; measure pdfjs's Font exits
    (58k now) and the suite on both backends with the prof6 tooling.
 
