@@ -274,3 +274,45 @@ are inlined (raytrace's vectors).
 Each step lands with textual MIR tests (before/after), a night test for
 the exit paths it creates, both jit-test lanes, and an Octane + React
 A/B over placements with code size (`--stats`) reported next to scores.
+
+## 8. Status (2026-09-30, end of the first session)
+
+Built (commits b06648e and after; MIR.md M5o has the measurements):
+
+- **M0** `load_slot`, and `canon_loads` dropping the load's retaining
+  frame stores.
+- **M1** LICM over per-edge writes, object results, `int.to_i32` and
+  `f64.to_int_exact` as hoistable guards; fixes to `hoist_guards` (entry
+  state kept as values) and to both passes' loop bodies (unreachable
+  predecessors). Not `box`/`weaken`: hoisting them lengthened live
+  ranges for nothing (crypto -4%).
+- **M2** `mem::mem_vn` (memory versions, numbering, forwarding, the
+  fresh-allocation clobber walk). Not yet: phi versions, DSE (**M3**).
+- **M4, first part** `lit.new`/`lit.init` for stamped literal sites. Not
+  yet: literals filled by later adds (the owner's `{}` then `o.x = ...`;
+  the analysis gives such a literal no row).
+- **M5** `mem::sroa` for `lit.new` objects, with the optimistic escape
+  check (the allocation's own guards pass, so their failures' uses do not
+  count) and rebuilds before `exit`, `exit.throw` and `exit.inline`;
+  `fold_unbox` and `fold_ints` after it. `{x: 123}.x + 2` folds to 125.
+  On real code it rarely fires: react's 404 typed literals all escape
+  (calls 35%, arrays, stores, closures, returns, nesting into other
+  literals). Nested literals and constructed objects (**M6**) are the
+  next reach.
+- **Slowpath isolation** (the owner's "pushing the slowpaths aside"): a
+  rejoining generic fallback kills every memory version at its join and
+  keeps everything in its loop. Dense element loads and stores now exit on
+  a miss instead, where no typed array can reach the site
+  (`elem_poly_sites`); stores first try the runtime's no-JS append
+  (`night_runtime_elem_grow`), so growth does not exit. Unconditional, it
+  was navier-stokes +30% and pdfjs -33% (a typed array the analysis took
+  for an array: 1.5M exits at one site).
+
+Lessons:
+
+- The validator declines invalid MIR to baseline silently
+  (`BUG: invalid MIR` in `--dump-tiers`): an early `fold_unbox` that
+  reused a pre-fence value declined 87 scripts with every lane passing.
+  `~/work/nm-mir-scratch/prof8/bugcheck.sh` counts them over the suite.
+- A pass that substitutes a value must not extend one with killable type
+  components past a fence (`gvn`'s and `fold_unbox`'s rule).

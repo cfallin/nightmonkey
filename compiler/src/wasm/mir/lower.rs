@@ -1142,7 +1142,8 @@ impl<'a> Lower<'a> {
         let op = &self.f.insts[inst].op;
         // `init_field` (ok, fail) calls the runtime's plain add on its
         // slow path.
-        matches!(op, Opcode::InitField(_)) || op.roles().iter().any(|r| matches!(r, SuccRole::Err | SuccRole::OkDirty))
+        matches!(op, Opcode::InitField(_) | Opcode::StoreElem(_, true))
+            || op.roles().iter().any(|r| matches!(r, SuccRole::Err | SuccRole::OkDirty))
     }
 
     /// Home slots: every managed value live across a may-GC instruction
@@ -2905,7 +2906,7 @@ impl<'a> Lower<'a> {
                 let f = self.edge(inst, 1, &[])?;
                 self.terminate(Terminator::Br { target: f });
             }
-            Opcode::StoreElem(duty) => {
+            Opcode::StoreElem(duty, append) => {
                 // An in-bounds overwrite of a non-hole dense element of
                 // unfrozen elements (an own writable data property); else
                 // `fail`. RANGES is dropped under the store's duty.
@@ -2934,6 +2935,28 @@ impl<'a> Lower<'a> {
                 let t = self.edge(inst, 0, &[])?;
                 self.terminate(Terminator::Br { target: t });
                 self.cur = fail;
+                // Past the initialized length or into a hole: the append
+                // arm, where the prototypes' proof allows (it writes the
+                // lengths, and runs no JS); else `fail`.
+                if APPEND_ARM && append {
+                    let miss = self.body.add_block();
+                    let recv = self.box_tagged(TAG_OBJECT, a[0]);
+                    let key = self.box_tagged(TAG_INT32, a[1]);
+                    self.elem_append_arm(inst, recv, key, a[2], duty, num, miss)?;
+                    self.cur = miss;
+                    // What the arm refused (growth, a row not yet cached):
+                    // the runtime's append, which runs no JS.
+                    if duty {
+                        self.elem_duty(a[0]);
+                    }
+                    let live = self.live_across(inst);
+                    let (ok, _) = self.gc_call(self.h.elem_grow, &[recv, a[1], a[2]], &live)?;
+                    self.epoch_same = None;
+                    let t = self.edge(inst, 0, &[])?;
+                    let f = self.edge(inst, 1, &[])?;
+                    self.cond_br(ok, t, f);
+                    return Ok(());
+                }
                 let f = self.edge(inst, 1, &[])?;
                 self.terminate(Terminator::Br { target: f });
             }

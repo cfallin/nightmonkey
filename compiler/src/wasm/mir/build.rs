@@ -183,6 +183,22 @@ impl Ty {
 /// costs far more than the ToInt32s int-first saves.
 const SPECULATE_INT_FIRST: bool = true;
 
+/// Whether a dense element load's miss (a hole, out of bounds) exits
+/// rather than running the generic read and rejoining, where no typed
+/// array can reach the site (`elem_poly_sites`: the bundle references no
+/// typed-array constructor), so a native receiver is one with dense
+/// elements and a miss is rare. Where one can, the generic read stays: a
+/// typed array the analysis took for an array misses every time, and an
+/// exit per execution costs far more than the facts the rejoin kills
+/// (pdfjs's FlateStream_getCode: 1.5M exits).
+const ELEM_LOAD_EXITS: bool = true;
+
+/// Whether a dense element store neither the inline arms nor the
+/// runtime's append can do (a hole under indexed prototypes, frozen
+/// elements) exits rather than running the generic store and rejoining,
+/// at a site as `ELEM_LOAD_EXITS` has them.
+const ELEM_STORE_EXITS: bool = true;
+
 /// Whether stamped literal sites build `lit.new` and `lit.init`
 /// (MIR-MEMORY.md §4) rather than `js.rt.newobject` and `js.rt.initprop`.
 const LIT_OPS: bool = true;
@@ -5896,6 +5912,13 @@ impl<'s, 'a> Run<'s, 'a> {
                     r
                 } else {
                 match self.native_elem(pc, recv, key) {
+                    Some((o, i)) if ELEM_LOAD_EXITS && !self.ta_poly_site => {
+                        // A dense element inline; out of bounds or a
+                        // hole, an exit (nothing has happened yet): no
+                        // generic op rejoins, so what the code after it
+                        // knows about memory survives it.
+                        self.guard(Opcode::LoadElem, vec![o, i], MType::VAL_TOP)
+                    }
                     Some((o, i)) => {
                         // A dense element inline; out of bounds or a
                         // hole, the generic op (a fence unless it keeps).
@@ -6009,6 +6032,30 @@ impl<'s, 'a> Run<'s, 'a> {
                     self.st.push(v);
                 } else {
                 match self.native_elem(pc, recv, key) {
+                    Some((o, i)) if ELEM_STORE_EXITS && !self.ta_poly_site => {
+                        // A dense overwrite or append inline (the lowering's
+                        // append arm); a store it cannot do (growth, a hole
+                        // past the prototypes' proof) exits before it.
+                        let y = if v.ty == Ty::F64
+                            && self
+                                .s
+                                .ctx
+                                .facts
+                                .elem_write_sites
+                                .get(&self.site(pc))
+                                .is_some_and(|m| m.prims().intersects(crate::opsem::PRIM_DOUBLE))
+                        {
+                            let t = MType::val(TagSet::DOUBLE);
+                            self.inst(Opcode::BoxDouble, vec![v.v], Some(t))
+                        } else {
+                            self.boxed(v)
+                        };
+                        let ok = self.new_block();
+                        let fail = self.exit_block(false);
+                        self.term(Opcode::StoreElem(duty, true), vec![o, i, y], vec![Self::goto(ok), Self::goto(fail)]);
+                        self.at(ok);
+                        self.st.push(v);
+                    }
                     Some((o, i)) => {
                         // A dense overwrite inline; else the generic op.
                         let v = self.demote_value_for_generic_arm(v);
@@ -6031,7 +6078,7 @@ impl<'s, 'a> Run<'s, 'a> {
                         };
                         let (ok, generic, join) = (self.new_block(), self.new_block(), self.new_block());
                         self.term(
-                            Opcode::StoreElem(duty),
+                            Opcode::StoreElem(duty, false),
                             vec![o, i, y],
                             vec![Self::goto(ok), Self::goto(generic)],
                         );

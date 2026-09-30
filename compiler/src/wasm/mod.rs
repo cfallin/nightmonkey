@@ -1032,6 +1032,7 @@ pub fn resolve_helpers(
         ctor_stamp: resolve(m, "night_runtime_ctor_stamp")?,
         ctor_restamp: resolve(m, "night_runtime_ctor_restamp")?,
         init_field: resolve(m, "night_runtime_init_field")?,
+        elem_grow: resolve(m, "night_runtime_elem_grow")?,
     })
 }
 

@@ -712,6 +712,10 @@ pub struct Helpers {
     /// cacheIdx, expectSpan, wantBits) -> ok`: MIR's `init_field` slow
     /// path (the object to the out-slot). May GC.
     pub init_field: Func,
+    /// `night_runtime_elem_grow(cx, top, recv i64, idx, val i64) -> ok`:
+    /// MIR's `store_elem.append` slow path, an append the inline arm
+    /// refused (growth, an uncached row). May GC; runs no JS.
+    pub elem_grow: Func,
     /// `night_runtime_set_fun_name(cx, top, fun i64, name i64, prefixKind i32) -> ok`:
     /// `JSOp::SetFunName` -- set the inferred name on an anonymous function.
     /// Leaves `fun` on the stack (no out-slot).
@@ -3828,6 +3832,11 @@ mod tests {
             returns: vec![Type::I32],
         });
         let init_field = stub(&mut m, initf_sig, true, "night_runtime_init_field");
+        let grow_sig = m.signatures.push(SignatureData {
+            params: vec![Type::I32, Type::I32, Type::I64, Type::I32, Type::I64],
+            returns: vec![Type::I32],
+        });
+        let elem_grow = stub(&mut m, grow_sig, true, "night_runtime_elem_grow");
         // math_unary: (kind i32, x f64) -> f64; math_pow: (x f64, y f64) -> f64.
         let mu_sig = m.signatures.push(SignatureData {
             params: vec![Type::I32, Type::F64],
@@ -4149,6 +4158,7 @@ mod tests {
                 ctor_stamp,
                 ctor_restamp,
                 init_field,
+                elem_grow,
             },
         )
     }

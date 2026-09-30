@@ -2765,6 +2765,39 @@ static uint32_t SetPropIcMiss(JSContext* cx, uint32_t top, uint64_t recv,
 // constructing type the caller continues with. 0 leaves the rest of the
 // constructor to baseline (an add not done is done there; one done
 // becomes an overwrite). May GC.
+uint32_t night_runtime_elem_grow(JSContext* cx, uint32_t top, uint64_t recv,
+                                 uint32_t idx, uint64_t val) {
+  SetNightTop(cx, top);
+  WriteNightOut(top, recv);
+  JS::Value rv = JS::Value::fromRawBits(recv);
+  if (!rv.isObject() || !rv.toObject().is<js::NativeObject>()) {
+    return 0;
+  }
+  JS::Rooted<js::NativeObject*> obj(cx, &rv.toObject().as<js::NativeObject>());
+  JS::RootedValue v(cx, JS::Value::fromRawBits(val));
+  if (idx != obj->getDenseInitializedLength() || idx == UINT32_MAX ||
+      !obj->isExtensible() || obj->denseElementsAreFrozen() ||
+      !NoExtraIndexedFast(obj)) {
+    return 0;
+  }
+  bool isArray = obj->is<js::ArrayObject>();
+  if (isArray && !obj->as<js::ArrayObject>().lengthIsWritable() &&
+      idx >= obj->as<js::ArrayObject>().length()) {
+    return 0;
+  }
+  if (!obj->ensureElements(cx, idx + 1)) {
+    cx->clearPendingException();
+    return 0;
+  }
+  obj->setDenseInitializedLength(idx + 1);
+  obj->initDenseElement(idx, v);
+  if (isArray && idx >= obj->as<js::ArrayObject>().length()) {
+    obj->as<js::ArrayObject>().setLength(cx, idx + 1);
+  }
+  WriteNightOut(top, JS::ObjectValue(*obj).asRawBits());
+  return 1;
+}
+
 uint32_t night_runtime_init_field(JSContext* cx, uint32_t top, uint64_t recv,
                                   uint32_t atomId, uint64_t val,
                                   uint32_t cacheIdx, uint32_t expectSpan,

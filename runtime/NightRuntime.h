@@ -407,6 +407,15 @@ int32_t night_runtime_mir_stress(uint32_t period);
 // MIR's `init_field` slow path: the plain add of the next predicted field
 // to an object under construction; 1 iff it stays `constructing(n+1)`
 // (`expectSpan` slots, `wantBits` kept). The object to the out-slot. May GC.
+// MIR's dense append slow path (`store_elem.append`): append `val` at index
+// `idx` of native object `recv` (boxed), `idx` its initialized length, when
+// that is an ordinary dense append (extensible, not frozen, a writable
+// length, no indexed property on it or its prototypes), growing the
+// elements as needed. Runs no JS. 1 iff it stored. The object to the
+// out-slot. May GC.
+NIGHT_RUNTIME_EXPORT(night_runtime_elem_grow)
+uint32_t night_runtime_elem_grow(JSContext* cx, uint32_t top, uint64_t recv,
+                                 uint32_t idx, uint64_t val);
 NIGHT_RUNTIME_EXPORT(night_runtime_init_field)
 uint32_t night_runtime_init_field(JSContext* cx, uint32_t top, uint64_t recv,
                                   uint32_t atomId, uint64_t val,

@@ -664,7 +664,10 @@ pub enum Opcode {
     NewArray,
     LoadElem,
     /// The RANGES duty (as `InitElem`'s).
-    StoreElem(bool),
+    /// ... and whether it also appends (past the initialized length, or
+    /// into a hole, where the prototypes' proof allows: it then writes
+    /// the lengths too), else fails; without, only an overwrite.
+    StoreElem(bool, bool),
     LoadTa,
     StoreTa,
     LengthArray,
@@ -805,7 +808,7 @@ impl Opcode {
             | AccessorProbe(..)
             | I32Ovf(_)
             | LoadElem
-            | StoreElem(_)
+            | StoreElem(..)
             | LoadTa
             | StoreTa
             | StrCharCodeAt
@@ -1922,7 +1925,7 @@ pub fn signature(op: &Opcode, args: &[Type], m: &Module) -> SigResult {
             i32r(&args[0], "new_array")?;
             Sig::result(Type::Obj(ObjInfo::kind(ObjKind::Array)))
         }
-        LoadElem | StoreElem(_) => {
+        LoadElem | StoreElem(..) => {
             arity(args, if *op == LoadElem { 2 } else { 3 })?;
             want_kind(&obj(&args[0], "elem op")?, ObjKind::Native, "elem op")?;
             i32r(&args[1], "elem op index")?;
@@ -2327,8 +2330,15 @@ pub fn effects(op: &Opcode, args: &[Type], m: &Module) -> Effects {
             fx.writes = vec![Region::Unknown];
             fx.flags = FlagsEffect::Bits(FlagBits::MUT_OTHER);
         }
-        StoreElem(_) => {
-            fx.writes = vec![Region::Elements(elements_root(recv, m))];
+        StoreElem(_, append) => {
+            // An overwrite, or an append (the lengths too).
+            let root = elements_root(recv, m);
+            fx.writes = vec![Region::Elements(root)];
+            if *append {
+                fx.writes.push(Region::ArrayLength(root));
+                // The runtime's append may grow the elements.
+                fx.may_gc = true;
+            }
             fx.flags = FlagsEffect::Bits(FlagBits::MUT_OTHER);
         }
         LoadTa | StoreTa => {
