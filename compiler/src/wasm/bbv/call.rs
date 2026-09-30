@@ -2702,7 +2702,7 @@ impl<'a> Bbv<'a> {
             let arr_blk = self.body.add_block();
             self.cond_br(is_arr, arr_blk, slow_blk);
             self.cur = arr_blk;
-            self.emit_alloc_inline(Some(0));
+            self.emit_alloc_inline(Some(0), 0);
             let arr = self.stack.pop().expect("alloc pushed the array");
             if let Some(pre) = pre_array.as_ref() {
                 let pre = pre.clone();

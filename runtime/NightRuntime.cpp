@@ -3496,13 +3496,21 @@ static unsigned InitAttrFlags(uint32_t kind) {
 // Object literal: a fresh empty `{}`. The translator's following init_prop/
 // init_elem calls define its properties in source order. Fills the site's
 // inline-alloc cell so subsequent allocations bump inline.
-bool night_runtime_new_object(JSContext* cx, uint32_t top, uint32_t cell) {
+bool night_runtime_new_object(JSContext* cx, uint32_t top, uint32_t cell,
+                              uint32_t nslots) {
   SetNightTop(cx, top);
   // NewObjectGCKind (the interpreter's NewInit kind): fixed slots available
   // for the literal's properties, so the init adds are raw fixed-slot stores
   // (JS_NewPlainObject would pick a 0-fixed-slot kind -> every add grows
-  // dynamic slots and the inline init arm can never fire).
-  JSObject* obj = js::NewPlainObjectWithAllocKind(cx, js::NewObjectGCKind());
+  // dynamic slots and the inline init arm can never fire). A literal whose
+  // layout row is longer (`nslots`, the compiler's) gets a kind with a
+  // fixed slot for each field: a predicted field in a dynamic slot clears
+  // SLOTS, on every allocation.
+  js::gc::AllocKind kind = js::NewObjectGCKind();
+  if (nslots > js::gc::GetGCKindSlots(kind)) {
+    kind = js::gc::GetGCObjectKind(std::min<size_t>(nslots, js::NativeObject::MAX_FIXED_SLOTS));
+  }
+  JSObject* obj = js::NewPlainObjectWithAllocKind(cx, kind);
   if (!obj) {
     return false;
   }

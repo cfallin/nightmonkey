@@ -396,7 +396,7 @@ pub fn mnemonic(op: &Opcode) -> String {
             RtOp::DelProp(_, true) => "js.rt.delprop.strict",
             RtOp::DelElem(false) => "js.rt.delelem",
             RtOp::DelElem(true) => "js.rt.delelem.strict",
-            RtOp::NewObject => "js.rt.newobject",
+            RtOp::NewObject(_) => "js.rt.newobject",
             RtOp::NewArray(_) => "js.rt.newarray",
             RtOp::InitProp(..) => "js.rt.initprop",
             RtOp::InitElem(_, false) => "js.rt.initelem",
@@ -580,6 +580,7 @@ fn immediates(m: &Module, op: &Opcode) -> Option<String> {
             atom(Some(m), *a)
         }
         JsRt(RtOp::NewArray(n))
+        | JsRt(RtOp::NewObject(n))
         | JsRt(RtOp::InitElem(n, _))
         | JsRt(RtOp::Symbol(n))
         | JsRt(RtOp::BuiltinObject(n))

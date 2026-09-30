@@ -3003,9 +3003,10 @@ impl<'a> Lower<'a> {
                         let sv = self.i32c(u32::from(strict));
                         (h.del_elem, vec![a[0], a[1], sv])
                     }
-                    RtOp::NewObject => {
+                    RtOp::NewObject(n) => {
                         let cell = self.alloc_inline(inst, None)?;
-                        (h.new_object, vec![cell])
+                        let nv = self.i32c(n);
+                        (h.new_object, vec![cell, nv])
                     }
                     RtOp::NewArray(len) => {
                         let cell = self.alloc_inline(inst, Some(len))?;

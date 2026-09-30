@@ -2450,9 +2450,10 @@ impl<'a> Gen<'a> {
             // --- literals ---
             NewInit | NewObject => {
                 skip(p, op);
-                let z = self.i32c(0);
-                let r = self.rt(h.new_object, &[z]);
                 let site = crate::ids::Site::new(self.sid, self.pc);
+                let z = self.i32c(0);
+                let n = self.i32c(self.ctx.lit_nslots_in.get(&site).copied().unwrap_or(0));
+                let r = self.rt(h.new_object, &[z, n]);
                 let w = self.ctx.lit_stamps_in.get(&site).map(|&l| (l + 1) | CLASS_WORD_SLOTS);
                 self.stamp_fresh(r, w);
                 self.set_slot(d, r);

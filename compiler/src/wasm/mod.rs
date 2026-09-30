@@ -1060,6 +1060,8 @@ pub struct EnvLayout {
     pub stamp_ctors_tx: HashMap<ScriptId, translate::StampCtorIn>,
     /// Object-literal stamp sites (site -> layout id), fixed-slot rows only.
     pub lit_stamps_tx: HashMap<Site, u32>,
+    /// Object-literal sites -> row length, capped at the 16 fixed slots.
+    pub lit_nslots_tx: HashMap<Site, u32>,
     /// Per atom: prefix-closed (layout k+1, predicted byte offset) pairs
     /// for the unknown-receiver add arms' runtime key check.
     pub layout_addpred_tx: HashMap<NameId, Vec<translate::AddPred>>,
@@ -1507,6 +1509,14 @@ pub fn layout_env(
         .filter(|(_, key)| likely_class_layouts[key].len() <= 16)
         .map(|(&site, key)| (site, ctor_layout_id[key]))
         .collect();
+    // Their allocations' fixed slots: a literal of more fields than the
+    // engine's default object kind holds would put the rest in dynamic
+    // slots, and the add check clears SLOTS for a predicted field there.
+    let lit_nslots_tx: HashMap<Site, u32> = facts
+        .lit_stamps
+        .iter()
+        .map(|(&site, key)| (site, u32::try_from(likely_class_layouts[key].len().min(16)).unwrap()))
+        .collect();
     // Per atom: every (layout k+1, predicted byte offset) pair across the
     // corpus, prefix-closed (a receiver keyed/stamped with a prefix layout
     // is adding toward the extension, so the prefix's id predicts the
@@ -1865,6 +1875,7 @@ pub fn layout_env(
         fused_list,
         stamp_ctors_tx,
         lit_stamps_tx,
+        lit_nslots_tx,
         layout_addpred_tx,
         ctor_nslots_tx,
         deleg_restamps_tx,
@@ -2072,6 +2083,7 @@ pub fn translate_all(
         local_restamps_in: &env.local_restamps_tx,
         construct_sites_in: &env.construct_sites_tx,
         lit_stamps_in: &env.lit_stamps_tx,
+        lit_nslots_in: &env.lit_nslots_tx,
         prop_sites_in: &env.prop_sites_tx,
         layout_field_masks_in: &env.layout_field_masks_tx,
         layout_field_types_in: &env.layout_field_types_tx,

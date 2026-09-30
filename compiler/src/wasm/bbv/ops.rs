@@ -1470,11 +1470,13 @@ impl<'a> Bbv<'a> {
             // --- object / array literals (generic helper arms) ---
             NewInit | NewObject => {
                 self.skip_operands(p, op);
-                self.emit_alloc_inline(None);
+                let site = Site::new(self.source_id, self.evid_pc(self.cur_pc));
+                let n = self.ctx.lit_nslots_in.get(&site).copied().unwrap_or(0);
+                self.emit_alloc_inline(None, n);
             }
             NewArray => {
                 let length = p.next_uint32().unwrap();
-                self.emit_alloc_inline(Some(length));
+                self.emit_alloc_inline(Some(length), 0);
             }
             InitProp | InitHiddenProp | InitLockedProp => {
                 let name_index = p.next_uint32().unwrap();

@@ -1259,6 +1259,7 @@ impl Parser {
             StampFresh(_) => StampFresh(self.int()?),
             JsRt(RtOp::BuiltinObject(_)) => JsRt(RtOp::BuiltinObject(self.int()?)),
             JsRt(RtOp::NewArray(_)) => JsRt(RtOp::NewArray(self.int()?)),
+            JsRt(RtOp::NewObject(_)) => JsRt(RtOp::NewObject(self.int()?)),
             JsRt(RtOp::InitElem(_, r)) => JsRt(RtOp::InitElem(self.int()?, r)),
             JsRt(RtOp::InitProp(..)) => {
                 let a = self.atom()?;
@@ -1647,7 +1648,7 @@ fn template(mn: &str) -> Option<Opcode> {
         JsRt(RtOp::DelProp(placeholder_atom, true)),
         JsRt(RtOp::DelElem(false)),
         JsRt(RtOp::DelElem(true)),
-        JsRt(RtOp::NewObject),
+        JsRt(RtOp::NewObject(0)),
         JsRt(RtOp::NewArray(0)),
         JsRt(RtOp::InitProp(placeholder_atom, 0)),
         JsRt(RtOp::InitElem(0, false)),

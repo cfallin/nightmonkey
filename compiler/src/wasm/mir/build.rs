@@ -5997,7 +5997,8 @@ impl<'s, 'a> Run<'s, 'a> {
                 self.push(v, Ty::Val(TagSet::BOOLEAN));
             }
             NewInit | NewObject if RT_OPS => {
-                let v = self.js(Opcode::JsRt(RtOp::NewObject), vec![], MType::val(TagSet::OBJECT));
+                let n = self.s.ctx.lit_nslots_in.get(&self.site(self.pc)).copied().unwrap_or(0);
+                let v = self.js(Opcode::JsRt(RtOp::NewObject(n)), vec![], MType::val(TagSet::OBJECT));
                 // An object-literal stamp site: the layout idx with SLOTS
                 // (the inits land at the row's slots by construction).
                 if let Some(&lid) = self.s.ctx.lit_stamps_in.get(&self.site(self.pc)) {

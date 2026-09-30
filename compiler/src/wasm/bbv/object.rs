@@ -196,7 +196,9 @@ impl<'a> Bbv<'a> {
         self.push_known(result, Repr::Boxed, prim_desc(PRIM_STRING));
     }
 
-    pub(super) fn emit_alloc_inline(&mut self, array_length: Option<u32>) {
+    /// `obj_slots`: an object literal's fixed-slot count (its layout row's
+    /// length, `lit_nslots_in`; 0 for the engine's default kind).
+    pub(super) fn emit_alloc_inline(&mut self, array_length: Option<u32>, obj_slots: u32) {
         // `Code`-only allocation (see emit_instanceof's cell note).
         let cell_idx = if self.mode == EmitMode::Code {
             self.atoms.next_alloc_cell()
@@ -309,7 +311,8 @@ impl<'a> Bbv<'a> {
         let ok = match array_length {
             None => {
                 let helper = self.helpers.new_object;
-                self.call_i32(helper, &[self.cx, top, cell])
+                let n = self.i32_const(obj_slots);
+                self.call_i32(helper, &[self.cx, top, cell, n])
             }
             Some(len) => {
                 let len_v = self.i32_const(len);

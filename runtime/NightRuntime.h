@@ -737,7 +737,8 @@ bool night_runtime_set_name(JSContext* cx, uint32_t top, uint64_t env,
 // fills it from the object it allocates so the compiled site can bump-allocate
 // inline next time.
 NIGHT_RUNTIME_EXPORT(night_runtime_new_object)
-bool night_runtime_new_object(JSContext* cx, uint32_t top, uint32_t cell);
+bool night_runtime_new_object(JSContext* cx, uint32_t top, uint32_t cell,
+                              uint32_t nslots);
 NIGHT_RUNTIME_EXPORT(night_runtime_new_array)
 bool night_runtime_new_array(JSContext* cx, uint32_t top, uint32_t length,
                              uint32_t cell);

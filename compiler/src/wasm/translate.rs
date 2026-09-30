@@ -2106,6 +2106,10 @@ pub struct TranslateCtx<'a> {
     /// fields all sit in fixed slots). The allocation stores the idx +
     /// SLOTS word so the literal-born population's class-fact guards hit.
     pub lit_stamps_in: &'a HashMap<Site, u32>,
+    /// Object-literal sites -> their layout row's length (at most the
+    /// engine's 16 fixed slots): the allocation's fixed-slot count, so
+    /// every predicted field is a fixed slot, as the add check wants.
+    pub lit_nslots_in: &'a HashMap<Site, u32>,
     pub prop_sites_in: &'a HashMap<Site, PropSiteIn>,
     /// Stamp key -> field name -> value mask. Layout-wide, so a receiver
     /// carrying a proven class fact can answer "does this field hold a
@@ -2879,6 +2883,7 @@ mod tests {
             local_restamps_in: empty_local_restamps(),
             construct_sites_in: empty_construct_sites(),
             lit_stamps_in: empty_lit_stamps(),
+            lit_nslots_in: empty_lit_stamps(),
             prop_sites_in: empty_prop_sites(),
             layout_field_masks_in: empty_layout_field_masks(),
             layout_field_types_in: empty_layout_field_masks(),
@@ -3531,7 +3536,7 @@ mod tests {
         });
         let set_name = stub(&mut m, set_name_sig, true, "night_runtime_set_name");
         let new_obj_sig = m.signatures.push(SignatureData {
-            params: vec![Type::I32, Type::I32, Type::I32],
+            params: vec![Type::I32, Type::I32, Type::I32, Type::I32],
             returns: vec![Type::I32],
         });
         let new_object = stub(&mut m, new_obj_sig, true, "night_runtime_new_object");
@@ -4545,6 +4550,7 @@ mod tests {
             local_restamps_in: empty_local_restamps(),
             construct_sites_in: empty_construct_sites(),
             lit_stamps_in: empty_lit_stamps(),
+            lit_nslots_in: empty_lit_stamps(),
             prop_sites_in: empty_prop_sites(),
             layout_field_masks_in: empty_layout_field_masks(),
             layout_field_types_in: empty_layout_field_masks(),
@@ -4652,6 +4658,7 @@ mod tests {
             local_restamps_in: empty_local_restamps(),
             construct_sites_in: empty_construct_sites(),
             lit_stamps_in: empty_lit_stamps(),
+            lit_nslots_in: empty_lit_stamps(),
             prop_sites_in: &sites,
             layout_field_masks_in: empty_layout_field_masks(),
             layout_field_types_in: empty_layout_field_masks(),
@@ -4776,6 +4783,7 @@ mod tests {
             local_restamps_in: empty_local_restamps(),
             construct_sites_in: empty_construct_sites(),
             lit_stamps_in: empty_lit_stamps(),
+            lit_nslots_in: empty_lit_stamps(),
             prop_sites_in: &sites,
             layout_field_masks_in: empty_layout_field_masks(),
             layout_field_types_in: empty_layout_field_masks(),
@@ -4888,6 +4896,7 @@ mod tests {
             local_restamps_in: empty_local_restamps(),
             construct_sites_in: empty_construct_sites(),
             lit_stamps_in: empty_lit_stamps(),
+            lit_nslots_in: empty_lit_stamps(),
             prop_sites_in: &sites,
             layout_field_masks_in: empty_layout_field_masks(),
             layout_field_types_in: empty_layout_field_masks(),
@@ -4999,6 +5008,7 @@ mod tests {
             local_restamps_in: empty_local_restamps(),
             construct_sites_in: empty_construct_sites(),
             lit_stamps_in: empty_lit_stamps(),
+            lit_nslots_in: empty_lit_stamps(),
             prop_sites_in: empty_prop_sites(),
             layout_field_masks_in: empty_layout_field_masks(),
             layout_field_types_in: empty_layout_field_masks(),
@@ -5179,6 +5189,7 @@ mod tests {
             local_restamps_in: empty_local_restamps(),
             construct_sites_in: empty_construct_sites(),
             lit_stamps_in: empty_lit_stamps(),
+            lit_nslots_in: empty_lit_stamps(),
             prop_sites_in: empty_prop_sites(),
             layout_field_masks_in: empty_layout_field_masks(),
             layout_field_types_in: empty_layout_field_masks(),
@@ -5312,6 +5323,7 @@ mod tests {
             local_restamps_in: empty_local_restamps(),
             construct_sites_in: empty_construct_sites(),
             lit_stamps_in: empty_lit_stamps(),
+            lit_nslots_in: empty_lit_stamps(),
             prop_sites_in: empty_prop_sites(),
             layout_field_masks_in: empty_layout_field_masks(),
             layout_field_types_in: empty_layout_field_masks(),
@@ -5454,6 +5466,7 @@ mod tests {
             local_restamps_in: empty_local_restamps(),
             construct_sites_in: empty_construct_sites(),
             lit_stamps_in: empty_lit_stamps(),
+            lit_nslots_in: empty_lit_stamps(),
             prop_sites_in: empty_prop_sites(),
             layout_field_masks_in: empty_layout_field_masks(),
             layout_field_types_in: empty_layout_field_masks(),
@@ -5583,6 +5596,7 @@ mod tests {
             local_restamps_in: empty_local_restamps(),
             construct_sites_in: empty_construct_sites(),
             lit_stamps_in: empty_lit_stamps(),
+            lit_nslots_in: empty_lit_stamps(),
             prop_sites_in: empty_prop_sites(),
             layout_field_masks_in: empty_layout_field_masks(),
             layout_field_types_in: empty_layout_field_masks(),
@@ -5678,6 +5692,7 @@ mod tests {
             local_restamps_in: empty_local_restamps(),
             construct_sites_in: empty_construct_sites(),
             lit_stamps_in: empty_lit_stamps(),
+            lit_nslots_in: empty_lit_stamps(),
             prop_sites_in: empty_prop_sites(),
             layout_field_masks_in: empty_layout_field_masks(),
             layout_field_types_in: empty_layout_field_masks(),
@@ -5786,6 +5801,7 @@ mod tests {
             local_restamps_in: empty_local_restamps(),
             construct_sites_in: empty_construct_sites(),
             lit_stamps_in: empty_lit_stamps(),
+            lit_nslots_in: empty_lit_stamps(),
             prop_sites_in: empty_prop_sites(),
             layout_field_masks_in: empty_layout_field_masks(),
             layout_field_types_in: empty_layout_field_masks(),
@@ -5896,6 +5912,7 @@ mod tests {
             local_restamps_in: empty_local_restamps(),
             construct_sites_in: empty_construct_sites(),
             lit_stamps_in: empty_lit_stamps(),
+            lit_nslots_in: empty_lit_stamps(),
             prop_sites_in: empty_prop_sites(),
             layout_field_masks_in: empty_layout_field_masks(),
             layout_field_types_in: empty_layout_field_masks(),
@@ -6006,6 +6023,7 @@ mod tests {
             local_restamps_in: empty_local_restamps(),
             construct_sites_in: empty_construct_sites(),
             lit_stamps_in: empty_lit_stamps(),
+            lit_nslots_in: empty_lit_stamps(),
             prop_sites_in: empty_prop_sites(),
             layout_field_masks_in: empty_layout_field_masks(),
             layout_field_types_in: empty_layout_field_masks(),
@@ -6172,6 +6190,7 @@ mod tests {
             local_restamps_in: empty_local_restamps(),
             construct_sites_in: empty_construct_sites(),
             lit_stamps_in: empty_lit_stamps(),
+            lit_nslots_in: empty_lit_stamps(),
             prop_sites_in: empty_prop_sites(),
             layout_field_masks_in: empty_layout_field_masks(),
             layout_field_types_in: empty_layout_field_masks(),

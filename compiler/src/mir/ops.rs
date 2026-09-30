@@ -228,8 +228,9 @@ pub enum RtOp {
     DelProp(AtomId, bool),
     /// `delete obj[key]` -> boolean.
     DelElem(bool),
-    /// `{}` -> object.
-    NewObject,
+    /// `{}` -> object, with fixed slots for this many fields (the literal's
+    /// layout row length; 0 for the engine's default).
+    NewObject(u32),
     /// `new Array(len)` for a literal of `len` elements -> object.
     NewArray(u32),
     /// Define own property `name` of `obj` to `v`, with the attributes.
@@ -395,7 +396,7 @@ impl RtOp {
             SetPropSuper(a, s) => SetPropSuper(f(a), s),
             GetBoundName(a) => GetBoundName(f(a)),
             NewPrivateName(a) => NewPrivateName(f(a)),
-            op @ (Instanceof | In | HasOwn | DelElem(_) | NewObject | NewArray(_) | InitElem(..)
+            op @ (Instanceof | In | HasOwn | DelElem(_) | NewObject(_) | NewArray(_) | InitElem(..)
             | ToPropertyKey | RegExp(_) | Iter | Check(_) | SetFunName(_) | GlobalThis | BigInt(_)
             | MutateProto | CheckPrivateField(..) | CheckIsObj(_) | CloseIter(_) | OptimizeSpreadCall
             | SpreadCall(_) | PushEnv(..) | EnterWith(_) | FreshenEnv(_) | BindVar | InitElemGetSet(_)
@@ -1461,7 +1462,7 @@ pub fn signature(op: &Opcode, args: &[Type], m: &Module) -> SigResult {
                     (2, Some(Type::val(TagSet::BOOLEAN)))
                 }
                 RtOp::DelProp(..) => (1, Some(Type::val(TagSet::BOOLEAN))),
-                RtOp::NewObject | RtOp::NewArray(_) => (0, Some(Type::val(TagSet::OBJECT))),
+                RtOp::NewObject(_) | RtOp::NewArray(_) => (0, Some(Type::val(TagSet::OBJECT))),
                 RtOp::InitProp(..) => (2, None),
                 RtOp::InitElem(..) => (3, None),
                 RtOp::ToPropertyKey => (1, Some(Type::VAL_TOP)),
