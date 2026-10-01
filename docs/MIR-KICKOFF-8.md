@@ -87,7 +87,8 @@ crypto, mandreel and navier-stokes.
   hottest numeric kernels) have nothing left; `lin_solve`'s closure reads
   hoisted once its element fallbacks exited (+25%).
 - **The blockers in hot loops are mostly generic property fallbacks**: the
-  IC path a typed access takes when its layout guard misses, which rejoins.
+  IC path a typed access takes when its layout guard misses, which rejoins,
+  and whose effect summary is `Unknown` (a getter may run).
   crypto's `montReduce` and `bnpSquareTo` (`js.getprop .t`, `.am`), box2d's
   contact solver (54 `js.getprop .x`, 54 `.y`, `.rA`, `.rB`, and
   `js.binop.mul`), raytrace's render loop (`js.getprop .RayTracer`,
@@ -103,31 +104,41 @@ crypto, mandreel and navier-stokes.
 
 ## Work, in order
 
-### 1. Property slowpath isolation (the largest lever)
+### 1. Precise effects for property fallbacks (the largest lever)
 
-A typed field access whose layout guard misses falls back to the IC and
-rejoins (`guard_layout_or`, `js_dirty_exits`'s clean edge); the generic op
-writes `Unknown`, so at the join every memory version dies and nothing in
-the loop hoists. Elements got the same fix this session (3ef18a4): a miss
-exits. For properties the risk is the same as pdfjs's typed array (a
-receiver class the analysis got wrong misses at every execution: one site
-made 1.5M exits), and the evidence that rules it out is weaker.
+A typed field access whose layout guard misses falls back to the generic
+IC op (`js.getprop`, via `guard_layout_or`) and rejoins. The guard is not
+the problem (it reads), nor are layout changes (type facts and memory
+versions are tracked separately). The problem is the fallback's effect
+summary: every generic op gets `Effects::generic` (`Unknown` reads and
+writes, may run JS), because on a receiver the guard did not prove, the
+property may be a getter or the receiver a proxy, and then arbitrary JS
+runs. That one summary covers both the common miss (a plain data property:
+a pure read) and the rare one (a getter: anything). In a loop it is an
+`Unknown` writer, so nothing hoists; at the rejoin every memory version dies.
 
-- Measure first: for each hot loop the fallbacks block, how often the guard
-  actually misses (`--mir-exit-census` counts IC misses as kind 91; add a
-  per-site count for these fallbacks).
-- Candidate policies: exit on a miss where the site's class prediction is
-  exact (`prop_sites` lo == hi, a constructor's `this`), keep the rejoin
-  where it is a range or a hint; or exit only inside loops.
-- **Design question for the owner**: Ion decides this with CacheIR
-  feedback. NightMonkey's wizening already runs the program once in the
-  interpreter: per-site IC outcomes recorded during that run could feed the
-  compile (profile-guided exit-or-rejoin), keeping the static analysis as
-  the type source. Is that in scope, or should the choice stay static?
-- Global namespace reads in loops (`Flog.RayTracer.Vector` in raytrace):
-  fused-gname reads of objects whose properties are then read generically;
-  a constant-object read (item 6) turns them into typed loads off a known
-  object.
+- **Split the fallback.** A data-only property read: the IC's inline ways
+  and probe, restricted to data properties (own slot, prototype holder),
+  with effects `reads Field(*, name)` and nothing else; a lookup that would
+  run code (getter, proxy, resolve hook) takes a fail edge, which exits or
+  goes generic. The common miss then stays in MIR as a read, with no exit
+  storm when a class prediction is wrong (the risk an exit-on-guard-miss
+  policy would carry: pdfjs's typed array made 1.5M exits at one site).
+- **The same for stores**: `js.setprop`'s continuing path is a data write of
+  `Field(*, name)` (it blocks reads of that name only); setters, proxies
+  and non-writable properties fail.
+- **And for generic arithmetic** (`js.binop.mul` in box2d's solver): the
+  numbers-only arms are pure; only object operands (`valueOf`) run JS, so
+  they take the fail edge.
+- Measure with `invscan.py`: the blockers listed above (crypto's
+  `montReduce`/`bnpSquareTo`, box2d's contact solver, raytrace's render
+  loop) should turn into hoists and numbered loads.
+- Global namespace reads in loops (`Flog.RayTracer.Vector` in raytrace)
+  are the same split, plus constant-object reads (item 6).
+- The element fallbacks (3ef18a4 made their misses exit) could use the same
+  split instead (a hole or out-of-bounds read through prototypes without
+  indexed properties is a read of `undefined`), lifting the
+  no-typed-array condition.
 
 ### 2. SROA of constructed objects (MIR-MEMORY.md §6, M6)
 
