@@ -409,3 +409,25 @@ ways forward, an owner's decision:
    bailout: every frame rebuilt, the caller continues in baseline too),
    for exits that name a replaced object; then a rebuild at the exit is
    the end of the object's MIR life.
+
+**Decided (owner, 2026-10-01): neither; materialize once, then cache.**
+An object rebuilt at an escape is real from then on: baseline may carry
+the reference anywhere, identity is observable (`===`), and every later
+escape must hand over the same reference. So `exit.inline` is an escape
+like a store to a global. What survives is caching, which unifies SROA
+with forwarding and loop-carried promotion (item 4):
+
+- Per allocation, the state at each point: the fields as SSA values; a
+  maybe-null reference (null until the first escape materializes it);
+  whether the fields are newer than the object (dirty).
+- At a merge (a loop header) the fields and the reference are block
+  params; the reference is null on paths that never materialized.
+- At an escape: allocate and initialize if the reference is null, else
+  write the dirty fields back; hand over the reference; after a point
+  that returns (`exit.inline`, a call), reload the fields. Write-backs go
+  on the edges into escape points, so the hot path stays scalar and the
+  reference "just sits there".
+- After materialization the effect summaries decide staleness: a writer
+  of `Unknown` or of `Field(*, name)` reloads the cache, a reader of
+  `Unknown` gets the write-back first. The same state then serves objects
+  that are not fresh allocations (load once, carry, write back).
