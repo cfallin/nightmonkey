@@ -1270,6 +1270,8 @@ impl Parser {
             JsSetName(_, strict) => JsSetName(self.atom()?, strict),
             LoadField(_) => LoadField(self.atom()?),
             LoadSlot(_) => LoadSlot(self.atom()?),
+            GetPropData(_) => GetPropData(self.atom()?),
+            SetPropData(_) => SetPropData(self.atom()?),
             StoreField(_) => StoreField(self.atom()?),
             InitField(_) => InitField(self.atom()?),
             GuardTags(_) => GuardTags(self.tags()?),
@@ -1677,6 +1679,11 @@ fn template(mn: &str) -> Option<Opcode> {
         JsSetName(placeholder_atom, true),
         LoadField(placeholder_atom),
         LoadSlot(placeholder_atom),
+        GetPropData(placeholder_atom),
+        GetElemData,
+        SetElemData(false),
+        SetElemData(true),
+        SetPropData(placeholder_atom),
         StoreField(placeholder_atom),
         InitField(placeholder_atom),
         PublishLayout,
@@ -1768,6 +1775,8 @@ fn template(mn: &str) -> Option<Opcode> {
     ] {
         all.push(JsCompare(c));
     }
+    let prims: Vec<Opcode> = all.iter().filter_map(crate::mir::ops::PrimOp::of).map(Prim).collect();
+    all.extend(prims);
     all.into_iter().find(|op| mnemonic(op) == mn)
 }
 

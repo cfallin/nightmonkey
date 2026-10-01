@@ -62,6 +62,7 @@
 #include "runtime/NightRuntimeData.h"  // js::night::NightRuntimeData (regex table)
 #include "runtime/NightRuntimeSlots.h"  // js::night::NightGet/SetHomeObject (isolated -inl TU)
 #include "runtime/NightStack.h"
+#include "builtin/Object.h"        // js::obj_toString
 #include "builtin/ModuleObject.h"  // js::StartDynamicModuleImport (baseline)
 #include "vm/ArgumentsObject.h"     // js::MappedArgumentsObject, Unmapped
 #include "vm/ArrayBufferObject.h"   // js::ArrayBufferObject::byteLength
@@ -90,11 +91,14 @@
 #include "vm/SymbolType.h"        // JS::Symbol::new_ (JSOp::NewPrivateName)
 #include "vm/ThrowMsgKind.h"      // js::ThrowCondition, ThrowMsgKindToErrNum
 #include "vm/TypedArrayObject.h"  // TypedArrayObject::getElementPure
+#include "vm/Watchtower.h"        // js::Watchtower::watchesPropertyAdd
 
 #include "vm/ArgumentsObject-inl.h"  // js::ArgumentsObject::setArg/arg
 #include "vm/Interpreter-inl.h"      // HasOwnProperty, ToPropertyKeyOperation
 #include "vm/JSScript-inl.h"         // JSScript::getRegExp
 #include "vm/NativeObject-inl.h"  // initDenseElement, setDenseInitializedLength
+#include "vm/ObjectOperations-inl.h"  // js::ClassMayResolveId
+#include "vm/JSObject-inl.h"  // js::HasNoToPrimitiveMethodPure, IsNativeFunction
 
 // Defined in vm/Interpreter.cpp (reactor build): resolve a global name exactly
 // as the interpreter's CASE(GetGName), against the global lexical environment.
@@ -2239,8 +2243,8 @@ bool night_runtime_set_property(JSContext* cx, uint32_t top, uint64_t recv,
 // GC, no rooting. `robj` is the receiver or its primitive wrapper. Writes
 // the result to the out-slot at `top` and returns true on a hit; a mega hit
 // also fills a free inline way for the shape.
-static bool TryLeafGetProbes(JSObject* robj, uint32_t atomId, uint32_t cacheIdx,
-                             uint32_t top) {
+static bool TryLeafGetProbesV(JSObject* robj, uint32_t atomId,
+                              uint32_t cacheIdx, JS::Value* out) {
   uint32_t shape = js::night::NightObjectShape(robj);
   MegaGetEntry& e = *MegaGet(shape, atomId);
   if (e.shape == shape && e.atomId == atomId) {
@@ -2254,9 +2258,8 @@ static bool TryLeafGetProbes(JSObject* robj, uint32_t atomId, uint32_t cacheIdx,
       holder = &robj->as<js::NativeObject>();
     }
     if (holderOk) {
-      const JS::Value& v = SlotEncRead(holder, e.slotEnc);
+      *out = SlotEncRead(holder, e.slotEnc);
       NoteGetWay(cacheIdx, e.shape, e.holderPtr, e.holderShape, e.slotEnc);
-      WriteNightOut(top, v.asRawBits());
       return true;
     }
   }
@@ -2274,17 +2277,26 @@ static bool TryLeafGetProbes(JSObject* robj, uint32_t atomId, uint32_t cacheIdx,
     }
     if (ok) {
       if (g.slotEnc == UINT32_MAX) {
-        WriteNightOut(top, JS::UndefinedValue().asRawBits());
+        *out = JS::UndefinedValue();
         return true;
       }
       js::NativeObject* holder =
           LinMem<js::NativeObject>(g.protoPtr[g.nHops - 1]);
-      const JS::Value& v = SlotEncRead(holder, g.slotEnc);
-      WriteNightOut(top, v.asRawBits());
+      *out = SlotEncRead(holder, g.slotEnc);
       return true;
     }
   }
   return false;
+}
+
+static bool TryLeafGetProbes(JSObject* robj, uint32_t atomId, uint32_t cacheIdx,
+                             uint32_t top) {
+  JS::Value v;
+  if (!TryLeafGetProbesV(robj, atomId, cacheIdx, &v)) {
+    return false;
+  }
+  WriteNightOut(top, v.asRawBits());
+  return true;
 }
 
 // The property-IC miss result bitset (see NightRuntime.h). CLEAN is the
@@ -2334,6 +2346,183 @@ static bool PristineGetterIs(JSObject* obj, JS::HandleId id,
   }
 }
 
+// The `length`/`byteLength` reads the IC cannot cache, as the pure reads
+// they are: a string value's, an array's (a custom data property), an
+// unmodified arguments object's (reified on demand), and the typed-array
+// and array-buffer prototype getters while still the engine's own. Leaf.
+static bool PureLengthRead(JSContext* cx, JS::Value rv, JS::HandleId id,
+                           JS::Value* out) {
+  const bool wantLength = id == js::NameToId(cx->names().length);
+  const bool wantByteLength = id == js::NameToId(cx->names().byteLength);
+  if (!wantLength && !wantByteLength) {
+    return false;
+  }
+  if (rv.isString() && wantLength) {
+    *out = JS::Int32Value(int32_t(rv.toString()->length()));
+    return true;
+  }
+  if (!rv.isObject()) {
+    return false;
+  }
+  JSObject* ro = &rv.toObject();
+  uint64_t len = 0;
+  bool have = false;
+  if (wantLength && ro->is<js::ArrayObject>()) {
+    len = ro->as<js::ArrayObject>().length();
+    have = true;
+  } else if (wantLength && ro->is<js::ArgumentsObject>() &&
+             !ro->as<js::ArgumentsObject>().hasOverriddenLength()) {
+    len = ro->as<js::ArgumentsObject>().initialLength();
+    have = true;
+  } else if (ro->is<js::TypedArrayObject>()) {
+    auto* ta = &ro->as<js::TypedArrayObject>();
+    if (wantLength &&
+        PristineGetterIs(ro, id, js::jit::InlinableNative::TypedArrayLength)) {
+      len = ta->length().valueOr(0);
+      have = true;
+    } else if (wantByteLength &&
+               PristineGetterIs(
+                   ro, id, js::jit::InlinableNative::TypedArrayByteLength)) {
+      len = ta->byteLength().valueOr(0);
+      have = true;
+    }
+  } else if (wantByteLength && ro->is<js::ArrayBufferObject>() &&
+             PristineGetterIs(ro, id,
+                              js::jit::InlinableNative::ArrayBufferByteLength)) {
+    len = ro->as<js::ArrayBufferObject>().byteLength();
+    have = true;
+  }
+  if (!have) {
+    return false;
+  }
+  *out = len <= uint64_t(INT32_MAX) ? JS::Int32Value(int32_t(len))
+                                    : JS::DoubleValue(double(len));
+  return true;
+}
+
+// Fill the site's inline ways and the mega table (or the guarded-chain
+// table) for `id` on native `obj`, where it resolves to a plain data slot
+// (or a proven absence). Leaf. False where neither populate applies.
+static bool PopulateGetCaches(JSContext* cx, JSObject* obj, jsid id,
+                              uint32_t atomId, uint32_t cacheIdx) {
+  uint32_t recvShape, holderPtr, holderShape, slotEnc;
+  if (js::night::NightPopulateInlineGetIC(cx, obj, id, &recvShape, &holderPtr,
+                                          &holderShape, &slotEnc)) {
+    NoteGetWay(cacheIdx, recvShape, holderPtr, holderShape, slotEnc);
+    // Fill the linmem mega entry unconditionally (direct-mapped overwrite).
+    MegaGetEntry& e = *MegaGet(recvShape, atomId);
+    e.atomId = atomId;
+    e.holderPtr = holderPtr;
+    e.holderShape = holderShape;
+    e.slotEnc = slotEnc;
+    e.pad = 0;
+    e.shape = recvShape;
+    return true;
+  }
+  if (!obj->is<js::NativeObject>()) {
+    return false;
+  }
+  // Guarded-chain populate: the plain coordinate was refused (invalidated
+  // teleporting / deep chain) -- record the per-hop guarded chain.
+  uint32_t nHops = 0;
+  uint32_t gSlotEnc = 0;
+  uint32_t pp[kGChainMaxHops];
+  uint32_t ps[kGChainMaxHops];
+  if (!js::night::NightPopulateGuardedChain(cx, obj, id, kGChainMaxHops, &nHops,
+                                            pp, ps, &gSlotEnc)) {
+    return false;
+  }
+  uint32_t shape = js::night::NightObjectShape(obj);
+  GChainEntry& g = *GChainSlot(shape, atomId);
+  g.atomId = atomId;
+  g.nHops = nHops;
+  g.slotEnc = gSlotEnc;
+  for (uint32_t h = 0; h < kGChainMaxHops; h++) {
+    g.protoPtr[h] = h < nHops ? pp[h] : 0;
+    g.protoShape[h] = h < nHops ? ps[h] : 0;
+  }
+  g.shape = shape;  // validity marker last
+  return true;
+}
+
+uint64_t night_runtime_get_prop_pure(JSContext* cx, uint64_t recv,
+                                     uint32_t atomId, uint32_t cacheIdx) {
+  JS::AutoCheckCannotGC nogc;
+  const uint64_t fail = JS::MagicValue(JS_GENERIC_MAGIC).asRawBits();
+  JS::HandleId id = AtomIdChecked(atomId);
+  if (!id.isAtom()) {
+    return fail;
+  }
+  JS::Value rv = JS::Value::fromRawBits(recv);
+  JS::Value out;
+  if (PureLengthRead(cx, rv, id, &out)) {
+    return out.asRawBits();
+  }
+  JSObject* obj;
+  if (rv.isObject()) {
+    obj = &rv.toObject();
+    if (TryLeafGetProbesV(obj, atomId, cacheIdx, &out)) {
+      return out.asRawBits();
+    }
+  } else {
+    // A primitive's own properties are its length and indices (a string
+    // wrapper's), which the arms above and the atom check rule out: the
+    // lookup starts at its prototype. No wrapper, so no populate (the
+    // ways key on receiver shapes).
+    JSProtoKey key = rv.isString()    ? JSProto_String
+                     : rv.isNumber()  ? JSProto_Number
+                     : rv.isBoolean() ? JSProto_Boolean
+                     : rv.isSymbol()  ? JSProto_Symbol
+                     : rv.isBigInt()  ? JSProto_BigInt
+                                      : JSProto_Null;
+    if (key == JSProto_Null) {
+      return fail;
+    }
+    obj = cx->global()->maybeGetPrototype(key);
+    if (!obj) {
+      return fail;
+    }
+  }
+  if (!js::GetPropertyPure(cx, obj, id, &out)) {
+    return fail;
+  }
+  if (rv.isObject()) {
+    PopulateGetCaches(cx, obj, id, atomId, cacheIdx);
+  }
+  return out.asRawBits();
+}
+
+int32_t night_runtime_to_primitive_pure(JSContext* cx, uint64_t bits) {
+  JS::AutoCheckCannotGC nogc;
+  JS::Value v = JS::Value::fromRawBits(bits);
+  if (!v.isObject()) {
+    return 1;
+  }
+  JSObject* obj = &v.toObject();
+  // Object.prototype's own conversion, found by pure lookups: no
+  // @@toPrimitive, `valueOf` the self-hosted Object_valueOf (ToObject),
+  // `toString` the native obj_toString, whose @@toStringTag read finds a
+  // data property or nothing.
+  if (!js::HasNoToPrimitiveMethodPure(obj, cx)) {
+    return 0;
+  }
+  JS::Value f;
+  if (!js::GetPropertyPure(cx, obj, js::NameToId(cx->names().valueOf), &f) ||
+      !js::IsSelfHostedFunctionWithName(f, cx->names().Object_valueOf)) {
+    return 0;
+  }
+  if (!js::GetPropertyPure(cx, obj, js::NameToId(cx->names().toString), &f) ||
+      !js::IsNativeFunction(f, js::obj_toString)) {
+    return 0;
+  }
+  JS::Value tag;
+  return js::GetPropertyPure(
+             cx, obj,
+             JS::PropertyKey::Symbol(cx->wellKnownSymbols().toStringTag), &tag)
+             ? 1
+             : 0;
+}
+
 // The "no GC, no stamp moved" proof for an IC-miss path that ran the
 // engine's generic operation: the two counters are what a getter/setter
 // that ran user code, or a resolve hook that allocated, would have moved.
@@ -2360,61 +2549,11 @@ uint32_t night_runtime_get_prop_ic_miss(JSContext* cx, uint32_t top,
                                         uint32_t cacheIdx) {
   SetNightTop(cx, top);
   JS::HandleId id = AtomIdChecked(atomId);
-  // Fast arms for `length` reads the IC cannot cache: string values (skip
-  // the receiver boxing entirely), arrays (custom data prop), and unmodified
-  // arguments objects (reified on demand).
   {
-    JS::Value rv = JS::Value::fromRawBits(recv);
-    const bool wantLength = id == js::NameToId(cx->names().length);
-    const bool wantByteLength = id == js::NameToId(cx->names().byteLength);
-    if (wantLength || wantByteLength) {
-      if (rv.isString() && wantLength) {
-        WriteNightOut(
-            top, JS::Int32Value(int32_t(rv.toString()->length())).asRawBits());
-        return kMissClean;
-      }
-      if (rv.isObject()) {
-        JSObject* ro = &rv.toObject();
-        uint64_t len = 0;
-        bool have = false;
-        if (wantLength && ro->is<js::ArrayObject>()) {
-          len = ro->as<js::ArrayObject>().length();
-          have = true;
-        } else if (wantLength && ro->is<js::ArgumentsObject>() &&
-                   !ro->as<js::ArgumentsObject>().hasOverriddenLength()) {
-          len = ro->as<js::ArgumentsObject>().initialLength();
-          have = true;
-        } else if (ro->is<js::TypedArrayObject>()) {
-          // The prototype getters (accessors, so the IC never caches them),
-          // served as the pure reads they are while still the engine's own.
-          auto* ta = &ro->as<js::TypedArrayObject>();
-          if (wantLength &&
-              PristineGetterIs(ro, id,
-                               js::jit::InlinableNative::TypedArrayLength)) {
-            len = ta->length().valueOr(0);
-            have = true;
-          } else if (wantByteLength &&
-                     PristineGetterIs(
-                         ro, id,
-                         js::jit::InlinableNative::TypedArrayByteLength)) {
-            len = ta->byteLength().valueOr(0);
-            have = true;
-          }
-        } else if (wantByteLength && ro->is<js::ArrayBufferObject>() &&
-                   PristineGetterIs(
-                       ro, id,
-                       js::jit::InlinableNative::ArrayBufferByteLength)) {
-          len = ro->as<js::ArrayBufferObject>().byteLength();
-          have = true;
-        }
-        if (have) {
-          JS::Value out = len <= uint64_t(INT32_MAX)
-                              ? JS::Int32Value(int32_t(len))
-                              : JS::DoubleValue(double(len));
-          WriteNightOut(top, out.asRawBits());
-          return kMissClean;
-        }
-      }
+    JS::Value out;
+    if (PureLengthRead(cx, JS::Value::fromRawBits(recv), id, &out)) {
+      WriteNightOut(top, out.asRawBits());
+      return kMissClean;
     }
   }
   // The mega and guarded-chain probes hoisted ABOVE the receiver rooting: both
@@ -2459,55 +2598,19 @@ uint32_t night_runtime_get_prop_ic_miss(JSContext* cx, uint32_t top,
   }
   // The populate paths' clean proof: a plain data slot on a native holder
   // (populate succeeds only for those) and the counters unmoved.
-  uint32_t recvShape, holderPtr, holderShape, slotEnc;
-  if (js::night::NightPopulateInlineGetIC(cx, obj, id, &recvShape, &holderPtr,
-                                          &holderShape, &slotEnc)) {
-    const bool clean = quiet.still(cx);
-    NoteGetWay(cacheIdx, recvShape, holderPtr, holderShape, slotEnc);
-    // Fill the linmem mega entry unconditionally (direct-mapped overwrite).
-    MegaGetEntry& e = *MegaGet(recvShape, atomId);
-    e.atomId = atomId;
-    e.holderPtr = holderPtr;
-    e.holderShape = holderShape;
-    e.slotEnc = slotEnc;
-    e.pad = 0;
-    e.shape = recvShape;
-    if (clean) {
+  if (PopulateGetCaches(cx, obj, id, atomId, cacheIdx)) {
+    if (quiet.still(cx)) {
       WriteNightOut(top, res.asRawBits());
       return kMissClean;
     }
-  } else if (obj->is<js::NativeObject>()) {
-    // Guarded-chain populate: the plain coordinate was refused (invalidated
-    // teleporting / deep chain) -- record the per-hop guarded chain.
-    uint32_t nHops = 0;
-    uint32_t gSlotEnc = 0;
-    uint32_t pp[kGChainMaxHops];
-    uint32_t ps[kGChainMaxHops];
-    if (js::night::NightPopulateGuardedChain(cx, obj, id, kGChainMaxHops,
-                                             &nHops, pp, ps, &gSlotEnc)) {
-      uint32_t shape = js::night::NightObjectShape(obj);
-      GChainEntry& g = *GChainSlot(shape, atomId);
-      g.atomId = atomId;
-      g.nHops = nHops;
-      g.slotEnc = gSlotEnc;
-      for (uint32_t h = 0; h < kGChainMaxHops; h++) {
-        g.protoPtr[h] = h < nHops ? pp[h] : 0;
-        g.protoShape[h] = h < nHops ? ps[h] : 0;
-      }
-      g.shape = shape;  // validity marker last
-      if (quiet.still(cx)) {
-        WriteNightOut(top, res.asRawBits());
-        return kMissClean;
-      }
-    } else if (gEnv.accessorCachePtr) {
-      // BOTH slot populates refused: likely a proto-chain GETTER --
-      // prime the accessor-call cache for the compiled accessor arm.
-      uint64_t callee;
-      uint32_t rs, hp, hs;
-      if (js::night::NightPrimeAccessor(cx, obj, id, /*wantSetter=*/false,
-                                        &callee, &rs, &hp, &hs)) {
-        WriteAccessorEntry(rs, atomId, /*kind=*/0, callee, hp, hs);
-      }
+  } else if (obj->is<js::NativeObject>() && gEnv.accessorCachePtr) {
+    // BOTH slot populates refused: likely a proto-chain GETTER --
+    // prime the accessor-call cache for the compiled accessor arm.
+    uint64_t callee;
+    uint32_t rs, hp, hs;
+    if (js::night::NightPrimeAccessor(cx, obj, id, /*wantSetter=*/false,
+                                      &callee, &rs, &hp, &hs)) {
+      WriteAccessorEntry(rs, atomId, /*kind=*/0, callee, hp, hs);
     }
   }
   WriteNightOut(top, res.get().asRawBits());
@@ -2551,6 +2654,274 @@ uint32_t night_runtime_set_prop_ic_miss(JSContext* cx, uint32_t top,
 }
 
 
+// Whether a set of `id` on `obj` runs no code and calls back into nothing:
+// a native object (not the global, not a typed array, no Watchtower
+// watch: a prototype, a fuse's holder) with `id` an own writable data
+// property (or a writable array length); or extensible, with no hook that could resolve or observe the
+// add, and `id` on no prototype but as a writable data property of an
+// ordinary native object (`PlainStore`, beyond plain objects).
+static bool NoCodeStore(JSContext* cx, JSObject* obj, JS::HandleId id) {
+  if (!obj->is<js::NativeObject>() || obj->is<js::GlobalObject>() ||
+      obj->is<js::TypedArrayObject>() || obj->getOpsSetProperty() ||
+      obj->getOpsLookupProperty()) {
+    return false;
+  }
+  js::NativeObject* nobj = &obj->as<js::NativeObject>();
+  if (js::Watchtower::watchesPropertyAdd(nobj) ||
+      js::Watchtower::watchesPropertyValueChange(nobj)) {
+    return false;
+  }
+  mozilla::Maybe<js::PropertyInfo> prop = nobj->lookupPure(id);
+  if (prop.isSome()) {
+    // An array's length (a custom data property): a truncation or an
+    // extension, which runs no code, and succeeds where every element is
+    // a configurable dense one (not sealed, nothing sparse).
+    if (nobj->is<js::ArrayObject>() && id == js::NameToId(cx->names().length)) {
+      return nobj->as<js::ArrayObject>().lengthIsWritable() &&
+             !nobj->denseElementsAreSealed() && !nobj->isIndexed();
+    }
+    return prop->isDataProperty() && prop->writable();
+  }
+  // An array's addProperty hook is the engine's own length bookkeeping.
+  if (!nobj->isExtensible() ||
+      (nobj->getClass()->getAddProperty() && !nobj->is<js::ArrayObject>()) ||
+      js::ClassMayResolveId(cx->names(), nobj->getClass(), id, nobj)) {
+    return false;
+  }
+  for (JSObject* p = nobj->staticPrototype(); p; p = p->staticPrototype()) {
+    if (!p->is<js::NativeObject>() || p->getOpsLookupProperty() ||
+        js::ClassMayResolveId(cx->names(), p->getClass(), id, p)) {
+      return false;
+    }
+    mozilla::Maybe<js::PropertyInfo> pp =
+        p->as<js::NativeObject>().lookupPure(id);
+    if (pp.isSome()) {
+      return pp->isDataProperty() && pp->writable();
+    }
+  }
+  return true;
+}
+
+uint32_t night_runtime_get_elem_pure(JSContext* cx, uint32_t top,
+                                     uint64_t recv, uint64_t key) {
+  SetNightTop(cx, top);
+  JS::RootedValue rv(cx, JS::Value::fromRawBits(recv));
+  JS::RootedValue kv(cx, JS::Value::fromRawBits(key));
+  // An object key's ToPropertyKey may call user code; null and undefined
+  // throw.
+  if (kv.isObject() || rv.isNullOrUndefined()) {
+    return 0;
+  }
+  JS::RootedId id(cx);
+  if (!js::ToPropertyKey(cx, kv, &id)) {
+    return 2;
+  }
+  if (rv.isString()) {
+    JS::RootedString str(cx, rv.toString());
+    if (id.isInt() && uint32_t(id.toInt()) < str->length()) {
+      // Flattened, as the engine's element read does: a rope built by
+      // `+=` then serves the inline char arm instead of being walked here
+      // on every read.
+      JSLinearString* linear = str->ensureLinear(cx);
+      if (!linear) {
+        return 2;
+      }
+      JSString* c =
+          cx->staticStrings().getUnitStringForElement(cx, linear, id.toInt());
+      if (!c) {
+        return 2;
+      }
+      WriteNightOut(top, JS::StringValue(c).asRawBits());
+      return 1;
+    }
+    if (id == js::NameToId(cx->names().length)) {
+      WriteNightOut(top, JS::Int32Value(int32_t(str->length())).asRawBits());
+      return 1;
+    }
+    if (id.isInt()) {
+      // Out of range: String.prototype is the empty String object, whose
+      // resolve hook (which the pure lookup refuses for any index)
+      // defines none; past it, Object.prototype and up.
+      JS::AutoCheckCannotGC nogc;
+      JSObject* sp = cx->global()->maybeGetPrototype(JSProto_String);
+      if (!sp || !sp->is<js::NativeObject>() ||
+          sp->as<js::NativeObject>().lookupPure(id).isSome() ||
+          sp->as<js::NativeObject>().getDenseInitializedLength() != 0) {
+        return 0;
+      }
+      JS::Value v = JS::UndefinedValue();
+      JSObject* op = sp->staticPrototype();
+      if (op && !js::GetPropertyPure(cx, op, id, &v)) {
+        return 0;
+      }
+      WriteNightOut(top, v.asRawBits());
+      return 1;
+    }
+  }
+  JS::AutoCheckCannotGC nogc;
+  JSObject* obj;
+  if (rv.isObject()) {
+    obj = &rv.toObject();
+    if (obj->is<js::ArgumentsObject>() && id.isInt()) {
+      JS::Value v = JS::UndefinedValue();
+      JS::MutableHandleValue mv = JS::MutableHandleValue::fromMarkedLocation(&v);
+      if (!obj->as<js::ArgumentsObject>().maybeGetElement(id.toInt(), mv)) {
+        return 0;
+      }
+      WriteNightOut(top, v.asRawBits());
+      return 1;
+    }
+  } else {
+    // As `night_runtime_get_prop_pure`: a primitive's own properties are
+    // a string's length and chars, taken above.
+    JSProtoKey pk = rv.isString()    ? JSProto_String
+                    : rv.isNumber()  ? JSProto_Number
+                    : rv.isBoolean() ? JSProto_Boolean
+                    : rv.isSymbol()  ? JSProto_Symbol
+                    : rv.isBigInt()  ? JSProto_BigInt
+                                     : JSProto_Null;
+    if (pk == JSProto_Null) {
+      return 0;
+    }
+    obj = cx->global()->maybeGetPrototype(pk);
+    if (!obj) {
+      return 0;
+    }
+  }
+  JS::Value v;
+  if (!js::GetPropertyPure(cx, obj, id, &v)) {
+    return 0;
+  }
+  WriteNightOut(top, v.asRawBits());
+  return 1;
+}
+
+uint32_t night_runtime_set_elem_pure(JSContext* cx, uint32_t top,
+                                     uint64_t recv, uint64_t key,
+                                     uint64_t val) {
+  SetNightTop(cx, top);
+  JS::Value rv = JS::Value::fromRawBits(recv);
+  JS::Value kv = JS::Value::fromRawBits(key);
+  JS::Value v = JS::Value::fromRawBits(val);
+  // An element by an int32 key (no conversion), of a native object the
+  // engine calls back into nothing for (not the global, an arguments
+  // object, a prototype or a fuse's holder).
+  if (!rv.isObject() || !kv.isInt32() || kv.toInt32() < 0 ||
+      !rv.toObject().is<js::NativeObject>()) {
+    return 0;
+  }
+  js::NativeObject* nobj = &rv.toObject().as<js::NativeObject>();
+  JS::PropertyKey id = JS::PropertyKey::Int(kv.toInt32());
+  if (nobj->is<js::GlobalObject>() || nobj->is<js::ArgumentsObject>() ||
+      nobj->getOpsSetProperty() || nobj->getOpsLookupProperty() ||
+      js::Watchtower::watchesPropertyAdd(nobj) ||
+      js::Watchtower::watchesPropertyValueChange(nobj)) {
+    return 0;
+  }
+  if (nobj->is<js::TypedArrayObject>()) {
+    // A number to a number array (an out-of-range index is ignored).
+    if (!v.isNumber() ||
+        js::Scalar::isBigIntType(nobj->as<js::TypedArrayObject>().type())) {
+      return 0;
+    }
+  } else {
+    js::PropertyResult prop;
+    if (!js::LookupOwnPropertyPure(cx, nobj, id, &prop)) {
+      return 0;
+    }
+    if (prop.isDenseElement()) {
+      if (nobj->denseElementsAreFrozen()) {
+        return 0;
+      }
+    } else if (prop.isNativeProperty()) {
+      if (!prop.propertyInfo().isDataProperty() ||
+          !prop.propertyInfo().writable()) {
+        return 0;
+      }
+    } else if (prop.isFound()) {
+      return 0;
+    } else {
+      // An add: nothing on the chain to run or refuse it (an array's
+      // addProperty hook is the engine's own length bookkeeping).
+      if (!nobj->isExtensible() ||
+          (nobj->getClass()->getAddProperty() && !nobj->is<js::ArrayObject>())) {
+        return 0;
+      }
+      if (nobj->is<js::ArrayObject>() &&
+          uint32_t(kv.toInt32()) >= nobj->as<js::ArrayObject>().length() &&
+          !nobj->as<js::ArrayObject>().lengthIsWritable()) {
+        return 0;
+      }
+      if (JSObject* proto = nobj->staticPrototype()) {
+        js::NativeObject* holder;
+        js::PropertyResult pp;
+        if (!js::LookupPropertyPure(cx, proto, id, &holder, &pp)) {
+          return 0;
+        }
+        if (pp.isFound() &&
+            !(pp.isDenseElement() ||
+              (pp.isNativeProperty() && pp.propertyInfo().isDataProperty() &&
+               pp.propertyInfo().writable()))) {
+          return 0;
+        }
+      }
+    }
+  }
+  uint32_t before = nobj->externalWord();
+  JS::RootedObject obj(cx, nobj);
+  JS::RootedValue rval(cx, v);
+  JS::RootedValue receiver(cx, rv);
+  JS::RootedId rid(cx, id);
+  JS::ObjectOpResult result;
+  if (!js::SetProperty(cx, obj, rid, rval, receiver, result)) {
+    return 3;
+  }
+  if (!result.ok()) {
+    // Nothing the checks above let through refuses; be exact anyway.
+    return 0;
+  }
+  uint32_t w = obj->externalWord();
+  constexpr uint32_t claims = js::night::kWordTypes | js::night::kWordSlots;
+  bool demoted = !(before & js::night::kWordConstructing) &&
+                 (((before & claims) & ~w) != 0 ||
+                  ((before & 0xFFFF) != 0 && (w & 0xFFFF) == 0));
+  return demoted ? 2 : 1;
+}
+
+uint32_t night_runtime_set_prop_pure(JSContext* cx, uint32_t top,
+                                     uint64_t recv, uint32_t atomId,
+                                     uint64_t val, uint32_t cacheIdx) {
+  JS::Value rv = JS::Value::fromRawBits(recv);
+  if (!rv.isObject()) {
+    return 0;
+  }
+  JSObject* obj = &rv.toObject();
+  JS::HandleId id = AtomIdChecked(atomId);
+  if (!id.isAtom() || !NoCodeStore(cx, obj, id)) {
+    return 0;
+  }
+  // The claims MIR reads of the object's published class: TYPES (kept
+  // for a conforming value, the vouched store) and SLOTS (an add off the
+  // class's slots drops it), and the class itself. RANGES, which no MIR
+  // claim reads, drops as on every engine store; a word under
+  // construction backs no fact past a generic op (the builder demotes
+  // its `Ctor` slots).
+  JS::Value v = JS::Value::fromRawBits(val);
+  uint32_t before = obj->externalWord();
+  bool vouched = NightStoreConforms(obj, atomId, v);
+  JS::RootedObject robj(cx, obj);
+  uint32_t r = SetPropIcMiss(cx, top, recv, atomId, val, cacheIdx,
+                             /*strict=*/false, vouched);
+  if (r == kMissErr) {
+    return 3;
+  }
+  uint32_t w = robj->externalWord();
+  constexpr uint32_t claims = js::night::kWordTypes | js::night::kWordSlots;
+  bool demoted = !(before & js::night::kWordConstructing) &&
+                 (((before & claims) & ~w) != 0 ||
+                  ((before & 0xFFFF) != 0 && (w & 0xFFFF) == 0));
+  return demoted ? 2 : 1;
+}
 
 static uint32_t SetPropIcMiss(JSContext* cx, uint32_t top, uint64_t recv,
                               uint32_t atomId, uint64_t val, uint32_t cacheIdx,

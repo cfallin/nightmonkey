@@ -16,7 +16,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use crate::mir::entity::{Block, Inst, Value};
 use crate::mir::func::{Edge, EdgeArg, Func, ValueDef};
 use crate::mir::module::Module;
-use crate::mir::ops::{effects, signature, ArithOp, KillSite, Opcode, SuccRole};
+use crate::mir::ops::{effects, signature, ArithOp, Effects, KillSite, Opcode, SuccRole};
 use crate::mir::types::{is_subtype, Type};
 
 /// A guard's identity: its op (with its static params) and its operand.
@@ -547,7 +547,8 @@ pub fn optimize(m: &Module, f: &mut Func) -> usize {
             + fold_ints(m, f)
             + if GVN { gvn(m, f) } else { 0 }
             + if LICM { licm(m, f) } else { 0 }
-            + if HOIST_GUARDS { hoist_guards(m, f) } else { 0 };
+            + if HOIST_GUARDS { hoist_guards(m, f) } else { 0 }
+            + if HOIST_READS { hoist_reads(m, f) } else { 0 };
         forward_params(m, f);
         let threaded = if THREAD_JUMPS { thread_jumps(f) } else { 0 };
         total += n;
@@ -1806,4 +1807,312 @@ pub fn hoist_guards(m: &Module, f: &mut Func) -> usize {
         return moved;
     }
     moved
+}
+
+/// Hoist read diamonds out of loops (MIR-MEMORY.md §2, KICKOFF-8 item 1).
+const HOIST_READS: bool = true;
+
+/// Hoist a loop's invariant read *diamonds*: a single-entry region whose
+/// entry is a guard (or `getprop.data`) on values from before the loop,
+/// made only of guards, `getprop.data` and quiet reads of nothing the loop
+/// writes, which rejoins at one block. The typed read of a predicted
+/// layout with its by-name fallback (`guard.layout` -> `load_slot` |
+/// `getprop.data` -> join) is one: no single op of it can move (the guard
+/// does not exit, so `hoist_guards` leaves it), but the whole computes one
+/// invariant value. The region moves to the preheader, its exits (a
+/// `getprop.data` that would run code, a guard with an exiting failure)
+/// become the loop's entry exit as `hoist_guards`' do, and the loop's
+/// entry to it jumps to the join with the hoisted values. A failure there
+/// is an exit the loop might not have taken (it may not have read the
+/// field at all), which is sound: baseline runs the loop. Returns how many
+/// regions moved; one loop per call, since the CFG changes.
+pub fn hoist_reads(m: &Module, f: &mut Func) -> usize {
+    let cfg = Cfg::new(f);
+    let mut preds: BTreeMap<Block, Vec<Block>> = BTreeMap::new();
+    for &b in &f.layout {
+        for s in f.succs(b) {
+            preds.entry(s).or_default().push(b);
+        }
+    }
+    let mut inst_block = BTreeMap::new();
+    for &b in &f.layout {
+        for &i in &f.blocks[b].insts {
+            inst_block.insert(i, b);
+        }
+    }
+    let quiet = |fx: &Effects| {
+        fx.writes.is_empty()
+            && !fx.may_gc
+            && !fx.may_throw
+            && !fx.may_run_js
+            && fx.kill.is_empty()
+            && matches!(fx.flags, crate::mir::ops::FlagsEffect::Bits(b) if b == crate::mir::ops::FlagBits::NONE)
+    };
+    for li in 0..f.loops.len() {
+        let l = f.loops[li].clone();
+        let Some(entry) = l.entry.clone() else { continue };
+        let (h, p0) = (l.header, l.preheader);
+        let Some(pt) = f.terminator(p0) else { continue };
+        if f.insts[pt].op != Opcode::Jump || f.succs(p0) != vec![h] || f.inst_frame[pt] != 0 {
+            continue;
+        }
+        let params = if entry.state.is_empty() {
+            f.blocks[p0].params.clone()
+        } else {
+            entry.state.clone()
+        };
+        if entry.slots.iter().filter(|&&x| x).count() != params.len() || f.frame.exit_arity(entry.pc) != Some(entry.slots.len()) {
+            continue;
+        }
+        let mut body: BTreeSet<Block> = BTreeSet::new();
+        body.insert(h);
+        let latches: Vec<Block> = preds
+            .get(&h)
+            .map(|ps| ps.iter().copied().filter(|&q| cfg.dominates(h, q)).collect())
+            .unwrap_or_default();
+        let mut work = latches.clone();
+        while let Some(b) = work.pop() {
+            if body.insert(b) {
+                work.extend(preds.get(&b).into_iter().flatten().copied().filter(|&q| cfg.reachable(q)));
+            }
+        }
+        if latches.is_empty() || body.contains(&p0) || !body.iter().all(|&b| cfg.dominates(p0, b)) {
+            continue;
+        }
+        // What the loop writes and kills, on edges that stay in it.
+        let mut writes = vec![];
+        let mut kills = vec![];
+        for &b in &body {
+            for &i in &f.blocks[b].insts {
+                let d = &f.insts[i];
+                let tys: Vec<Type> = d.args.iter().map(|&v| f.values[v].ty).collect();
+                let fx = effects(&d.op, &tys, m);
+                if d.succs.is_empty() {
+                    writes.extend(crate::mir::mem::writes_on(f, m, i, &fx, None));
+                }
+                for (role, e) in f.succ_edges(i) {
+                    if body.contains(&e.block) {
+                        writes.extend(crate::mir::mem::writes_on(f, m, i, &fx, Some(role)));
+                    }
+                }
+                if !fx.kill.is_empty() {
+                    kills.push(fx.kill);
+                }
+            }
+        }
+        let outside = |v: Value| def_block(f, v, &inst_block).is_some_and(|b| !body.contains(&b));
+        // A value from before the loop up to representation: a chain of
+        // `box`/`weaken`/`unbox` in the loop (which `licm` leaves) over
+        // one, which moves with the region. The chain's insts, defs first.
+        let chain = |v: Value| -> Option<Vec<Inst>> {
+            let mut out = vec![];
+            let mut work = vec![(v, 0usize)];
+            while let Some((v, depth)) = work.pop() {
+                if outside(v) {
+                    continue;
+                }
+                let ValueDef::Result(i, 0) = f.values[v].def else { return None };
+                let d = &f.insts[i];
+                if depth > 8 || f.inst_frame[i] != 0 || !matches!(d.op, Opcode::Box | Opcode::Weaken | Opcode::Unbox(_)) {
+                    return None;
+                }
+                if !out.contains(&i) {
+                    out.push(i);
+                }
+                work.extend(d.args.iter().map(|&a| (a, depth + 1)));
+            }
+            out.reverse();
+            Some(out)
+        };
+        // An exit block a region's failure may go to: outside the loop,
+        // no params, ending in an exit.
+        let exit_block = |b: Block| {
+            !body.contains(&b)
+                && f.blocks[b].params.is_empty()
+                && f.terminator(b).is_some_and(|t| matches!(f.insts[t].op, Opcode::Exit { .. }))
+        };
+        // The ops a region may hold, with an operand rule checked later.
+        let movable = |i: Inst| -> bool {
+            let d = &f.insts[i];
+            if f.inst_frame[i] != 0 {
+                return false;
+            }
+            let tys: Vec<Type> = d.args.iter().map(|&v| f.values[v].ty).collect();
+            match d.op {
+                Opcode::Jump | Opcode::GetPropData(_) => {}
+                ref op if hoistable_guard(op) && !matches!(op, Opcode::CheckFuse(_) | Opcode::CheckBinding(..)) => {}
+                ref op if !op.is_terminator() => {
+                    if matches!(op, Opcode::FrameStore(_)) {
+                        return false;
+                    }
+                }
+                _ => return false,
+            }
+            let fx = effects(&d.op, &tys, m);
+            quiet(&fx) && !fx.reads.iter().any(|r| writes.iter().any(|w| w.overlaps(r)))
+        };
+        for &e in cfg.rpo.iter().filter(|b| body.contains(b)) {
+            let Some(t) = f.terminator(e) else { continue };
+            let d = &f.insts[t];
+            let starts = matches!(d.op, Opcode::GetPropData(_))
+                || hoistable_guard(&d.op) && !matches!(d.op, Opcode::CheckFuse(_) | Opcode::CheckBinding(..));
+            if !starts || !movable(t) {
+                continue;
+            }
+            let Some(mut lift) = d.args.iter().map(|&a| chain(a)).collect::<Option<Vec<_>>>().map(|c| c.concat()) else {
+                continue;
+            };
+            // Every iteration passes it (as `hoist_guards` asks): a read
+            // under a condition (`if (o) s += o.t`) may be one whose
+            // receiver fails it on every entry.
+            let mut seen = BTreeSet::new();
+            let mut work = vec![h];
+            while let Some(b) = work.pop() {
+                if b == e || !body.contains(&b) || !seen.insert(b) {
+                    continue;
+                }
+                work.extend(f.succs(b));
+            }
+            if latches.iter().any(|q| seen.contains(q)) {
+                continue;
+            }
+            // The join: the nearest block every path from the entry back
+            // to the header passes (paths into exits leave the loop). The
+            // region: what the entry reaches before it.
+            let reach_avoiding = |x: Option<Block>| -> (BTreeSet<Block>, bool) {
+                let mut seen = BTreeSet::new();
+                let mut back = false;
+                let mut work: Vec<Block> = f.insts[t].succs.iter().map(|s| s.block).collect();
+                while let Some(b) = work.pop() {
+                    if Some(b) == x || !body.contains(&b) {
+                        continue;
+                    }
+                    if b == h || b == e {
+                        back = true;
+                        continue;
+                    }
+                    if seen.insert(b) {
+                        if seen.len() > 64 {
+                            return (seen, true);
+                        }
+                        work.extend(f.succs(b));
+                    }
+                }
+                (seen, back)
+            };
+            let (all, _) = reach_avoiding(None);
+            let mut order: Vec<Block> = cfg.rpo.iter().copied().filter(|b| all.contains(b)).collect();
+            order.truncate(16);
+            let Some((join, region)) = order.into_iter().find_map(|x| {
+                let (r, back) = reach_avoiding(Some(x));
+                (!back).then_some((x, r))
+            }) else {
+                continue;
+            };
+            if !region.iter().all(|&b| f.blocks[b].insts.iter().all(|&i| movable(i))) {
+                continue;
+            }
+            // Its edges go to itself, the join, or exits.
+            let ok = std::iter::once(t).chain(region.iter().filter_map(|&b| f.terminator(b))).all(|i| {
+                f.insts[i]
+                    .succs
+                    .iter()
+                    .all(|s| region.contains(&s.block) || s.block == join || exit_block(s.block) && s.args.is_empty())
+            });
+            // Entered only from the entry and itself.
+            let single = region.iter().all(|b| {
+                preds
+                    .get(b)
+                    .into_iter()
+                    .flatten()
+                    .filter(|&&q| cfg.reachable(q))
+                    .all(|q| *q == e || region.contains(q))
+            });
+            if !ok || !single || region.iter().any(|&b| f.terminator(b).is_none()) {
+                continue;
+            }
+            // Its operands are from before the loop or its own; its
+            // values reach the rest of the loop only as the join's params,
+            // which no kill in the loop may end.
+            let own = |v: Value| def_block(f, v, &inst_block).is_some_and(|b| region.contains(&b));
+            let mut operands_ok = true;
+            for &i in region.iter().flat_map(|&b| f.blocks[b].insts.iter()) {
+                let d = &f.insts[i];
+                let vals = d.args.iter().copied().chain(d.succs.iter().flat_map(|s| s.args.iter()).filter_map(|a| match *a {
+                    EdgeArg::Value(v) => Some(v),
+                    _ => None,
+                }));
+                for v in vals {
+                    if own(v) {
+                        continue;
+                    }
+                    match chain(v) {
+                        Some(c) => lift.extend(c),
+                        None => operands_ok = false,
+                    }
+                }
+            }
+            let mut seen_lift = BTreeSet::new();
+            lift.retain(|&i| seen_lift.insert(i));
+            // What the lifted chain defines lives across the loop where
+            // the loop still uses it.
+            let lifted_tys: Vec<Type> = lift.iter().flat_map(|&i| f.insts[i].results.iter().map(|&v| f.values[v].ty)).collect();
+            let join_tys: Vec<Type> = f.blocks[join].params.iter().map(|&v| f.values[v].ty).collect();
+            if !operands_ok || join_tys.iter().chain(&lifted_tys).any(|ty| kills.iter().any(|k| k.matches(ty))) {
+                continue;
+            }
+            // Move it: the entry's op ends the preheader, the region's
+            // edges to the join go to a new preheader with its params, and
+            // its exits are the loop's entry exit.
+            let ex = f.add_block();
+            let (_, dead) = f.add_inst(ex, Opcode::ConstVal(crate::mir::ops::ConstVal::Dead), vec![], &[Type::VAL_TOP], vec![]);
+            let mut ps = params.iter();
+            let ops: Vec<Value> = entry.slots.iter().map(|&x| if x { *ps.next().unwrap() } else { dead[0] }).collect();
+            let exit = Opcode::Exit {
+                pc: entry.pc,
+                nargs: f.frame.formals,
+                nlocals: f.frame.locals,
+            };
+            f.add_inst(ex, exit, ops, &[], vec![]);
+            let p2 = f.add_block();
+            let hoisted: Vec<Value> = join_tys.iter().map(|&ty| f.add_param(p2, ty)).collect();
+            let jump = f.insts[pt].clone();
+            f.blocks[p0].insts.pop();
+            let (nj, _) = f.add_inst(p2, Opcode::Jump, vec![], &[], jump.succs.clone());
+            f.inst_frame[nj] = 0;
+            let retarget = |f: &mut Func, i: Inst| {
+                for s in f.insts[i].succs.iter_mut() {
+                    if s.block == join {
+                        s.block = p2;
+                    } else if !region.contains(&s.block) && s.args.is_empty() && !body.contains(&s.block) {
+                        s.block = ex;
+                    }
+                }
+            };
+            for &b in &region {
+                let rt = f.terminator(b).unwrap();
+                retarget(f, rt);
+            }
+            for &i in &lift {
+                let b = inst_block[&i];
+                f.blocks[b].insts.retain(|&x| x != i);
+                f.blocks[p0].insts.push(i);
+            }
+            let td = f.insts[t].clone();
+            f.blocks[e].insts.pop();
+            let (moved, _) = f.add_inst(p0, td.op, td.args.clone(), &[], td.succs.clone());
+            f.inst_frame[moved] = 0;
+            retarget(f, moved);
+            let frame = f.inst_frame[t];
+            let args = hoisted.iter().map(|&v| EdgeArg::Value(v)).collect();
+            let (ej, _) = f.add_inst(e, Opcode::Jump, vec![], &[], vec![Edge { block: join, args }]);
+            f.inst_frame[ej] = frame;
+            f.loops[li].preheader = p2;
+            if let Some(en) = f.loops[li].entry.as_mut() {
+                en.state = params.clone();
+            }
+            return 1;
+        }
+    }
+    0
 }

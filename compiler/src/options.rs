@@ -189,6 +189,10 @@ pub const MIR_EXIT_CENSUS_KIND: u32 = 90;
 pub const MIR_GUARD_CENSUS_KIND: u32 = 92;
 /// The census kind of MIR property-get IC misses (with `--mir-exit-census`).
 pub const MIR_GET_MISS_CENSUS_KIND: u32 = 91;
+/// The census kind of split ops' runtime-helper calls (`getprop.data`,
+/// `setprop.data`, `getelem.data`, `setelem.data`, `prim.*`), with
+/// `--mir-exit-census`.
+pub const MIR_SLOW_CENSUS_KIND: u32 = 97;
 /// Census kind for `--block-census` under MIR: one count per MIR block.
 pub const MIR_BLOCK_CENSUS_KIND: u32 = 92;
 

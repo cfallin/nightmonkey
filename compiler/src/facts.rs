@@ -316,6 +316,13 @@ pub struct LikelyFacts {
     /// these names whose receivers did not classify still emit the
     /// (fully dynamically guarded) accessor arm, without a static target.
     pub accessor_names: HashSet<NameId>,
+    /// Names a property read may reach a getter by: every modeled
+    /// accessor's, every literal or class accessor's, every name a
+    /// `defineProperty`-shaped call passes, and the builtins' accessor
+    /// properties. A read of any other name runs no code where it finds a
+    /// property (MIR's `getprop.data` exits on the rare miss; these keep
+    /// the generic read).
+    pub getter_names: HashSet<NameId>,
     /// How each call site resolved (see [`CallResolution`]). Absent = the
     /// site did not resolve and takes the generic dispatch.
     pub call_sites: HashMap<Site, CallResolution>,

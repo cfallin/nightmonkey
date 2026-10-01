@@ -176,6 +176,11 @@
   NIGHT_RUNTIME_HELPER(night_runtime_ctor_restamp)                \
   NIGHT_RUNTIME_HELPER(night_runtime_init_field)                  \
   NIGHT_RUNTIME_HELPER(night_runtime_elem_grow)                   \
+  NIGHT_RUNTIME_HELPER(night_runtime_get_prop_pure)               \
+  NIGHT_RUNTIME_HELPER(night_runtime_set_prop_pure)               \
+  NIGHT_RUNTIME_HELPER(night_runtime_to_primitive_pure)           \
+  NIGHT_RUNTIME_HELPER(night_runtime_get_elem_pure)               \
+  NIGHT_RUNTIME_HELPER(night_runtime_set_elem_pure)               \
   NIGHT_RUNTIME_HELPER(night_runtime_regex_ci_compare)
 
 namespace js {

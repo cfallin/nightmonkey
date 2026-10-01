@@ -434,6 +434,42 @@ pub enum JsCc {
     Ge,
 }
 
+/// A generic numeric op or compare that `Opcode::Prim` does on primitive
+/// operands only.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum PrimOp {
+    Add,
+    Binop(JsBinop),
+    Unop(JsUnop),
+    Compare(JsCc),
+    ToNumeric,
+}
+
+impl PrimOp {
+    /// The generic op it restricts.
+    pub fn generic(self) -> Opcode {
+        match self {
+            PrimOp::Add => Opcode::JsAdd,
+            PrimOp::Binop(b) => Opcode::JsBinop(b),
+            PrimOp::Unop(u) => Opcode::JsUnop(u),
+            PrimOp::Compare(c) => Opcode::JsCompare(c),
+            PrimOp::ToNumeric => Opcode::JsToNumeric,
+        }
+    }
+
+    /// The restriction of a generic op, if it has one.
+    pub fn of(op: &Opcode) -> Option<PrimOp> {
+        Some(match *op {
+            Opcode::JsAdd => PrimOp::Add,
+            Opcode::JsBinop(b) => PrimOp::Binop(b),
+            Opcode::JsUnop(u) => PrimOp::Unop(u),
+            Opcode::JsCompare(c) => PrimOp::Compare(c),
+            Opcode::JsToNumeric => PrimOp::ToNumeric,
+            _ => return None,
+        })
+    }
+}
+
 /// An opcode with its immediates. Operands are `InstData::args`.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Opcode {
@@ -577,10 +613,52 @@ pub enum Opcode {
     ArgsMappedSet(u32),
     JsToBool,
     JsToNumeric,
+    /// The generic op on operands that run no code in it: primitives (and
+    /// for an equality, two objects, or an object and null or undefined),
+    /// ok with its result. An operand whose conversion would call user
+    /// code (`valueOf`, `toString`, `Symbol.toPrimitive`) fails before
+    /// anything happened; a TypeError or RangeError of the op itself
+    /// (a Symbol, BigInt mixing) takes `err`. Allocates (concatenation, a
+    /// BigInt), writes nothing (MIR-MEMORY.md §1, KICKOFF-8 item 1).
+    Prim(PrimOp),
     JsGetProp(AtomId),
+    /// `recv.name` where the lookup runs no code: an own or prototype data
+    /// property, an absent one (`undefined`), or a pure builtin length; ok
+    /// with the value. A lookup that would run code (a getter, a proxy, a
+    /// resolve hook, a primitive with no prototype) or throw (`null`,
+    /// `undefined`) fails, before anything happened. It reads the field by
+    /// name and nothing else (MIR-MEMORY.md §1: a property fallback's
+    /// common case, which must not write `Unknown`).
+    GetPropData(AtomId),
+    /// `recv.name = v` where the set runs no code: an overwrite of an own
+    /// writable data property of a native object (or of an array's
+    /// writable length), or an add to an
+    /// extensible one with no setter, read-only property or hook on its
+    /// chain; not on the global or an object Watchtower watches.
+    /// `ok_clean` once stored; `ok_dirty` once stored where the store
+    /// demoted a claim of the object's published class (a value not of the
+    /// field's type, an add off the class's slots); anything else fails
+    /// before anything happened; an engine error takes `err`. Its clean
+    /// edge writes the field by name and nothing else.
+    SetPropData(AtomId),
     /// Strict-mode (`true`) or sloppy assignment.
     JsSetProp(AtomId, bool),
     JsGetElem,
+    /// `recv[key]` where the read runs no code: a primitive key (an object
+    /// key's ToPropertyKey may call user code), found as a data property,
+    /// an element (dense, a typed array's, an arguments object's, a
+    /// string's char), or absent (`undefined`); ok with the value. A read
+    /// that would run code (a getter, a proxy, a resolve hook) or throw
+    /// fails before anything happened; an engine error (OOM, interning the
+    /// key) takes `err`. Reads anything, writes nothing.
+    GetElemData,
+    /// `recv[key] = v` where the set runs no code, with the RANGES duty
+    /// (as `JsSetElem`'s): an element of a native object or array (an
+    /// overwrite of a writable one; an add with no setter or read-only
+    /// element on the chain; a writable length), or a typed array's of a
+    /// number. Edges as `setprop.data`'s. With an int32 key its clean edge
+    /// writes elements and lengths only.
+    SetElemData(bool),
     /// Strictness, and the RANGES duty (as `InitElem`'s).
     JsSetElem(bool, bool),
     JsGetName(AtomId),
@@ -780,6 +858,7 @@ impl SuccRole {
 const OK_FAIL: &[SuccRole] = &[SuccRole::Ok, SuccRole::Fail];
 const CLEAN_DIRTY_ERR: &[SuccRole] = &[SuccRole::OkClean, SuccRole::OkDirty, SuccRole::Err];
 const OK_ERR: &[SuccRole] = &[SuccRole::Ok, SuccRole::Err];
+const OK_FAIL_ERR: &[SuccRole] = &[SuccRole::Ok, SuccRole::Fail, SuccRole::Err];
 
 impl Opcode {
     /// The successor edges this op has, in order. Empty for non-terminators
@@ -812,18 +891,25 @@ impl Opcode {
             | LoadTa
             | StoreTa
             | StrCharCodeAt
+            | GetPropData(_)
             | InitField(_) => OK_FAIL.to_vec(),
             JsAdd | JsBinop(_) | JsUnop(_) | JsCompare(_) | JsToNumeric | JsGetProp(_)
-            | JsSetProp(..) | JsGetElem | JsSetElem(..) | JsBoxThis | JsBindGName(_)
+            | JsSetProp(..) | JsGetElem | JsSetElem(..) | JsBindGName(_)
             | JsSetName(..) | LoadField(_) | StoreField(_) | Call | CallIter | CallEval(_) | CallDirect | Construct(..)
             | CallNative(_) | JsGetName(_) | CreateThis(..) => CLEAN_DIRTY_ERR.to_vec(),
             // Clean if the callee's baseline rest demoted nothing.
             ExitInline { .. } => CLEAN_DIRTY_ERR.to_vec(),
             // Allocations: no kill, so no effect report.
             JsLambda(_) | LitNew(_) | LitInit(..) => OK_ERR.to_vec(),
+            // The global `this`, or a primitive's wrapper: no user code.
+            JsBoxThis => OK_ERR.to_vec(),
             JsRt(_) | ApplyFwd => CLEAN_DIRTY_ERR.to_vec(),
             ArgsObject | RestArray(_) => OK_ERR.to_vec(),
             JsThrow => vec![SuccRole::Err],
+            Prim(_) | GetElemData => OK_FAIL_ERR.to_vec(),
+            SetPropData(_) | SetElemData(_) => {
+                vec![SuccRole::OkClean, SuccRole::OkDirty, SuccRole::Fail, SuccRole::Err]
+            }
             _ => vec![],
         }
     }
@@ -1548,6 +1634,20 @@ pub fn signature(op: &Opcode, args: &[Type], m: &Module) -> SigResult {
             val(&args[1], "js.compare")?;
             Sig::output(Type::Bool)
         }
+        Prim(p) => return signature(&p.generic(), args, m),
+        GetElemData => {
+            arity(args, 2)?;
+            val(&args[0], "getelem.data receiver")?;
+            val(&args[1], "getelem.data key")?;
+            Sig::output(Type::VAL_TOP)
+        }
+        SetElemData(_) => {
+            arity(args, 3)?;
+            for t in args {
+                val(t, "setelem.data operand")?;
+            }
+            Sig::none()
+        }
         JsTypeof => {
             arity(args, 1)?;
             val(&args[0], "js.typeof")?;
@@ -1706,6 +1806,17 @@ pub fn signature(op: &Opcode, args: &[Type], m: &Module) -> SigResult {
             arity(args, 1)?;
             val(&args[0], "js.tonumeric")?;
             Sig::output(Type::val(number_or_bigint))
+        }
+        GetPropData(_) => {
+            arity(args, 1)?;
+            val(&args[0], "getprop.data receiver")?;
+            Sig::output(Type::VAL_TOP)
+        }
+        SetPropData(_) => {
+            arity(args, 2)?;
+            val(&args[0], "setprop.data receiver")?;
+            val(&args[1], "setprop.data value")?;
+            Sig::none()
         }
         JsGetProp(_) | JsGetElem | JsSetProp(..) | JsSetElem(..) => {
             let n = match op {
@@ -2209,6 +2320,27 @@ fn field_region(o: Option<&ObjInfo>, name: AtomId) -> Region {
     }
 }
 
+/// What a by-name data read of `name` through an unproven receiver may
+/// read: the field in any class, the global binding of that name (the
+/// receiver may be the global object), and for `length`/`byteLength` the
+/// array, string and typed-array lengths the runtime's pure arms serve.
+fn prop_regions(name: AtomId, m: &Module) -> Vec<Region> {
+    let mut r = vec![Region::Field { name, keys: None }];
+    r.extend(m.bindings.iter().filter(|(_, d)| d.name == name).map(|(b, _)| Region::Global(b)));
+    let chars = m.atoms.get(name).map(|a| a.chars());
+    let is = |s: &str| chars.is_some_and(|c| c.iter().copied().eq(s.encode_utf16()));
+    if is("length") || is("byteLength") {
+        r.push(Region::ArrayLength(None));
+        r.push(Region::TypedArrayLength);
+    }
+    r
+}
+
+/// Whether atom `name` is `length`.
+fn is_length(name: AtomId, m: &Module) -> bool {
+    m.atoms.get(name).is_some_and(|a| a.chars().iter().copied().eq("length".encode_utf16()))
+}
+
 /// The elements root a receiver's layout claim proves, if every layout in
 /// its range names the same one.
 fn elements_root(o: Option<&ObjInfo>, m: &Module) -> Option<crate::ids::RegionRoot> {
@@ -2249,15 +2381,38 @@ pub fn effects(op: &Opcode, args: &[Type], m: &Module) -> Effects {
     let mut fx = Effects::PURE;
     match op {
         JsAdd | JsBinop(_) | JsUnop(_) | JsCompare(_) | JsToNumeric | JsGetProp(_)
-        | JsSetProp(..) | JsGetElem | JsSetElem(..) | JsBoxThis | JsBindGName(_) | JsSetName(..) => {
+        | JsSetProp(..) | JsGetElem | JsSetElem(..) | JsBindGName(_) | JsSetName(..) => {
             return Effects::generic(FlagsEffect::Dynamic)
         }
         JsGetName(_) => return Effects::generic(FlagsEffect::Dynamic),
+        // No user code runs: a concatenation or a BigInt allocates.
+        Prim(_) => fx.may_gc = true,
+        // Any location; interning the key or a string's char allocates.
+        GetElemData => {
+            fx.reads = vec![Region::Unknown];
+            fx.may_gc = true;
+        }
+        // An int32 key names an element: the elements, an array's length,
+        // a typed array's data; any other key may name a field.
+        SetElemData(_) => {
+            let int_key = matches!(args.get(1), Some(Type::Val(v)) if v.tags.is_nonempty_subset_of(TagSet::INT32));
+            fx.writes = if int_key {
+                [Region::Elements(None), Region::ArrayLength(None)]
+                    .into_iter()
+                    .chain(TaKind::ALL.iter().map(|&k| Region::TypedArrayData(k)))
+                    .collect()
+            } else {
+                vec![Region::Unknown]
+            };
+            fx.may_gc = true;
+            fx.kill = KillPattern::ALL;
+            fx.flags = FlagsEffect::Dynamic;
+        }
         JsRt(_) => return Effects::generic(FlagsEffect::Dynamic),
         ApplyFwd => return Effects::generic(FlagsEffect::Callee),
         // Allocations: they run no JS and change no class word (a GC moves
         // objects but keeps their words), so they kill nothing.
-        ArgsObject | RestArray(_) | JsLambda(_) => {
+        ArgsObject | RestArray(_) | JsLambda(_) | JsBoxThis => {
             fx.may_gc = true;
             fx.may_throw = true;
         }
@@ -2302,6 +2457,20 @@ pub fn effects(op: &Opcode, args: &[Type], m: &Module) -> Effects {
             fx.flags = FlagsEffect::Dynamic;
         }
         LoadSlot(name) => fx.reads = vec![field_region(recv, *name)],
+        GetPropData(name) => fx.reads = prop_regions(*name, m),
+        // A field (never the global's), or an array's length (which may
+        // drop elements): an add may grow the slots; a demotion takes the
+        // dirty edge.
+        SetPropData(name) => {
+            fx.writes = prop_regions(*name, m)
+                .into_iter()
+                .filter(|r| !matches!(r, Region::Global(_)))
+                .chain(is_length(*name, m).then_some(Region::Elements(None)))
+                .collect();
+            fx.may_gc = true;
+            fx.kill = KillPattern::ALL;
+            fx.flags = FlagsEffect::Dynamic;
+        }
         InitField(name) => {
             fx.writes = vec![field_region(recv, *name)];
             fx.may_gc = true;

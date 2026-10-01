@@ -125,6 +125,8 @@ pub struct ScanTables {
     /// (the `defineProperty(target, name, descriptor)` shape): the
     /// interned name.
     pub call_str_arg1: HashMap<Site, NameId>,
+    /// Names a literal or class accessor (`get x()`, `set x(v)`) defines.
+    pub accessor_defs: rustc_hash::FxHashSet<NameId>,
 }
 
 #[derive(Clone, PartialEq)]
@@ -585,6 +587,13 @@ impl<'a, 'b> Scan<'a, 'b> {
             self.join_rows.insert(pc, srow);
         }
         self.ft_dead = false;
+    }
+
+    fn accessor_def(&mut self, name_index: u32) {
+        if let Some(name) = self.atom(name_index) {
+            let n = self.names.intern(&name);
+            self.tables.accessor_defs.insert(n);
+        }
     }
 
     fn atom(&self, name_index: u32) -> Option<JsString> {
@@ -1598,6 +1607,19 @@ impl OpcodeVisitor for Scan<'_, '_> {
     }
     fn init_locked_prop(&mut self, name_index: u32) {
         self.prop_write(name_index, true);
+    }
+    // The stack effect is `before_op`'s; these only record the name.
+    fn init_prop_getter(&mut self, name_index: u32) {
+        self.accessor_def(name_index);
+    }
+    fn init_hidden_prop_getter(&mut self, name_index: u32) {
+        self.accessor_def(name_index);
+    }
+    fn init_prop_setter(&mut self, name_index: u32) {
+        self.accessor_def(name_index);
+    }
+    fn init_hidden_prop_setter(&mut self, name_index: u32) {
+        self.accessor_def(name_index);
     }
     fn arguments(&mut self) {
         let mut e = Entry::imm(Prims::EMPTY);

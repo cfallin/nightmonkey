@@ -476,6 +476,18 @@ const INLINE_CONSTRUCT: bool = true;
 /// Typed field accesses exit on a dirty IC arm rather than rejoin.
 const DIRTY_EXITS: bool = true;
 
+/// A generic numeric op or compare whose operands are not predicted
+/// objects is `prim.*`, exiting where an operand would call user code.
+const PRIM_OPS: bool = true;
+
+/// A generic element read is a data read (`getelem.data`), exiting where
+/// the read would run code.
+const ELEM_DATA: bool = true;
+
+/// A by-name property read whose name no known getter has is a data read
+/// (`getprop.data`), exiting where the lookup would run code.
+const DATA_GETS: bool = true;
+
 /// A type test a branch consumes narrows the tested value on the branch
 /// it proves (`fuse_test`).
 const NARROW_TESTS: bool = true;
@@ -1253,7 +1265,7 @@ impl<'s, 'a> Run<'s, 'a> {
     /// for its lowering's direct arms.
     fn attach_targets(&mut self, inst: mir::Inst) {
         if let Some((classes, complete)) = self.store_mask.clone() {
-            if matches!(self.f.insts[inst].op, Opcode::StoreField(_) | Opcode::JsSetProp(..)) {
+            if matches!(self.f.insts[inst].op, Opcode::StoreField(_) | Opcode::JsSetProp(..) | Opcode::SetPropData(_)) {
                 let a = self.f.attachments.push(mir::func::Attachment {
                     site: Some(self.site(self.pc)),
                     field_types: classes.iter().map(|&(k, t)| (k, mir::func::encode_tags(t))).collect(),
@@ -1264,7 +1276,7 @@ impl<'s, 'a> Run<'s, 'a> {
                 return;
             }
         }
-        if self.ta_poly_site && matches!(self.f.insts[inst].op, Opcode::JsGetElem | Opcode::JsSetElem(..)) {
+        if self.ta_poly_site && matches!(self.f.insts[inst].op, Opcode::JsGetElem | Opcode::GetElemData | Opcode::JsSetElem(..) | Opcode::SetElemData(_)) {
             let a = self.f.attachments.push(mir::func::Attachment {
                 site: Some(self.site(self.pc)),
                 ta_poly: true,
@@ -2870,6 +2882,152 @@ impl<'s, 'a> Run<'s, 'a> {
         let (x, y) = (self.boxed(recv), self.boxed(v));
         self.accessor_call(a, true, target, vec![x, y], MType::VAL_TOP, Opcode::JsSetProp(a, strict));
         true
+    }
+
+    /// A generic numeric op or compare (`js`) on `args`, as `prim.*`: an
+    /// operand whose conversion would call user code (`valueOf`,
+    /// `toString`, `Symbol.toPrimitive` of its own) exits here, before the
+    /// op, for baseline to do it; the op's own TypeError or RangeError
+    /// takes the throw exit.
+    fn prim_or_js(&mut self, op: Opcode, args: Vec<mir::Value>, out: MType) -> mir::Value {
+        let Some(p) = mir::ops::PrimOp::of(&op).filter(|_| PRIM_OPS) else {
+            return self.js(op, args, out);
+        };
+        let ok = self.new_block();
+        let r = self.f.add_param(ok, out);
+        let fail = self.exit_block(false);
+        let err = self.exit_block(true);
+        self.term(
+            Opcode::Prim(p),
+            args,
+            vec![
+                Edge {
+                    block: ok,
+                    args: vec![EdgeArg::Out(0)],
+                },
+                Self::goto(fail),
+                Self::goto(err),
+            ],
+        );
+        self.at(ok);
+        r
+    }
+
+    /// `x[k] = y` (`post` the value, left on the stack): with an int32 key,
+    /// a set that runs no code (`setelem.data`) where a demotion can exit
+    /// after it, a set that would run code exiting here, before the op;
+    /// else the generic set.
+    fn set_elem(&mut self, strict: bool, duty: bool, x: mir::Value, k: mir::Value, y: mir::Value, post: Slot) {
+        let int_key = matches!(self.f.ty(k), MType::Val(v) if v.tags.is_nonempty_subset_of(TagSet::INT32));
+        if ELEM_DATA && int_key {
+            if let Some(dirty) = self.dirty_exit(None, Some(post)) {
+                let ok = self.new_block();
+                let fail = self.exit_block(false);
+                let err = self.exit_block(true);
+                let op = Opcode::SetElemData(duty);
+                self.retain_locals(&op);
+                let (inst, _) = self.f.add_inst(
+                    self.cur,
+                    op,
+                    vec![x, k, y],
+                    &[],
+                    vec![Self::goto(ok), dirty, Self::goto(fail), Self::goto(err)],
+                );
+                self.attach_targets(inst);
+                self.live = false;
+                self.at(ok);
+                return;
+            }
+        }
+        self.js_void_keep(Opcode::JsSetElem(strict, duty), vec![x, k, y], post);
+    }
+
+    /// `x[k]` as a data read (`getelem.data`): a read that would run code
+    /// or throw exits here, before the op, for baseline to do it; an
+    /// engine error takes the throw exit.
+    fn get_elem(&mut self, x: mir::Value, k: mir::Value) -> mir::Value {
+        if !ELEM_DATA {
+            return self.js(Opcode::JsGetElem, vec![x, k], MType::VAL_TOP);
+        }
+        let ok = self.new_block();
+        let r = self.f.add_param(ok, MType::VAL_TOP);
+        let fail = self.exit_block(false);
+        let err = self.exit_block(true);
+        self.term(
+            Opcode::GetElemData,
+            vec![x, k],
+            vec![
+                Edge {
+                    block: ok,
+                    args: vec![EdgeArg::Out(0)],
+                },
+                Self::goto(fail),
+                Self::goto(err),
+            ],
+        );
+        self.at(ok);
+        r
+    }
+
+    /// Whether a by-name read of `a` can be `getprop.data`: no getter the
+    /// analysis knows of has its name (`getter_names`), so a lookup that
+    /// would run code is rare, and exits.
+    fn data_get_ok(&self, a: mir::entity::AtomId) -> bool {
+        DATA_GETS
+            && self.s.names.is_some_and(|ns| {
+                ns.lookup(self.mm.atoms[a].chars())
+                    .is_none_or(|n| !self.s.ctx.facts.getter_names.contains(&n))
+            })
+    }
+
+    /// `x.a` as a data read (`getprop.data`, MIR-MEMORY.md §1): ok with
+    /// the value; a lookup that would run code or throw exits here, before
+    /// the op, for baseline to do it.
+    fn data_get(&mut self, a: mir::entity::AtomId, x: mir::Value) -> mir::Value {
+        let ok = self.new_block();
+        let r = self.f.add_param(ok, MType::VAL_TOP);
+        let exit = self.exit_block(false);
+        self.term(
+            Opcode::GetPropData(a),
+            vec![x],
+            vec![
+                Edge {
+                    block: ok,
+                    args: vec![EdgeArg::Out(0)],
+                },
+                Self::goto(exit),
+            ],
+        );
+        self.at(ok);
+        r
+    }
+
+    /// `x.a = y` (`post` the value, left on the stack) through the IC: a
+    /// set that runs no code (`setprop.data`, MIR-MEMORY.md §1) where no
+    /// known setter has the name and a demotion can exit after it, a set
+    /// that would run code exiting here, before the op, for baseline to
+    /// do it; else the generic set.
+    fn set_prop(&mut self, a: mir::entity::AtomId, strict: bool, x: mir::Value, y: mir::Value, post: Slot) {
+        if self.data_get_ok(a) {
+            if let Some(dirty) = self.dirty_exit(None, Some(post)) {
+                let ok = self.new_block();
+                let fail = self.exit_block(false);
+                let err = self.exit_block(true);
+                self.retain_locals(&Opcode::SetPropData(a));
+                let (inst, _) = self.f.add_inst(
+                    self.cur,
+                    Opcode::SetPropData(a),
+                    vec![x, y],
+                    &[],
+                    vec![Self::goto(ok), dirty, Self::goto(fail), Self::goto(err)],
+                );
+                self.attach_targets(inst);
+                self.live = false;
+                self.at(ok);
+                return;
+            }
+        }
+        self.js_void_keep(Opcode::JsSetProp(a, strict), vec![x, y], post);
     }
 
     /// The probe-and-call diamond of `accessor_get`/`accessor_set`:
@@ -5064,7 +5222,7 @@ impl<'s, 'a> Run<'s, 'a> {
                             Sub => (Opcode::JsBinop(JsBinop::Sub), arith),
                             _ => (Opcode::JsBinop(JsBinop::Mul), arith),
                         };
-                        let r = self.js(jop, vec![x, y], MType::val(tags));
+                        let r = self.prim_or_js(jop, vec![x, y], MType::val(tags));
                         self.push(r, Ty::Val(tags));
                     }
                 }
@@ -5215,7 +5373,7 @@ impl<'s, 'a> Run<'s, 'a> {
                     } else {
                         let tags = TagSet::prims(crate::opsem::NUM | PRIM_BIGINT);
                         let x = self.boxed(a);
-                        let r = self.js(Opcode::JsToNumeric, vec![x], MType::val(tags));
+                        let r = self.prim_or_js(Opcode::JsToNumeric, vec![x], MType::val(tags));
                         self.push(r, Ty::Val(tags));
                     }
                 }
@@ -5282,7 +5440,7 @@ impl<'s, 'a> Run<'s, 'a> {
                     }
                     _ => {
                         let (x, y) = (self.boxed(a), self.boxed(b));
-                        self.js(Opcode::JsCompare(jcc), vec![x, y], MType::Bool)
+                        self.prim_or_js(Opcode::JsCompare(jcc), vec![x, y], MType::Bool)
                     }
                 };
                 self.push(r, Ty::Bool);
@@ -5372,7 +5530,7 @@ impl<'s, 'a> Run<'s, 'a> {
                         }],
                     );
                     self.at(e);
-                    let b = self.js(Opcode::JsBoxThis, vec![v], MType::val(obj));
+                    let b = self.js_static(Opcode::JsBoxThis, vec![v], MType::val(obj));
                     self.term(
                         Opcode::Jump,
                         vec![],
@@ -5700,7 +5858,12 @@ impl<'s, 'a> Run<'s, 'a> {
                     // every time. The claim is guarded after the join. The
                     // IC arm keeps facts, a kill exiting; where it cannot,
                     // it is a fence, and `Obj` slots meet as `ObjHint`.
-                    self.demote_for_generic_arm(1);
+                    // A data read (`getprop.data`) kills nothing; a generic
+                    // one fences.
+                    let data = self.data_get_ok(a);
+                    if !data {
+                        self.demote_for_generic_arm(1);
+                    }
                     let x = self.boxed(recv);
                     let join = self.new_block();
                     let jr = self.f.add_param(join, MType::VAL_TOP);
@@ -5719,7 +5882,11 @@ impl<'s, 'a> Run<'s, 'a> {
                         }],
                     );
                     self.at(generic);
-                    let r = self.js(Opcode::JsGetProp(a), vec![x], MType::VAL_TOP);
+                    let r = if data {
+                        self.data_get(a, x)
+                    } else {
+                        self.js(Opcode::JsGetProp(a), vec![x], MType::VAL_TOP)
+                    };
                     self.term(
                         Opcode::Jump,
                         vec![],
@@ -5733,7 +5900,11 @@ impl<'s, 'a> Run<'s, 'a> {
                     self.guard_result(site.claim, pc + op.len(), false);
                 } else {
                     let x = self.boxed(recv);
-                    let r = self.js(Opcode::JsGetProp(a), vec![x], MType::VAL_TOP);
+                    let r = if self.data_get_ok(a) {
+                        self.data_get(a, x)
+                    } else {
+                        self.js(Opcode::JsGetProp(a), vec![x], MType::VAL_TOP)
+                    };
                     // `Math.<fn>`, for a typed call (`math_call`).
                     if self.gname_vals.get(&recv.v).is_some_and(|&g| self.atom_is(g, "Math")) {
                         if let Some(m) = math_fn_named(&std::string::String::from_utf16_lossy(self.mm.atoms[a].chars())) {
@@ -5818,13 +5989,13 @@ impl<'s, 'a> Run<'s, 'a> {
                         self.term(Opcode::Jump, vec![], vec![Self::goto(join)]);
                         self.at(generic);
                         let y = self.boxed(v);
-                        self.js_void_keep(Opcode::JsSetProp(a, op == StrictSetProp), vec![r, y], v);
+                        self.set_prop(a, op == StrictSetProp, r, y, v);
                         self.term(Opcode::Jump, vec![], vec![Self::goto(join)]);
                         self.at(join);
                     }
                     None => {
                         let (x, y) = (self.boxed(recv), self.boxed(v));
-                        self.js_void_keep(Opcode::JsSetProp(a, op == StrictSetProp), vec![x, y], v);
+                        self.set_prop(a, op == StrictSetProp, x, y, v);
                     }
                 }
                 self.repush(v);
@@ -5863,8 +6034,11 @@ impl<'s, 'a> Run<'s, 'a> {
                 let ta = self.ta_elem(pc, recv, key);
                 let r = if let Some((o, i, k)) = ta {
                     // The element inline, as a boxed number; out of
-                    // bounds, the generic op (a fence unless it keeps).
-                    self.demote_for_generic_arm(1);
+                    // bounds, the generic op (a fence unless it keeps, or
+                    // a data read).
+                    if !ELEM_DATA {
+                        self.demote_for_generic_arm(1);
+                    }
                     let (ok, generic, join) = (self.new_block(), self.new_block(), self.new_block());
                     let raw = if k.is_float() { MType::F64_TOP } else { MType::I32_TOP };
                     let p = self.f.add_param(ok, raw);
@@ -5894,7 +6068,7 @@ impl<'s, 'a> Run<'s, 'a> {
                     );
                     self.at(generic);
                     let (x, kb) = (self.boxed(recv), self.boxed(key));
-                    let r = self.js(Opcode::JsGetElem, vec![x, kb], MType::VAL_TOP);
+                    let r = self.get_elem(x, kb);
                     self.term(
                         Opcode::Jump,
                         vec![],
@@ -5921,8 +6095,11 @@ impl<'s, 'a> Run<'s, 'a> {
                     }
                     Some((o, i)) => {
                         // A dense element inline; out of bounds or a
-                        // hole, the generic op (a fence unless it keeps).
-                        self.demote_for_generic_arm(1);
+                        // hole, the generic op (a fence unless it keeps,
+                        // or a data read).
+                        if !ELEM_DATA {
+                            self.demote_for_generic_arm(1);
+                        }
                         let (ok, generic, join) = (self.new_block(), self.new_block(), self.new_block());
                         let p = self.f.add_param(ok, MType::VAL_TOP);
                         let jr = self.f.add_param(join, MType::VAL_TOP);
@@ -5948,7 +6125,7 @@ impl<'s, 'a> Run<'s, 'a> {
                         );
                         self.at(generic);
                         let (x, k) = (self.boxed(recv), self.boxed(key));
-                        let r = self.js(Opcode::JsGetElem, vec![x, k], MType::VAL_TOP);
+                        let r = self.get_elem(x, k);
                         self.term(
                             Opcode::Jump,
                             vec![],
@@ -5962,7 +6139,7 @@ impl<'s, 'a> Run<'s, 'a> {
                     }
                     None => {
                         let (x, k) = (self.boxed(recv), self.boxed(key));
-                        self.js(Opcode::JsGetElem, vec![x, k], MType::VAL_TOP)
+                        self.get_elem(x, k)
                     }
                 }
                 };
@@ -6026,7 +6203,7 @@ impl<'s, 'a> Run<'s, 'a> {
                     self.term(Opcode::Jump, vec![], vec![Self::goto(join)]);
                     self.at(generic);
                     let (x, kb, y) = (self.boxed(recv), self.boxed(key), self.boxed(v));
-                    self.js_void_keep(Opcode::JsSetElem(op == StrictSetElem, duty), vec![x, kb, y], v);
+                    self.set_elem(op == StrictSetElem, duty, x, kb, y, v);
                     self.term(Opcode::Jump, vec![], vec![Self::goto(join)]);
                     self.at(join);
                     self.st.push(v);
@@ -6086,14 +6263,14 @@ impl<'s, 'a> Run<'s, 'a> {
                         self.term(Opcode::Jump, vec![], vec![Self::goto(join)]);
                         self.at(generic);
                         let (x, k) = (self.boxed(recv), self.boxed(key));
-                        self.js_void_keep(Opcode::JsSetElem(op == StrictSetElem, duty), vec![x, k, y], v);
+                        self.set_elem(op == StrictSetElem, duty, x, k, y, v);
                         self.term(Opcode::Jump, vec![], vec![Self::goto(join)]);
                         self.at(join);
                         self.st.push(v);
                     }
                     None => {
                         let (x, k, y) = (self.boxed(recv), self.boxed(key), self.boxed(v));
-                        self.js_void_keep(Opcode::JsSetElem(op == StrictSetElem, duty), vec![x, k, y], v);
+                        self.set_elem(op == StrictSetElem, duty, x, k, y, v);
                         self.repush(v);
                     }
                 }
@@ -6965,7 +7142,7 @@ impl<'s, 'a> Run<'s, 'a> {
             _ if no_big => TagSet::NUMBER,
             _ => TagSet::prims(crate::opsem::NUM | PRIM_BIGINT),
         };
-        let r = self.js(Opcode::JsBinop(k), vec![x, y], MType::val(tags));
+        let r = self.prim_or_js(Opcode::JsBinop(k), vec![x, y], MType::val(tags));
         if tags == TagSet::INT32 {
             // Always an int32: unboxed, the guard never fails.
             let i = self.guard(Opcode::GuardUnbox(UnboxKind::I32), vec![r], MType::I32_TOP);
@@ -6981,7 +7158,7 @@ impl<'s, 'a> Run<'s, 'a> {
             JsUnop::Pos => TagSet::NUMBER,
             _ => TagSet::prims(crate::opsem::NUM | PRIM_BIGINT),
         };
-        let r = self.js(Opcode::JsUnop(u), vec![x], MType::val(tags));
+        let r = self.prim_or_js(Opcode::JsUnop(u), vec![x], MType::val(tags));
         self.push(r, Ty::Val(tags));
     }
 }

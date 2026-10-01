@@ -2438,6 +2438,7 @@ impl<'a> Lower<'a> {
                 };
                 self.guard(inst, ok, &[r])?;
             }
+            Opcode::Prim(p) => self.prim_op(inst, p, &a)?,
             Opcode::JsAdd
             | Opcode::JsBinop(_)
             | Opcode::JsUnop(_)
@@ -2596,11 +2597,14 @@ impl<'a> Lower<'a> {
                 let z = self.i32c(0);
                 self.js_call(inst, self.h.get_gname, &[at, z], false)?;
             }
-            Opcode::JsGetProp(name) => {
+            Opcode::JsGetProp(name) | Opcode::GetPropData(name) => {
                 // The site's inline cache (as bbv's fact-free reads): the
                 // shared probe `night_ic_get` (own and holder ways, then
                 // the megamorphic table) takes `ok_clean` on a hit; a miss
-                // runs the generic get and fills the site's ways.
+                // runs the generic get and fills the site's ways. For
+                // `getprop.data` the same arms take `ok`, and a miss asks
+                // the runtime's pure lookup, failing where it would run
+                // code.
                 let cache = self.atoms.next_prop_cache();
                 let way_base = self.i32c(IC_WAY_ADDR_PLACEHOLDER);
                 self.prop_ic_patches.push((way_base, cache * INLINE_IC_STRIDE));
@@ -2635,13 +2639,19 @@ impl<'a> Lower<'a> {
                     self.length_arms(inst, a[0], ic)?;
                     self.cur = ic;
                 }
-                self.get_ic(inst, name, a[0], way_base, cache)?;
+                if let Opcode::GetPropData(_) = d.op {
+                    self.get_ic_pure(inst, name, a[0], way_base, cache)?;
+                } else {
+                    self.get_ic(inst, name, a[0], way_base, cache)?;
+                }
             }
             Opcode::JsSetProp(name, strict) => self.set_ic(inst, name, a[0], a[1], strict)?,
-            Opcode::JsGetElem => {
+            Opcode::SetPropData(name) => self.set_ic_pure(inst, name, a[0], a[1])?,
+            Opcode::JsGetElem | Opcode::GetElemData => {
                 // An in-bounds, non-hole dense element of a native object
-                // inline (as baseline does), taking `ok_clean`; everything
-                // else through the helper.
+                // inline (as baseline does), taking `ok_clean` (`ok`);
+                // everything else through the helper (for `getelem.data`,
+                // its pure read, failing where the read would run code).
                 let slow = self.body.add_block();
                 let v = self.dense_element(a[0], a[1], slow);
                 let t = self.edge(inst, 0, &[v])?;
@@ -2701,9 +2711,26 @@ impl<'a> Lower<'a> {
                     self.terminate(Terminator::Br { target: t });
                     self.cur = generic;
                 }
-                self.js_call(inst, self.h.get_element, &[a[0], a[1]], false)?;
+                if d.op == Opcode::GetElemData {
+                    self.slow_census(inst);
+                    let live = self.live_across(inst);
+                    let (r, v) = self.gc_call(self.h.get_elem_pure, &[a[0], a[1]], &live)?;
+                    self.epoch_same = None;
+                    let one = self.i32c(1);
+                    let ok = self.bin(Operator::I32Eq, r, one, Type::I32);
+                    let t = self.edge(inst, 0, &[v])?;
+                    let other = self.body.add_block();
+                    self.cond_br(ok, t, Self::to(other));
+                    self.cur = other;
+                    let none = self.un(Operator::I32Eqz, r, Type::I32);
+                    let f = self.edge(inst, 1, &[])?;
+                    let e = self.edge(inst, 2, &[])?;
+                    self.cond_br(none, f, e);
+                } else {
+                    self.js_call(inst, self.h.get_element, &[a[0], a[1]], false)?;
+                }
             }
-            Opcode::JsSetElem(strict, duty) => {
+            Opcode::JsSetElem(_, duty) | Opcode::SetElemData(duty) => {
                 // An in-bounds overwrite of a non-hole dense element inline,
                 // taking `ok_clean`: an own writable data property unless
                 // the elements are frozen. The store bypasses the engine,
@@ -2751,8 +2778,17 @@ impl<'a> Lower<'a> {
                     self.terminate(Terminator::Br { target: t });
                     self.cur = generic;
                 }
-                let sv = self.i32c(u32::from(strict));
-                self.js_call(inst, self.h.set_element, &[a[0], a[1], a[2], sv], false)?;
+                if let Opcode::JsSetElem(strict, _) = d.op {
+                    let sv = self.i32c(u32::from(strict));
+                    self.js_call(inst, self.h.set_element, &[a[0], a[1], a[2], sv], false)?;
+                } else {
+                    // `setelem.data`: the runtime's set, as `set_ic_pure`'s.
+                    self.slow_census(inst);
+                    let live = self.live_across(inst);
+                    let (r, _) = self.gc_call(self.h.set_elem_pure, &[a[0], a[1], a[2]], &live)?;
+                    self.epoch_same = None;
+                    self.store_codes(inst, r)?;
+                }
             }
             Opcode::LengthArray => {
                 // The elements header's length word, unsigned.
@@ -3750,7 +3786,13 @@ impl<'a> Lower<'a> {
             }
             Opcode::StoreField(name) => self.field_op(inst, name, a[0], Some(a[1]))?,
             Opcode::JsBoxThis => {
-                self.js_call(inst, self.h.box_nonstrict_this, &[a[0]], false)?;
+                // Allocates (a primitive's wrapper); runs no user code.
+                let live = self.live_across(inst);
+                let (ok, r) = self.gc_call(self.h.box_nonstrict_this, &[a[0]], &live)?;
+                self.epoch_same = None;
+                let t = self.edge(inst, 0, &[r])?;
+                let e = self.edge(inst, 1, &[])?;
+                self.cond_br(ok, t, e);
             }
             Opcode::JsBindGName(name) => {
                 if let Some(&bid) = self.gname_bids.get(&name) {
@@ -3923,9 +3965,35 @@ impl<'a> Lower<'a> {
     /// With no dynamic effect report yet, success takes `ok_dirty`, which
     /// is always sound.
     fn js_op(&mut self, inst: mir::Inst, op: &Opcode, a: &[Value]) -> R<()> {
+        if let Opcode::JsCompare(cc) = *op {
+            self.equality_arms(inst, cc, a)?;
+        }
+        let (f, args, bool_out) = self.op_helper(op, a);
+        self.js_call(inst, f, &args, bool_out)
+    }
+
+    /// An equality's inline arms (against a string literal, then bbv's
+    /// tag ladder), taking edge 0.
+    fn equality_arms(&mut self, inst: mir::Inst, cc: JsCc, a: &[Value]) -> R<()> {
+        if matches!(cc, JsCc::Eq | JsCc::Ne | JsCc::StrictEq | JsCc::StrictNe) {
+            // Against a string literal (an atom): bbv's ladder.
+            let args = self.f.insts[inst].args.clone();
+            if self.is_str_literal(args[1]) {
+                self.literal_eq(inst, cc, a[0], a[1])?;
+            } else if self.is_str_literal(args[0]) {
+                self.literal_eq(inst, cc, a[1], a[0])?;
+            }
+            self.equality_fast_arm(inst, cc, a[0], a[1])?;
+        }
+        Ok(())
+    }
+
+    /// The runtime helper of a generic numeric op or compare, its
+    /// arguments, and whether its result is a bool.
+    fn op_helper(&mut self, op: &Opcode, a: &[Value]) -> (Func, Vec<Value>, bool) {
         let h = self.h;
-        let (f, args): (Func, Vec<Value>) = match *op {
-            Opcode::JsAdd => (h.add, vec![a[0], a[1]]),
+        match *op {
+            Opcode::JsAdd => (h.add, vec![a[0], a[1]], false),
             Opcode::JsBinop(b) => {
                 let kind = match b {
                     JsBinop::Sub => BINOP_SUB,
@@ -3938,14 +4006,14 @@ impl<'a> Lower<'a> {
                     JsBinop::Lsh => BINOP_LSH,
                     JsBinop::Rsh => BINOP_RSH,
                     JsBinop::Ursh => BINOP_URSH,
-                    JsBinop::Pow => return self.js_call(inst, h.pow, &[a[0], a[1]], false),
+                    JsBinop::Pow => return (h.pow, vec![a[0], a[1]], false),
                 };
                 let k = self.i32c(kind);
-                (h.binop, vec![k, a[0], a[1]])
+                (h.binop, vec![k, a[0], a[1]], false)
             }
             Opcode::JsUnop(u) => match u {
-                JsUnop::Neg => (h.neg, vec![a[0]]),
-                JsUnop::Pos => (h.pos, vec![a[0]]),
+                JsUnop::Neg => (h.neg, vec![a[0]], false),
+                JsUnop::Pos => (h.pos, vec![a[0]], false),
                 JsUnop::BitNot | JsUnop::Inc | JsUnop::Dec => {
                     let kind = match u {
                         JsUnop::BitNot => BINOP_BITNOT,
@@ -3953,20 +4021,10 @@ impl<'a> Lower<'a> {
                         _ => BINOP_DEC,
                     };
                     let k = self.i32c(kind);
-                    (h.binop, vec![k, a[0], a[0]])
+                    (h.binop, vec![k, a[0], a[0]], false)
                 }
             },
             Opcode::JsCompare(cc) => {
-                if matches!(cc, JsCc::Eq | JsCc::Ne | JsCc::StrictEq | JsCc::StrictNe) {
-                    // Against a string literal (an atom): bbv's ladder.
-                    let args = self.f.insts[inst].args.clone();
-                    if self.is_str_literal(args[1]) {
-                        self.literal_eq(inst, cc, a[0], a[1])?;
-                    } else if self.is_str_literal(args[0]) {
-                        self.literal_eq(inst, cc, a[1], a[0])?;
-                    }
-                    self.equality_fast_arm(inst, cc, a[0], a[1])?;
-                }
                 let kind = match cc {
                     JsCc::Eq => CMP_EQ,
                     JsCc::Ne => CMP_NE,
@@ -3978,12 +4036,82 @@ impl<'a> Lower<'a> {
                     JsCc::Ge => CMP_GE,
                 };
                 let k = self.i32c(kind);
-                return self.js_call(inst, h.compare, &[k, a[0], a[1]], true);
+                (h.compare, vec![k, a[0], a[1]], true)
             }
-            Opcode::JsToNumeric => (h.tonumeric, vec![a[0]]),
+            Opcode::JsToNumeric => (h.tonumeric, vec![a[0]], false),
             _ => unreachable!(),
+        }
+    }
+
+    /// `prim.*` (`Opcode::Prim`): the generic op's inline arms taking
+    /// `ok`; then `fail` where an operand's conversion would call user
+    /// code (an object whose ToPrimitive is not Object.prototype's own,
+    /// unless an equality compares it with an object, null or undefined;
+    /// never in a strict one); then its helper, which runs no user code on
+    /// such operands: `ok` with the result, or `err` for the op's own
+    /// TypeError or RangeError.
+    fn prim_op(&mut self, inst: mir::Inst, p: crate::mir::ops::PrimOp, a: &[Value]) -> R<()> {
+        use crate::mir::ops::PrimOp;
+        let g = p.generic();
+        self.numeric_fast_arms(inst, &g, a)?;
+        if p == PrimOp::Add {
+            let d = self.f.insts[inst].clone();
+            self.concat_arm(inst, &d, a)?;
+        }
+        if let PrimOp::Compare(cc) = p {
+            self.equality_arms(inst, cc, a)?;
+        }
+        let is_obj = |l: &mut Self, v: Value| {
+            let t = l.tag_of(v);
+            l.tag_is(t, TAG_OBJECT as u32)
         };
-        self.js_call(inst, f, &args, false)
+        let user = match p {
+            PrimOp::Compare(JsCc::StrictEq | JsCc::StrictNe) => None,
+            PrimOp::Compare(JsCc::Eq | JsCc::Ne) => {
+                // Converted only against a primitive other than null or
+                // undefined.
+                let (oa, ob) = (is_obj(self, a[0]), is_obj(self, a[1]));
+                let one = self.bin(Operator::I32Xor, oa, ob, Type::I32);
+                let nullish = |l: &mut Self, v: Value| {
+                    let t = l.tag_of(v);
+                    let u = l.tag_is(t, TAG_UNDEFINED as u32);
+                    let n = l.tag_is(t, TAG_NULL as u32);
+                    l.bin(Operator::I32Or, u, n, Type::I32)
+                };
+                let (na, nb) = (nullish(self, a[0]), nullish(self, a[1]));
+                let either = self.bin(Operator::I32Or, na, nb, Type::I32);
+                let neither = self.un(Operator::I32Eqz, either, Type::I32);
+                let conv = self.bin(Operator::I32And, one, neither, Type::I32);
+                let (ua, ub) = (self.converts_user(a[0]), self.converts_user(a[1]));
+                let u = self.bin(Operator::I32Or, ua, ub, Type::I32);
+                Some(self.bin(Operator::I32And, conv, u, Type::I32))
+            }
+            PrimOp::Unop(_) | PrimOp::ToNumeric => Some(self.converts_user(a[0])),
+            _ => {
+                let (ua, ub) = (self.converts_user(a[0]), self.converts_user(a[1]));
+                Some(self.bin(Operator::I32Or, ua, ub, Type::I32))
+            }
+        };
+        if let Some(user) = user {
+            let fail = self.edge(inst, 1, &[])?;
+            let go = self.body.add_block();
+            self.cond_br(user, fail, Self::to(go));
+            self.cur = go;
+        }
+        let (f, args, bool_out) = self.op_helper(&g, a);
+        self.slow_census(inst);
+        let live = self.live_across(inst);
+        let (ok, result) = self.gc_call(f, &args, &live)?;
+        self.epoch_same = None;
+        let out = if bool_out {
+            self.un(Operator::I32WrapI64, result, Type::I32)
+        } else {
+            result
+        };
+        let t = self.edge(inst, 0, &[out])?;
+        let e = self.edge(inst, 2, &[])?;
+        self.cond_br(ok, t, e);
+        Ok(())
     }
 
     /// The inline arms of a read of syntactic global binding `bid` (bbv's
@@ -4765,6 +4893,33 @@ impl<'a> Lower<'a> {
         self.js_call(inst, self.h.get_prop_ic_miss, &[recv, at, c], false)
     }
 
+    /// `getprop.data`'s inline cache: `get_ic`'s ways and probe taking
+    /// `ok`, then the runtime's pure lookup (a leaf: no rooting), which
+    /// fills the ways as the IC miss does; its magic result (the lookup
+    /// would run code or throw) takes `fail`.
+    fn get_ic_pure(&mut self, inst: mir::Inst, name: mir::entity::AtomId, recv: Value, way_base: Value, cache: u32) -> R<()> {
+        let at = self.atom(name);
+        let probe = self.body.add_block();
+        self.get_ic_ways(inst, recv, way_base, cache * INLINE_IC_STRIDE, probe)?;
+        self.cur = probe;
+        let r = self.call(self.h.ic_get_poly, &[recv, at, way_base], &[Type::I64]);
+        let tag = self.tag_of(r);
+        let miss = self.tag_is(tag, TAG_MAGIC as u32);
+        let slow = self.body.add_block();
+        let t = self.edge(inst, 0, &[r])?;
+        self.cond_br(miss, Self::to(slow), t);
+        self.cur = slow;
+        self.slow_census(inst);
+        let c = self.i32c(cache);
+        let r = self.call(self.h.get_prop_pure, &[self.cx, recv, at, c], &[Type::I64]);
+        let tag = self.tag_of(r);
+        let fail = self.tag_is(tag, TAG_MAGIC as u32);
+        let t = self.edge(inst, 0, &[r])?;
+        let f = self.edge(inst, 1, &[])?;
+        self.cond_br(fail, f, t);
+        Ok(())
+    }
+
     /// A property store's inline cache: way 0 (an overwrite of the own slot
     /// the way describes) and the add-transition replay, taking `ok_clean`;
     /// a miss runs the generic set (vouched where the value keeps the
@@ -4797,6 +4952,79 @@ impl<'a> Lower<'a> {
         let (c, sv) = (self.i32c(cache), self.i32c(u32::from(strict)));
         let sv = self.bin(Operator::I32Or, sv, vouch, Type::I32);
         self.js_call(inst, self.h.set_prop_ic_miss, &[recv, at, val, c, sv], false)
+    }
+
+    /// `--mir-exit-census`: count a split op's call of its runtime helper
+    /// (kind `MIR_SLOW_CENSUS_KIND`), with its static record.
+    fn slow_census(&mut self, inst: mir::Inst) {
+        let Some(census) = self.exit_census else { return };
+        static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        crate::diag_line!(
+            "night: mir slowcall {id} sid#{} {}",
+            self.f.script,
+            mir::print::mnemonic(&self.f.insts[inst].op)
+        );
+        let (k, i) = (self.i32c(crate::options::MIR_SLOW_CENSUS_KIND), self.i32c(id));
+        self.call1(census, &[k, i], Type::I32);
+    }
+
+    /// 1 iff boxed `v` is an object whose ToPrimitive would run user code
+    /// (anything but Object.prototype's own conversion: the runtime's pure
+    /// check, a leaf).
+    fn converts_user(&mut self, v: Value) -> Value {
+        let t = self.tag_of(v);
+        let obj = self.tag_is(t, TAG_OBJECT as u32);
+        let (chk, join) = (self.body.add_block(), self.body.add_block());
+        let r = self.body.add_blockparam(join, Type::I32);
+        let z = self.i32c(0);
+        self.cond_br(obj, Self::to(chk), BlockTarget { block: join, args: vec![z] });
+        self.cur = chk;
+        let ok = self.call1(self.h.to_primitive_pure, &[self.cx, v], Type::I32);
+        let bad = self.un(Operator::I32Eqz, ok, Type::I32);
+        self.terminate(Terminator::Br {
+            target: BlockTarget { block: join, args: vec![bad] },
+        });
+        self.cur = join;
+        r
+    }
+
+    /// `setprop.data`'s inline cache: `set_ic`'s way and add-transition
+    /// replay taking `ok_clean` (they demote no claim MIR reads), then the
+    /// runtime's set, which fails where it would run code, and reports a
+    /// demotion (`ok_dirty`).
+    fn set_ic_pure(&mut self, inst: mir::Inst, name: mir::entity::AtomId, recv: Value, val: Value) -> R<()> {
+        let at = self.atom(name);
+        let cache = self.atoms.next_prop_cache();
+        let way = self.i32c(IC_WAY_ADDR_PLACEHOLDER);
+        self.prop_ic_patches.push((way, cache * INLINE_IC_STRIDE));
+        let (trans, slow) = (self.body.add_block(), self.body.add_block());
+        self.set_ic_ways(inst, at, recv, val, way, trans, slow)?;
+        self.cur = trans;
+        self.set_ic_trans(inst, name, recv, val, way, slow)?;
+        self.cur = slow;
+        self.slow_census(inst);
+        let c = self.i32c(cache);
+        let live = self.live_across(inst);
+        let (r, _) = self.gc_call(self.h.set_prop_pure, &[recv, at, val, c], &live)?;
+        self.epoch_same = None;
+        self.store_codes(inst, r)
+    }
+
+    /// A data store's helper result `r` (1 clean, 2 dirty, 0 fail, 3 err)
+    /// to the edge of that role (`setprop.data`, `setelem.data`).
+    fn store_codes(&mut self, inst: mir::Inst, r: Value) -> R<()> {
+        for (code, idx) in [(1, 0), (2, 1), (0, 2)] {
+            let c = self.i32c(code);
+            let is = self.bin(Operator::I32Eq, r, c, Type::I32);
+            let t = self.edge(inst, idx, &[])?;
+            let other = self.body.add_block();
+            self.cond_br(is, t, Self::to(other));
+            self.cur = other;
+        }
+        let e = self.edge(inst, 3, &[])?;
+        self.terminate(Terminator::Br { target: e });
+        Ok(())
     }
 
     /// `load_field`/`store_field` (§4.3). Under a SLOTS claim (a guard

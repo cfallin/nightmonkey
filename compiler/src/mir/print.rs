@@ -353,6 +353,7 @@ pub fn mnemonic(op: &Opcode) -> String {
         ),
         Math(f) => format!("math.{}", math_name(*f)),
         JsAdd => "js.add".into(),
+        Prim(p) => format!("prim.{}", mnemonic(&p.generic()).trim_start_matches("js.")),
         JsBinop(b) => format!("js.binop.{}", js_binop_name(*b)),
         JsUnop(u) => format!("js.unop.{}", js_unop_name(*u)),
         JsCompare(c) => format!("js.compare.{}", js_cc_name(*c)),
@@ -466,6 +467,11 @@ pub fn mnemonic(op: &Opcode) -> String {
         JsSetName(_, true) => "js.setname.strict".into(),
         LoadField(_) => "load_field".into(),
         LoadSlot(_) => "load_slot".into(),
+        GetPropData(_) => "getprop.data".into(),
+        GetElemData => "getelem.data".into(),
+        SetElemData(false) => "setelem.data".into(),
+        SetElemData(true) => "setelem.data.ranges".into(),
+        SetPropData(_) => "setprop.data".into(),
         StoreField(_) => "store_field".into(),
         InitField(_) => "init_field".into(),
         PublishLayout => "publish_layout".into(),
@@ -542,6 +548,8 @@ fn immediates(m: &Module, op: &Opcode) -> Option<String> {
         | JsSetName(a, _)
         | LoadField(a)
         | LoadSlot(a)
+        | GetPropData(a)
+        | SetPropData(a)
         | StoreField(a)
         | InitField(a) => atom(Some(m), *a),
         GuardTags(t) => tags_str(*t),

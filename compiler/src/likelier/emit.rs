@@ -1803,6 +1803,7 @@ impl Solver<'_> {
         self.emit_value_claims(&mut facts);
         facts.omitted_formals = self.omitted_formals.clone();
         let deleg = self.emit_call_sites(&mut facts, &mut caps);
+        self.emit_getter_names(&mut facts);
         // The analysis half of the speculation trace (see `viz`).
         if let Some(mut out) = super::viz::stream(self.opts) {
             super::viz::write_arg_types(self, &mut out);
@@ -2057,6 +2058,28 @@ impl Solver<'_> {
 
     /// How each call site resolved, plus the delegation edges the layout
     /// analysis walks through.
+    fn emit_getter_names(&self, facts: &mut LikelyFacts) {
+        // The builtins' accessor properties (getters on prototypes and
+        // constructors), by name; not `length` and `byteLength`, whose
+        // engine getters the runtime serves as the pure reads they are.
+        const BUILTIN: &[&str] = &[
+            "__proto__", "buffer", "byteOffset", "callee", "caller", "description", "detached",
+            "dotAll", "flags", "global", "growable", "hasIndices", "ignoreCase", "input",
+            "lastMatch", "lastParen", "leftContext", "maxByteLength", "multiline", "resizable",
+            "rightContext", "size", "source", "species", "stack", "sticky", "unicode",
+            "unicodeSets",
+        ];
+        facts.getter_names.extend(facts.accessor_names.iter().copied());
+        facts.getter_names.extend(self.tables.accessor_defs.iter().copied());
+        facts.getter_names.extend(self.tables.call_str_arg1.values().copied());
+        for s in BUILTIN {
+            let chars: Vec<u16> = s.encode_utf16().collect();
+            if let Some(n) = self.names.lookup(&chars) {
+                facts.getter_names.insert(n);
+            }
+        }
+    }
+
     fn emit_call_sites(&self, facts: &mut LikelyFacts, caps: &mut CapDrops) -> Delegation {
         // Scripted targets: 1..=MAX_SITE_TARGETS, emitted as a guard chain.
         for (&site, fns) in &self.site_likely_calls {

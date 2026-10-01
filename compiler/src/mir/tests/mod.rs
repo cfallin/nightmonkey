@@ -853,3 +853,89 @@ b12(v32: obj{L3 types slots}):\n  v33 = load_slot v32 x\n  return v33\n",
     ));
     assert!(text.contains("guard.layout"), "{text}");
 }
+
+/// A loop reading `v4.x` by name (`getprop.data`) through a receiver from
+/// before it, with `body` after the read (b3 has the value as `v7`; it
+/// ends by jumping to b4 with the counter). The loop's entry state is set
+/// as the builder sets it (the text format has none).
+fn data_read_loop(body: &str) -> Module {
+    let src = format!(
+        "module {{\n  layout L3 = {{ x: val{{int32}} }}\n}}\n\
+func @s1 (formals=1, locals=0, depths={{0:0}}) {{\n  root entry b0\n  loop b2 preheader=b1\n\
+b0(v0: obj{{Function(s1)}}, v1: val, v2: val):\n  jump b1(v1, v2)\n\
+b1(v3: val, v4: val):\n  v5 = const.i32 0\n  jump b2(v5)\n\
+b2(v6: i32):\n  getprop.data v4 x -> ok b3(v7: val), fail b9\n\
+b3(v7: val):\n{body}\
+b4(v11: i32):\n  v12 = const.i32 100\n  v13 = i32.cmp.lt v11, v12\n  br v13 -> then b2(v11), else b8\n\
+b8:\n  return v7\n\
+b9:\n  exit pc=0 this=v1 args=[v2] locals=[] rval=v1 stack=[]\n}}\n"
+    );
+    let mut m = parse_ok(&src);
+    m.funcs[0].loops[0].entry = Some(crate::mir::func::LoopEntry {
+        pc: crate::ids::Pc::new(0),
+        slots: vec![true, true, false],
+        state: vec![],
+    });
+    verify_module(&m).expect("valid before");
+    m
+}
+
+fn optimize_module(mut m: Module) -> String {
+    let mut f = m.funcs.pop().unwrap();
+    crate::mir::opt::optimize(&m, &mut f);
+    m.funcs.push(f);
+    let text = print_module(&m);
+    if let Err(es) = verify_module(&m) {
+        panic!("invalid after optimizing: {:?}\n{text}", es);
+    }
+    text
+}
+
+/// The block (`bN:` or `bN(`) holding `needle`.
+fn block_of<'a>(text: &'a str, needle: &str) -> &'a str {
+    let blk = text.split("\n\n").find(|b| b.contains(needle)).unwrap_or("");
+    blk.split([':', '(']).next().unwrap_or("")
+}
+
+#[test]
+fn data_read_hoists_with_its_exit() {
+    // Nothing in the loop writes `x`: the read leaves it, its fail edge
+    // becoming the loop's entry exit (pc 0, the entry state).
+    let text = optimize_module(data_read_loop(
+        "  v10 = const.i32 1\n  i32.add.ovf v6, v10 -> ok b4(v11: i32), fail b9\n",
+    ));
+    assert_eq!(text.matches("getprop.data").count(), 1, "{text}");
+    let at = block_of(&text, "getprop.data");
+    assert!(at == "b1" || !text.contains(&format!("loop b2 preheader={at}")), "{text}");
+    let loop_blocks = ["b2:", "b2(", "b3(", "b4("];
+    let inside = text
+        .split("\n\n")
+        .filter(|b| loop_blocks.iter().any(|p| b.starts_with(p)))
+        .any(|b| b.contains("getprop.data"));
+    assert!(!inside, "still in the loop:\n{text}");
+}
+
+#[test]
+fn data_read_stays_under_a_store_of_its_name() {
+    // `v4.x = i` in the loop (a by-name store): the read stays.
+    let text = optimize_module(data_read_loop(
+        "  v10 = const.i32 1\n  v14 = box v6\n\
+  setprop.data v4, v14 x -> ok_clean b5, ok_dirty b9, fail b9, err b9\n\
+b5:\n  i32.add.ovf v6, v10 -> ok b4(v11: i32), fail b9\n",
+    ));
+    let inside = text
+        .split("\n\n")
+        .filter(|b| b.starts_with("b2(") || b.starts_with("b2:"))
+        .any(|b| b.contains("getprop.data"));
+    assert!(inside, "hoisted past a store of `x`:\n{text}");
+}
+
+#[test]
+fn data_reads_number() {
+    // Two reads of `v4.x` with no write between: the second is the first.
+    let text = optimize_module(data_read_loop(
+        "  getprop.data v4 x -> ok b5(v15: val), fail b9\n\
+b5(v15: val):\n  v10 = const.i32 1\n  i32.add.ovf v6, v10 -> ok b4(v11: i32), fail b9\n",
+    ));
+    assert_eq!(text.matches("getprop.data").count(), 1, "{text}");
+}

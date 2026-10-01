@@ -316,3 +316,51 @@ Lessons:
   `~/work/nm-mir-scratch/prof8/bugcheck.sh` counts them over the suite.
 - A pass that substitutes a value must not extend one with killable type
   components past a fence (`gvn`'s and `fold_unbox`'s rule).
+
+## 9. Generic fallbacks with precise effects (KICKOFF-8 item 1)
+
+A generic op's summary is `Unknown` because on operands nothing proved,
+it may run code. Split, the common case is an op of its own that runs no
+code, with precise effects; a case that would run code takes a `fail`
+edge (an exit before the op, for baseline to do it), and a case that
+demoted a claim takes the dirty edge (an exit after it). The two-track
+rule holds: running user code is the GEN track. Which names may reach a
+getter is static (`getter_names`: modeled `defineProperty` accessors,
+literal and class accessors, every `defineProperty`-shaped call's name,
+the builtins' accessors); a site of such a name keeps the generic op.
+
+| op | runs | `fail` | effects (clean edge) |
+|---|---|---|---|
+| `getprop.data` | own or prototype data property, absence, pure builtin lengths | getter, proxy, resolve hook, null/undefined | reads `Field(*, name)` (+ `Global` of that name, lengths) |
+| `setprop.data` | overwrite of a writable data property, add with nothing on the chain, writable array length | setter, read-only, non-extensible, the global, a watched object (prototype, fuse holder) | writes `Field(*, name)` (+ array length, elements) |
+| `getelem.data` | elements (dense, holes through the prototypes, typed arrays, arguments, string chars), names by primitive keys | getter, proxy, object key | reads anything, writes nothing |
+| `setelem.data` (int32 key) | element overwrite, append, sparse add, number to a typed array | setter on the chain, frozen, non-extensible, arguments, value needing conversion | writes elements, lengths, typed-array data |
+| `prim.*` | arithmetic and compares on primitives, and on objects whose conversion is Object.prototype's own (a pure runtime check) | an object with its own conversion | none (may GC) |
+| `js.box_this` | the global `this`, or a primitive's wrapper | (never) | an allocation |
+
+The runtime helpers are pure lookups (`GetPropertyPure`,
+`LookupPropertyPure`), the IC's populate paths (so a fallback still fills
+the site's ways), and for stores the engine's own set behind those
+checks, with the object's word compared before and after for a demotion
+of TYPES, SLOTS or its class (RANGES, which no MIR claim reads, may drop
+as on every engine store).
+
+`opt::hoist_reads` then moves a loop's invariant read *diamond* to its
+preheader: the predicted layout's guard, the slot load and the by-name
+fallback rejoining, one invariant value whose guard does not exit (so
+`hoist_guards` leaves it). Its exits become the loop's entry exit; the
+`box`/`weaken`/`unbox` chain of its receiver (which `licm` leaves in
+place) moves with it. Only a region every iteration passes moves: a read
+under a condition (`if (o) s += o.x`) may be one whose receiver fails it
+on every entry.
+
+Lessons:
+
+- Exit storms show in `--mir-exit-census` and nowhere else (the lanes
+  pass, scores move a few percent). Every refusal of a split op needs a
+  census over the suite: arrays carry an `addProperty` hook (the engine's
+  own length bookkeeping), RegExps keep `lastIndex` as a plain data
+  property, objects under construction take adds, a string's index past
+  its end reaches `String.prototype`'s resolve hook, and `v == EOF` with
+  `EOF = {}` converts an object through Object.prototype's builtins: each
+  of these first exited at every execution.

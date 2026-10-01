@@ -404,9 +404,6 @@ int32_t night_runtime_mir_stress(uint32_t period);
 // carries the CONSTRUCTING sentinel with our early key (or none) and its
 // slot span covers the layout's `nFields`, keeping the `keepBits` validity
 // bits that survived construction. Leaf.
-// MIR's `init_field` slow path: the plain add of the next predicted field
-// to an object under construction; 1 iff it stays `constructing(n+1)`
-// (`expectSpan` slots, `wantBits` kept). The object to the out-slot. May GC.
 // MIR's dense append slow path (`store_elem.append`): append `val` at index
 // `idx` of native object `recv` (boxed), `idx` its initialized length, when
 // that is an ordinary dense append (extensible, not frozen, a writable
@@ -416,6 +413,52 @@ int32_t night_runtime_mir_stress(uint32_t period);
 NIGHT_RUNTIME_EXPORT(night_runtime_elem_grow)
 uint32_t night_runtime_elem_grow(JSContext* cx, uint32_t top, uint64_t recv,
                                  uint32_t idx, uint64_t val);
+// MIR's `getprop.data` miss (leaf: no GC, no JS): `recv.atomId` where
+// the lookup runs no code -- an own or prototype data property, an absent
+// one, or a pure builtin length -- filling the site's inline ways as the
+// IC miss does. A magic value where the lookup would run code (a getter, a
+// proxy, a resolve hook) or throw.
+NIGHT_RUNTIME_EXPORT(night_runtime_get_prop_pure)
+uint64_t night_runtime_get_prop_pure(JSContext* cx, uint64_t recv,
+                                     uint32_t atomId, uint32_t cacheIdx);
+// MIR's `setprop.data` miss: `recv.atomId = val` where the set runs no
+// code (an own writable data property of a native object, or an add with
+// no setter, read-only property or hook on the chain; never the global or
+// a Watchtower-watched object), through the IC miss path (filling the
+// site's way). 1 once stored, 2 once stored where it demoted a claim of
+// the object's published class MIR reads (TYPES, SLOTS, the class), 0
+// where it would not be such a set (nothing done), 3 on an engine error.
+// May GC.
+// Whether ToPrimitive of `v` (boxed) runs no user code: a primitive, or
+// an object whose conversion is Object.prototype's own (no @@toPrimitive,
+// the builtin valueOf and toString, a data @@toStringTag or none), found
+// by pure lookups (MIR's `prim.*`). Leaf.
+NIGHT_RUNTIME_EXPORT(night_runtime_to_primitive_pure)
+int32_t night_runtime_to_primitive_pure(JSContext* cx, uint64_t v);
+// MIR's `getelem.data` miss: `recv[key]` where the read runs no code (a
+// primitive key; a data property, an element of a dense, typed-array,
+// arguments object or string, or nothing, by pure lookups). 1 with the
+// value in the out-slot, 0 where it would run code or throw (nothing
+// done), 2 on an engine error. May GC (interning the key, a char).
+NIGHT_RUNTIME_EXPORT(night_runtime_get_elem_pure)
+uint32_t night_runtime_get_elem_pure(JSContext* cx, uint32_t top,
+                                     uint64_t recv, uint64_t key);
+// MIR's `setelem.data` miss: `recv[key] = val` for an int32 key where the
+// set runs no code (an element of a native object or array, writable or
+// added with nothing on the chain to refuse or run; a number to a typed
+// array's element; never the global, an arguments object or a watched
+// object). Codes as `night_runtime_set_prop_pure`'s. May GC.
+NIGHT_RUNTIME_EXPORT(night_runtime_set_elem_pure)
+uint32_t night_runtime_set_elem_pure(JSContext* cx, uint32_t top,
+                                     uint64_t recv, uint64_t key,
+                                     uint64_t val);
+NIGHT_RUNTIME_EXPORT(night_runtime_set_prop_pure)
+uint32_t night_runtime_set_prop_pure(JSContext* cx, uint32_t top,
+                                     uint64_t recv, uint32_t atomId,
+                                     uint64_t val, uint32_t cacheIdx);
+// MIR's `init_field` slow path: the plain add of the next predicted field
+// to an object under construction; 1 iff it stays `constructing(n+1)`
+// (`expectSpan` slots, `wantBits` kept). The object to the out-slot. May GC.
 NIGHT_RUNTIME_EXPORT(night_runtime_init_field)
 uint32_t night_runtime_init_field(JSContext* cx, uint32_t top, uint64_t recv,
                                   uint32_t atomId, uint64_t val,

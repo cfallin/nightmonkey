@@ -24,11 +24,12 @@ enum Version {
 }
 
 /// The heap reads `mem_vn` numbers: a function of their receiver and the
-/// memory they read. `load_field` (the IC form) only on its clean edge.
+/// memory they read. `load_field` (the IC form) only on its clean edge,
+/// `getprop.data` on its `ok` one.
 fn vn_read(op: &Opcode) -> bool {
     matches!(
         op,
-        Opcode::LoadSlot(_) | Opcode::LoadField(_) | Opcode::LengthArray | Opcode::LengthTa
+        Opcode::LoadSlot(_) | Opcode::LoadField(_) | Opcode::GetPropData(_) | Opcode::LengthArray | Opcode::LengthTa
     )
 }
 

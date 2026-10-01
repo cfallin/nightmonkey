@@ -716,6 +716,29 @@ pub struct Helpers {
     /// MIR's `store_elem.append` slow path, an append the inline arm
     /// refused (growth, an uncached row). May GC; runs no JS.
     pub elem_grow: Func,
+    /// `night_runtime_get_prop_pure(cx, recv i64, atomId, cacheIdx) -> i64`
+    /// (leaf): MIR's `getprop.data` miss, `recv.atom` where the lookup runs
+    /// no code (data properties, absence, pure builtin lengths), filling
+    /// the site's ways; a magic value where it would run code or throw.
+    /// No GC, no JS.
+    pub get_prop_pure: Func,
+    /// `night_runtime_set_prop_pure(cx, top, recv i64, atomId, val i64,
+    /// cacheIdx) -> 1 stored | 2 stored, demoting a claim | 0 a set that
+    /// would run code | 3 error`: MIR's `setprop.data` miss. May GC; runs
+    /// no JS.
+    pub set_prop_pure: Func,
+    /// `night_runtime_to_primitive_pure(cx, v i64) -> i32` (leaf): 1 iff
+    /// ToPrimitive of `v` runs no user code (a primitive, or Object.prototype's
+    /// own conversion): MIR's `prim.*` on an object operand.
+    pub to_primitive_pure: Func,
+    /// `night_runtime_get_elem_pure(cx, top, recv i64, key i64) -> 1 ok |
+    /// 0 a read that would run code | 2 error`, the value to the out-slot:
+    /// MIR's `getelem.data` miss. May GC; runs no JS.
+    pub get_elem_pure: Func,
+    /// `night_runtime_set_elem_pure(cx, top, recv i64, key i64, val i64)
+    /// -> 1 stored | 2 stored, demoting a claim | 0 a set that would run
+    /// code | 3 error`: MIR's `setelem.data` miss. May GC; runs no JS.
+    pub set_elem_pure: Func,
     /// `night_runtime_set_fun_name(cx, top, fun i64, name i64, prefixKind i32) -> ok`:
     /// `JSOp::SetFunName` -- set the inferred name on an anonymous function.
     /// Leaves `fun` on the stack (no out-slot).
@@ -3837,6 +3860,31 @@ mod tests {
             returns: vec![Type::I32],
         });
         let elem_grow = stub(&mut m, grow_sig, true, "night_runtime_elem_grow");
+        let gpp_sig = m.signatures.push(SignatureData {
+            params: vec![Type::I32, Type::I64, Type::I32, Type::I32],
+            returns: vec![Type::I64],
+        });
+        let get_prop_pure = stub_i64(&mut m, gpp_sig, "night_runtime_get_prop_pure");
+        let spp_sig = m.signatures.push(SignatureData {
+            params: vec![Type::I32, Type::I32, Type::I64, Type::I32, Type::I64, Type::I32],
+            returns: vec![Type::I32],
+        });
+        let set_prop_pure = stub(&mut m, spp_sig, true, "night_runtime_set_prop_pure");
+        let tpp_sig = m.signatures.push(SignatureData {
+            params: vec![Type::I32, Type::I64],
+            returns: vec![Type::I32],
+        });
+        let to_primitive_pure = stub(&mut m, tpp_sig, true, "night_runtime_to_primitive_pure");
+        let gep_sig = m.signatures.push(SignatureData {
+            params: vec![Type::I32, Type::I32, Type::I64, Type::I64],
+            returns: vec![Type::I32],
+        });
+        let get_elem_pure = stub(&mut m, gep_sig, true, "night_runtime_get_elem_pure");
+        let sep_sig = m.signatures.push(SignatureData {
+            params: vec![Type::I32, Type::I32, Type::I64, Type::I64, Type::I64],
+            returns: vec![Type::I32],
+        });
+        let set_elem_pure = stub(&mut m, sep_sig, true, "night_runtime_set_elem_pure");
         // math_unary: (kind i32, x f64) -> f64; math_pow: (x f64, y f64) -> f64.
         let mu_sig = m.signatures.push(SignatureData {
             params: vec![Type::I32, Type::F64],
@@ -4159,6 +4207,11 @@ mod tests {
                 ctor_restamp,
                 init_field,
                 elem_grow,
+                get_prop_pure,
+                set_prop_pure,
+                to_primitive_pure,
+                get_elem_pure,
+                set_elem_pure,
             },
         )
     }
