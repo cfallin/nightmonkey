@@ -15,7 +15,7 @@ ff147 = []
 [dependencies]
 # AOT Wasm emitter: builds the codegen core module and merges it into
 # the runtime reactor module (weval-style).
-waffle = "0.3.1"
+waffle = "0.3.2"
 log = "0.4"
 # Fast non-SipHash maps: the translator/merge keys are small integers (pcs,
 # entity ids), and profile showed SipHash dominating large-input translation.
