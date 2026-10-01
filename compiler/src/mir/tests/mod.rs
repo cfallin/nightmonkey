@@ -939,3 +939,36 @@ b5(v15: val):\n  v10 = const.i32 1\n  i32.add.ovf v6, v10 -> ok b4(v11: i32), fa
     ));
     assert_eq!(text.matches("getprop.data").count(), 1, "{text}");
 }
+
+/// `a[i]` twice through an array `v4` and an index `v5`, with `between`
+/// in b11 (which ends by jumping to b12).
+fn elem_twice(between: &str) -> String {
+    format!(
+        "module {{}}\n\
+func @s1 (formals=2, locals=0, depths={{0:0}}) {{\n  root entry b0\n\
+b0(v0: obj{{Function(s1)}}, v1: val, v2: val, v3: val):\n  guard.unbox.obj v2 -> ok b5(v20: obj), fail b9\n\
+b5(v20: obj):\n  guard.kind v20 Array -> ok b6(v4: obj{{Array}}), fail b9\n\
+b6(v4: obj{{Array}}):\n  guard.unbox.i32 v3 -> ok b7(v5: i32), fail b9\n\
+b7(v5: i32):\n  load_elem v4, v5 -> ok b10(v30: val), fail b9\n\
+b10(v30: val):\n  jump b11\n\
+b11:\n{between}\
+b12:\n  load_elem v4, v5 -> ok b13(v31: val), fail b9\n\
+b13(v31: val):\n  return v31\n\
+b9:\n  exit pc=0 this=v1 args=[v2, v3] locals=[] rval=v1 stack=[]\n}}\n"
+    )
+}
+
+#[test]
+fn element_loads_number() {
+    let text = optimized(&elem_twice("  jump b12\n"));
+    assert_eq!(text.matches("load_elem").count(), 1, "{text}");
+    assert!(text.contains("return v30"), "{text}");
+}
+
+#[test]
+fn element_loads_do_not_number_across_a_store() {
+    let text = optimized(&elem_twice(
+        "  v40 = const.val null\n  store_elem v4, v5, v40 -> ok b12, fail b9\n",
+    ));
+    assert_eq!(text.matches("load_elem").count(), 2, "{text}");
+}

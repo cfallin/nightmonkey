@@ -480,6 +480,16 @@ const DIRTY_EXITS: bool = true;
 /// objects is `prim.*`, exiting where an operand would call user code.
 const PRIM_OPS: bool = true;
 
+/// A wrapper constructor's forward of its `this` under construction exits
+/// where the target is not the one resolved for the copy, or the `.apply`
+/// is not the builtin (no generic op sees the object).
+const CTOR_FWD_EXITS: bool = true;
+
+/// An inlined `new F()` of a layout constructor allocates `this` from
+/// `F.prototype` (`new_this`), which runs no code, instead of the generic
+/// `create_this`.
+const NEW_THIS: bool = true;
+
 /// A generic element read is a data read (`getelem.data`), exiting where
 /// the read would run code.
 const ELEM_DATA: bool = true;
@@ -3562,6 +3572,16 @@ impl<'s, 'a> Run<'s, 'a> {
             block: join,
             args: vec![EdgeArg::Out(0)],
         };
+        // A wrapper constructor's forward of its `this` under construction
+        // to the target the analysis resolved for this copy: another target
+        // (`initialize` replaced) is baseline's to call, which keeps the
+        // object from every generic op (MIR-MEMORY.md §6).
+        if this_raw.is_some() && CTOR_FWD_EXITS {
+            let ex = self.exit_block(false);
+            self.term(Opcode::Jump, vec![], vec![Self::goto(ex)]);
+            self.at(join);
+            return result;
+        }
         let (op, args) = fallback.unwrap_or((Opcode::Call, vals.to_vec()));
         match dirty {
             Some(d) => {
@@ -3631,9 +3651,18 @@ impl<'s, 'a> Run<'s, 'a> {
         let ctor = self.new_block();
         self.term(Opcode::Br, vec![is_ctor], vec![Self::goto(ctor), Self::goto(generic)]);
         self.at(ctor);
-        // A fence: the next pc's value is the construct's, not `this`, so
-        // a kill here has nowhere to exit to.
-        let this = self.js_fence(Opcode::CreateThis(nslots, word), vec![vals[0], nt], MType::val(TagSet::OBJECT));
+        // A layout constructor that is its own new.target (`new F()`):
+        // `this` from its `prototype`, read by name (its fail exits before
+        // the `new`), an allocation (MIR-MEMORY.md §6). Else a fence: the
+        // next pc's value is the construct's, not `this`, so a kill here
+        // has nowhere to exit to.
+        let proto_atom = self.mm.intern_atom(&"prototype".encode_utf16().collect::<Vec<u16>>());
+        let this = if NEW_THIS && nt == vals[0] && self.ctor_of_word(k, word).is_some() && self.data_get_ok(proto_atom) {
+            let proto = self.data_get(proto_atom, vals[0]);
+            self.js_static(Opcode::NewThis(nslots, word), vec![kobj, proto], MType::val(TagSet::OBJECT))
+        } else {
+            self.js_fence(Opcode::CreateThis(nslots, word), vec![vals[0], nt], MType::val(TagSet::OBJECT))
+        };
         // The object `create_this` made carries `word` (§2.3): under
         // construction for the constructor's own layout, with no field
         // yet. The body is built for that `this`, whose adds are then
@@ -3772,15 +3801,22 @@ impl<'s, 'a> Run<'s, 'a> {
             }],
         );
         self.at(slow);
-        let r = self.js(helper.0, helper.1, MType::VAL_TOP);
-        self.term(
-            Opcode::Jump,
-            vec![],
-            vec![Edge {
-                block: join,
-                args: vec![EdgeArg::Value(r)],
-            }],
-        );
+        if raw.is_some() && CTOR_FWD_EXITS {
+            // Another `.apply` for a `this` under construction: baseline's
+            // (`inline_call_this`'s rule).
+            let ex = self.exit_block(false);
+            self.term(Opcode::Jump, vec![], vec![Self::goto(ex)]);
+        } else {
+            let r = self.js(helper.0, helper.1, MType::VAL_TOP);
+            self.term(
+                Opcode::Jump,
+                vec![],
+                vec![Edge {
+                    block: join,
+                    args: vec![EdgeArg::Value(r)],
+                }],
+            );
+        }
         self.at(join);
         result
     }

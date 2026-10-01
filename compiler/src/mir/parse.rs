@@ -1320,6 +1320,11 @@ impl Parser {
                 self.expect_punct(",")?;
                 CreateThis(n, self.int()?)
             }
+            NewThis(..) => {
+                let n = self.int()?;
+                self.expect_punct(",")?;
+                NewThis(n, self.int()?)
+            }
             CtorStamp(..) | CtorPublish(..) => {
                 let l = self.int()?;
                 self.expect_punct(",")?;
@@ -1715,6 +1720,7 @@ fn template(mn: &str) -> Option<Opcode> {
         CallDirect,
         Construct(0, 0),
         CreateThis(0, 0),
+        NewThis(0, 0),
         FnIsCtor,
         ObjEmulatesUndef,
         Restamp(0),

@@ -703,6 +703,23 @@ bool NightConstruct(JSContext* cx, void* spPtr, uint32_t argc, uint32_t nSlots,
 // base constructors compile (derived use `SuperCall`, unsupported), so
 // `CreateThis` yields a real object, never the derived-class uninitialized-this
 // magic.
+bool NightNewThis(JSContext* cx, uint64_t calleeBits, uint64_t protoBits,
+                  uint32_t nSlots, uint64_t* out, uint32_t stampWord) {
+  RootedValue cv(cx, JS::Value::fromRawBits(calleeBits));
+  RootedFunction callee(cx, &cv.toObject().as<JSFunction>());
+  JS::Value pv = JS::Value::fromRawBits(protoBits);
+  RootedObject proto(cx, pv.isObject() ? &pv.toObject() : nullptr);
+  RootedObject thisObj(
+      cx, AllocNSlots(cx, callee, nSlots == NIGHT_NO_NSLOTS ? 0 : nSlots, proto));
+  if (!thisObj) {
+    return false;
+  }
+  js::night::NightSetClassWord(thisObj, stampWord,
+                               js::night::NightBumpSite::ConstructStamp);
+  *out = ObjectValue(*thisObj).asRawBits();
+  return true;
+}
+
 bool NightCreateThis(JSContext* cx, uint64_t calleeBits, uint64_t newTargetBits,
                      uint32_t nSlots, uint64_t* out, uint32_t stampWord) {
   RootedValue ntv(cx, JS::Value::fromRawBits(newTargetBits));

@@ -723,7 +723,7 @@ pub struct Helpers {
     /// No GC, no JS.
     pub get_prop_pure: Func,
     /// `night_runtime_set_prop_pure(cx, top, recv i64, atomId, val i64,
-    /// cacheIdx) -> 1 stored | 2 stored, demoting a claim | 0 a set that
+    /// cacheIdx, flags) -> 1 stored | 2 stored, demoting a claim | 0 a set that
     /// would run code | 3 error`: MIR's `setprop.data` miss. May GC; runs
     /// no JS.
     pub set_prop_pure: Func,
@@ -739,6 +739,10 @@ pub struct Helpers {
     /// -> 1 stored | 2 stored, demoting a claim | 0 a set that would run
     /// code | 3 error`: MIR's `setelem.data` miss. May GC; runs no JS.
     pub set_elem_pure: Func,
+    /// `night_runtime_new_this(cx, top, callee i64, proto i64, nslots, cell,
+    /// word) -> ok`: MIR's `new_this` slow path (the object to the
+    /// out-slot). May GC; runs no JS.
+    pub new_this: Func,
     /// `night_runtime_set_fun_name(cx, top, fun i64, name i64, prefixKind i32) -> ok`:
     /// `JSOp::SetFunName` -- set the inferred name on an anonymous function.
     /// Leaves `fun` on the stack (no out-slot).
@@ -3866,7 +3870,7 @@ mod tests {
         });
         let get_prop_pure = stub_i64(&mut m, gpp_sig, "night_runtime_get_prop_pure");
         let spp_sig = m.signatures.push(SignatureData {
-            params: vec![Type::I32, Type::I32, Type::I64, Type::I32, Type::I64, Type::I32],
+            params: vec![Type::I32, Type::I32, Type::I64, Type::I32, Type::I64, Type::I32, Type::I32],
             returns: vec![Type::I32],
         });
         let set_prop_pure = stub(&mut m, spp_sig, true, "night_runtime_set_prop_pure");
@@ -3885,6 +3889,11 @@ mod tests {
             returns: vec![Type::I32],
         });
         let set_elem_pure = stub(&mut m, sep_sig, true, "night_runtime_set_elem_pure");
+        let nt_sig = m.signatures.push(SignatureData {
+            params: vec![Type::I32, Type::I32, Type::I64, Type::I64, Type::I32, Type::I32, Type::I32],
+            returns: vec![Type::I32],
+        });
+        let new_this = stub(&mut m, nt_sig, true, "night_runtime_new_this");
         // math_unary: (kind i32, x f64) -> f64; math_pow: (x f64, y f64) -> f64.
         let mu_sig = m.signatures.push(SignatureData {
             params: vec![Type::I32, Type::F64],
@@ -4212,6 +4221,7 @@ mod tests {
                 to_primitive_pure,
                 get_elem_pure,
                 set_elem_pure,
+                new_this,
             },
         )
     }

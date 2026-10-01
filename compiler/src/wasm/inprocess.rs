@@ -702,6 +702,7 @@ mod tests {
         "night_runtime_to_primitive_pure",
         "night_runtime_get_elem_pure",
         "night_runtime_set_elem_pure",
+        "night_runtime_new_this",
         "night_runtime_bigint",
         "night_runtime_non_syntactic_global_this",
         "night_runtime_set_intrinsic",

@@ -111,6 +111,11 @@ bool NightConstruct(JSContext* cx, void* spPtr, uint32_t argc, uint32_t nSlots,
 // predicted layout, else an ordinary `CreateThis`.
 bool NightCreateThis(JSContext* cx, uint64_t calleeBits, uint64_t newTargetBits,
                      uint32_t nSlots, uint64_t* out, uint32_t stampWord);
+// `NightCreateThis` for a scripted (non-derived) constructor that is its own
+// new.target, its `prototype` already read (`protoBits`; a non-object
+// means the realm's Object.prototype): runs no code.
+bool NightNewThis(JSContext* cx, uint64_t calleeBits, uint64_t protoBits,
+                  uint32_t nSlots, uint64_t* out, uint32_t stampWord);
 
 bool NightException(JSContext* cx, uint64_t* out);
 void NightThrow(JSContext* cx, uint64_t valBits);

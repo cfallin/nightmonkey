@@ -3049,6 +3049,21 @@ impl<'a> Lower<'a> {
                 self.terminate(Terminator::Br { target: f });
             }
             Opcode::InlineEnter => self.inline_enter(&d, &a)?,
+            Opcode::NewThis(nslots, word) => {
+                // May GC: root what is live across it. Runs no code.
+                let live = self.live_across(inst);
+                self.root(&live)?;
+                let top_off = self.top_off(live.len());
+                let top = self.add_off(self.vp, top_off);
+                let callee = self.box_tagged(TAG_OBJECT, a[0]);
+                let ok = self.construct_this_with(top, callee, callee, Some(a[1]), nslots, word);
+                self.after_gc(&live);
+                self.cold = true;
+                let r = self.load_i64(self.vp, top_off);
+                let t = self.edge(inst, 0, &[r])?;
+                let e = self.edge(inst, 1, &[])?;
+                self.cond_br(ok, t, e);
+            }
             Opcode::CreateThis(nslots, word) => {
                 // May GC: root what is live across it.
                 let live = self.live_across(inst);
@@ -5004,9 +5019,10 @@ impl<'a> Lower<'a> {
         self.set_ic_trans(inst, name, recv, val, way, slow)?;
         self.cur = slow;
         self.slow_census(inst);
+        let vouch = self.vouch_types(inst, recv, val);
         let c = self.i32c(cache);
         let live = self.live_across(inst);
-        let (r, _) = self.gc_call(self.h.set_prop_pure, &[recv, at, val, c], &live)?;
+        let (r, _) = self.gc_call(self.h.set_prop_pure, &[recv, at, val, c, vouch], &live)?;
         self.epoch_same = None;
         self.store_codes(inst, r)
     }
@@ -6057,6 +6073,21 @@ impl<'a> Lower<'a> {
         nslots: u32,
         word: u32,
     ) -> Value {
+        self.construct_this_with(top, callee, new_target, None, nslots, word)
+    }
+
+    /// `construct_this`, or with `proto` (`new_this`: the callee is its own
+    /// new.target and its `prototype` is read) the cell's arm comparing it
+    /// with the cell's prototype, and the `new_this` helper.
+    fn construct_this_with(
+        &mut self,
+        top: Value,
+        callee: Value,
+        new_target: Value,
+        proto: Option<Value>,
+        nslots: u32,
+        word: u32,
+    ) -> Value {
         let cell = self.i32c(CONSTRUCT_CELL_ADDR_PLACEHOLDER);
         let idx = self.atoms.next_construct_cell();
         self.construct_cell_patches.push((cell, idx + 1));
@@ -6074,19 +6105,26 @@ impl<'a> Lower<'a> {
         let filled = self.bin(Operator::I32Ne, ashape, z, Type::I32);
         let s_ok = self.bin(Operator::I32Eq, cshape, live_shape, Type::I32);
         let g_ok = self.bin(Operator::I32Eq, cgen, live_gen, Type::I32);
-        let hit = self.bin(Operator::I32And, filled, s_ok, Type::I32);
+        // With the prototype given, the cell's shape is the object's for
+        // it, whoever the callee's shape is.
+        let hit = if proto.is_some() { filled } else { self.bin(Operator::I32And, filled, s_ok, Type::I32) };
         let hit = self.bin(Operator::I32And, hit, g_ok, Type::I32);
         self.check(hit, slow);
-        // A reassigned `.prototype` keeps the callee's shape.
-        let enc = self.load_i32(cell, CONSTRUCT_CELL_PROTOSLOTENC);
-        let one = self.i32c(1);
-        let dynamic = self.bin(Operator::I32And, enc, one, Type::I32);
-        let not1 = self.i32c(!1);
-        let off = self.bin(Operator::I32And, enc, not1, Type::I32);
-        let slots = self.load_i32(cptr, NATIVE_SLOTS_OFFSET);
-        let sb = self.select(Type::I32, slots, cptr, dynamic);
-        let addr = self.bin(Operator::I32Add, sb, off, Type::I32);
-        let pval = self.load_i64(addr, 0);
+        let pval = match proto {
+            Some(p) => p,
+            None => {
+                // A reassigned `.prototype` keeps the callee's shape.
+                let enc = self.load_i32(cell, CONSTRUCT_CELL_PROTOSLOTENC);
+                let one = self.i32c(1);
+                let dynamic = self.bin(Operator::I32And, enc, one, Type::I32);
+                let not1 = self.i32c(!1);
+                let off = self.bin(Operator::I32And, enc, not1, Type::I32);
+                let slots = self.load_i32(cptr, NATIVE_SLOTS_OFFSET);
+                let sb = self.select(Type::I32, slots, cptr, dynamic);
+                let addr = self.bin(Operator::I32Add, sb, off, Type::I32);
+                self.load_i64(addr, 0)
+            }
+        };
         let pt = self.tag_of(pval);
         let p_obj = self.tag_is(pt, TAG_OBJECT as u32);
         let pptr = self.un(Operator::I32WrapI64, pval, Type::I32);
@@ -6130,11 +6168,14 @@ impl<'a> Lower<'a> {
         });
         self.cur = slow;
         let (nv, wv) = (self.i32c(nslots), self.i32c(word));
-        let made = self.call1(
-            self.h.create_this,
-            &[self.cx, top, callee, new_target, nv, cell, wv],
-            Type::I32,
-        );
+        let made = match proto {
+            Some(p) => self.call1(self.h.new_this, &[self.cx, top, callee, p, nv, cell, wv], Type::I32),
+            None => self.call1(
+                self.h.create_this,
+                &[self.cx, top, callee, new_target, nv, cell, wv],
+                Type::I32,
+            ),
+        };
         self.terminate(Terminator::Br {
             target: BlockTarget {
                 block: done,

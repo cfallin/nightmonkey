@@ -364,3 +364,48 @@ Lessons:
   its end reaches `String.prototype`'s resolve hook, and `v == EOF` with
   `EOF = {}` converts an object through Object.prototype's builtins: each
   of these first exited at every execution.
+- A split op's runtime half must keep every fast path of the generic
+  helper it replaces, or the site's inline caches stop being filled:
+  `getelem.data` without the megamorphic by-value lookup's fill sent
+  react's string-keyed reads to the helper 5.2M times a run (react -5%,
+  found by ablation); `setprop.data` running its purity walk before the
+  IC's cached replays cost splay 2.6%.
+
+- Tried and not landed: an inlined call's target miss exiting instead
+  of calling generically (the same rule for call fallbacks). Where only
+  some of a site's targets are spliced it storms (richards' polymorphic
+  `run`: 1.7M exits); limited to sites whose analyzed callee set holds
+  only scripts, every one spliced, react still made 780k (`clz32 =
+  Math.clz32 ? Math.clz32 : clz32Fallback`: the analysis never sees the
+  native reach the site). For box2d +1.2%, the rest flat (serial).
+
+## 10. Constructed objects (KICKOFF-8 item 2), first steps
+
+- **`new_this(callee, proto)`**: an inlined `new F()` of a layout
+  constructor that is its own new.target allocates `this` from
+  `F.prototype`, read by name first (`getprop.data`, whose fail exits
+  before the `new`). An allocation (ok, err), not a fence: the generic
+  `create_this` it replaces wrote `Unknown`. The site's construct cell
+  serves it inline when `proto` is the cell's prototype; else
+  `night_runtime_new_this`.
+- **Forwarding wrapper constructors** (`this.initialize.apply(this,
+  arguments)`, the target resolved per inlined copy): another target, or
+  an `.apply` that is not the builtin, exits instead of forwarding
+  generically, so no generic op sees the object under construction.
+
+What blocks SROA of them (`prof8/ctorscan.py` over raytrace's MIR: all
+41 inlined constructs escape): the object reaches `exit.inline`s on cold
+paths of the inlined body (a `getprop.data` that fails inside the
+wrapper), and `exit.inline` *returns to MIR*: its continuation keeps
+using the object, which baseline may have changed (or stored) meanwhile.
+(The current `sroa` is safe only because an `inline.enter` operand is an
+escape, so no inlined callee's exit can name a replaced object.) Two
+ways forward, an owner's decision:
+
+1. **Partial escape**: at such an `exit.inline`, rebuild the object and
+   continue with the real one (its later reads become real loads, and
+   joins of the virtual and the real object materialize it there).
+2. **An exit that leaves the whole inline stack** for baseline (Ion's
+   bailout: every frame rebuilt, the caller continues in baseline too),
+   for exits that name a replaced object; then a rebuild at the exit is
+   the end of the object's MIR life.

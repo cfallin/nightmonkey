@@ -791,6 +791,12 @@ pub enum Opcode {
     /// sized `nslots` and seeded with the alloc word, as a direct construct
     /// makes it (the site's construct cell, else `create_this`).
     CreateThis(u32, u32),
+    /// `create_this` of a proven scripted constructor that is its own
+    /// new.target, with its `prototype` (`callee, proto`): a fresh object
+    /// sized `nslots`, seeded with the alloc word, whose prototype is
+    /// `proto` (or Object.prototype if `proto` is no object). Runs no code;
+    /// an allocation (MIR-MEMORY.md §6).
+    NewThis(u32, u32),
     /// Whether function `f` is a constructor (its flags): an arrow
     /// function or a method is not.
     FnIsCtor,
@@ -902,7 +908,7 @@ impl Opcode {
             // Allocations: no kill, so no effect report.
             JsLambda(_) | LitNew(_) | LitInit(..) => OK_ERR.to_vec(),
             // The global `this`, or a primitive's wrapper: no user code.
-            JsBoxThis => OK_ERR.to_vec(),
+            JsBoxThis | NewThis(..) => OK_ERR.to_vec(),
             JsRt(_) | ApplyFwd => CLEAN_DIRTY_ERR.to_vec(),
             ArgsObject | RestArray(_) => OK_ERR.to_vec(),
             JsThrow => vec![SuccRole::Err],
@@ -1861,6 +1867,15 @@ pub fn signature(op: &Opcode, args: &[Type], m: &Module) -> SigResult {
             val(&args[1], "create_this new.target")?;
             Sig::output(Type::val(TagSet::OBJECT))
         }
+        NewThis(..) => {
+            arity(args, 2)?;
+            let o = obj(&args[0], "new_this callee")?;
+            want(matches!(o.kind, ObjKind::Function(Some(_))), || {
+                "new_this: callee's script is not known".into()
+            })?;
+            val(&args[1], "new_this proto")?;
+            Sig::output(Type::val(TagSet::OBJECT))
+        }
         FnIsCtor => {
             arity(args, 1)?;
             obj(&args[0], "fn.is_ctor")?;
@@ -2412,7 +2427,7 @@ pub fn effects(op: &Opcode, args: &[Type], m: &Module) -> Effects {
         ApplyFwd => return Effects::generic(FlagsEffect::Callee),
         // Allocations: they run no JS and change no class word (a GC moves
         // objects but keeps their words), so they kill nothing.
-        ArgsObject | RestArray(_) | JsLambda(_) | JsBoxThis => {
+        ArgsObject | RestArray(_) | JsLambda(_) | JsBoxThis | NewThis(..) => {
             fx.may_gc = true;
             fx.may_throw = true;
         }

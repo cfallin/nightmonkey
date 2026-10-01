@@ -425,10 +425,11 @@ uint64_t night_runtime_get_prop_pure(JSContext* cx, uint64_t recv,
 // code (an own writable data property of a native object, or an add with
 // no setter, read-only property or hook on the chain; never the global or
 // a Watchtower-watched object), through the IC miss path (filling the
-// site's way). 1 once stored, 2 once stored where it demoted a claim of
-// the object's published class MIR reads (TYPES, SLOTS, the class), 0
-// where it would not be such a set (nothing done), 3 on an engine error.
-// May GC.
+// site's way). `flags` bit 1 (2): the compiled vouch, as
+// `night_runtime_set_prop_ic_miss`'s. 1 once stored, 2 once stored where
+// it demoted a claim of the object's published class MIR reads (TYPES,
+// SLOTS, the class), 0 where it would not be such a set (nothing done), 3
+// on an engine error. May GC.
 // Whether ToPrimitive of `v` (boxed) runs no user code: a primitive, or
 // an object whose conversion is Object.prototype's own (no @@toPrimitive,
 // the builtin valueOf and toString, a data @@toStringTag or none), found
@@ -452,10 +453,19 @@ NIGHT_RUNTIME_EXPORT(night_runtime_set_elem_pure)
 uint32_t night_runtime_set_elem_pure(JSContext* cx, uint32_t top,
                                      uint64_t recv, uint64_t key,
                                      uint64_t val);
+// MIR's `new_this`: `this` for a proven scripted constructor that is its
+// own new.target, with `prototype` already read (`protoBits`; a non-object
+// means Object.prototype). Fills the site's construct cell. Runs no code.
+// May GC.
+NIGHT_RUNTIME_EXPORT(night_runtime_new_this)
+bool night_runtime_new_this(JSContext* cx, uint32_t top, uint64_t calleeBits,
+                            uint64_t protoBits, uint32_t nSlots,
+                            uint32_t cellAddr, uint32_t stampWord);
 NIGHT_RUNTIME_EXPORT(night_runtime_set_prop_pure)
 uint32_t night_runtime_set_prop_pure(JSContext* cx, uint32_t top,
                                      uint64_t recv, uint32_t atomId,
-                                     uint64_t val, uint32_t cacheIdx);
+                                     uint64_t val, uint32_t cacheIdx,
+                                     uint32_t flags);
 // MIR's `init_field` slow path: the plain add of the next predicted field
 // to an object under construction; 1 iff it stays `constructing(n+1)`
 // (`expectSpan` slots, `wantBits` kept). The object to the out-slot. May GC.

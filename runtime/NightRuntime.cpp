@@ -2702,9 +2702,31 @@ static bool NoCodeStore(JSContext* cx, JSObject* obj, JS::HandleId id) {
   return true;
 }
 
+static bool TryPureElementRead(JSContext* cx, uint32_t top, uint64_t recv,
+                               uint64_t key);
+static bool SetPropCached(JSContext* cx, uint32_t top, uint64_t recv,
+                          uint32_t atomId, uint64_t val, uint32_t cacheIdx,
+                          bool vouched);
+
+// Whether a store that changed `obj`'s word from `before` to `after`
+// demoted a claim of its published class MIR reads: TYPES or SLOTS, or the
+// class itself. RANGES, which no MIR claim reads, may drop as on every
+// engine store; a word under construction backs no fact past a generic op
+// (the builder demotes its `Ctor` slots).
+static bool DemotedForMir(uint32_t before, uint32_t after) {
+  constexpr uint32_t claims = js::night::kWordTypes | js::night::kWordSlots;
+  return !(before & js::night::kWordConstructing) &&
+         (((before & claims) & ~after) != 0 ||
+          ((before & 0xFFFF) != 0 && (after & 0xFFFF) == 0));
+}
+
+
 uint32_t night_runtime_get_elem_pure(JSContext* cx, uint32_t top,
                                      uint64_t recv, uint64_t key) {
   SetNightTop(cx, top);
+  if (TryPureElementRead(cx, top, recv, key)) {
+    return 1;
+  }
   JS::RootedValue rv(cx, JS::Value::fromRawBits(recv));
   JS::RootedValue kv(cx, JS::Value::fromRawBits(key));
   // An object key's ToPropertyKey may call user code; null and undefined
@@ -2880,22 +2902,28 @@ uint32_t night_runtime_set_elem_pure(JSContext* cx, uint32_t top,
     // Nothing the checks above let through refuses; be exact anyway.
     return 0;
   }
-  uint32_t w = obj->externalWord();
-  constexpr uint32_t claims = js::night::kWordTypes | js::night::kWordSlots;
-  bool demoted = !(before & js::night::kWordConstructing) &&
-                 (((before & claims) & ~w) != 0 ||
-                  ((before & 0xFFFF) != 0 && (w & 0xFFFF) == 0));
-  return demoted ? 2 : 1;
+  return DemotedForMir(before, obj->externalWord()) ? 2 : 1;
 }
 
 uint32_t night_runtime_set_prop_pure(JSContext* cx, uint32_t top,
                                      uint64_t recv, uint32_t atomId,
-                                     uint64_t val, uint32_t cacheIdx) {
+                                     uint64_t val, uint32_t cacheIdx,
+                                     uint32_t flags) {
+  SetNightTop(cx, top);
   JS::Value rv = JS::Value::fromRawBits(recv);
-  if (!rv.isObject()) {
+  if (!rv.isObject() || rv.toObject().is<js::GlobalObject>()) {
     return 0;
   }
-  JSObject* obj = &rv.toObject();
+  JS::RootedObject robj(cx, &rv.toObject());
+  bool vouched = (flags & kSetVouchTypes) ||
+                 NightStoreConforms(robj, atomId, JS::Value::fromRawBits(val));
+  // The IC's cached replays first: populated only from plain data stores,
+  // they run no code (and need no lookup here).
+  uint32_t before = robj->externalWord();
+  if (SetPropCached(cx, top, recv, atomId, val, cacheIdx, vouched)) {
+    return DemotedForMir(before, robj->externalWord()) ? 2 : 1;
+  }
+  JSObject* obj = robj;
   JS::HandleId id = AtomIdChecked(atomId);
   if (!id.isAtom() || !NoCodeStore(cx, obj, id)) {
     return 0;
@@ -2906,46 +2934,37 @@ uint32_t night_runtime_set_prop_pure(JSContext* cx, uint32_t top,
   // claim reads, drops as on every engine store; a word under
   // construction backs no fact past a generic op (the builder demotes
   // its `Ctor` slots).
-  JS::Value v = JS::Value::fromRawBits(val);
-  uint32_t before = obj->externalWord();
-  bool vouched = NightStoreConforms(obj, atomId, v);
-  JS::RootedObject robj(cx, obj);
   uint32_t r = SetPropIcMiss(cx, top, recv, atomId, val, cacheIdx,
                              /*strict=*/false, vouched);
   if (r == kMissErr) {
     return 3;
   }
-  uint32_t w = robj->externalWord();
-  constexpr uint32_t claims = js::night::kWordTypes | js::night::kWordSlots;
-  bool demoted = !(before & js::night::kWordConstructing) &&
-                 (((before & claims) & ~w) != 0 ||
-                  ((before & 0xFFFF) != 0 && (w & 0xFFFF) == 0));
-  return demoted ? 2 : 1;
+  return DemotedForMir(before, robj->externalWord()) ? 2 : 1;
 }
 
-static uint32_t SetPropIcMiss(JSContext* cx, uint32_t top, uint64_t recv,
-                              uint32_t atomId, uint64_t val, uint32_t cacheIdx,
-                              bool strict, bool vouched) {
-  SetNightTop(cx, top);
-  JS::HandleId id = AtomIdChecked(atomId);
-  // Fused globals: a fused global's write must never be served by the
-  // inline/mega set caches (their hits bypass this helper): do the write
-  // generically, arm or blow the fuses, and cache nothing for this (shape,
-  // atom).
-  if (JS::Value::fromRawBits(recv).isObject() &&
-      IsActiveGlobal(&JS::Value::fromRawBits(recv).toObject())) {
-    MaybeBlowBindingFuseAtom(atomId, val);
-    if (FindGnameFuse(atomId)) {
-      MaybeGnameFuseBlow(atomId, val);
-      JS::RootedObject gobj(cx, &JS::Value::fromRawBits(recv).toObject());
-      if (!GenericSetWithStrict(cx, gobj, id, val, recv, strict)) {
-        return kMissErr;
-      }
-      MaybeGnameFuseArmAfterStore(cx, atomId, val);
-      MaybeRearmBindingFuseAtom(cx, atomId);
-      return kMissOk;
-    }
+// Mega-table state machine (write side): way0 is the MONO way ([recvShape, 0,
+// slotEnc, absSlot]); a second shape sentinels it and the site is served
+// by the C++ mega-SET cache from here on.
+static void NoteSetShape(uint32_t cacheIdx, uint32_t recvShape,
+                         uint32_t slotEnc, uint32_t absSlot) {
+  uint32_t* way0 = InlineWay(cacheIdx, 0);
+  if (way0[0] == 0 || way0[0] == recvShape) {
+    way0[1] = 0;
+    way0[2] = slotEnc;
+    way0[3] = absSlot;
+    way0[0] = recvShape;  // shape last: the way's validity marker.
+  } else if (way0[0] != kIcPolySentinel) {
+    way0[0] = kIcPolySentinel;
   }
+}
+
+// The set IC's cached replays (no lookup, no JS): the site's add-transition
+// row, the global (shape, atom) add table, the mega-SET probe. True when
+// one served the store.
+static bool SetPropCached(JSContext* cx, uint32_t top, uint64_t recv,
+                          uint32_t atomId, uint64_t val, uint32_t cacheIdx,
+                          bool vouched) {
+  SetNightTop(cx, top);
   // Add-transition row (linear-memory, after the site's ways; the
   // compiled body replays fixed-slot adds inline and only falls here for
   // dynamic slots, barrier-needing stores to tenured receivers, or a proto
@@ -2962,7 +2981,7 @@ static uint32_t SetPropIcMiss(JSContext* cx, uint32_t top, uint64_t recv,
       if (js::night::NightTryAddPropTransition(cx, recv, row[0], row[1], row[3],
                                                protoPtrs, protoShapes,
                                                numProtos, val)) {
-        return kMissClean;
+        return true;
       }
     }
   }
@@ -2993,28 +3012,9 @@ static uint32_t SetPropIcMiss(JSContext* cx, uint32_t top, uint64_t recv,
         FillTransRow(srow, trow.oldShape, trow.newShape, trow.slot, nfixed,
                      trow.protoPtrs, trow.protoShapes, trow.numProtos);
       }
-      return kMissClean;
+      return true;
     }
   }
-  // Mega-table state machine (write side): way0 is the MONO way ([recvShape, 0,
-  // slotEnc, absSlot]); a second shape sentinels it and the site is served
-  // by the C++ mega-SET cache from here on.
-  uint32_t* way0 = InlineWay(cacheIdx, 0);
-  auto fillSetWay0 = [&](uint32_t recvShape, uint32_t slotEnc,
-                         uint32_t absSlot) {
-    way0[1] = 0;
-    way0[2] = slotEnc;
-    way0[3] = absSlot;
-    way0[0] = recvShape;  // shape last: the way's validity marker.
-  };
-  auto noteSetShape = [&](uint32_t recvShape, uint32_t slotEnc,
-                          uint32_t absSlot) {
-    if (way0[0] == 0 || way0[0] == recvShape) {
-      fillSetWay0(recvShape, slotEnc, absSlot);
-    } else if (way0[0] != kIcPolySentinel) {
-      way0[0] = kIcPolySentinel;
-    }
-  };
   // Megamorphic secondary SET probe (leaf: pure loads + a barriered store).
   if (JS::Value::fromRawBits(recv).isObject()) {
     js::NativeObject* nobj = static_cast<js::NativeObject*>(
@@ -3024,9 +3024,38 @@ static uint32_t SetPropIcMiss(JSContext* cx, uint32_t top, uint64_t recv,
     if (e.shape == shape && e.atomId == atomId) {
       AutoVouchedStore v(vouched);
       nobj->setSlot(e.absSlot, JS::Value::fromRawBits(val));
-      noteSetShape(e.shape, e.slotEnc, e.absSlot);
-      return kMissClean;
+      NoteSetShape(cacheIdx, e.shape, e.slotEnc, e.absSlot);
+      return true;
     }
+  }
+  return false;
+}
+
+static uint32_t SetPropIcMiss(JSContext* cx, uint32_t top, uint64_t recv,
+                              uint32_t atomId, uint64_t val, uint32_t cacheIdx,
+                              bool strict, bool vouched) {
+  SetNightTop(cx, top);
+  JS::HandleId id = AtomIdChecked(atomId);
+  // Fused globals: a fused global's write must never be served by the
+  // inline/mega set caches (their hits bypass this helper): do the write
+  // generically, arm or blow the fuses, and cache nothing for this (shape,
+  // atom).
+  if (JS::Value::fromRawBits(recv).isObject() &&
+      IsActiveGlobal(&JS::Value::fromRawBits(recv).toObject())) {
+    MaybeBlowBindingFuseAtom(atomId, val);
+    if (FindGnameFuse(atomId)) {
+      MaybeGnameFuseBlow(atomId, val);
+      JS::RootedObject gobj(cx, &JS::Value::fromRawBits(recv).toObject());
+      if (!GenericSetWithStrict(cx, gobj, id, val, recv, strict)) {
+        return kMissErr;
+      }
+      MaybeGnameFuseArmAfterStore(cx, atomId, val);
+      MaybeRearmBindingFuseAtom(cx, atomId);
+      return kMissOk;
+    }
+  }
+  if (SetPropCached(cx, top, recv, atomId, val, cacheIdx, vouched)) {
+    return kMissClean;
   }
   const MissQuiet quiet(cx);
   bool populated = false;
@@ -3097,7 +3126,7 @@ static uint32_t SetPropIcMiss(JSContext* cx, uint32_t top, uint64_t recv,
     if (js::night::NightPopulateInlineSetIC(cx, obj, id, &recvShape, &slotEnc,
                                             &absSlot, &reason)) {
       populated = true;
-      noteSetShape(recvShape, slotEnc, absSlot);
+      NoteSetShape(cacheIdx, recvShape, slotEnc, absSlot);
       // Fill the mega cache unconditionally (global, direct-mapped
       // overwrite).
       MegaSetEntry& e = *MegaSet(recvShape, atomId);
@@ -3600,9 +3629,13 @@ bool night_runtime_set_name(JSContext* cx, uint32_t top, uint64_t env,
   return true;
 }
 
-bool night_runtime_get_element(JSContext* cx, uint32_t top, uint64_t recv,
+// The pure element reads `night_runtime_get_element` and MIR's
+// `getelem.data` serve first: an in-bounds dense element, a typed array's,
+// the engine's megamorphic by-value lookup (filling the site's inline
+// by-value probe), an arguments object's. No GC, no user code; true with
+// the value in the out-slot.
+static bool TryPureElementRead(JSContext* cx, uint32_t top, uint64_t recv,
                                uint64_t key) {
-  SetNightTop(cx, top);
   // In-bounds, non-hole dense element of a native object: an own data
   // property, so the read is the element itself. BBV and baseline inline
   // this arm; the MIR tier's generic element read reaches it here.
@@ -3708,6 +3741,15 @@ bool night_runtime_get_element(JSContext* cx, uint32_t top, uint64_t recv,
         return true;
       }
     }
+  }
+  return false;
+}
+
+bool night_runtime_get_element(JSContext* cx, uint32_t top, uint64_t recv,
+                               uint64_t key) {
+  SetNightTop(cx, top);
+  if (TryPureElementRead(cx, top, recv, key)) {
+    return true;
   }
   // String-receiver element read. The inline string arm requires a LINEAR
   // string, and the generic path below reads through a rope WITHOUT ever
@@ -6469,6 +6511,37 @@ bool night_runtime_construct(JSContext* cx, uint32_t top, uint32_t sp,
 #endif
 }
 
+// Fill construct cell `cellAddr` from a fresh `this` made for `callee`
+// (see `night_runtime_create_this`).
+static void FillConstructCell(JSContext* cx, uint32_t cellAddr, uint64_t out,
+                              uint64_t calleeBits) {
+  if (!cellAddr) {
+    return;
+  }
+  JS::Value ov = JS::Value::fromRawBits(out);
+  JS::Value cv = JS::Value::fromRawBits(calleeBits);
+  auto* cell = LinMem<js::night::NightConstructCell>(cellAddr);
+  if (ov.isObject() && cv.isObject() && cv.toObject().is<JSFunction>() &&
+      js::night::NightFillAllocCellObject(&cell->alloc, &ov.toObject())) {
+    JSObject* thisObj = &ov.toObject();
+    JS::RootedObject callee(cx, &cv.toObject());
+    uint32_t recvShape, holderPtr, holderShape, slotEnc;
+    JS::PropertyKey protoKey = js::NameToId(cx->names().prototype);
+    if (js::night::NightPopulateInlineGetIC(cx, callee, protoKey, &recvShape,
+                                            &holderPtr, &holderShape,
+                                            &slotEnc) &&
+        holderPtr == 0) {
+      cell->protoPtr =
+          uint32_t(reinterpret_cast<uintptr_t>(thisObj->staticPrototype()));
+      cell->protoSlotEnc = slotEnc;
+      cell->gen = gEnv.propicGenPtr ? InlineGen() : 0;
+      // The ctor shape arms the guard, so it is written last.
+      cell->ctorShape =
+          uint32_t(reinterpret_cast<uintptr_t>(callee->shape()));
+    }
+  }
+}
+
 // Direct construct: create `this` for a specialized `new`; writes the boxed
 // object to the out-slot at `top`. May GC (allocates) -> the caller uses the
 // rooting handshake.
@@ -6490,30 +6563,7 @@ bool night_runtime_create_this(JSContext* cx, uint32_t top, uint64_t calleeBits,
   // protoSlotEnc@32]. The inline hit guards C's shape + generation + a LIVE
   // re-read of `.prototype == protoPtr` (a reassignment leaves the shape but
   // must not reuse the stale this-shape).
-  if (cellAddr) {
-    JS::Value ov = JS::Value::fromRawBits(out);
-    JS::Value cv = JS::Value::fromRawBits(calleeBits);
-    auto* cell = LinMem<js::night::NightConstructCell>(cellAddr);
-    if (ov.isObject() && cv.isObject() && cv.toObject().is<JSFunction>() &&
-        js::night::NightFillAllocCellObject(&cell->alloc, &ov.toObject())) {
-      JSObject* thisObj = &ov.toObject();
-      JS::RootedObject callee(cx, &cv.toObject());
-      uint32_t recvShape, holderPtr, holderShape, slotEnc;
-      JS::PropertyKey protoKey = js::NameToId(cx->names().prototype);
-      if (js::night::NightPopulateInlineGetIC(cx, callee, protoKey, &recvShape,
-                                              &holderPtr, &holderShape,
-                                              &slotEnc) &&
-          holderPtr == 0) {
-        cell->protoPtr =
-            uint32_t(reinterpret_cast<uintptr_t>(thisObj->staticPrototype()));
-        cell->protoSlotEnc = slotEnc;
-        cell->gen = gEnv.propicGenPtr ? InlineGen() : 0;
-        // The ctor shape arms the guard, so it is written last.
-        cell->ctorShape =
-            uint32_t(reinterpret_cast<uintptr_t>(callee->shape()));
-      }
-    }
-  }
+  FillConstructCell(cx, cellAddr, out, calleeBits);
   WriteNightOut(top, out);
   return true;
 #else
@@ -6521,6 +6571,33 @@ bool night_runtime_create_this(JSContext* cx, uint32_t top, uint64_t calleeBits,
   (void)newTargetBits;
   (void)nSlots;
   (void)cellAddr;
+  return false;
+#endif
+}
+
+// MIR's `new_this`: `night_runtime_create_this` for a proven scripted
+// constructor that is its own new.target, its `prototype` already read
+// (`protoBits`). Fills the site's construct cell, whose inline arm then
+// compares the prototype with the cell's. Runs no code. May GC.
+bool night_runtime_new_this(JSContext* cx, uint32_t top, uint64_t calleeBits,
+                            uint64_t protoBits, uint32_t nSlots,
+                            uint32_t cellAddr, uint32_t stampWord) {
+  SetNightTop(cx, top);
+#ifdef ENABLE_JS_NIGHTMONKEY
+  uint64_t out = 0;
+  if (!js::night::NightNewThis(cx, calleeBits, protoBits, nSlots, &out,
+                               stampWord)) {
+    return false;
+  }
+  FillConstructCell(cx, cellAddr, out, calleeBits);
+  WriteNightOut(top, out);
+  return true;
+#else
+  (void)calleeBits;
+  (void)protoBits;
+  (void)nSlots;
+  (void)cellAddr;
+  (void)stampWord;
   return false;
 #endif
 }

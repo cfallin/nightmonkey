@@ -507,6 +507,7 @@ pub fn mnemonic(op: &Opcode) -> String {
         CallDirect => "call_direct".into(),
         Construct(..) => "construct".into(),
         CreateThis(..) => "create_this".into(),
+        NewThis(..) => "new_this".into(),
         FnIsCtor => "fn.is_ctor".into(),
         ObjEmulatesUndef => "obj.emulates_undef".into(),
         Restamp(_) => "restamp".into(),
@@ -619,7 +620,7 @@ fn immediates(m: &Module, op: &Opcode) -> Option<String> {
             n.to_string()
         }
         JsRt(RtOp::InitProp(a, attrs)) => format!("{}, {attrs}", atom(Some(m), *a)),
-        Construct(n, w) | CreateThis(n, w) => format!("{n}, {w}"),
+        Construct(n, w) | CreateThis(n, w) | NewThis(n, w) => format!("{n}, {w}"),
         Restamp(i) => i.to_string(),
         StampFresh(w) => format!("{w:#x}"),
         CtorStamp(l, n, k) | CtorPublish(l, n, k) => format!("{l}, {n}, {k}"),

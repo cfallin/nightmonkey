@@ -23,13 +23,19 @@ enum Version {
     Phi(Block),
 }
 
-/// The heap reads `mem_vn` numbers: a function of their receiver and the
-/// memory they read. `load_field` (the IC form) only on its clean edge,
-/// `getprop.data` on its `ok` one.
+/// The heap reads `mem_vn` numbers: a function of their operands (the
+/// receiver, an element's index) and the memory they read. `load_field`
+/// (the IC form) only on its clean edge, `getprop.data` and `load_elem`
+/// on their `ok` ones.
 fn vn_read(op: &Opcode) -> bool {
     matches!(
         op,
-        Opcode::LoadSlot(_) | Opcode::LoadField(_) | Opcode::GetPropData(_) | Opcode::LengthArray | Opcode::LengthTa
+        Opcode::LoadSlot(_)
+            | Opcode::LoadField(_)
+            | Opcode::GetPropData(_)
+            | Opcode::LoadElem
+            | Opcode::LengthArray
+            | Opcode::LengthTa
     )
 }
 
@@ -114,7 +120,7 @@ fn alloc_of(f: &Func, r: Value, preds: &BTreeMap<Block, Vec<Inst>>) -> Option<In
 /// A forward dataflow gives each location a function's heap reads touch
 /// its version at every point: the last writer on every path, or the
 /// block where paths with different writers meet. A read is keyed by its
-/// op, its receiver's root and the versions of what it reads; a repeat
+/// op, its operands' roots and the versions of what it reads; a repeat
 /// whose first occurrence dominates it is that value. A `load_slot` or
 /// `load_field` whose version is a slotted `store_field` or `init_field`
 /// through the same object takes the stored value; past a store through a
@@ -208,7 +214,7 @@ pub fn mem_vn(m: &Module, f: &mut Func) -> usize {
         }
     }
     // Rewrite: walk each block from its entry versions.
-    type Key = (Opcode, Value, Vec<Version>);
+    type Key = (Opcode, Vec<Value>, Vec<Version>);
     let mut first: HashMap<Key, (Value, Block)> = HashMap::new();
     let mut prev: HashMap<(Inst, usize), Version> = HashMap::new();
     let mut subst: BTreeMap<Value, Value> = BTreeMap::new();
@@ -292,7 +298,8 @@ pub fn mem_vn(m: &Module, f: &mut Func) -> usize {
                     }
                 }
                 if let Some(out) = out {
-                    let key = (d.op.clone(), recv, vs);
+                    let roots = d.args.iter().map(|&a| root(f, a, &preds)).collect();
+                    let key = (d.op.clone(), roots, vs);
                     match first.get(&key) {
                         Some(&(v, vb))
                             if v != out
