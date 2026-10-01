@@ -11,3 +11,11 @@
 - use a DSL to write lowering cases and type transfer functions for each op?
   - maybe ISLE?
 - `module_is_bigint_free` is weird and we should do better
+- AOT output is not reproducible: two compiles of one input differ in the
+  data segment (the wizened heap), not in code (checked 2026-10-01 on
+  richards and crypto: code sections byte-identical, MIR dumps identical).
+  The wizening run executes the benchmark's top-level `main()`, and
+  Octane's harness runs for a fixed time, so iteration counts and heap
+  contents vary. Options: a deterministic clock during wizening (a fixed
+  `Date.now`/`performance.now` sequence), or no timed run at wizen time
+  (as `prof7/octane/` already does for box2d and mandreel).
