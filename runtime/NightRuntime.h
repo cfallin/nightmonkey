@@ -803,10 +803,12 @@ bool night_runtime_new_private_name(JSContext* cx, uint32_t top,
 // GC/throw). `night_runtime_lambda` clones the function template
 // `script->getFunction(funcIndex)` capturing `env`. `night_runtime_env_setup`
 // takes the body's own `script` (compiled-body ABI 5th arg) so it returns the
-// global lexical environment for a global script (spec 2b).
+// global lexical environment for a global script (spec 2b). Both take a row
+// address (`NightLambdaCell` / `NightEnvCell`; 0: none) that the first
+// allocation they make fills, for the compiled body's inline replay.
 NIGHT_RUNTIME_EXPORT(night_runtime_env_setup)
 bool night_runtime_env_setup(JSContext* cx, uint32_t top, uint32_t sp,
-                             uint32_t script);
+                             uint32_t script, uint32_t cellAddr);
 
 // Top-level (global) script support (spec 2c / Object).
 // `night_runtime_global_decl_ instantiation` runs the global script's pc-0 op
@@ -828,7 +830,8 @@ void night_runtime_set_aliased(JSContext* cx, uint64_t env, uint32_t hops,
                                uint32_t slot, uint64_t val);
 NIGHT_RUNTIME_EXPORT(night_runtime_lambda)
 bool night_runtime_lambda(JSContext* cx, uint32_t top, uint64_t env,
-                          uint32_t script, uint32_t funcIndex);
+                          uint32_t script, uint32_t funcIndex,
+                          uint32_t cellAddr);
 
 // Exceptions. `night_runtime_exception` gets and clears the
 // pending exception (the `Exception` op), boxed into the out-slot (false on

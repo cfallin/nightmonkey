@@ -105,6 +105,12 @@ pub struct Instrumentation {
     /// Emit `night_runtime_census(MIR_BLOCK_CENSUS_KIND, id)` at the head of
     /// every MIR block: how often each block runs.
     pub blocks: bool,
+    /// Emit `night_runtime_census(MIR_ROOT_CENSUS_KIND, id)` at every MIR
+    /// rooting site that stores (a GC call's `root`, an edge's slot
+    /// conform, a terminator's retain flush), and print the static
+    /// `night: mir root <id> sid#<s> <where> <op> stores <n> cold <c>` map
+    /// while compiling: the executed rooting stores, by site.
+    pub roots: bool,
     /// Emit `night_runtime_census(90, id)` at every MIR exit, and print the
     /// static `night: mir exit <id> sid#<s> pc <p> <mode>` map while
     /// compiling: how often each exit is taken, which is where a MIR body's
@@ -125,6 +131,8 @@ pub const MIR_GET_MISS_CENSUS_KIND: u32 = 91;
 pub const MIR_SLOW_CENSUS_KIND: u32 = 97;
 /// Census kind for `--block-census` under MIR: one count per MIR block.
 pub const MIR_BLOCK_CENSUS_KIND: u32 = 92;
+/// Census kind for `--root-census`: one count per executed rooting site.
+pub const MIR_ROOT_CENSUS_KIND: u32 = 93;
 
 /// Which compiled tiers a script may use (`docs/BASELINE.md` §5).
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
@@ -220,6 +228,7 @@ impl Options {
             "--guard-census" => self.instrument.guards = true,
             "--mir-exit-census" => self.instrument.mir_exits = true,
             "--block-census" => self.instrument.blocks = true,
+            "--root-census" => self.instrument.roots = true,
             _ => return Ok(false),
         }
         Ok(true)

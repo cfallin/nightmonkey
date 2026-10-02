@@ -981,7 +981,8 @@ impl<'a> Gen<'a> {
             } else {
                 let script = self.script_ptr();
                 let es = self.h.env_setup;
-                let env = self.rt(es, &[self.sp, script]);
+                let no_cell = self.i32c(0);
+                let env = self.rt(es, &[self.sp, script, no_cell]);
                 self.set_env(env);
             }
         }
@@ -1832,7 +1833,8 @@ impl<'a> Gen<'a> {
                 let env = self.env();
                 let script = self.script_ptr();
                 let f = self.i32c(fi);
-                let r = self.rt(h.lambda, &[env, script, f]);
+                let no_cell = self.i32c(0);
+                let r = self.rt(h.lambda, &[env, script, f, no_cell]);
                 self.set_slot(d, r);
             }
             FunWithProto => {

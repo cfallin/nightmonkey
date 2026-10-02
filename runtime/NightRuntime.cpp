@@ -6470,10 +6470,33 @@ bool night_runtime_new_this(JSContext* cx, uint32_t top, uint64_t calleeBits,
 // ---
 
 bool night_runtime_env_setup(JSContext* cx, uint32_t top, uint32_t sp,
-                             uint32_t script) {
+                             uint32_t script, uint32_t cellAddr) {
   SetNightTop(cx, top);
-  return js::night::NightEnvSetup(cx, LinMem<void>(sp), LinMem<void>(script),
-                                  LinMem<uint64_t>(top));
+  if (!js::night::NightEnvSetup(cx, LinMem<void>(sp), LinMem<void>(script),
+                                LinMem<uint64_t>(top))) {
+    return false;
+  }
+#ifdef ENABLE_JS_NIGHTMONKEY
+  // Fill the row the inline prologue replays: only for a prologue that makes
+  // a CallObject and nothing else (no named-lambda environment).
+  auto* cell = LinMem<js::night::NightEnvCell>(cellAddr);
+  JS::Value out = JS::Value::fromRawBits(*LinMem<uint64_t>(top));
+  JSScript* s = LinMem<JSScript>(script);
+  if (cellAddr && gEnv.propicGenPtr && !s->isGlobalCode() &&
+      out.isObject()) {
+    JS::Value calleeV = LinMem<JS::Value>(sp)[0];
+    JSFunction* callee = &calleeV.toObject().as<JSFunction>();
+    if (callee->needsCallObject() && !callee->needsNamedLambdaEnvironment() &&
+        js::night::NightFillEnvCell(cell, &out.toObject())) {
+      cell->gen = InlineGen();
+      // The slot span (enclosing, callee, bindings) arms the row.
+      cell->armed = out.toObject().as<js::NativeObject>().slotSpan();
+    }
+  }
+#else
+  (void)cellAddr;
+#endif
+  return true;
 }
 
 bool night_runtime_global_decl_instantiation(JSContext* cx, uint32_t top,
@@ -6500,10 +6523,45 @@ void night_runtime_set_aliased(JSContext* cx, uint64_t env, uint32_t hops,
 }
 
 bool night_runtime_lambda(JSContext* cx, uint32_t top, uint64_t env,
-                          uint32_t script, uint32_t funcIndex) {
+                          uint32_t script, uint32_t funcIndex,
+                          uint32_t cellAddr) {
   SetNightTop(cx, top);
-  return js::night::NightLambda(cx, env, LinMem<void>(script), funcIndex,
-                                LinMem<uint64_t>(top));
+  if (!js::night::NightLambda(cx, env, LinMem<void>(script), funcIndex,
+                              LinMem<uint64_t>(top))) {
+    return false;
+  }
+#ifdef ENABLE_JS_NIGHTMONKEY
+  // Fill the row the inline Lambda replays: the clone must be the canonical
+  // function's object word for word but for its environment slot, which is
+  // what the replay copies.
+  auto* cell = LinMem<js::night::NightLambdaCell>(cellAddr);
+  JS::Value out = JS::Value::fromRawBits(*LinMem<uint64_t>(top));
+  if (cellAddr && gEnv.propicGenPtr && out.isObject()) {
+    JSObject* clone = &out.toObject();
+    JSFunction* canonical =
+        LinMem<JSScript>(script)->getFunction(js::GCThingIndex(funcIndex));
+    if (!js::gc::IsInsideNursery(canonical) && canonical->isInterpreted() &&
+        !canonical->hasDynamicSlots() &&
+        js::night::NightFillLambdaCell(cell, clone)) {
+      size_t size = js::gc::Arena::thingSize(canonical->getAllocKind());
+      size_t env = js::NativeObject::getFixedSlotOffset(
+          JSFunction::NativeFuncOrInterpretedEnvSlot);
+      const uint8_t* a = reinterpret_cast<const uint8_t*>(clone);
+      const uint8_t* b = reinterpret_cast<const uint8_t*>(canonical);
+      if (clone->as<JSFunction>().getAllocKind() ==
+              canonical->getAllocKind() &&
+          memcmp(a, b, env) == 0 &&
+          memcmp(a + env + 8, b + env + 8, size - env - 8) == 0) {
+        cell->gen = InlineGen();
+        // The canonical function arms the row.
+        cell->templateFun = uint32_t(reinterpret_cast<uintptr_t>(canonical));
+      }
+    }
+  }
+#else
+  (void)cellAddr;
+#endif
+  return true;
 }
 
 bool night_runtime_exception(JSContext* cx, uint32_t top) {

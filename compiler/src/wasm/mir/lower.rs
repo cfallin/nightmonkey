@@ -58,6 +58,8 @@ use crate::wasm::baseline::layout::{
     ONRAMP_BACKOFF,
 };
 use crate::wasm::mir::abi::{
+    CALLOBJ_CALLEE_OFFSET, CALLOBJ_ENCLOSING_OFFSET, ENV_CELL_ARMED, ENV_CELL_CLASS_WORD, ENV_CELL_GEN,
+    LAMBDA_CELL_GEN, LAMBDA_CELL_TEMPLATE,
     BINOP_BITAND, BINOP_BITNOT, BINOP_BITOR, BINOP_BITXOR, BINOP_DEC, BINOP_DIV, BINOP_INC,
     BINOP_LSH, BINOP_MOD, BINOP_MUL, BINOP_RSH, BINOP_SUB, BINOP_URSH, CLASS_WORD_SHALLOW,
     CLASS_WORD_RANGES, CLASS_WORD_SENTINEL, CLASS_WORD_SLOTS, SHAPE_SMALL_SLOTSPAN_MASK_BITS,
@@ -401,6 +403,20 @@ struct Lower<'a> {
     exit_census: Option<Func>,
     /// The census helper, when blocks are counted (`--block-census`).
     block_census: Option<Func>,
+    /// The census helper, when rooting stores are counted (`--root-census`).
+    root_census: Option<Func>,
+    /// The instruction being lowered, for the root census's labels.
+    cur_inst: Option<mir::Inst>,
+    /// Per frame (0 the function's own, then the inline frames): whether
+    /// any instruction in it or in a frame inlined into it may GC
+    /// (`may_gc`; an `exit.inline` does). Computed on first use.
+    frame_gc: Option<Vec<bool>>,
+    /// The inline frame the current block's `inline.enter` entered, if any:
+    /// the retaining stores pending at its terminator are for that callee.
+    block_enters: Option<u32>,
+    /// Retaining stores handed to a block's sole predecessor's successor:
+    /// still pending on entry, written at its first GC point (`root`).
+    carried_retain: BTreeMap<mir::Block, Vec<((u32, u32), mir::Value)>>,
     /// One exit hub per frame shape (`exit_hub`).
     exit_hubs: BTreeMap<Vec<Option<BoxKind>>, Block>,
     /// One `exit.inline` hub per inline frame: its entry and last blocks,
@@ -458,6 +474,8 @@ pub struct LowerOpts {
     pub exit_census: bool,
     /// Count every MIR block's executions (`--block-census`).
     pub block_census: bool,
+    /// Count every executed rooting site (`--root-census`).
+    pub root_census: bool,
     /// Strict-mode code: a field store's generic fallback throws on failure.
     pub strict: bool,
     /// The activation's environment is its callee's (`baseline::env_is_plain`).
@@ -566,6 +584,11 @@ pub fn lower<'a>(
         opsize: BTreeMap::new(),
         exit_census: if o.exit_census { h.census } else { None },
         block_census: if o.block_census { h.census } else { None },
+        root_census: if o.root_census { h.census } else { None },
+        cur_inst: None,
+        frame_gc: None,
+        block_enters: None,
+        carried_retain: BTreeMap::new(),
         exit_hubs: BTreeMap::new(),
         inline_hubs: BTreeMap::new(),
         strict: o.strict,
@@ -1021,8 +1044,13 @@ impl<'a> Lower<'a> {
                 let (k, i) = (self.i32c(crate::options::MIR_BLOCK_CENSUS_KIND), self.i32c(id));
                 self.call1(census, &[k, i], Type::I32);
             }
+            self.block_enters = None;
             for &inst in &f.blocks[b].insts {
                 self.cold = false;
+                self.cur_inst = Some(inst);
+                if matches!(f.insts[inst].op, Opcode::InlineEnter) {
+                    self.block_enters = Some(f.inst_frame[inst]);
+                }
                 // Retaining stores still pending at a terminator that
                 // cannot GC (an inlined call's entry): the GC points are
                 // past the block, so they are written here.
@@ -1030,7 +1058,37 @@ impl<'a> Lower<'a> {
                     && !self.f.insts[inst].succs.is_empty()
                     && !self.may_gc(inst)
                 {
-                    self.flush_retain(None)?;
+                    // An inlined callee that cannot GC needs none: the
+                    // caller's next GC point retains its locals itself.
+                    let callee_gc = self.block_enters.is_none_or(|fid| self.frame_may_gc(fid));
+                    // Into a successor this block alone reaches, and before
+                    // it is entered: still pending there, written only where
+                    // a GC point actually runs (a slow path, a call).
+                    let succs = &self.f.insts[inst].succs;
+                    let sole = match succs.as_slice() {
+                        [e] => Some(e.block),
+                        _ => None,
+                    }
+                    .filter(|s| {
+                        self.preds.get(s).is_some_and(|p| p.len() == 1) && !self.plans.contains_key(s)
+                    });
+                    if !callee_gc {
+                        // An inlined callee that cannot GC needs none: the
+                        // caller's next GC point retains its locals itself.
+                    } else if let Some(s) = sole {
+                        // What the successor has a value for (its live-ins);
+                        // the rest is written here.
+                        let live_in = &self.live_in[&s];
+                        let (carry, write): (Vec<_>, Vec<_>) =
+                            self.pending_retain.iter().copied().partition(|(_, v)| live_in.contains(v));
+                        self.pending_retain = write;
+                        let n = self.flush_retain(None)?;
+                        self.root_tick("retain", n);
+                        self.carried_retain.insert(s, carry);
+                    } else {
+                        let n = self.flush_retain(None)?;
+                        self.root_tick("retain", n);
+                    }
                     self.pending_retain.clear();
                 }
                 let before = self.body.values.len();
@@ -1132,6 +1190,33 @@ impl<'a> Lower<'a> {
             }
         }
         (stores, entered)
+    }
+
+    /// Whether frame `fid`, or a frame inlined into it, has an instruction
+    /// that may GC.
+    fn frame_may_gc(&mut self, fid: u32) -> bool {
+        if self.frame_gc.is_none() {
+            let f = self.f;
+            let mut gc = vec![false; f.inline_frames.len() + 1];
+            for i in f.blocks.values().flat_map(|b| b.insts.iter().copied()) {
+                if !self.may_gc(i) {
+                    continue;
+                }
+                let mut fr = f.inst_frame[i];
+                loop {
+                    if gc[fr as usize] {
+                        break;
+                    }
+                    gc[fr as usize] = true;
+                    if fr == 0 {
+                        break;
+                    }
+                    fr = f.inline_frames[fr as usize - 1].parent;
+                }
+            }
+            self.frame_gc = Some(gc);
+        }
+        self.frame_gc.as_ref().unwrap()[fid as usize]
     }
 
     /// Whether `inst` may call something that GCs (a superset of where the
@@ -1348,7 +1433,7 @@ impl<'a> Lower<'a> {
         self.slotted.clear();
         self.dirty = dirty;
         self.framed = framed;
-        self.pending_retain.clear();
+        self.pending_retain = self.carried_retain.remove(&b).unwrap_or_default();
         for (v, loc, es) in plan {
             match loc {
                 Loc::Param => {
@@ -1376,6 +1461,8 @@ impl<'a> Lower<'a> {
         let saved = self.cur;
         self.cur = p.tb;
         let mut args = p.args;
+        let mut stores = 0u32;
+        let mut stored: Vec<String> = vec![];
         for (v, loc, es) in self.plans[&b].clone() {
             let (reg, sl) = p.snap.get(&v).copied().unwrap_or((None, false));
             let lost = || format!("lowering: {v} is live into {b} but has no value on an edge");
@@ -1385,6 +1472,10 @@ impl<'a> Lower<'a> {
                 let boxed = self.boxed(&t, r)?;
                 let off = self.home_off(v)?;
                 self.store_i64(self.vp, off, boxed);
+                stores += 1;
+                if self.root_census.is_some() {
+                    stored.push(format!("{v}:{loc:?}:{es}"));
+                }
             }
             match loc {
                 Loc::Param => {
@@ -1421,7 +1512,13 @@ impl<'a> Lower<'a> {
             let undef = self.i64c(UNDEF);
             for s in extra {
                 self.store_i64(self.vp, self.root_base + 8 * s, undef);
+                stores += 1;
             }
+        }
+        if self.root_census.is_some() {
+            let cold = std::mem::replace(&mut self.cold, p.cold);
+            self.root_tick(&format!("edge->{b}[{}]", stored.join(",")), stores);
+            self.cold = cold;
         }
         let wb = self.blocks[&b];
         self.terminate(Terminator::Br {
@@ -1588,7 +1685,7 @@ impl<'a> Lower<'a> {
         let zero = self.i64c(TAG_INT32 << 32);
         self.store_i64(vp, l.resume(), zero);
         self.store_i64(vp, l.backoff(), zero);
-        if self.own_env || self.is_gen {
+        if self.is_gen {
             self.init_root_area();
         } else {
             // Not written here: every slot may hold a dead frame's value,
@@ -1598,11 +1695,26 @@ impl<'a> Lower<'a> {
             self.dirty = (0..self.nslots).collect();
         }
         if self.own_env {
+            // The CallObject inline from the script's row, where it is
+            // armed: no GC, so nothing is rooted and the frame's values
+            // stand. Else the helper, which fills the row.
+            let cell = self.i32c(CONSTRUCT_CELL_ADDR_PLACEHOLDER);
+            let idx = self.atoms.next_construct_cell();
+            self.construct_cell_patches.push((cell, idx + 1));
+            let slow = self.body.add_block();
+            let env = self.env_inline(cell, slow);
+            self.store_i64(vp, l.env(), env);
+            let dirty = self.dirty.clone();
+            self.enter_entry_root(root, &vals)?;
+            self.cur = slow;
+            self.dirty = dirty;
             // Every slot is valid: the GC may run. Failing, the throw has
             // no handler (baseline's prologue: pc 0, depth 0).
+            self.init_root_area();
+            self.dirty.clear();
             let top = self.add_off(self.vp, self.top_off(0));
             let script = self.script_ptr();
-            let ok = self.call1(self.h.env_setup, &[self.cx, top, self.sp, script], Type::I32);
+            let ok = self.call1(self.h.env_setup, &[self.cx, top, self.sp, script, cell], Type::I32);
             let (made, fail) = (self.body.add_block(), self.body.add_block());
             self.cond_br(ok, Self::to(made), Self::to(fail));
             self.cur = fail;
@@ -1620,12 +1732,18 @@ impl<'a> Lower<'a> {
                 vals.push(self.load_i64(self.sp, self.layout.arg(i)));
             }
         }
+        self.enter_entry_root(root, &vals)
+    }
+
+    /// The entry's last step: enter the entry root with callee, `this`
+    /// and the formals, `vals`.
+    fn enter_entry_root(&mut self, root: mir::Block, vals: &[Value]) -> R<()> {
         let params = self.f.blocks[root].params.clone();
         if params.len() != vals.len() {
             return Err("lowering: the entry root's params are not the frame".into());
         }
         let mut args = vec![];
-        for (&p, &v) in params.iter().zip(&vals) {
+        for (&p, &v) in params.iter().zip(vals) {
             let t = self.ty(p);
             if machine(&t).is_some() {
                 args.push(self.unboxed_managed(&t, v));
@@ -2017,7 +2135,28 @@ impl<'a> Lower<'a> {
         let e = self.opsize.entry("(root sites / stores)".into()).or_default();
         e.0 += 1;
         e.1 += stores;
+        self.root_tick("root", stores);
         Ok(())
+    }
+
+    /// `--root-census`: count this rooting site's executions, where it
+    /// stored anything, and print its static record.
+    fn root_tick(&mut self, what: &str, stores: u32) {
+        let Some(census) = self.root_census else { return };
+        if stores == 0 {
+            return;
+        }
+        static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let op = self.cur_inst.map_or("-".to_string(), |i| mir::print::mnemonic(&self.f.insts[i].op));
+        crate::diag_line!(
+            "night: mir root {id} sid#{} {what}@{} {op} stores {stores} cold {}",
+            self.f.script,
+            self.cur_mblock,
+            self.cold
+        );
+        let (k, i) = (self.i32c(crate::options::MIR_ROOT_CENSUS_KIND), self.i32c(id));
+        self.call1(census, &[k, i], Type::I32);
     }
 
     /// After a may-GC call: `live`'s register copies may point to moved
@@ -2577,11 +2716,22 @@ impl<'a> Lower<'a> {
                 self.cond_br(ok, t, e);
             }
             Opcode::JsLambda(index) => {
+                // Inline from the site's row: no GC, so the ok edge keeps
+                // everything in registers. The helper (which fills the
+                // row), and the rooting, only on the slow path.
                 let env = self.box_tagged(TAG_OBJECT, a[0]);
+                let cell = self.i32c(CONSTRUCT_CELL_ADDR_PLACEHOLDER);
+                let idx = self.atoms.next_construct_cell();
+                self.construct_cell_patches.push((cell, idx + 1));
+                let slow = self.body.add_block();
+                let r = self.lambda_inline(cell, env, slow);
+                let t = self.edge(inst, 0, &[r])?;
+                self.terminate(Terminator::Br { target: t });
+                self.cur = slow;
                 let script = self.script_ptr();
                 let i = self.i32c(index);
                 let live = self.live_across(inst);
-                let (ok, r) = self.gc_call(self.h.lambda, &[env, script, i], &live)?;
+                let (ok, r) = self.gc_call(self.h.lambda, &[env, script, i, cell], &live)?;
                 let t = self.edge(inst, 0, &[r])?;
                 let e = self.edge(inst, 1, &[])?;
                 self.cond_br(ok, t, e);
@@ -3057,13 +3207,20 @@ impl<'a> Lower<'a> {
             }
             Opcode::InlineEnter => self.inline_enter(&d, &a)?,
             Opcode::NewThis(nslots, word) => {
-                // May GC: root what is live across it. Runs no code.
+                // Runs no code. The inline nursery allocation cannot GC, so
+                // it takes the ok edge with everything still in registers;
+                // only the helper call on its slow path may GC, and only
+                // there is what is live across it rooted.
                 let live = self.live_across(inst);
+                let callee = self.box_tagged(TAG_OBJECT, a[0]);
+                let (this_v, slow, cell) = self.construct_this_inline(callee, Some(a[1]), word);
+                let t = self.edge(inst, 0, &[this_v])?;
+                self.terminate(Terminator::Br { target: t });
+                self.cur = slow;
                 self.root(&live)?;
                 let top_off = self.top_off(live.len());
                 let top = self.add_off(self.vp, top_off);
-                let callee = self.box_tagged(TAG_OBJECT, a[0]);
-                let ok = self.construct_this_with(top, callee, callee, Some(a[1]), nslots, word);
+                let ok = self.construct_this_call(top, callee, callee, Some(a[1]), nslots, word, cell);
                 self.after_gc(&live);
                 self.cold = true;
                 let r = self.load_i64(self.vp, top_off);
@@ -6111,11 +6268,183 @@ impl<'a> Lower<'a> {
         nslots: u32,
         word: u32,
     ) -> Value {
+        let done = self.body.add_block();
+        let ok_p = self.body.add_blockparam(done, Type::I32);
+        let (this_v, slow, cell) = self.construct_this_inline(callee, proto, word);
+        self.store_i64(top, 0, this_v);
+        let one = self.i32c(1);
+        self.terminate(Terminator::Br {
+            target: BlockTarget {
+                block: done,
+                args: vec![one],
+            },
+        });
+        self.cur = slow;
+        let made = self.construct_this_call(top, callee, new_target, proto, nslots, word, cell);
+        self.terminate(Terminator::Br {
+            target: BlockTarget {
+                block: done,
+                args: vec![made],
+            },
+        });
+        self.cur = done;
+        ok_p
+    }
+
+    /// `construct_this_with`'s helper call, in its slow block: the
+    /// object from the runtime (which also fills the site's cell), at
+    /// `top`; the status.
+    fn construct_this_call(
+        &mut self,
+        top: Value,
+        callee: Value,
+        new_target: Value,
+        proto: Option<Value>,
+        nslots: u32,
+        word: u32,
+        cell: Value,
+    ) -> Value {
+        let (nv, wv) = (self.i32c(nslots), self.i32c(word));
+        match proto {
+            Some(p) => self.call1(self.h.new_this, &[self.cx, top, callee, p, nv, cell, wv], Type::I32),
+            None => self.call1(
+                self.h.create_this,
+                &[self.cx, top, callee, new_target, nv, cell, wv],
+                Type::I32,
+            ),
+        }
+    }
+
+    /// Bump `total` bytes off the nursery, or branch to `slow` where it has
+    /// no room; returns the new cell's start (where its nursery header
+    /// goes).
+    fn nursery_bump(&mut self, total: Value, slow: Block) -> Value {
+        let posp_slot = self.i32c(self.h.nursery_pos_slot);
+        let posp = self.load_i32(posp_slot, 0);
+        let pos = self.load_i32(posp, 0);
+        let newpos = self.bin(Operator::I32Add, pos, total, Type::I32);
+        let endp_slot = self.i32c(self.h.nursery_end_slot);
+        let endp = self.load_i32(endp_slot, 0);
+        let end = self.load_i32(endp, 0);
+        let fits = self.bin(Operator::I32LeU, newpos, end, Type::I32);
+        self.check(fits, slow);
+        self.store_i32(posp, 0, newpos);
+        pos
+    }
+
+    /// Whether row `cell` is armed (its word at `armed_off` nonzero) under
+    /// the live property-IC generation (at `gen_off`); else `slow`.
+    fn check_row(&mut self, cell: Value, armed_off: u32, gen_off: u32, slow: Block) -> Value {
+        let armed = self.load_i32(cell, armed_off);
+        let z = self.i32c(0);
+        let filled = self.bin(Operator::I32Ne, armed, z, Type::I32);
+        let cgen = self.load_i32(cell, gen_off);
+        let gen_addr = self.i32c(self.h.prop_ic_gen_base);
+        let live_gen = self.load_i32(gen_addr, 0);
+        let g_ok = self.bin(Operator::I32Eq, cgen, live_gen, Type::I32);
+        let hit = self.bin(Operator::I32And, filled, g_ok, Type::I32);
+        self.check(hit, slow);
+        armed
+    }
+
+    /// Copy `nbytes` (a multiple of 8, at least 8) from `src` to `dst`.
+    fn copy_words(&mut self, dst: Value, src: Value, nbytes: Value) {
+        let (lp, body, done) = (self.body.add_block(), self.body.add_block(), self.body.add_block());
+        let off = self.body.add_blockparam(lp, Type::I32);
+        let z = self.i32c(0);
+        self.terminate(Terminator::Br { target: BlockTarget { block: lp, args: vec![z] } });
+        self.cur = lp;
+        let more = self.bin(Operator::I32LtU, off, nbytes, Type::I32);
+        self.cond_br(more, Self::to(body), Self::to(done));
+        self.cur = body;
+        let s = self.bin(Operator::I32Add, src, off, Type::I32);
+        let w = self.load_i64(s, 0);
+        let d = self.bin(Operator::I32Add, dst, off, Type::I32);
+        self.store_i64(d, 0, w);
+        let eight = self.i32c(8);
+        let next = self.bin(Operator::I32Add, off, eight, Type::I32);
+        self.terminate(Terminator::Br { target: BlockTarget { block: lp, args: vec![next] } });
+        self.cur = done;
+    }
+
+    /// `Lambda` inline from the site's row (`NightLambdaCell`): a nursery
+    /// copy of the canonical function with environment `env` (boxed).
+    /// Returns the boxed closure; `slow` where the row is not armed under
+    /// the live generation or the nursery has no room.
+    fn lambda_inline(&mut self, cell: Value, env: Value, slow: Block) -> Value {
+        let tmpl = self.check_row(cell, LAMBDA_CELL_TEMPLATE, LAMBDA_CELL_GEN, slow);
+        let total = self.load_i32(cell, 4);
+        let pos = self.nursery_bump(total, slow);
+        let hdr = self.load_i32(cell, 16);
+        self.store_i32(pos, 0, hdr);
+        let hb = self.i32c(NURSERY_HEADER_BYTES);
+        let obj = self.bin(Operator::I32Add, pos, hb, Type::I32);
+        let nbytes = self.bin(Operator::I32Sub, total, hb, Type::I32);
+        self.copy_words(obj, tmpl, nbytes);
+        self.store_i64(obj, FUNC_ENV_SLOT_OFFSET, env);
+        let payload = self.un(Operator::I64ExtendI32U, obj, Type::I64);
+        let tag = self.i64c(TAG_OBJECT << 32);
+        self.bin(Operator::I64Or, payload, tag, Type::I64)
+    }
+
+    /// The prologue's CallObject inline from the script's row
+    /// (`NightEnvCell`): enclosing environment the callee's, callee, then
+    /// the bindings undefined. Returns it boxed; `slow` where the row is
+    /// not armed under the live generation or the nursery has no room.
+    fn env_inline(&mut self, cell: Value, slow: Block) -> Value {
+        let span = self.check_row(cell, ENV_CELL_ARMED, ENV_CELL_GEN, slow);
+        let total = self.load_i32(cell, 4);
+        let pos = self.nursery_bump(total, slow);
+        let hdr = self.load_i32(cell, 16);
+        self.store_i32(pos, 0, hdr);
+        let hb = self.i32c(NURSERY_HEADER_BYTES);
+        let obj = self.bin(Operator::I32Add, pos, hb, Type::I32);
+        let shape = self.load_i32(cell, 0);
+        self.store_i32(obj, SHAPE_OFFSET, shape);
+        let word = self.load_i32(cell, ENV_CELL_CLASS_WORD);
+        self.store_i32(obj, OBJ_CLASS_IDX_OFFSET, word);
+        let slotsw = self.load_i32(cell, 8);
+        self.store_i32(obj, NATIVE_SLOTS_OFFSET, slotsw);
+        let elemsw = self.load_i32(cell, 12);
+        self.store_i32(obj, OBJ_ELEMENTS_OFFSET, elemsw);
+        let callee = self.load_i64(self.sp, FrameLayout::CALLEE);
+        let f = self.un(Operator::I32WrapI64, callee, Type::I32);
+        let enclosing = self.load_i64(f, FUNC_ENV_SLOT_OFFSET);
+        self.store_i64(obj, CALLOBJ_ENCLOSING_OFFSET, enclosing);
+        self.store_i64(obj, CALLOBJ_CALLEE_OFFSET, callee);
+        // The bindings, slots 2 up to the span: undefined.
+        let (lp, body, done) = (self.body.add_block(), self.body.add_block(), self.body.add_block());
+        let k = self.body.add_blockparam(lp, Type::I32);
+        let two = self.i32c(2);
+        self.terminate(Terminator::Br { target: BlockTarget { block: lp, args: vec![two] } });
+        self.cur = lp;
+        let more = self.bin(Operator::I32LtU, k, span, Type::I32);
+        self.cond_br(more, Self::to(body), Self::to(done));
+        self.cur = body;
+        let three = self.i32c(3);
+        let off = self.bin(Operator::I32Shl, k, three, Type::I32);
+        let a = self.bin(Operator::I32Add, obj, off, Type::I32);
+        let undef = self.i64c(UNDEF);
+        self.store_i64(a, FIXED_SLOTS_BASE, undef);
+        let one = self.i32c(1);
+        let next = self.bin(Operator::I32Add, k, one, Type::I32);
+        self.terminate(Terminator::Br { target: BlockTarget { block: lp, args: vec![next] } });
+        self.cur = done;
+        let payload = self.un(Operator::I64ExtendI32U, obj, Type::I64);
+        let tag = self.i64c(TAG_OBJECT << 32);
+        self.bin(Operator::I64Or, payload, tag, Type::I64)
+    }
+
+    /// `construct_this_with`'s inline half: with the site's cell
+    /// describing the callee (and its `.prototype`), bump-allocate the
+    /// object in the nursery and fill its header. Leaves the current
+    /// block at the success point with the boxed object; returns it, the
+    /// (empty) slow block every miss branches to, and the cell. Runs no
+    /// code and cannot GC: the slow block's helper call can.
+    fn construct_this_inline(&mut self, callee: Value, proto: Option<Value>, word: u32) -> (Value, Block, Value) {
         let cell = self.i32c(CONSTRUCT_CELL_ADDR_PLACEHOLDER);
         let idx = self.atoms.next_construct_cell();
         self.construct_cell_patches.push((cell, idx + 1));
-        let done = self.body.add_block();
-        let ok_p = self.body.add_blockparam(done, Type::I32);
         let slow = self.body.add_block();
         let cptr = self.un(Operator::I32WrapI64, callee, Type::I32);
         let ashape = self.load_i32(cell, 0);
@@ -6156,17 +6485,8 @@ impl<'a> Lower<'a> {
         let p_ok = self.bin(Operator::I32And, p_obj, p_eq, Type::I32);
         self.check(p_ok, slow);
         // Room in the nursery, then bump and fill the header.
-        let posp_slot = self.i32c(self.h.nursery_pos_slot);
-        let posp = self.load_i32(posp_slot, 0);
-        let pos = self.load_i32(posp, 0);
         let total = self.load_i32(cell, 4);
-        let newpos = self.bin(Operator::I32Add, pos, total, Type::I32);
-        let endp_slot = self.i32c(self.h.nursery_end_slot);
-        let endp = self.load_i32(endp_slot, 0);
-        let end = self.load_i32(endp, 0);
-        let fits = self.bin(Operator::I32LeU, newpos, end, Type::I32);
-        self.check(fits, slow);
-        self.store_i32(posp, 0, newpos);
+        let pos = self.nursery_bump(total, slow);
         let hdr = self.load_i32(cell, 16);
         self.store_i32(pos, 0, hdr);
         let hb = self.i32c(NURSERY_HEADER_BYTES);
@@ -6181,32 +6501,7 @@ impl<'a> Lower<'a> {
         let payload = self.un(Operator::I64ExtendI32U, obj, Type::I64);
         let tag = self.i64c(TAG_OBJECT << 32);
         let this_v = self.bin(Operator::I64Or, payload, tag, Type::I64);
-        self.store_i64(top, 0, this_v);
-        let one = self.i32c(1);
-        self.terminate(Terminator::Br {
-            target: BlockTarget {
-                block: done,
-                args: vec![one],
-            },
-        });
-        self.cur = slow;
-        let (nv, wv) = (self.i32c(nslots), self.i32c(word));
-        let made = match proto {
-            Some(p) => self.call1(self.h.new_this, &[self.cx, top, callee, p, nv, cell, wv], Type::I32),
-            None => self.call1(
-                self.h.create_this,
-                &[self.cx, top, callee, new_target, nv, cell, wv],
-                Type::I32,
-            ),
-        };
-        self.terminate(Terminator::Br {
-            target: BlockTarget {
-                block: done,
-                args: vec![made],
-            },
-        });
-        self.cur = done;
-        ok_p
+        (this_v, slow, cell)
     }
 
     /// `lhs instanceof rhs` inline, taking

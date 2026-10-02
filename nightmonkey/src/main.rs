@@ -101,6 +101,9 @@ Instrumentation (CHANGES the generated code; never on in production)
                            every MIR block: executed blocks, dumped at exit
   --guard-census           bucket the dense-append helper's misses by
                            reason, dumped at exit
+  --root-census            emit night_runtime_census calls at every rooting
+                           site that stores (GC calls, edges, retain
+                           flushes): executed rooting stores by site
   -h, --help               print this message
 "
     )

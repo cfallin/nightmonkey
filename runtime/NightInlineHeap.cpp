@@ -17,6 +17,7 @@
 #include "js/Realm.h"        // JS::Realm::offsetOfActiveGlobal
 #include "runtime/NightRegionShape.h"  // Night_allocCellBytes, Night_constructCellBytes
 #include "vm/ArrayObject.h"
+#include "vm/EnvironmentObject.h"  // CallObject (the environment rows)
 #include "vm/JSContext.h"
 #include "vm/JSFunction.h"  // js::FunctionFlags::BASESCRIPT
 #include "vm/JSObject.h"
@@ -197,6 +198,18 @@ static_assert(offsetof(NightArrayAllocCell, length) == 28,
               "array cell length@28");
 static_assert(offsetof(NightConstructCell, ctorShape) == 20,
               "construct cell ctorShape@20");
+static_assert(sizeof(NightLambdaCell) <= js::night::Night_constructCellBytes,
+              "a Lambda row fits a construct row");
+static_assert(offsetof(NightLambdaCell, templateFun) == 20,
+              "lambda cell templateFun@20");
+static_assert(offsetof(NightLambdaCell, gen) == 24, "lambda cell gen@24");
+static_assert(sizeof(NightEnvCell) <= js::night::Night_constructCellBytes,
+              "an environment row fits a construct row");
+static_assert(offsetof(NightEnvCell, armed) == 20, "env cell armed@20");
+static_assert(offsetof(NightEnvCell, gen) == 24, "env cell gen@24");
+static_assert(offsetof(NightEnvCell, classWord) == 28,
+              "env cell classWord@28");
+
 static_assert(offsetof(NightConstructCell, gen) == 24, "construct cell gen@24");
 static_assert(offsetof(NightConstructCell, protoPtr) == 28,
               "construct cell protoPtr@28");
@@ -262,6 +275,56 @@ bool NightFillAllocCellObject(NightAllocCell* cell, JSObject* obj) {
   // The shape word arms the row, so it is written last: a compiled body can
   // read the row between any two of these stores.
   cell->shape = uint32_t(reinterpret_cast<uintptr_t>(nobj->shape()));
+  return true;
+}
+
+// Only a nursery clone of a tenured canonical function with only fixed slots
+// qualifies: the inline path copies the canonical function's words.
+bool NightFillLambdaCell(NightLambdaCell* cell, JSObject* clone) {
+  if (!cell || !gc::IsInsideNursery(clone) || !clone->is<JSFunction>()) {
+    return false;
+  }
+  NativeObject* nobj = &clone->as<NativeObject>();
+  if (nobj->hasDynamicSlots()) {
+    return false;
+  }
+  gc::AllocKind kind = clone->as<JSFunction>().getAllocKind();
+  RawObjectWords words(clone);
+  cell->alloc.shape = uint32_t(reinterpret_cast<uintptr_t>(nobj->shape()));
+  cell->alloc.totalSize =
+      uint32_t(gc::Arena::thingSize(kind) + Nursery::nurseryCellHeaderSize());
+  cell->alloc.slotsWord = words.slots;
+  cell->alloc.elementsWord = words.elements;
+  cell->alloc.headerWord = words.header;
+  return true;
+}
+
+// Only a nursery CallObject with only fixed slots qualifies.
+bool NightFillEnvCell(NightEnvCell* cell, JSObject* callobj) {
+  if (!cell || !gc::IsInsideNursery(callobj) || !callobj->is<CallObject>()) {
+    return false;
+  }
+  // The replay writes the enclosing environment to fixed slot 0 and the
+  // callee to fixed slot 1 (CALLOBJ_ENCLOSING_OFFSET, CALLOBJ_CALLEE_OFFSET).
+  if (EnvironmentObject::enclosingEnvironmentSlot() != 0 ||
+      CallObject::calleeSlot() != 1) {
+    return false;
+  }
+  NativeObject* nobj = &callobj->as<NativeObject>();
+  if (nobj->hasDynamicSlots() ||
+      nobj->slotSpan() > nobj->numFixedSlots()) {
+    return false;
+  }
+  gc::AllocKind kind = gc::GetGCObjectKind(nobj->numFixedSlots());
+  RawObjectWords words(callobj);
+  cell->classWord = *reinterpret_cast<const uint32_t*>(
+      reinterpret_cast<uintptr_t>(callobj) + sizeof(uint32_t));
+  cell->alloc.shape = uint32_t(reinterpret_cast<uintptr_t>(nobj->shape()));
+  cell->alloc.totalSize =
+      uint32_t(gc::Arena::thingSize(kind) + Nursery::nurseryCellHeaderSize());
+  cell->alloc.slotsWord = words.slots;
+  cell->alloc.elementsWord = words.elements;
+  cell->alloc.headerWord = words.header;
   return true;
 }
 

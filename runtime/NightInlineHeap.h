@@ -72,6 +72,33 @@ struct NightConstructCell {
   uint32_t protoSlotEnc;
 };
 
+// A `Lambda` site's row, in the construct-cell region: the alloc words of the
+// first clone made there, then the canonical function every clone copies
+// (`templateFun`, written last: it arms the row) and the property-IC
+// generation it was filled under (a major GC may move the function). A clone
+// is the canonical function's object word for word but for its environment
+// slot (NewFunctionClone: same shape, flags, argument count, atom and script;
+// extended slots undefined in both), so the inline path copies it and stores
+// the environment.
+struct NightLambdaCell {
+  NightAllocCell alloc;
+  uint32_t templateFun;
+  uint32_t gen;
+};
+
+// A function's environment-setup row, in the construct-cell region: the alloc
+// words of the first CallObject its prologue made (its shape is the
+// FunctionScope's environment shape), armed (`armed`, written last) only when
+// that prologue makes nothing else -- no named-lambda environment -- and the
+// CallObject has only fixed slots: enclosing environment, callee, then the
+// bindings, which start undefined.
+struct NightEnvCell {
+  NightAllocCell alloc;
+  uint32_t armed;
+  uint32_t gen;
+  uint32_t classWord;  // the object's word at +4 (the likely-class word)
+};
+
 // The addresses of the nursery bump words (the pair the JIT's
 // bumpPointerAllocate uses). False when nursery object allocation is off --
 // the caller then leaves the linmem slots zero and no cell ever fills.
@@ -84,6 +111,11 @@ bool NightNurseryAddresses(JSContext* cx, uint32_t* posAddr, uint32_t* endAddr);
 bool NightFillAllocCellObject(NightAllocCell* cell, JSObject* obj);
 bool NightFillAllocCellArray(NightArrayAllocCell* cell, JSObject* obj,
                              uint32_t length);
+// Fill a Lambda row from `clone`, made from `canonical` (the generation is
+// the caller's to write, before `templateFun`, which this leaves to it).
+bool NightFillLambdaCell(NightLambdaCell* cell, JSObject* clone);
+// Fill an environment row from `callobj` (the same split).
+bool NightFillEnvCell(NightEnvCell* cell, JSObject* callobj);
 
 // The generational (post-write) barrier behind an inlined store. The
 // compiled code already performed the store and checked inline that the

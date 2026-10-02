@@ -220,6 +220,18 @@ pub(crate) const CONSTRUCT_CELL_GEN: u32 = 24;
 pub(crate) const CONSTRUCT_CELL_PROTOPTR: u32 = 28;
 pub(crate) const CONSTRUCT_CELL_PROTOSLOTENC: u32 = 32;
 pub(crate) const CONSTRUCT_CELL_ADDR_PLACEHOLDER: u32 = 0xDEAD_C000;
+// A `Lambda` site's row (`NightLambdaCell`) and a prologue's CallObject row
+// (`NightEnvCell`), in the construct-cell region: an alloc row, then the
+// arming word (the canonical function; the CallObject's slot span), the
+// property-IC generation, and (the CallObject) its class word.
+pub(crate) const LAMBDA_CELL_TEMPLATE: u32 = 20;
+pub(crate) const LAMBDA_CELL_GEN: u32 = 24;
+pub(crate) const ENV_CELL_ARMED: u32 = 20;
+pub(crate) const ENV_CELL_GEN: u32 = 24;
+pub(crate) const ENV_CELL_CLASS_WORD: u32 = 28;
+// A CallObject's fixed slots: enclosing environment, then callee.
+pub(crate) const CALLOBJ_ENCLOSING_OFFSET: u32 = 16;
+pub(crate) const CALLOBJ_CALLEE_OFFSET: u32 = 24;
 
 /// Instanceof cell: `[funShape u32][gen u32][slotenc u32]`. Must match
 /// `NightRuntime.cpp`'s `populate`.
