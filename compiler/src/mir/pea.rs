@@ -469,7 +469,7 @@ fn pea_one(m: &Module, f: &mut Func, cfg: &Cfg, t: Inst, tried: &mut BTreeSet<In
     let val_ty = Type::val(TagSet::OBJECT);
     let claim = LayoutClaim {
         keys: KeyRange::one(key),
-        types: word & crate::wasm::bbv::abi::CLASS_WORD_SHALLOW != 0,
+        types: word & crate::wasm::mir::abi::CLASS_WORD_SHALLOW != 0,
         slots: true,
         state: LayoutState::Published,
     };

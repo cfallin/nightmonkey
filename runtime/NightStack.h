@@ -42,8 +42,8 @@ namespace js {
 namespace nightrt {
 
 // Headroom a compiled body may use above its incoming frame without a
-// check: the compiled call guard (compiler/src/wasm/bbv/call.rs,
-// NIGHT_STACK_HEADROOM) admits a direct call only when frame top + this
+// check: the compiled call guard (compiler/src/wasm/mir/lower.rs
+// and baseline/codegen.rs, HEADROOM) admits a direct call only when frame top + this
 // stays below the limit, and the engine-side entry paths must reserve the
 // same, or a body entered near the limit writes past the stack.
 static constexpr size_t kNightStackHeadroomSlots = (64 * 1024) / sizeof(JS::Value);

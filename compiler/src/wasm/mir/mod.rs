@@ -3,9 +3,12 @@
 //! exit and throw pcs as resume targets, and lower the MIR into the
 //! script's table entry, with the baseline body beside it.
 
+pub(crate) mod abi;
 pub mod build;
+pub mod helpers;
 pub(crate) mod inline;
 pub mod lower;
+pub(crate) mod stamp;
 
 use crate::bytecode::Script;
 use crate::ids::ScriptId;
@@ -150,7 +153,7 @@ pub fn translate_script(
         .filter_map(|(a, s)| {
             let n = atoms.names.lookup(s.chars())?;
             let pairs = ctx.layout_addpred_in.get(&n)?;
-            // Capped, as bbv's: an over-full list only costs the helper.
+            // Capped: an over-full list only costs the helper.
             (pairs.len() <= 16).then(|| (a, pairs.iter().map(|p| (p.key.get(), p.offset)).collect()))
         })
         .collect();

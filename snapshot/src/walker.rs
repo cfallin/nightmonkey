@@ -561,7 +561,7 @@ impl<'a, M: MemAccess> Walker<'a, M> {
         .any(|&f| lay.get(f) as u8 == kind);
         // The template shape's fixed-slot count: `Shape::immutableFlags`
         // (word 1 of the shape, the offset every emitted shape read in
-        // `bbv/abi.rs` already bakes in) bits 6..11 (`FIXED_SLOTS_SHIFT` /
+        // `wasm/mir/abi.rs` already bakes in) bits 6..11 (`FIXED_SLOTS_SHIFT` /
         // `FIXED_SLOTS_MASK`). Read at the fixed offset rather than through
         // a new descriptor field: a descriptor change invalidates every
         // recorded fixture and every baseline binary's snapshots.

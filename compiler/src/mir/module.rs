@@ -133,7 +133,7 @@ pub struct Module {
     /// (§5.5). Not printed: a module parsed from text has none.
     pub script_addrs: BTreeMap<crate::ids::ScriptId, u32>,
     /// Restamp descriptors `restamp` ops index: the runtime helper's
-    /// arguments (`bbv::restamp_args`: layout, field count, kept bits,
+    /// arguments (`stamp::restamp_args`: layout, field count, kept bits,
     /// prefix keys + 1). Not printed.
     pub restamps: Vec<[u32; 7]>,
     /// The least stamp idx an array allocation carries (array keys grow

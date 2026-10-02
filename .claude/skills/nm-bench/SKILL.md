@@ -1,6 +1,6 @@
 ---
 name: nm-bench
-description: Benchmark NightMonkey on Octane + react. Use to A/B two builds (keep/drop calls, reported deltas), to check a build for silent baseline fallbacks and exit storms before measuring, or to produce the cross-engine table (native Ion and baseline, the wasm interpreter, weval, NightMonkey MIR/BBV).
+description: Benchmark NightMonkey on Octane + react. Use to A/B two builds (keep/drop calls, reported deltas), to check a build for silent baseline fallbacks and exit storms before measuring, or to produce the cross-engine table (native Ion and baseline, the wasm interpreter, weval, NightMonkey MIR, and a second NightMonkey build).
 ---
 
 # nm-bench
@@ -35,7 +35,7 @@ of dropped outliers, and each variant relative to the first.
 
 A variant is a directory `$W/v/<name>/` with `nightmonkey` and `js`. The
 wasm shell links the runtime, so a runtime change needs its own `js`.
-Optional files: `pipe` (the `--pipeline`: mir, baseline or legacy) and
+Optional files: `pipe` (the `--pipeline`: mir or baseline) and
 `env` (`VAR=value` lines for the compile). To ablate a pass, build with its
 flag flipped, `snap` it, and flip it back.
 
@@ -65,7 +65,7 @@ keep/drop call:
 
 ```
 .claude/skills/nm-bench/lanes.sh 3                  # best of 3 per cell
-LANES="native-ion aot aot-legacy" .claude/skills/nm-bench/lanes.sh 3
+LANES="native-ion aot aot-base" BASE_NIGHTMONKEY=... BASE_JS=... .claude/skills/nm-bench/lanes.sh 3
 ```
 
 | lane | what | needs |
@@ -74,8 +74,7 @@ LANES="native-ion aot aot-legacy" .claude/skills/nm-bench/lanes.sh 3
 | native-baseline | `js --no-ion` | same |
 | wasm-interp | the C++ interpreter on wasm32-wasi: the floor | `WASM_JS`, built with `configs/mozconfig-wasm`; reads the program on stdin |
 | weval | weval + PBL over the wizer shell: the peer wasm AOT | `WEVAL_JS` (`configs/mozconfig-weval`), `weval`; init function `wizer.initialize` (with a dot) |
-| aot | this checkout, `--pipeline mir` | `make -C build` |
-| aot-legacy | this checkout, `--pipeline legacy` (BBV) | same |
+| aot | this checkout (MIR) | `make -C build` |
 | aot-base | another build's `nightmonkey` and `js`, its default pipeline (or `BASE_PIPE`) | `BASE_NIGHTMONKEY`, `BASE_JS` |
 
 The ratio columns are A/B speedups: aot over wasm-interp and weval, and ion

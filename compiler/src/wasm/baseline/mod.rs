@@ -6,8 +6,8 @@
 //! Baseline is the correctness floor under MIR: a MIR exit writes a
 //! baseline frame ([`layout`]) and resumes baseline at a pc, and baseline
 //! loop headers onramp into MIR. It shares the AOT stack, the helper ABI
-//! and the body signature with the legacy BBV path, so baseline bodies,
-//! BBV bodies and the interpreter call one another freely.
+//! and the body signature with MIR, so baseline bodies, MIR bodies and
+//! the interpreter call one another freely.
 
 mod codegen;
 pub(crate) use codegen::{env_is_plain, needs_env};
@@ -25,7 +25,7 @@ use waffle::{FunctionBody, Module};
 pub const FORCE_INTERPRETER: &str = "ForceInterpreter";
 
 /// Translate one script to a baseline body, or decline. Same contract as
-/// `bbv::translate_script`: `Outcome::Compiled` with a `night_abi_sig2`
+/// `mir::translate_script`: `Outcome::Compiled` with a `night_abi_sig2`
 /// body, or `Outcome::Skipped` with the reason (the script is then
 /// interpreted).
 pub fn translate_script(
@@ -104,7 +104,7 @@ pub fn build_body(
     // (an Emscripten-style giant function) becomes a function of millions
     // of blocks: waffle's backend validation walks the dominator tree per
     // value use, and the engine then compiles it as one Wasm function. Such
-    // scripts stay interpreted. The bound is looser than BBV's 128 KiB: a
+    // scripts stay interpreted. The bound is generous: a
     // few-hundred-KiB script compiles fine here.
     const MAX_BASELINE_BYTECODE: usize = 1024 * 1024;
     if script.bytecode.len() > MAX_BASELINE_BYTECODE {

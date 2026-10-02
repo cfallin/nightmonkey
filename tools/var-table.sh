@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Variant table: A/B several COMPILER binaries against each other (and
-# against the plain legacy lane) from ONE snapshot set: build once, run
+# Variant table: A/B several COMPILER binaries against each other from ONE
+# snapshot set: build once, run
 # interleaved with fresh-copy cwasm under taskset -c 1, and never compile
 # during a measurement.
 #
@@ -8,8 +8,8 @@
 #     js/src/night/tools/var-table.sh build
 #   ... run [reps]
 #
-# (Every variant is the BBV lane -- this script A/Bs COMPILER BINARIES, e.g.
-# base vs patched nightmonkey builds.)
+# (This script A/Bs COMPILER BINARIES, e.g. base vs patched nightmonkey
+# builds, each with its default pipeline.)
 set -u
 cd "$(dirname "$0")/../../../.." || exit 1
 OUT=${OUT:-$HOME/tmp/night-w6}

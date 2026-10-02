@@ -380,9 +380,8 @@ bool NightEnvSetup(JSContext* cx, void* spPtr, void* scriptPtr, uint64_t* out) {
   RootedFunction callee(cx, &frame[0].toObject().as<JSFunction>());
   RootedObject enclosing(cx, callee->environment());
   // A named lambda that captures its own name gets that binding's
-  // environment first, as js::InitFunctionEnvironmentObjects does. (BBV
-  // gates such functions out at compile time, translate.rs
-  // `env_unsupported`; the baseline tier compiles them.)
+  // environment first, as js::InitFunctionEnvironmentObjects does. (The
+  // baseline tier compiles such functions.)
   if (callee->needsNamedLambdaEnvironment()) {
     NamedLambdaObject* declEnv = NamedLambdaObject::createWithoutEnclosing(
         cx, callee, gc::Heap::Default);

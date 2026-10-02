@@ -144,92 +144,55 @@ maintaining separate arithmetic semantics. Predicted results remain untrusted;
 an interval originating at a guarded or canonical producer can become a proof
 inside codegen.
 
-## 5. Translation and basic-block versioning
+## 5. Translation: the MIR and baseline tiers
 
 `wasm/mod.rs` runs analysis, lays out memory regions, translates scripts and
 regexps, places functions in the indirect table, and patches address
 placeholders after bases are known.
 
-`wasm/bbv` is the actual JavaScript bytecode to Wasm bytecode translator. Each
-bytecode operation ends a generated block; a workqueue emits every reachable
-structural version.
+Scripts compile in two tiers (`docs/MIR.md`, `docs/BASELINE.md`).
 
-### Versions, predictions, and tracks
+- **Baseline** (`wasm/baseline`) lowers each JSOp straight to Wasm, with no
+  speculation: trivial ops inline, everything else a direct call to a runtime
+  helper. The whole JS frame lives in NightStack memory, so the program state
+  at any pc is the frame plus the static operand depth there. Baseline compiles
+  every script except `ForceInterpreter` ones, and it is the correctness floor.
+- **MIR** (`mir/`, built and lowered by `wasm/mir`) is a typed SSA IR that
+  represents only the optimistic path. Every predicted fact is checked once at
+  its source and then held in the type of the value that carries it; a failed
+  check is an *exit*, which writes the baseline frame and resumes the script's
+  baseline body at that pc. Every loop header can take an *onramp* back from
+  baseline. A validator checks the IR's typing and fences after building and
+  after optimization (guard folding and hoisting, scalar replacement,
+  load/store forwarding).
 
-The overall strategy of the codegen backend is to emit code in two "tracks":
-optimistic (OPT) and generic (GEN). The optimistic track is meant to align with
-all of the predictions that the static type analysis makes; if the program
-diverges from those types, execution is shunted to the generic track. Likewise,
-in the other direction, if execution in the generic track can prove that it
-meets all the assumptions of the optimistic track, we can shunt execution back.
-We sometimes call these "offramps" and "onramps", colloquially. Each transition
-may involve some boxing/unboxing, because OPT can carry values in raw unboxed
-form.
-
-Reducibility concerns (Wasm requires reducible CFGs) complexify the two-track
-design somewhat: we need to duplicate code further into versions that are keyed
-on which loop headers they are dominated by. Otherwise, an onramp or offramp
-would become a side-entrance to the other copy of any loop in the current
-loop-nest.
-
-A basic block in the emitted IR is part of the lowering for a given JSOp for
-one "version". That version is identified by its PC, execution track,
-nested-loop token-vector class (the above-mentioned reducibility scheme), and
-inline-segment depth (the means of conceptually duplicating code for inlining).
-
-Each version carries a fact context: known types, object class-stamps (see
-below), and unboxed representation choices for each value.  `predict.rs`
-computes one optimistic context per program point; the generic track carries no
-speculative facts.
-
-The translator first runs a context-only fixpoint, then emits against the
-closed prediction map. If emission discovers an unclosed successor, the script
-is retried with less specialization. The bottom compile-ladder rung emits
-generic-only code.
-
-The optimistic track carries facts proved by guards and prior operations. Side
-arms handle cases outside an optimistic lowering and continue with weakened
-facts. The generic track uses boxed values and runtime helpers and is the
-correctness floor.
-
-All inter-operation edges pass through the continuation and `theta` machinery
-in `version.rs` (named for the corresponding `theta` function in Static Basic
-Block Versioning, which our version management previously followed more
-closely). This code owns fact joining, track weakening, loop tokens, reducible
-CFG construction, values carried across blocks, and guarded recovery from weak
-loop or call-return paths. Lowerings must not bypass it for ordinary bytecode
-successors.
+A script MIR declines compiles as baseline alone; the tier census
+(`--dump-tiers`) records which tier took each script and why others declined.
+MIR and baseline bodies are separate Wasm functions sharing one frame format,
+so the MIR function's CFG may be irreducible (onramps into nested loops); waffle's
+reducifier handles that.
 
 ### Representations and proofs
 
-An operand records Wasm representation separately from JavaScript type. Common
-representations are boxed `JS::Value`, `i32`, exact integer `i64`, `f64`, object
-or string pointer, and boolean.
-
-A codegen fact must originate in a dominating runtime guard, an exact producer,
-a helper or canonical-boxing invariant, or preservation across a proven effect
-class. An analysis prediction alone may not manufacture an unboxed value or
+A MIR type is a representation and a refinement: "boxed, known int32" and
+"raw i32" are different types, and unboxing the former is infallible. A fact
+must originate in a dominating runtime guard, an exact producer, a helper or
+canonical-boxing invariant, or a ghost value standing for a global condition
+(a fuse). An analysis prediction alone may not manufacture an unboxed value or
 remove a required check. Generic helpers accept and return full boxed values
 and preserve JavaScript exception behavior.
 
 Before a may-GC call, every live GC value must be visible in the traced AOT
-stack or another engine root. `live.rs` and frame flushing determine what is
-materialized. Compiled direct calls return an error result and effect bits;
+stack or another engine root; MIR's lowering spills and reloads them around
+may-GC ops. Compiled direct calls return an error result and effect bits;
 effect bits kill heap, stamp, and binding facts but do not replace rooting.
 
 ### Inlining
 
-Inlining creates a synthetic bytecode segment in the caller's PC space. The
-callee uses an alternate frame view and its returns rejoin the caller. Try
-notes, environments, arguments, script-relative operands, generator state, and
-absolute side-table PCs need special handling.
-
-The implementation currently admits a callee unless an opcode is in the manual
-`splice_blocked` list. That list is a correctness boundary: omitting a
-root-frame-relative or script-relative lowering can miscompile. The desired
-invariant is complete use of active frame/script abstractions so ordinary
-lowerings are splice-safe by construction; we will eventually complete that
-migration.
+MIR inlines by splicing: a small callee's MIR, built on its own, is copied
+into the caller at the call site. The callee keeps a real baseline-format
+frame (an inline frame) kept current by write-through, so each of its exits
+finishes the callee in its baseline body and continues the caller.
 
 ## 6. Object layouts and stamps
 
@@ -295,7 +258,7 @@ installation; address and length words remain absolute.
 
 `NightHelperList.h` is the C++ helper manifest. Rust's `Helpers` structure and
 resolution logic manually duplicate it and should be generated from the same
-source. `bbv/abi.rs` records SpiderMonkey offsets and selector values baked into
+source. `wasm/mir/abi.rs` records SpiderMonkey offsets and selector values baked into
 Wasm. `NightInlineHeap.cpp` statically asserts the engine-layout half. New ABI
 data should use generated shared definitions rather than paired literals.
 
@@ -322,16 +285,16 @@ be enforced or redesigned before runtime destruction and recreation.
 
 ## 10. Generators, async, exceptions, and regexps
 
-Generator and async bodies have generic-track support in `bbv/generator.rs` and
-`NightGenerator.cpp`. Suspension stores locals and operands in an engine object
+Generator and async bodies compile in the baseline tier (with
+`NightGenerator.cpp`). Suspension stores locals and operands in an engine object
 using an AOT-owned layout; resume re-enters the same compiled script. An
-AOT-suspended generator cannot resume in the interpreter. Bodies needing an
-arguments object remain unsupported, and resumable bodies do not receive the
-ordinary optimistic specialization.
+AOT-suspended generator cannot resume in the interpreter. Bodies that read
+their actuals after a yield remain unsupported, and resumable bodies do not
+receive MIR's optimistic specialization.
 
 Try notes feed CFG and frame construction. Calls and helpers propagate pending
-exceptions through the error result. Inlining rejects contexts whose exception
-or frame semantics cannot be represented by a splice.
+exceptions through the error result. MIR inlines only callees without handlers,
+so an inlined callee's throws go straight to the call's exception edge.
 
 `wasm/regex.rs` translates supported irregexp bytecode to Wasm. Runtime matching
 selects installed matchers by pattern and flags. A matcher returns success,
@@ -347,13 +310,12 @@ various heuristics; cleanup is ongoing.
 
 ## 12. Capabilities and fallback
 
-The exhaustive match in `bbv/ops.rs` determines lowering support. Explicit
-declines include BigInt literals, eval variants, module imports,
-explicit-resource-management operations, and interpreter/debugger escapes.
-Environment gates reject frame shapes the runtime cannot model.
+The baseline tier's exhaustive match (`wasm/baseline/codegen.rs`) determines
+lowering support: every JSOp except `ForceInterpreter`. The MIR builder declines
+what it does not model, and such a script compiles as baseline alone.
 
-Opcode knowledge is also duplicated in analysis transfer, effects, splice
-safety, visualization, and auxiliary scans. An exhaustive lowering match does
+Opcode knowledge is also duplicated in analysis transfer, effects, inline
+eligibility, and auxiliary scans. An exhaustive lowering match does
 not make those classifications exhaustive. A single opcode capability
 description should state stack and immediate shape, analysis transfer, effects,
 frame/script relativity, splice safety, and lowering support. New opcodes should
@@ -361,7 +323,7 @@ fail tests until every dimension is classified.
 
 Fallback has three levels:
 
-1. failed specialization continues in generic compiled code;
+1. a failed MIR check exits to the script's baseline body;
 2. helpers and regex matchers use established engine slow paths;
 3. untranslatable scripts have no AOT entry and remain interpreted.
 
@@ -372,24 +334,20 @@ silently interpret a declined script does not establish generated-code coverage.
 
 Validation includes Rust unit tests, jit-tests and jstests in AOT and
 interpreter-only wasm lanes, differential application runs, Wasm validation,
-post-translation reducibility checks, C++ assertions for baked layouts, and
+the MIR validator, C++ assertions for baked layouts, and
 diagnostics for degradation, skipped scripts, guards, effects, and caches.
 
 ## 14. Glossary
 
 - **likely fact**: an untrusted analysis prediction.
 - **codegen fact**: a property proved by a guard or sound producer and carried
-  in a BBV context.
-- **track**: optimistic or generic execution state in version identity.
-- **side arm**: a guarded alternative inside one lowering.
-- **rung**: a retry step of the compile ladder with less specialization.
-- **theta**: the continuation and version-interning logic between operations.
-- **carrier**: an unboxed SSA value passed between versions.
-- **splice**: an inlined callee represented as synthetic bytecode.
+  in a MIR type.
+- **exit**: a MIR edge that writes the baseline frame and resumes baseline.
+- **splice**: an inlined callee's MIR copied into its caller.
 - **stamp**: the object word identifying layout and valid subclaims.
 - **region**: a compatible contiguous family of layout keys.
 - **fuse**: an armed condition with a complete invalidation cut.
 - **choke/chokepoint**: an invalidation point. Prefer that standard term in new
   code.
-- **dirty**: a lineage whose facts were weakened by effects or a failed route.
-- **on-ramp**: a guarded edge from a weak lineage to an optimistic context.
+- **on-ramp**: a MIR entry at a loop header that reads a baseline frame back
+  into SSA.

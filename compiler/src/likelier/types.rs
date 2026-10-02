@@ -241,8 +241,8 @@ pub fn arith_interval(
 }
 
 /// Result (prim mask, range) for an arith op over operand typesets: the
-/// opsem vocabulary at the Likely stance (the optimistic ladder bbv's
-/// lowering committed to; every consumer guards or fences). Monotone in
+/// opsem vocabulary at the Likely stance (the optimistic ladder; every
+/// consumer guards or fences). Monotone in
 /// both operands (fixpoint-safe).
 pub fn arith_transfer(op: NumOp, a: &TypeSet, b: Option<&TypeSet>) -> (Prims, Range) {
     let ob = b.map(opnd);

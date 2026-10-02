@@ -4,15 +4,14 @@
 #
 #   lanes.sh [N]          (N runs per cell, default 3)
 #
-# Lanes (LANES= picks; default all but aot-legacy):
+# Lanes (LANES= picks; default all but aot-base):
 #   native-ion       system js, full JIT: the ceiling
 #   native-baseline  system js --no-ion: baseline interpreter + compiler
 #   wasm-interp      SpiderMonkey's C++ interpreter built for wasm32-wasi:
 #                    the wasm floor (configs/mozconfig-wasm)
 #   weval            weval + PBL over the wizer shell: the peer wasm AOT
 #                    (configs/mozconfig-weval)
-#   aot              this build, --pipeline mir
-#   aot-legacy       this build, --pipeline legacy (BBV)
+#   aot              this build (MIR)
 #   aot-base         another build's nightmonkey and js (BASE_NIGHTMONKEY,
 #                    BASE_JS), with its default pipeline unless BASE_PIPE
 #                    names one: e.g. a branch that predates --pipeline
@@ -48,9 +47,8 @@ module() {
   local lane=$1 b=$2 m=$O/$lane-$b
   [ -f "$m.cwasm" ] && { echo "$m.cwasm"; return; }
   case $lane in
-    aot|aot-legacy)
-      local p=mir; [ "$lane" = aot-legacy ] && p=legacy
-      "$NIGHTMONKEY" --shell "$NIGHT_JS" "$W/src/$b.js" -o "$m.wasm" --pipeline $p >/dev/null 2>&1 || return 1 ;;
+    aot)
+      "$NIGHTMONKEY" --shell "$NIGHT_JS" "$W/src/$b.js" -o "$m.wasm" >/dev/null 2>&1 || return 1 ;;
     aot-base)
       [ -n "$BASE_NIGHTMONKEY" ] && [ -n "$BASE_JS" ] || return 1
       "$BASE_NIGHTMONKEY" --shell "$BASE_JS" "$W/src/$b.js" -o "$m.wasm" ${BASE_PIPE:+--pipeline "$BASE_PIPE"} >/dev/null 2>&1 || return 1 ;;

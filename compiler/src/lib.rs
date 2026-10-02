@@ -36,16 +36,18 @@
 //! - [`source`] -- the input object graph, read out of the engine's linear
 //!   memory by `night-snapshot`. The sole input: the compiler reads no
 //!   other channel, and in particular takes no profiling data.
-//! - [`bytecode`] -- the SpiderMonkey bytecode reader ([`disasm`] dumps it).
+//! - [`bytecode`] -- the SpiderMonkey bytecode reader.
 //! - [`likelier`] -- the likely-types analysis: one incremental fixpoint
 //!   over constraints generated once per function, with calling context as
 //!   part of edge identity. Its output is [`facts::LikelyFacts`], the whole
 //!   contract between analysis and translator.
-//! - [`wasm`] -- the translator. `wasm::bbv` is the one codegen path:
-//!   workqueue basic-block versioning, which lowers each bytecode op in as
-//!   many type-specialized versions as the program actually reaches, so a
-//!   failed speculation is an ordinary edge to a differently-typed version
-//!   rather than a deoptimization event.
+//! - [`mir`] and [`wasm`] -- the translator, in two tiers. `wasm::mir`
+//!   builds each script into MIR, a typed SSA IR in which every predicted
+//!   fact is checked once at its source and then held, optimizes it, and
+//!   lowers it to Wasm; a failed check exits to the script's baseline body
+//!   (`wasm::baseline`), a generic one-op-at-a-time lowering that also
+//!   compiles every script MIR declines (`docs/MIR.md`,
+//!   `docs/BASELINE.md`).
 //! - [`opsem`] -- the operator-semantics vocabulary (result types, numeric
 //!   ranges, interval arithmetic) that the analysis and the lowering share,
 //!   so both reason about `+` in the same words.
@@ -57,7 +59,6 @@
 
 pub mod bytecode;
 pub mod constants;
-pub mod disasm;
 pub mod env_regions;
 pub mod facts;
 pub mod ids;
@@ -68,7 +69,6 @@ pub mod opsem;
 pub mod options;
 pub mod region_shape;
 pub mod source;
-pub mod view;
 pub mod wasm;
 
 pub use options::{Diagnostics, Options, Pipeline};

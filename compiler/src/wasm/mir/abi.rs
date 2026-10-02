@@ -14,7 +14,7 @@
 // --- JS::Value ------------------------------------------------------------
 //
 // The nunbox32 tags and magic payloads live in translate.rs and are imported
-// through `bbv::*`. What is here is the boundary the two halves of a boxed
+// from there. What is here is the boundary the two halves of a boxed
 // value are separated at.
 
 /// Tag values at or above this are GC things (the tag half of a nunbox32
@@ -36,7 +36,6 @@ pub(crate) const VAL_GCTHING_TAG_MIN: u32 = 0xFFFF_FF86;
 
 pub(crate) const SHAPE_OFFSET: u32 = 0;
 pub(crate) const OBJ_CLASS_IDX_OFFSET: u32 = 4;
-pub(super) const OBJ_SLOTS_OFFSET: u32 = 8;
 pub(crate) const OBJ_ELEMENTS_OFFSET: u32 = 12;
 pub(crate) const FIXED_SLOTS_BASE: u32 = 16;
 /// `slots_` again, reached from a `NativeObject*` in the slot-address
@@ -59,9 +58,6 @@ pub(crate) const NATIVE_SLOTS_OFFSET: u32 = 8;
 // construction, under the sentinel, and after the ctor-exit stamp), which is
 // what lets one guard form serve both.
 
-/// The flags half, as a u16 at offset 6 -- the same bits as `CLASS_WORD_*`
-/// shifted down 16, for the arms that load only the half they test.
-pub(super) const OBJ_CLASS_FLAGS_OFFSET: u32 = 6;
 pub(crate) const CLASS_WORD_SHALLOW: u32 = 0x0001_0000;
 pub(crate) const CLASS_WORD_SLOTS: u32 = 0x0002_0000;
 /// The predicted VALUE RANGES of the layout's masked fields hold. Unlike
@@ -73,14 +69,6 @@ pub(crate) const CLASS_WORD_SLOTS: u32 = 0x0002_0000;
 /// up its 13th bit for it.
 pub(crate) const CLASS_WORD_RANGES: u32 = 0x4000_0000;
 pub(crate) const CLASS_WORD_SENTINEL: u32 = 0x8000_0000;
-/// Post-stamp reuse of the lowest early-key bit (the key space is dead
-/// once the idx is stamped): an unpredicted-key add landed BEYOND the
-/// object's own layout length, so its own prefix predictions still hold
-/// (slots assign sequentially) but the bit history no longer certifies a
-/// clump-sibling's extension -- the prefix-advance restamp declines on
-/// it. Set only on stamped (non-sentinel) words; while the sentinel is
-/// up this bit is part of the early key.
-pub(super) const CLASS_WORD_ADV_INELIGIBLE: u32 = 0x0004_0000;
 pub(crate) const EARLY_KEY_SHIFT: u32 = 18;
 pub const EARLY_KEY_MAX: u32 = 0x0FFF;
 
@@ -106,8 +94,6 @@ pub(crate) const SHAPE_SMALL_SLOTSPAN_MASK_BITS: u32 = 0x3ff;
 pub(crate) const SHAPE_PERMUTED_SLOTS_BIT: u32 = 1 << 21;
 pub(crate) const BASESHAPE_CLASP_OFFSET: u32 = 0;
 pub(crate) const BASESHAPE_PROTO_OFFSET: u32 = 8;
-pub(super) const CLASP_FLAGS_OFFSET: u32 = 4;
-pub(super) const JSCLASS_EMULATES_UNDEFINED: u32 = 1 << 6;
 
 // --- ObjectElements -------------------------------------------------------
 //
@@ -124,7 +110,6 @@ pub(crate) const ELEMENTS_CAPACITY_BACK: u32 = 8;
 pub(crate) const ELEMENTS_LENGTH_BACK: u32 = 4;
 pub(crate) const ELEMENTS_FLAG_FIXED: u32 = 0x1;
 pub(crate) const ELEMENTS_FROZEN_FLAG: u32 = 0x40;
-pub(super) const ELEMENTS_NON_PACKED_FLAG: u32 = 0x80;
 /// Any of these set means the dense append arm must bail to the helper.
 pub(crate) const ELEMENTS_PUSH_BAIL_MASK: u32 = 0x72;
 
@@ -190,21 +175,6 @@ pub(crate) const NURSERY_HEADER_BYTES: u32 = 8;
 
 // --- the compiled frame ---------------------------------------------------
 
-/// The frame's fixed head, in bytes: the callee slot and `this`. The formals
-/// follow it, one boxed Value each, then the locals.
-pub(super) const FRAME_ARGS_OFFSET: u32 = 16;
-
-/// `Bbv::frame_stale` key bit for a formal (`STALE_ARG | argno`); the rest
-/// of the space is local numbers.
-pub(super) const STALE_ARG: u32 = 1 << 31;
-/// Carried-key bit for a raw carrier of the PARENT frame's local riding
-/// through an inline segment (`OUTER_LOCAL | localno`): the value stays in
-/// SSA across the splice instead of a boxed store at the seam and a load
-/// at the return. Immune to the callee's GCs by repr, invisible to the
-/// callee (caller slots are private), handed back as a plain carrier on
-/// the return edge, and flushed to its slot at any edge that drops it.
-pub(super) const OUTER_LOCAL: u32 = 1 << 30;
-
 // --- the sig2 return flags word -------------------------------------------
 //
 // Bits set = effects happened, so ORs accumulate and gen_only bodies return
@@ -250,16 +220,6 @@ pub(crate) const CONSTRUCT_CELL_GEN: u32 = 24;
 pub(crate) const CONSTRUCT_CELL_PROTOPTR: u32 = 28;
 pub(crate) const CONSTRUCT_CELL_PROTOSLOTENC: u32 = 32;
 pub(crate) const CONSTRUCT_CELL_ADDR_PLACEHOLDER: u32 = 0xDEAD_C000;
-
-/// Base of the per-funcidx ctor-nslots region (u32 per funcref-table index,
-/// 0 = unknown), patched by `translate_all` once table placement is done. An
-/// unresolved construct site's fast arm indexes it with the classified
-/// funcidx so `night_runtime_create_this` (and thus the construct cell it
-/// primes) sizes `this` for the ctor's full layout. Sizing it generically
-/// instead lands the ctor's later fields in dynamic slots, which defeats
-/// every fixed-slot-only inline set arm downstream -- the whole field-init
-/// sequence falls back to the set-miss helper.
-pub(super) const NSLOTS_REGION_PLACEHOLDER: u32 = 0xDEAD_D000;
 
 /// Instanceof cell: `[funShape u32][gen u32][slotenc u32]`. Must match
 /// `NightRuntime.cpp`'s `populate`.
@@ -336,12 +296,6 @@ pub(crate) const IC_TRANS_PROTO_HOPS: u32 = 4;
 /// the arm falls to the helper, which replays against all of them.
 pub(crate) const IC_TRANS_INLINE_HOPS: u32 = 2;
 
-/// A stamping ctor's proto-proof cell (one IC row, see `Bbv::proto_on`):
-/// the root `this` the proof was minted on, then the `IC_TRANS_INLINE_HOPS`
-/// proto shape words its replay validated live.
-pub(super) const PROTO_CELL_RECV: u32 = 0;
-pub(super) const PROTO_CELL_SHAPE0: u32 = 4;
-
 // --- the global megamorphic tables ----------------------------------------
 //
 // Direct-mapped, power-of-two, GC-zeroed; the probe hashes (shape, atom).
@@ -358,8 +312,7 @@ pub(super) use crate::region_shape::{MEGA_ATOM_OFF as MEGA_ATOM, MEGA_SHAPE_OFF 
 // rather than inlined at each site, so nothing here reads them.
 
 pub(super) use crate::region_shape::{
-    MEGA_SET_ABS_SLOT_OFF as MEGA_SET_ABSSLOT, MEGA_SET_ENTRY_BYTES, MEGA_SET_SIZE,
-    MEGA_SET_SLOT_ENC_OFF as MEGA_SET_SLOTENC,
+    MEGA_SET_ENTRY_BYTES, MEGA_SET_SIZE,
 };
 
 // --- helper-ABI argument codes --------------------------------------------

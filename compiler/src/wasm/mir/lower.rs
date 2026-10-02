@@ -57,7 +57,7 @@ use crate::wasm::baseline::layout::{
     FrameLayout, ResumeMode, ResumeWord, ARGC_FLAGS, ARGC_ONRAMP_BIT, ARGC_RESUME_BIT, ERR_DEOPT,
     ONRAMP_BACKOFF,
 };
-use crate::wasm::bbv::abi::{
+use crate::wasm::mir::abi::{
     BINOP_BITAND, BINOP_BITNOT, BINOP_BITOR, BINOP_BITXOR, BINOP_DEC, BINOP_DIV, BINOP_INC,
     BINOP_LSH, BINOP_MOD, BINOP_MUL, BINOP_RSH, BINOP_SUB, BINOP_URSH, CLASS_WORD_SHALLOW,
     CLASS_WORD_RANGES, CLASS_WORD_SENTINEL, CLASS_WORD_SLOTS, SHAPE_SMALL_SLOTSPAN_MASK_BITS,
@@ -101,9 +101,8 @@ const CANONICAL_NAN_BITS: u64 = 0x7FF8_0000_0000_0000;
 
 /// How much of an inline frame's fixed slots (env, arguments object,
 /// new.target, rval, resume word, backoff) its `inline.enter` writes.
-/// BBV's splices write none of them: only an exit into the callee's
-/// baseline body reads them, so the exit hub writes what the entry left
-/// out, and the frame's GC scan (`frame_top`) stops below it.
+/// Only an exit into the callee's baseline body reads the rest, so the
+/// exit hub writes what the entry left out, and the frame's GC scan (`frame_top`) stops below it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Fixed {
     /// All six: the callee reads its arguments object or new.target from
@@ -374,7 +373,7 @@ struct Lower<'a> {
     /// `fail`, its only way in).
     script_memo: BTreeMap<mir::Block, (mir::Value, Value)>,
     /// Whether the function makes an arguments object (`args.object`):
-    /// then its element reads try bbv's `arguments[i]` arm.
+    /// then its element reads try the `arguments[i]` arm (`args_element`).
     makes_args: bool,
     /// A `check.binding`'s fact, with its value-fuse test (`load_gname`'s).
     binding_armed: BTreeMap<mir::Value, Value>,
@@ -390,9 +389,9 @@ struct Lower<'a> {
     prop_ic_patches: Vec<(Value, u32)>,
     /// `instanceof` cell placeholders (`Outcome::Compiled::iof_cell_patches`).
     iof_cell_patches: Vec<(Value, u32)>,
-    /// Construct cell placeholders (bbv's per-site cell).
+    /// Construct cell placeholders (one cell per site).
     construct_cell_patches: Vec<(Value, u32)>,
-    /// Call value cell placeholders (bbv's per-site cell; 0: the trash row).
+    /// Call value cell placeholders (one cell per site; 0: the trash row).
     call_cell_patches: Vec<(Value, u32)>,
     likely_patches: Vec<(Value, Value, u32)>,
     alloc_cell_patches: Vec<(Value, u32)>,
@@ -1897,7 +1896,7 @@ impl<'a> Lower<'a> {
 
     /// The stamp epoch (`gNightStampEpoch`, low word), which every
     /// demotion of a stamped object's class word bumps: unchanged across
-    /// a call, no layout fact was invalidated (bbv's `emit_epoch_read`).
+    /// a call, no layout fact was invalidated.
     fn epoch(&mut self) -> Value {
         let slot = self.i32c(self.h.strlit_slot + crate::region_shape::STRLIT_STAMP_EPOCH_ADDR_OFF);
         let addr = self.load_i32(slot, 0);
@@ -2470,7 +2469,7 @@ impl<'a> Lower<'a> {
                 self.def(inst, v);
             }
             Opcode::JsConstantStrictEq(k) => {
-                // `ConstantStrictEqual` inline (bbv's): the operand's type
+                // `ConstantStrictEqual` inline: the operand's type
                 // byte, then its payload.
                 let v = self.constant_strict_eq(a[0], k);
                 self.def(inst, v);
@@ -2569,7 +2568,7 @@ impl<'a> Lower<'a> {
                 // inline, else the helper (which fills the row).
                 let site = self.init_prop_inline(inst, a[0], a[1])?;
                 let at = self.atom(name);
-                let av = self.i32c(crate::wasm::bbv::abi::INIT_ATTR_ENUMERATE);
+                let av = self.i32c(crate::wasm::mir::abi::INIT_ATTR_ENUMERATE);
                 let sv = self.i32c(site);
                 let live = self.live_across(inst);
                 let (ok, _) = self.gc_call(self.h.init_prop, &[a[0], at, a[1], av, sv], &live)?;
@@ -2598,7 +2597,7 @@ impl<'a> Lower<'a> {
                 self.js_call(inst, self.h.get_gname, &[at, z], false)?;
             }
             Opcode::JsGetProp(name) | Opcode::GetPropData(name) => {
-                // The site's inline cache (as bbv's fact-free reads): the
+                // The site's inline cache (a fact-free read): the
                 // shared probe `night_ic_get` (own and holder ways, then
                 // the megamorphic table) takes `ok_clean` on a hit; a miss
                 // runs the generic get and fills the site's ways. For
@@ -2611,7 +2610,7 @@ impl<'a> Lower<'a> {
                 let nm = String::from_utf16_lossy(self.mm.atoms[name].chars());
                 if nm == "charCodeAt" || nm == "charAt" {
                     // A string's pristine char method, while String.prototype
-                    // is untouched (bbv's char-op read): the cached native.
+                    // is untouched: the cached native.
                     let cell = if nm == "charCodeAt" { self.h.str_ccat_cell } else { self.h.str_cat_cell };
                     let ic = self.body.add_block();
                     let tag = self.tag_of(a[0]);
@@ -2657,7 +2656,7 @@ impl<'a> Lower<'a> {
                 let t = self.edge(inst, 0, &[v])?;
                 self.terminate(Terminator::Br { target: t });
                 self.cur = slow;
-                // bbv's other pure arms, where the operands' types admit
+                // The other pure arms, where the operands' types admit
                 // them: a string's char, and a string key's megamorphic
                 // probe (`obj[name]`).
                 let (rt, kt) = (value_tags(&self.ty(d.args[0])), value_tags(&self.ty(d.args[1])));
@@ -2687,7 +2686,7 @@ impl<'a> Lower<'a> {
                     self.terminate(Terminator::Br { target: t });
                     self.cur = other;
                 }
-                // An arguments object's element (bbv's `arguments[i]` arm),
+                // An arguments object's element (`args_element`),
                 // in a function that makes one.
                 if self.makes_args && !rt.intersect(TagSet::OBJECT).is_empty() && !kt.intersect(TagSet::INT32).is_empty() {
                     let other = self.body.add_block();
@@ -2697,7 +2696,7 @@ impl<'a> Lower<'a> {
                     self.cur = other;
                 }
                 if self.ta_poly(inst) {
-                    // A typed array of any kind (bbv's poly-TA arm): the
+                    // A typed array of any kind: the
                     // probe's value, or the magic tag on a miss.
                     let generic = self.body.add_block();
                     let (obj, idx) = self.obj_int(a[0], a[1], generic);
@@ -2735,7 +2734,7 @@ impl<'a> Lower<'a> {
                 // taking `ok_clean`: an own writable data property unless
                 // the elements are frozen. The store bypasses the engine,
                 // so it owes the array stamp's RANGES claim its duty: a
-                // clear, as bbv's for a value not proven inside the claim
+                // clear for a value not proven inside the claim
                 // (no MIR fact rests on it; the epoch bump tells callers').
                 let num = matches!(self.ty(d.args[2]), MType::Val(s) if s.tags.subset_of(TagSet::NUMBER));
                 let slow = self.body.add_block();
@@ -2767,7 +2766,7 @@ impl<'a> Lower<'a> {
                     self.cur = generic;
                 }
                 if self.ta_poly(inst) {
-                    // A typed array of any kind (bbv's poly-TA store probe).
+                    // A typed array of any kind (the poly-TA store probe).
                     let generic = self.body.add_block();
                     let (obj, idx) = self.obj_int(a[0], a[1], generic);
                     let ok = self.call1(self.h.ta_set_poly, &[obj, idx, a[2]], Type::I32);
@@ -2844,8 +2843,7 @@ impl<'a> Lower<'a> {
                 self.guard(inst, native, &[a[0]])?;
             }
             Opcode::GuardKind(ObjKind::TypedArray(k)) => {
-                // The class is the kind's typed-array class (bbv's
-                // `ta_clasp_eq`).
+                // The class is the kind's typed-array class.
                 let shape = self.load_i32(a[0], SHAPE_OFFSET);
                 let base = self.load_i32(shape, SHAPE_BASESHAPE_OFFSET);
                 let clasp = self.load_i32(base, BASESHAPE_CLASP_OFFSET);
@@ -3010,7 +3008,7 @@ impl<'a> Lower<'a> {
             Opcode::CallEval(pc) => self.js_eval_op(inst, &a, pc)?,
             Opcode::GuardScript(sid) => self.guard_script(inst, &d, &a, sid)?,
             Opcode::AccessorProbe(name, set) => {
-                // bbv's accessor arm: the (receiver shape, atom, kind)-hashed
+                // The accessor arm: the (receiver shape, atom, kind)-hashed
                 // row the IC miss helpers prime for a prototype getter or
                 // setter, its holder's shape still the recorded one.
                 use crate::wasm::translate::{
@@ -3149,7 +3147,7 @@ impl<'a> Lower<'a> {
                         (h.new_array, vec![lv, cell])
                     }
                     RtOp::InitProp(name, attrs) => {
-                        let site = if attrs == crate::wasm::bbv::abi::INIT_ATTR_ENUMERATE {
+                        let site = if attrs == crate::wasm::mir::abi::INIT_ATTR_ENUMERATE {
                             self.init_prop_inline(inst, a[0], a[1])?
                         } else {
                             u32::MAX
@@ -3168,7 +3166,7 @@ impl<'a> Lower<'a> {
                         };
                         match index {
                             Some(i)
-                                if attrs == crate::wasm::bbv::abi::INIT_ATTR_ENUMERATE
+                                if attrs == crate::wasm::mir::abi::INIT_ATTR_ENUMERATE
                                     && i < crate::constants::INLINE_INIT_ELEM_CAP =>
                             {
                                 self.init_elem_inline(inst, a[0], i, a[2], duty)?
@@ -3215,7 +3213,7 @@ impl<'a> Lower<'a> {
                             RtOp::BuiltinObject(kind) => (kind, self.atoms.builtin_object_cell(kind), h.builtin_object_cell),
                             _ => unreachable!(),
                         };
-                        let cell = self.i32c(crate::wasm::bbv::abi::INTRINSIC_CELL_ADDR_PLACEHOLDER);
+                        let cell = self.i32c(crate::wasm::mir::abi::INTRINSIC_CELL_ADDR_PLACEHOLDER);
                         self.intrinsic_cell_patches.push((cell, row));
                         let bits = self.load_i64(cell, 0);
                         let z = self.i64c(0);
@@ -3516,7 +3514,7 @@ impl<'a> Lower<'a> {
                 self.exit_inline(inst, &d, &a, pc, nargs, nlocals, throw)?
             }
             Opcode::Construct(nslots, word) => {
-                // `new Array()` (bbv's bump arm): the pristine Array
+                // `new Array()`: the pristine Array
                 // constructor, as its own new.target, makes what `[]` does.
                 if a.len() == 3 && self.names_atom("Array") {
                     let (callee, nt) = (a[0], a[2]);
@@ -3560,8 +3558,7 @@ impl<'a> Lower<'a> {
                 // Direct: a compiled constructor gets its `this` from
                 // `create_this` (sized and stamped for the site) and runs
                 // by a direct call, with no trip through the engine's
-                // construct (bbv's direct construct, without its inline
-                // allocation cell).
+                // construct.
                 const HEADROOM: u32 = 64 * 1024;
                 let (funcidx, script) = self.classify(callee);
                 let z = self.i32c(0);
@@ -3651,7 +3648,7 @@ impl<'a> Lower<'a> {
             Opcode::GuardLayout { keys, types, slots } => {
                 // The stamp word (`JSObject*+4`): identity is layout key + 1
                 // in the low 16 bits; TYPES is the SHALLOW bit (§4.3). The
-                // SLOTS bit too, as bbv's class guard: a claim then holds
+                // SLOTS bit too: a claim then holds
                 // the fields at their slots, until a kill (only the engine
                 // clears SLOTS, bumping the epoch), so the field ops under
                 // it load and store with no test of their own.
@@ -3659,7 +3656,7 @@ impl<'a> Lower<'a> {
                 let m = self.i32c(0xFFFF);
                 let id = self.bin(Operator::I32And, w, m, Type::I32);
                 let want = if types { CLASS_WORD_SHALLOW } else { 0 } | if slots { CLASS_WORD_SLOTS } else { 0 };
-                // One masked compare, as bbv's class guard: identity and
+                // One masked compare: identity and
                 // the bits at once. Over a range, the masked word less the
                 // lowest wanted word is at most the span only with every
                 // bit there (a missing bit, at 1 << 16 or above, wraps it).
@@ -3856,7 +3853,7 @@ impl<'a> Lower<'a> {
             }
             Opcode::ConstStr(name) => {
                 // The atom itself, from the startup-filled atom table (a
-                // pinned atom never moves), as bbv's `emit_string_literal`:
+                // pinned atom never moves):
                 // one load, no allocation.
                 let id = self.atoms.intern_chars(self.mm.atoms[name].chars());
                 let slot = self.i32c(self.h.atom_table_slot);
@@ -3975,7 +3972,7 @@ impl<'a> Lower<'a> {
         id
     }
 
-    /// `a + b` of two strings: the quiet concat helper (bbv's arm: it runs
+    /// `a + b` of two strings: the quiet concat helper (it runs
     /// no user code and touches no stamp, so it takes `ok_clean`), where
     /// both operands' types admit a string.
     fn concat_arm(&mut self, inst: mir::Inst, d: &mir::func::InstData, a: &[Value]) -> R<()> {
@@ -4016,11 +4013,11 @@ impl<'a> Lower<'a> {
         self.js_call(inst, f, &args, bool_out)
     }
 
-    /// An equality's inline arms (against a string literal, then bbv's
+    /// An equality's inline arms (against a string literal, then the
     /// tag ladder), taking edge 0.
     fn equality_arms(&mut self, inst: mir::Inst, cc: JsCc, a: &[Value]) -> R<()> {
         if matches!(cc, JsCc::Eq | JsCc::Ne | JsCc::StrictEq | JsCc::StrictNe) {
-            // Against a string literal (an atom): bbv's ladder.
+            // Against a string literal (an atom): `literal_eq`'s ladder.
             let args = self.f.insts[inst].args.clone();
             if self.is_str_literal(args[1]) {
                 self.literal_eq(inst, cc, a[0], a[1])?;
@@ -4158,8 +4155,8 @@ impl<'a> Lower<'a> {
         Ok(())
     }
 
-    /// The inline arms of a read of syntactic global binding `bid` (bbv's
-    /// `emit_get_gname_inline_guarded`), each taking the op's `ok` edge:
+    /// The inline arms of a read of syntactic global binding `bid`, each
+    /// taking the op's `ok` edge:
     /// the binding's value-fuse cell while armed; else its cached slot row
     /// while the global's shape is the one the row was resolved against;
     /// else the resolve leaf (no GC) and the slot. Falls through to the
@@ -4262,8 +4259,7 @@ impl<'a> Lower<'a> {
         let two = self.i32c(2);
         // The binding's value fuse (`gGlobalVals[bid]`): an armed cell whose
         // value changes mirrors a non-GC value in place, and otherwise is
-        // unarmed with the re-arm left to the runtime (bbv's
-        // `emit_blow_binding_value_fuse`).
+        // unarmed with the re-arm left to the runtime.
         let vals = self.i32c(self.h.global_vals_base + 16 * bid);
         let fw = self.load_i32(vals, 8);
         let armed = self.bin(Operator::I32Eq, fw, one, Type::I32);
@@ -4365,8 +4361,8 @@ impl<'a> Lower<'a> {
         Ok(())
     }
 
-    /// The inline arm of binding syntactic global name `bid` (bbv's
-    /// `emit_bind_gname_inline`): with the binding's slot row resolved
+    /// The inline arm of binding syntactic global name `bid`:
+    /// with the binding's slot row resolved
     /// against the global's live shape (or re-resolved by the leaf), the
     /// binding object is the global object, taking `ok_clean`. Falls
     /// through to the helper otherwise.
@@ -4396,8 +4392,8 @@ impl<'a> Lower<'a> {
         Ok(())
     }
 
-    /// The inline arm of a write to syntactic global binding `bid` (bbv's
-    /// `emit_set_name_inline_guarded`), taking `ok_clean`: with the
+    /// The inline arm of a write to syntactic global binding `bid`,
+    /// taking `ok_clean`: with the
     /// binding's slot row resolved against the global's live shape (or
     /// re-resolved by the leaf) and writable, store `val` with barriers,
     /// then keep the binding's value fuse, the bind epoch and a fused
@@ -4724,7 +4720,7 @@ impl<'a> Lower<'a> {
         }
     }
 
-    /// `x ==/=== lit` for a string literal `lit` (an atom), bbv's
+    /// `x ==/=== lit` for a string literal `lit` (an atom), a
     /// literal-RHS ladder, each deciding arm taking `ok_clean`: a
     /// non-string is unequal (strictly; loosely it coerces: the helper's);
     /// the same pointer is equal; an atom that is not it is unequal (one
@@ -4732,7 +4728,7 @@ impl<'a> Lower<'a> {
     /// different length is unequal; two linear strings compare their
     /// characters (a pure leaf). A rope falls through to the generic arms.
     fn literal_eq(&mut self, inst: mir::Inst, cc: JsCc, x: Value, lit: Value) -> R<()> {
-        use crate::wasm::bbv::abi::{STRING_ATOM_BIT, STRING_FLAGS_OFFSET};
+        use crate::wasm::mir::abi::{STRING_ATOM_BIT, STRING_FLAGS_OFFSET};
         let negate = matches!(cc, JsCc::Ne | JsCc::StrictNe);
         let strict = matches!(cc, JsCc::StrictEq | JsCc::StrictNe);
         let generic = self.body.add_block();
@@ -4851,11 +4847,11 @@ impl<'a> Lower<'a> {
         self.terminate(Terminator::Br { target: t });
         self.cur = slow;
         if STRING_EQ_ARM {
-            // Two strings (bbv's `emit_string_eq_arm`): one pointer is
+            // Two strings: one pointer is
             // equal; different lengths (a rope carries its length, so no
             // flatten) or two atoms (deduplicated) are unequal. Else the
             // helper compares the characters.
-            use crate::wasm::bbv::abi::{STRING_ATOM_BIT, STRING_FLAGS_OFFSET};
+            use crate::wasm::mir::abi::{STRING_ATOM_BIT, STRING_FLAGS_OFFSET};
             let generic = self.body.add_block();
             let sa = self.tag_is(ta, TAG_STRING as u32);
             let sb = self.tag_is(tb, TAG_STRING as u32);
@@ -4903,7 +4899,7 @@ impl<'a> Lower<'a> {
         self.clean_or_dirty(inst, ok, same, &[out])
     }
 
-    /// A property read's inline cache past its special arms (bbv's
+    /// A property read's inline cache past its special arms (a
     /// fact-free read): the ways, then the shared probe `night_ic_get`
     /// (own and holder ways, the megamorphic table), taking `ok_clean` on
     /// a hit; a miss runs the generic get and fills the site's ways.
@@ -5079,7 +5075,7 @@ impl<'a> Lower<'a> {
     /// alone) finds the slot through the site's inline cache: the field,
     /// by name, is still of its claim's type. A store keeps TYPES only with
     /// a value of the field's predicted type (`store_types`); at a known
-    /// slot another demotes the word inline (bbv's store choke: the bits
+    /// slot another demotes the word inline (the store choke: the bits
     /// cleared, the epoch bumped) and takes `ok_dirty`. GC barriers unless
     /// the value is a number.
     fn field_op(
@@ -5187,15 +5183,14 @@ impl<'a> Lower<'a> {
         self.cur = cont;
     }
 
-    /// A get IC's inline ways (bbv's `emit_get_ic_inline_arms`): with
+    /// A get IC's inline ways: with
     /// `recv` an object whose shape one of the site's ways names (way 0 at
     /// `way0`, the rest `INLINE_IC_WAY_BYTES` apart from its row offset
     /// `way_off`), the value from its own fixed slot, or through the way's
     /// holder (a prototype method) while the holder keeps its shape,
     /// taking `ok_clean`; else `probe`.
     /// A property IC's receiver test: an object, or `miss`. Skipped when
-    /// the receiver's type (`args[0]`) already says object, as bbv skips
-    /// it for an object-only operand.
+    /// the receiver's type (`args[0]`) already says object.
     fn check_recv_object(&mut self, inst: mir::Inst, recv: Value, miss: Block) {
         let tags = value_tags(&self.ty(self.f.insts[inst].args[0]));
         if tags.is_nonempty_subset_of(TagSet::OBJECT) {
@@ -5257,7 +5252,7 @@ impl<'a> Lower<'a> {
         Ok(())
     }
 
-    /// A set IC's way 0 (`bbv`'s `emit_set_prop_ic_inline` without its
+    /// A set IC's way 0 (not its
     /// transition and megamorphic arms): with `recv` an object of the
     /// way's shape, store `val` to the slot the way names and take
     /// `ok_clean`; else branch to `slow`. The store bypasses the engine's
@@ -5265,7 +5260,7 @@ impl<'a> Lower<'a> {
     /// could falsify: RANGES never, TYPES unless `val` is a number.
     /// A set IC's overwrite arms: way 0 (the site's one shape), or past
     /// one shape (way 0 sentineled) the (shape, atom) row the module's
-    /// `night_ic_set_cold` finds in the mega-set table (bbv's arm). Both
+    /// `night_ic_set_cold` finds in the mega-set table. Both
     /// name the slot for one shared store; a mono miss takes `trans`, no
     /// mega row or a non-object `slow`.
     #[allow(clippy::too_many_arguments)]
@@ -5304,7 +5299,7 @@ impl<'a> Lower<'a> {
         self.cur = w0;
         to_store(self, way, IC_SET_SLOTENC, IC_SET_ABSSLOT);
         self.cur = poly;
-        let sentinel = self.i32c(crate::wasm::bbv::abi::IC_POLY_SENTINEL);
+        let sentinel = self.i32c(crate::wasm::mir::abi::IC_POLY_SENTINEL);
         let is_poly = self.bin(Operator::I32Eq, cached, sentinel, Type::I32);
         let mega = self.body.add_block();
         self.cond_br(is_poly, Self::to(mega), Self::to(trans));
@@ -5385,7 +5380,7 @@ impl<'a> Lower<'a> {
         self.load_i32(f, FUNC_SCRIPT_SLOT_OFFSET)
     }
 
-    /// A set IC's add-transition row replayed inline (bbv's add arm, in its
+    /// A set IC's add-transition row replayed inline (in a
     /// sound subset): `recv` an object of the row's pre-add shape, the
     /// row's prototype hops unchanged (all four, live), and the add unable to falsify the object's class-word bits.
     /// That holds when it has no SLOTS, or lands where one of the name's
@@ -5446,7 +5441,7 @@ impl<'a> Lower<'a> {
         let k = self.bin(Operator::I32Or, k_sent, k_idx, Type::I32);
         // An add past the layout's extent (its bound in the this-cells
         // table; 0 = unknown) leaves every predicted slot where it was:
-        // SLOTS holds (bbv's runtime add check).
+        // SLOTS holds.
         let three = self.i32c(3);
         let koff = self.bin(Operator::I32Shl, k, three, Type::I32);
         let tbase = self.i32c(self.h.this_cells_base.wrapping_sub(8));
@@ -5485,7 +5480,7 @@ impl<'a> Lower<'a> {
 
     /// The pristine `charCodeAt`/`charAt` on a linear string with an
     /// in-bounds int32 index, and `String.fromCharCode` of a code below 256
-    /// (bbv's char arms): the char inline (`charAt` and `fromCharCode`
+    /// (the char arms): the char inline (`charAt` and `fromCharCode`
     /// only below 256, a static unit string), taking `ok_clean`; else
     /// branch to `other` (the call). The callee is compared against the
     /// startup-cached natives' bits: a monkeypatched one misses.
@@ -5650,8 +5645,7 @@ impl<'a> Lower<'a> {
     }
 
     /// A layout constructor's first stamp of its completed `this`, inline
-    /// (bbv's `emit_class_idx_stamp_impl`; `night_runtime_ctor_stamp`'s
-    /// gates): an object still under construction whose early key is ours
+    /// (`night_runtime_ctor_stamp`'s gates): an object still under construction whose early key is ours
     /// or none, with a slot span covering the row, gets the layout's idx
     /// plus the validity bits that survived construction.
     fn ctor_stamp_inline(&mut self, thisv: Value, layout: u32, nfields: u32, keep: u32, exact: bool) {
@@ -6088,8 +6082,8 @@ impl<'a> Lower<'a> {
         self.cur = done;
     }
 
-    /// The construct `this` for a direct construct (bbv's
-    /// `emit_construct_this`): with the site's cell describing the callee
+    /// The construct `this` for a direct construct:
+    /// with the site's cell describing the callee
     /// (its shape, under the live IC generation) and its live `.prototype`
     /// still the cached one, a nursery bump of the cached empty `this`;
     /// else `create_this`, which also fills the cell. Leaves `this` at
@@ -6215,7 +6209,7 @@ impl<'a> Lower<'a> {
         ok_p
     }
 
-    /// `lhs instanceof rhs` inline (bbv's `emit_instanceof`), taking
+    /// `lhs instanceof rhs` inline, taking
     /// `ok_clean`: with the site's cell describing `rhs` (its shape, under
     /// the live IC generation), read its `.prototype` from the cached slot
     /// and walk `lhs`'s prototype chain (bounded) for it. Anything else
@@ -6320,7 +6314,7 @@ impl<'a> Lower<'a> {
     /// initializedLength is 0, and a proxy fails the native check first.
     /// Element `key` (a boxed int32) of `recv` (boxed), an arguments
     /// object whose element is neither overridden nor forwarded to a call
-    /// object (bbv's arm, `ArgumentsObject::element`): its data's slot;
+    /// object (as `ArgumentsObject::element`): its data's slot;
     /// anything else branches to `fail`.
     fn args_element(&mut self, recv: Value, key: Value, fail: Block) -> Value {
         let tag = self.tag_of(recv);
@@ -6370,8 +6364,8 @@ impl<'a> Lower<'a> {
     }
 
     /// `s[i]` of a linear latin1 string (boxed) and an in-bounds int32
-    /// index (boxed): the unit string from the static strings table
-    /// (bbv's `emit_string_elem_arm`); anything else branches to `fail`.
+    /// index (boxed): the unit string from the static strings table;
+    /// anything else branches to `fail`.
     fn string_char(&mut self, recv: Value, key: Value, fail: Block) -> Value {
         let tag = self.tag_of(recv);
         let is_str = self.tag_is(tag, TAG_STRING as u32);
@@ -6466,8 +6460,8 @@ impl<'a> Lower<'a> {
         (obj, elements, idx, addr, v)
     }
 
-    /// A dense append, or a store into a hole, call-free (bbv's
-    /// `emit_elem_append_arm`): with `night_elem_append_check` proving it
+    /// A dense append, or a store into a hole, call-free: with
+    /// `night_elem_append_check` proving it
     /// legal (the receiver's shape in the append cache, its prototypes
     /// holding no indexed property, room left) and returning the element's
     /// address, store it and, for an append, bump the initialized length,
@@ -6673,7 +6667,7 @@ impl<'a> Lower<'a> {
         self.cur = direct_b;
         let argc_v = self.i32c(argc);
         let undef = self.i64c(UNDEF);
-        // The site's likely callees (bbv's likely-callee arm, and its guard
+        // The site's likely callees (one, or a guard
         // chain for a small polymorphic set): each one's table index (a
         // patched const; `u32::MAX` while uncompiled, so the arm is dead)
         // against the classified funcidx, and on a match a static `call`
@@ -6744,7 +6738,7 @@ impl<'a> Lower<'a> {
         let argc_v = self.i32c(argc);
         if NATIVE_ROUTE {
             // A native callee (the classify proved a function with no
-            // script) goes straight to its JSNative (bbv's native route);
+            // script) goes straight to its JSNative;
             // `native_dispatch` punts the natives that need the generic
             // call's handling back to it.
             let (nat_b, gen_b) = (self.body.add_block(), self.body.add_block());
@@ -6779,7 +6773,7 @@ impl<'a> Lower<'a> {
     }
 
     /// An object or array literal (`array_len`) from the site's
-    /// inline-alloc cell (bbv's `emit_alloc_inline`): with the cell filled
+    /// inline-alloc cell: with the cell filled
     /// and room in the nursery, bump and write the header the cell holds
     /// (an array's elements inline, empty), taking `ok_clean`. Returns the
     /// cell, for the helper that fills it, with `cur` on the miss.
@@ -6836,7 +6830,7 @@ impl<'a> Lower<'a> {
         Ok(cell)
     }
 
-    /// `InitProp` on a literal under construction (bbv's `emit_init_prop`):
+    /// `InitProp` on a literal under construction:
     /// replay the site's add transition from its IC row (the helper fills
     /// it) while the literal has the row's old shape: store the value in
     /// the fresh slot (no pre-barrier: nothing was there), swap in the new
@@ -6867,7 +6861,7 @@ impl<'a> Lower<'a> {
         Ok(cache)
     }
 
-    /// Native `Math` calls on numbers (bbv's arms), matched by the callee's
+    /// Native `Math` calls on numbers, matched by the callee's
     /// `JSNative` against the pristine natives table, so a replaced or
     /// self-hosted clone is told apart without fuses: one-argument
     /// sqrt/abs/floor/ceil/trunc/fround inline, sin/cos by a leaf, clz32;
@@ -6990,14 +6984,14 @@ impl<'a> Lower<'a> {
         Ok(())
     }
 
-    /// `InitElemArray index` filling an array literal (bbv's
-    /// `emit_init_elem_array`): with a value that is neither a GC thing
+    /// `InitElemArray index` filling an array literal:
+    /// with a value that is neither a GC thing
     /// (no barrier) nor the hole, dense elements with no flag but FIXED,
     /// and the initialized length at `index` with room, store and bump it
     /// (clearing RANGES under the store's `duty`), taking `ok_clean`;
     /// `cur` is left on the miss.
     fn init_elem_inline(&mut self, inst: mir::Inst, arr: Value, index: u32, val: Value, duty: bool) -> R<()> {
-        use crate::wasm::bbv::abi::ELEMENTS_FLAG_FIXED;
+        use crate::wasm::mir::abi::ELEMENTS_FLAG_FIXED;
         let slow = self.body.add_block();
         let vt = self.tag_of(val);
         let magic = self.i32c(TAG_MAGIC as u32);
@@ -7035,8 +7029,8 @@ impl<'a> Lower<'a> {
         Ok(())
     }
 
-    /// Whether the function names atom `s` (a builtin arm's gate, as bbv's
-    /// `script_names_push`: an arm costs code where it never fires).
+    /// Whether the function names atom `s` (a builtin arm's gate: an arm
+    /// costs code where it never fires).
     fn names_atom(&self, s: &str) -> bool {
         self.mm.atoms.iter().any(|(_, a)| a.chars().iter().copied().eq(s.encode_utf16()))
     }
@@ -7048,8 +7042,8 @@ impl<'a> Lower<'a> {
         self.bin(Operator::I64Eq, callee, bits, Type::I32)
     }
 
-    /// `Array.prototype.push(v)` on a dense array, call-free (bbv's push
-    /// arm): with the elements packed, room left, and the receiver's shape
+    /// `Array.prototype.push(v)` on a dense array, call-free: with
+    /// the elements packed, room left, and the receiver's shape
     /// in the append cache with its protos' shapes unchanged (no indexed
     /// property can appear on them), store at the end and bump the
     /// initialized length and `length`, taking `ok_clean` with the new
@@ -7148,7 +7142,7 @@ impl<'a> Lower<'a> {
         self.store_i32(a, 0, v);
     }
 
-    /// `Array.prototype.pop()` on a dense array (bbv's pop arm): with the
+    /// `Array.prototype.pop()` on a dense array: with the
     /// elements packed and non-empty, no incremental marking (the dropped
     /// element would lose its barrier), and no hole at the end, shrink by
     /// one, taking `ok_clean` with the last element; else `other`.
@@ -7201,7 +7195,7 @@ impl<'a> Lower<'a> {
         Ok(())
     }
 
-    /// `restamp` (bbv's inline `emit_class_idx_stamp_impl` restamp): the
+    /// `restamp`: the
     /// runtime's two-phase gates (`night_runtime_ctor_restamp`), with its
     /// two common outcomes inline: a word already of the layout stays,
     /// and a native object under construction for it (its early key none,
@@ -7280,7 +7274,7 @@ impl<'a> Lower<'a> {
     /// is compiled (§5.5): its class is a function class, its script slot
     /// is that script (a native's slot never is), and the script has a
     /// table index. A lone guard (one likely callee) first probes a value
-    /// cell of its own, as bbv's inline guard: a hit is one compare of the
+    /// cell of its own: a hit is one compare of the
     /// callee against the row, with no load through it. The full test fills
     /// the row as `night_call_classify` does (tenured callees only; a
     /// second callee poisons it). In a chain over several targets the
@@ -7404,7 +7398,7 @@ impl<'a> Lower<'a> {
     /// `classify`, and whether the callee is a native function (known
     /// only on a cell miss: the cell holds scripted callees).
     fn classify_native(&mut self, callee: Value) -> (Value, Value, Value) {
-        // The site's value cell (bbv's `emit_inline_classify`): the steady
+        // The site's value cell: the steady
         // state is one callee repeating, and a hit is the whole classify.
         // The fill caches tenured functions only, and a major GC zeroes
         // the region; a zero row never false-hits (it is the double +0).

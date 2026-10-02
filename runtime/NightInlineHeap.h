@@ -31,7 +31,7 @@ namespace night {
  *
  * The compiler's half of this layout is `ALLOC_CELL_BYTES` /
  * `CONSTRUCT_CELL_BYTES` in compiler/src/wasm/translate.rs; the emitted
- * stores are in compiler/src/wasm/bbv/object.rs. The static_asserts in
+ * stores are in compiler/src/wasm/mir/lower.rs. The static_asserts in
  * NightInlineHeap.cpp pin the field offsets those constants encode, so
  * changing a field here without changing translate.rs is a build error
  * rather than a silent miscompile.

@@ -19,7 +19,6 @@
 #include "runtime/NightRuntime.h"
 
 #define FOR_EACH_NIGHT_RUNTIME_HELPER(NIGHT_RUNTIME_HELPER)       \
-  NIGHT_RUNTIME_HELPER(night_runtime_callee_night_target)         \
   NIGHT_RUNTIME_HELPER(night_runtime_add)                         \
   NIGHT_RUNTIME_HELPER(night_runtime_concat)                      \
   NIGHT_RUNTIME_HELPER(night_runtime_call)                        \
@@ -27,7 +26,6 @@
   NIGHT_RUNTIME_HELPER(night_runtime_native_dispatch)             \
   NIGHT_RUNTIME_HELPER(night_runtime_apply_fwd)                   \
   NIGHT_RUNTIME_HELPER(night_runtime_construct)                   \
-  NIGHT_RUNTIME_HELPER(night_runtime_get_property)                \
   NIGHT_RUNTIME_HELPER(night_runtime_set_property)                \
   NIGHT_RUNTIME_HELPER(night_runtime_get_prop_ic_miss)            \
   NIGHT_RUNTIME_HELPER(night_runtime_set_prop_ic_miss)            \
@@ -40,7 +38,6 @@
   NIGHT_RUNTIME_HELPER(night_runtime_get_intrinsic)               \
   NIGHT_RUNTIME_HELPER(night_runtime_get_intrinsic_cell)          \
   NIGHT_RUNTIME_HELPER(night_runtime_census)                      \
-  NIGHT_RUNTIME_HELPER(night_runtime_strlit_verify)               \
   NIGHT_RUNTIME_HELPER(night_runtime_str_chars_eq)                \
   NIGHT_RUNTIME_HELPER(night_runtime_tonumeric)                   \
   NIGHT_RUNTIME_HELPER(night_runtime_pos)                         \
@@ -52,7 +49,6 @@
   NIGHT_RUNTIME_HELPER(night_runtime_box_nonstrict_this)          \
   NIGHT_RUNTIME_HELPER(night_runtime_get_mapped_arg)              \
   NIGHT_RUNTIME_HELPER(night_runtime_set_mapped_arg)              \
-  NIGHT_RUNTIME_HELPER(night_runtime_validate_this_layout)        \
   NIGHT_RUNTIME_HELPER(night_runtime_in)                          \
   NIGHT_RUNTIME_HELPER(night_runtime_has_own)                     \
   NIGHT_RUNTIME_HELPER(night_runtime_to_property_key)             \
@@ -152,11 +148,8 @@
   NIGHT_RUNTIME_HELPER(night_runtime_post_write_barrier)          \
   NIGHT_RUNTIME_HELPER(night_runtime_post_write_barrier_elem)     \
   NIGHT_RUNTIME_HELPER(night_runtime_pre_write_barrier)           \
-  NIGHT_RUNTIME_HELPER(night_runtime_resolve_global_slot)         \
   NIGHT_RUNTIME_HELPER(night_runtime_resolve_global_slot_guarded) \
-  NIGHT_RUNTIME_HELPER(night_runtime_set_global)                  \
   NIGHT_RUNTIME_HELPER(night_runtime_binding_written)             \
-  NIGHT_RUNTIME_HELPER(night_runtime_binding_value)               \
   NIGHT_RUNTIME_HELPER(night_runtime_math_unary)                  \
   NIGHT_RUNTIME_HELPER(night_runtime_math_pow)                    \
   NIGHT_RUNTIME_HELPER(night_runtime_fmod)                        \
@@ -168,7 +161,6 @@
   NIGHT_RUNTIME_HELPER(night_runtime_obj_with_proto)              \
   NIGHT_RUNTIME_HELPER(night_runtime_fun_with_proto)              \
   NIGHT_RUNTIME_HELPER(night_runtime_set_fun_name)                \
-  NIGHT_RUNTIME_HELPER(night_runtime_no_extra_indexed)            \
   NIGHT_RUNTIME_HELPER(night_runtime_gen_is_closing)              \
   NIGHT_RUNTIME_HELPER(night_runtime_mir_stress)                  \
   NIGHT_RUNTIME_HELPER(night_runtime_slots_covered)               \

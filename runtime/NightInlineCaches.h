@@ -27,7 +27,7 @@ namespace night {
 // OFFSET from its base, with bit 0 set when the base is the object's
 // out-of-line `slots_` vector rather than the object itself. Offsets are
 // multiples of 8, so the bit is free and the decode is two masks, a select
-// and an add (`Bbv::emit_slot_addr`).
+// and an add.
 static inline uint32_t NightSlotEnc(bool isDynamic, uint32_t idx) {
   return isDynamic ? (idx * 8u) | 1u : 16u + idx * 8u;
 }

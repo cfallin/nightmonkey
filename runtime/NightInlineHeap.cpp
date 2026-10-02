@@ -45,7 +45,7 @@ namespace night {
 // flag bits is a compile-time constant baked into the wasm, and its other
 // half is a constant in the compiler:
 //
-//   js/src/night/compiler/src/wasm/bbv/abi.rs   the object/shape/string/
+//   js/src/night/compiler/src/wasm/mir/abi.rs   the object/shape/string/
 //                                               context offsets and flag bits
 //   js/src/night/compiler/src/wasm/translate.rs FIXED_SLOTS_BASE and the
 //                                               reserved-region row layouts
@@ -147,8 +147,7 @@ static_assert(JS::Realm::offsetOfActiveGlobal() == 72, "REALM_GLOBAL_OFFSET");
 //
 // An interpreted JSFunction keeps its BaseScript* as a PrivateValue in fixed
 // slot 2, and a compiled body's funcref index lives in the script. The
-// specialized call path loads both inline instead of calling
-// night_runtime_callee_night_target.
+// call classify (the inline probe and night_call_classify) loads both.
 static_assert(uint16_t(js::FunctionFlags::BASESCRIPT) == (1u << 5),
               "FUNCTION_FLAGS_BASESCRIPT");
 static_assert(NativeObject::getFixedSlotOffset(2) == 32,

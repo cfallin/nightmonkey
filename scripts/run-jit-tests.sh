@@ -7,10 +7,9 @@
 # shell cannot run at all). The compiled lanes (the default) compile every
 # test in-process and also skips tests/jit-test-excludes.txt; NIGHT_INPROCESS_OFF=1
 # runs the same shell with the tier off (the interpreter-only lane).
-# NIGHT_OPTIONS passes compiler flags; with `--pipeline baseline` or `mir` (the
-# default: no `--pipeline`) the lane also skips
-# tests/jit-test-excludes-baseline.txt, and with `mir`
-# tests/jit-test-excludes-mir.txt. `--pipeline legacy` is the BBV lane.
+# NIGHT_OPTIONS passes compiler flags. The compiled lanes also skip
+# tests/jit-test-excludes-baseline.txt, and the mir lane (the default: no
+# `--pipeline`, or `--pipeline mir`) tests/jit-test-excludes-mir.txt.
 set -euo pipefail
 
 if [ $# -lt 1 ]; then
@@ -39,12 +38,10 @@ if [ "${NIGHT_INPROCESS_OFF:-0}" != 1 ]; then
   pipeline=mir
   case " ${NIGHT_OPTIONS:-} " in
     *" --pipeline baseline "*) pipeline=baseline ;;
-    *" --pipeline legacy "*) pipeline=legacy ;;
   esac
-  # The baseline-tier lanes: see tests/jit-test-excludes-baseline.txt.
-  case $pipeline in
-    baseline | mir) cat "$here/tests/jit-test-excludes-baseline.txt" >> "$combined" ;;
-  esac
+  # Both compiled lanes run the baseline tier: see
+  # tests/jit-test-excludes-baseline.txt.
+  cat "$here/tests/jit-test-excludes-baseline.txt" >> "$combined"
   if [ $pipeline = mir ]; then
     cat "$here/tests/jit-test-excludes-mir.txt" >> "$combined"
   fi

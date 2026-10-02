@@ -780,9 +780,8 @@ const THREAD_JUMPS: bool = true;
 /// block would send it, the block's own instructions copied along. The
 /// builder's boolean diamonds (`x != null`, `!c`, a tag test's merge) then
 /// branch where they test instead of materializing a bool for a later
-/// branch, as bbv's compare-and-branch does. An edge is never threaded
-/// into a loop header, a loop's preheader or a root, so loops keep their
-/// shape. Returns how many edges moved.
+/// branch. An edge is never threaded into a loop header, a loop's
+/// preheader or a root, so loops keep their shape. Returns how many edges moved.
 pub fn thread_jumps(f: &mut Func) -> usize {
     let mut fixed: BTreeSet<Block> = f.roots.iter().map(|r| r.block).collect();
     for l in &f.loops {

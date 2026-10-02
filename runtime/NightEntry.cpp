@@ -157,7 +157,7 @@ static EnterNightStatus EnterNightGlobal(JSContext* cx, JSScript* script,
   // as a private-GC-thing Value, which the AOT stack's tracer forwards like
   // any other. The body re-derives its `JSScript*` from here on every use
   // rather than holding the ABI parameter in a wasm local, because `SCRIPT`
-  // is a compacting GC kind (see `Bbv::cur_script_value`).
+  // is a compacting GC kind (see the tiers' `script_ptr`).
   sp[0] = JS::PrivateGCThingValue(script);
   sp[1] = ObjectValue(*cx->global()->lexicalEnvironment().thisObject());
   stack.setTop(frameTop);

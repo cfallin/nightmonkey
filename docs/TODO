@@ -1,6 +1,3 @@
-- async/generator codegen (legacy BBV; the baseline tier has it)
-- remaining unsupported opcodes in legacy BBV: `Eval`, `BigInt`, ES module
-  import ops, `using` (the baseline tier compiles all of these)
 - module scripts are never compiled by any tier: the shell loads a root
   module through the module loader, which never calls the `scriptCompiled`
   extension hook, so neither the in-process batch nor snapshot

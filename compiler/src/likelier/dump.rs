@@ -83,12 +83,6 @@ pub fn dump_facts(facts: &LikelyFacts, path: &str) {
     for (&site, &claim) in &facts.aliased_sites {
         lines.push(format!("aliased_sites {site} = {:#x}", claim.bits()));
     }
-    for &site in &facts.fractional_arith_sites {
-        lines.push(format!("fractional_arith_sites {site}"));
-    }
-    for &site in &facts.string_arith_sites {
-        lines.push(format!("string_arith_sites {site}"));
-    }
     for (&site, key) in &facts.lit_stamps {
         lines.push(format!("lit_stamps {site} = {}", key.get()));
     }
@@ -253,26 +247,6 @@ pub fn dump_facts(facts: &LikelyFacts, path: &str) {
             lo.get(),
             hi.get(),
             mask.bits()
-        ));
-    }
-    for (&sid, e) in &facts.script_effects {
-        let mut fields = String::new();
-        for &(range, name) in &e.field_writes {
-            let cls = match range {
-                Some((lo, hi)) => format!("{}..{}", lo.get(), hi.get()),
-                None => "?".to_string(),
-            };
-            let _ = write!(fields, " {}:{}", cls, esc(facts.names.get(name)));
-        }
-        lines.push(format!(
-            "effect sid#{} = {}{fields}{}",
-            sid.get(),
-            e.label(),
-            if e.gname_writes.is_empty() {
-                String::new()
-            } else {
-                format!(" gnames={}", names(&facts.names, &e.gname_writes))
-            },
         ));
     }
     lines.sort();

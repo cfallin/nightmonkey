@@ -174,8 +174,8 @@ impl Ty {
 
 /// The representation a numeric claim is speculated in (§8's
 /// guard-at-defs): int32 for an int32-only claim; with `int_first`, also
-/// for a number claim with int32 in it that is not flagged double-first
-/// (the order bbv's typed-load ladder tries), exiting on a double; f64
+/// for a number claim with int32 in it that is not flagged double-first,
+/// exiting on a double; f64
 /// for other number claims. `None` for anything else. Int-first suits
 /// formals, element and name reads (indices, digits, counters: crypto's
 /// am3 gains 17%); property reads and call results often hold doubles
@@ -244,10 +244,10 @@ fn num_claim_ty(claim: crate::facts::Claim, int_first: bool) -> Option<Ty> {
 
 impl<'a> Shape<'a> {
     /// Whether callee `k` is small enough to inline at `pc` among
-    /// `ntargets` targets: bbv's caps, 150 bytes of bytecode for one
+    /// `ntargets` targets: 150 bytes of bytecode for one
     /// target (200 in a loop), 500 each for several.
     /// Layout `cls`'s field `name`: its slot and value claim, from the
-    /// layout rows (`this_layouts_in`, as bbv's `layout_fields`).
+    /// layout rows (`this_layouts_in`).
     fn layout_field(&self, cls: u32, name: crate::ids::NameId) -> Option<(u32, crate::facts::Claim)> {
         let mut cache = self.layout_fields.borrow_mut();
         let m = cache.get_or_insert_with(|| {
@@ -270,7 +270,7 @@ impl<'a> Shape<'a> {
         if let Some(v) = self.name_classes.borrow().get(&name) {
             return v.clone();
         }
-        let v: Vec<(u32, TagSet)> = crate::wasm::bbv::field_classes(self.ctx, name)
+        let v: Vec<(u32, TagSet)> = crate::wasm::mir::stamp::field_classes(self.ctx, name)
             .into_iter()
             .map(|(k, c)| (k, claim_tags(c)))
             .collect();
@@ -282,16 +282,16 @@ impl<'a> Shape<'a> {
     /// TYPES where layout `k` predicts a type for any field
     /// (`layout_types_bit`).
     fn types_bit(&self, k: u32) -> u32 {
-        crate::wasm::bbv::layout_types_bit(self.ctx, k)
+        crate::wasm::mir::stamp::layout_types_bit(self.ctx, k)
     }
 
     /// A construct site's allocation word (`typed_alloc_word`).
     fn alloc_word(&self, mono: Option<ScriptId>, site: crate::ids::Site) -> u32 {
-        crate::wasm::bbv::typed_alloc_word(self.ctx, mono, site)
+        crate::wasm::mir::stamp::typed_alloc_word(self.ctx, mono, site)
     }
 
-    /// Whether a call of script `k` may go straight to its compiled body
-    /// (bbv's `likely_call_target`): not a class constructor, generator or
+    /// Whether a call of script `k` may go straight to its compiled body:
+    /// not a class constructor, generator or
     /// async function.
     fn direct_ok(&self, k: ScriptId) -> bool {
         matches!(
@@ -527,7 +527,7 @@ const FIELD_MASKS: bool = true;
 
 /// How many classes a store lists (`field_claim`) before it names only
 /// the receiver's predicted ones.
-const MAX_STORE_CLASSES: usize = crate::wasm::bbv::MAX_STORE_CLASSES;
+const MAX_STORE_CLASSES: usize = crate::wasm::mir::stamp::MAX_STORE_CLASSES;
 
 /// Receivers the analysis hints one class for get typed sites
 /// (`hinted_site`).
@@ -585,18 +585,16 @@ const LENGTH_ARRAY: bool = true;
 /// Guard a method's `this` to its predicted layouts at `FunctionThis`.
 const THIS_ENTRY_GUARD: bool = true;
 
-// Inlining admission mirrors bbv's (`Bbv::inline_candidates_for`): the
-// same caps in the same order, so both tiers inline the same sites.
 /// How deep inlining nests below a call site in a loop, and below one not
-/// in a loop (the root site's: bbv's `max_depth`).
+/// in a loop (the root site's).
 const MAX_INLINE_DEPTH_LOOP: u32 = 8;
 const MAX_INLINE_DEPTH: u32 = 4;
 /// The most sites one function splices, its callees' own included,
-/// counted depth-first (bbv's per-body `MAX_INLINE_SITES`).
+/// counted depth-first.
 const MAX_INLINE_SITES: u32 = crate::constants::MAX_INLINE_SITES;
 /// The most targets a call site inlines (a guard chain on the script).
 const MAX_INLINE_TARGETS: usize = crate::constants::MAX_INLINE_TARGETS;
-/// Splice fuel (bbv's `SPLICE_FUEL_VALUES`, 100000 waffle values, at the
+/// Splice fuel (100000 waffle values, at the
 /// ~4 values a MIR instruction lowers to): past this many instructions a
 /// function splices nothing more, but callees of at most
 /// `SMALL_SPLICE_BC` bytes, up to the harder line.
@@ -898,7 +896,7 @@ fn int32_demand(script: &Script, ops: &[Op]) -> std::collections::BTreeSet<Pc> {
 /// its formals receive, and the constructing `this` it receives, if any.
 type CalleeKey = (ScriptId, Vec<Option<ScriptId>>, Option<(u32, u32, bool)>, InlineCtx);
 
-/// Where a callee is built for inlining (bbv's segment context): its
+/// Where a callee is built for inlining: its
 /// depth, the sites it may splice itself, whether the root call site is
 /// in a loop (which sets the depth cap), and the loop nest around it.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
@@ -953,7 +951,7 @@ struct Shape<'a> {
     syn_bids: BTreeMap<u32, u32>,
     names: Option<&'a crate::ids::Names>,
     /// The `T.apply(this, arguments)` sites whose arguments object is
-    /// never observed (bbv's `compute_apply_fwd_pcs`), if the script has
+    /// never observed (`compute_apply_fwd_pcs`), if the script has
     /// them.
     apply_fwd: Option<rustc_hash::FxHashSet<Pc>>,
     /// The `.length` reads and `GetElem`s of an arguments object that has
@@ -1445,8 +1443,7 @@ impl<'s, 'a> Run<'s, 'a> {
         }
     }
 
-    /// bbv's inlining admission (`Bbv::inline_candidates_for`, with its
-    /// per-target rules): which of `sids` the site at `self.pc` inlines,
+    /// The inlining admission (with its per-target rules): which of `sids` the site at `self.pc` inlines,
     /// each built by `build` where the site puts it, in order; `None` for
     /// none. Counts the site, and the sites its callees splice, against
     /// this function's budget.
@@ -1470,7 +1467,7 @@ impl<'s, 'a> Run<'s, 'a> {
             return None;
         }
         let script = s.script;
-        // bbv's rule (no splicing into a function that uses `arguments`,
+        // The rule (no splicing into a function that uses `arguments`,
         // mapped formals or actuals), except where `arguments` only feeds
         // `T.apply(this, arguments)` forwards (`apply_fwd`, never made):
         // the frame's actuals are read in place, whatever is spliced.
@@ -1528,15 +1525,14 @@ impl<'s, 'a> Run<'s, 'a> {
                 return None;
             }
             let room = crate::constants::CONSTRUCT_CLOSURE_CAP;
-            let est = crate::wasm::bbv::splice_closure_cost(s.ctx, picked[0], max_depth - ictx.depth, room, Some(self.site(pc)));
+            let est = crate::wasm::mir::inline::splice_closure_cost(s.ctx, picked[0], max_depth - ictx.depth, room, Some(self.site(pc)));
             if est > room {
                 return None;
             }
         }
-        // Depth-first, as bbv's walk: each target is a spliced segment,
-        // and may splice what the budget has left once it and the
-        // segments before it count (bbv checks the budget per site, then
-        // splices every target it picked).
+        // Depth-first: each target is a spliced segment, and may splice
+        // what the budget has left once it and the segments before it
+        // count.
         let mut used = self.inline_sites;
         let mut out = vec![];
         let mut admitted = None;
@@ -1579,7 +1575,7 @@ impl<'s, 'a> Run<'s, 'a> {
         let op = Opcode::CtorStamp(
             si.layout_id,
             u32::try_from(si.fields.len()).unwrap(),
-            crate::wasm::bbv::typed_keep_bits(self.s.ctx, si),
+            crate::wasm::mir::stamp::typed_keep_bits(self.s.ctx, si),
         );
         let t = self.boxed(self.st[0]);
         self.inst(op, vec![t], None);
@@ -1607,7 +1603,7 @@ impl<'s, 'a> Run<'s, 'a> {
             let op = Opcode::CtorPublish(
                 si.layout_id,
                 u32::try_from(si.fields.len()).unwrap(),
-                crate::wasm::bbv::typed_keep_bits(self.s.ctx, si),
+                crate::wasm::mir::stamp::typed_keep_bits(self.s.ctx, si),
             );
             self.inst(op, vec![t], None);
         }
@@ -1663,7 +1659,7 @@ impl<'s, 'a> Run<'s, 'a> {
     }
 
     fn restamp(&mut self, si: &StampCtorIn, v: mir::Value) {
-        let Some(r) = crate::wasm::bbv::typed_restamp_args(self.s.ctx, si) else {
+        let Some(r) = crate::wasm::mir::stamp::typed_restamp_args(self.s.ctx, si) else {
             return;
         };
         let i = u32::try_from(self.mm.restamps.len()).unwrap();
@@ -1672,7 +1668,7 @@ impl<'s, 'a> Run<'s, 'a> {
     }
 
     /// Whether an element store at `pc` of `v` owes the array stamp's
-    /// RANGES and TYPES claims a clear (bbv's `emit_elem_store_duty`): the
+    /// RANGES and TYPES claims a clear: the
     /// site's claim, or the intersection of every claim for a receiver
     /// the analysis did not place, unless `v` is proven an int32 inside it
     /// (an element claim is an int32 range). No claim, no duty.
@@ -2226,10 +2222,10 @@ impl<'s, 'a> Run<'s, 'a> {
     /// and its TYPES, when a construct allocates it with `word`: the
     /// sentinel with `k`'s own early key (`CTOR_TYPES`).
     fn ctor_of_word(&mut self, k: ScriptId, word: u32) -> Option<(u32, bool)> {
-        if !CTOR_TYPES || word & crate::wasm::bbv::CLASS_WORD_SENTINEL == 0 {
+        if !CTOR_TYPES || word & crate::wasm::mir::abi::CLASS_WORD_SENTINEL == 0 {
             return None;
         }
-        let early = (word >> crate::wasm::bbv::abi::EARLY_KEY_SHIFT) & 0xFFF;
+        let early = (word >> crate::wasm::mir::abi::EARLY_KEY_SHIFT) & 0xFFF;
         // A shared wrapper constructor has no row of its own: the site's
         // (`construct_sites_in`) put its key in the word.
         let key = match self.s.ctx.stamp_ctors_in.get(&k) {
@@ -2240,7 +2236,7 @@ impl<'s, 'a> Run<'s, 'a> {
             return None;
         }
         self.ctor_layout(key)?;
-        Some((key, word & crate::wasm::bbv::CLASS_WORD_SHALLOW != 0))
+        Some((key, word & crate::wasm::mir::abi::CLASS_WORD_SHALLOW != 0))
     }
 
     /// `recv.f` for an object under construction (§2.3) whose field `f`
@@ -2528,8 +2524,7 @@ impl<'s, 'a> Run<'s, 'a> {
         // inlining `new` passed it (`Ctor`), else left unguarded; so is a
         // method a constructor calls on it (`ctor_publish`: early
         // publication stamps it only once every field is there), whose
-        // accesses guard it each, reading through the IC on a miss, as
-        // bbv's lazy class facts do.
+        // accesses guard it each, reading through the IC on a miss.
         if matches!(self.top().ty, Ty::Ctor(..))
             || ctx.stamp_ctors_in.contains_key(&sid)
             || ctx.deleg_restamps_in.contains_key(&sid)
@@ -2843,7 +2838,7 @@ impl<'s, 'a> Run<'s, 'a> {
     }
 
     /// A property access with no site row, through a receiver the analysis
-    /// hints one class for (`val_cls`: bbv's advisory tier, from
+    /// hints one class for (`val_cls`: advisory, from
     /// `arg_cls` and `field_cls_sites`): that class's field, from its
     /// layout row (`this_layouts_in`). The hint is unchecked; the typed
     /// access guards it, reading through the IC on a miss.
@@ -2857,8 +2852,8 @@ impl<'s, 'a> Run<'s, 'a> {
         self.site_for(cls, cls, slot, claim, true, name)
     }
 
-    /// The accessor an accessor-site property access calls (bbv's
-    /// `accessor_sites`, the modeled `Object.defineProperty` accessors):
+    /// The accessor an accessor-site property access calls
+    /// (`accessor_sites`, the modeled `Object.defineProperty` accessors):
     /// the site's resolved getter or setter, or, for a name registered as
     /// an accessor somewhere, `None` (probed without a static target).
     /// `None` outright where neither applies.
@@ -3345,7 +3340,7 @@ impl<'s, 'a> Run<'s, 'a> {
     }
 
     /// A generic op that keeps the frame's proven layouts on its clean
-    /// edge (bbv's epoch keep: the lowering takes `ok_clean` when the
+    /// edge (the epoch keep: the lowering takes `ok_clean` when the
     /// stamp epoch did not move across the op's helper, so no class word
     /// was demoted), its dirty edge exiting at the next pc with the op's
     /// result (`out`) or the value it leaves (`post`). Only where there is
@@ -3748,8 +3743,8 @@ impl<'s, 'a> Run<'s, 'a> {
         result
     }
 
-    /// `target.apply(this, arguments)` at a proven forward site (bbv's
-    /// `compute_apply_fwd_pcs`: the arguments object feeds only such calls,
+    /// `target.apply(this, arguments)` at a proven forward site
+    /// (`compute_apply_fwd_pcs`: the arguments object feeds only such calls,
     /// so it was never made), operands `apply, target, this, placeholder`.
     /// With the `.apply` the pristine builtin, the site's known targets
     /// are inlined, their formals read from this frame's actuals; any other
@@ -3758,7 +3753,7 @@ impl<'s, 'a> Run<'s, 'a> {
         let site = self.site(self.pc);
         let facts = &self.s.ctx.facts;
         // Resolved for the site that entered this copy where the analysis
-        // has it per entry (bbv's `seg_entry_site`).
+        // has it per entry.
         let per_entry = self.s.ictx.entry.and_then(|e| facts.apply_targets_in.get(&(e, site)));
         let sids: Vec<ScriptId> = match per_entry.or_else(|| facts.apply_targets.get(&site)) {
             Some(&k) => vec![k],
@@ -3828,7 +3823,7 @@ impl<'s, 'a> Run<'s, 'a> {
     }
 
     /// `hasOwnProperty.call(o, k)` where the analysis resolved the site's
-    /// target to the builtin (`apply_natives`), as legacy's native arm.
+    /// target to the builtin (`apply_natives`).
     fn hasown_site(&self) -> bool {
         let site = self.site(self.pc);
         let facts = &self.s.ctx.facts;
@@ -4484,8 +4479,7 @@ impl<'s, 'a> Run<'s, 'a> {
                         let v = self.top().v;
                         self.this_vals.insert(v);
                     }
-                    // A property read's value class, hinted (bbv's
-                    // `attach_likely_cls`).
+                    // A property read's value class, hinted.
                     if matches!(op, JSOp::GetProp | JSOp::GetElem) {
                         if let Some(&(lo, hi)) = self.s.ctx.facts.field_cls_sites.get(&self.site(pc)) {
                             if lo == hi {
@@ -4903,7 +4897,7 @@ impl<'s, 'a> Run<'s, 'a> {
             };
             let v = self.f.add_param(b0, ty.mir());
             self.st.push(Slot { v, ty });
-            // The formal's advisory class (bbv's lazy tier: unguarded
+            // The formal's advisory class (unguarded
             // until a typed access checks it).
             let key = (self.s.sid, ArgIndex::new(i + 1));
             if let Some(&(lo, hi)) = self.s.ctx.facts.arg_cls.get(&key) {
@@ -5069,8 +5063,7 @@ impl<'s, 'a> Run<'s, 'a> {
                 self.push(r, Ty::Val(sym));
             }
             GetIntrinsic if RT_OPS => {
-                // A realm constant, from its cell once armed (bbv's
-                // `emit_get_intrinsic`).
+                // A realm constant, from its cell once armed.
                 let a = self.atom(p.next_uint32().unwrap())?;
                 let r = self.js(Opcode::JsRt(RtOp::Intrinsic(a)), vec![], MType::VAL_TOP);
                 self.push(r, Ty::Val(TagSet::ALL));
@@ -5436,7 +5429,7 @@ impl<'s, 'a> Run<'s, 'a> {
                     _ => (Cc::Ne, JsCc::StrictNe),
                 };
                 // Against a null or undefined constant: tag tests, which
-                // run no user code (no fence), as bbv's.
+                // run no user code (no fence).
                 let nullish = |t: Ty| {
                     let tags = t.tags();
                     !tags.is_empty() && tags.subset_of(TagSet::prims(PRIM_NULL | PRIM_UNDEFINED))
@@ -6199,7 +6192,7 @@ impl<'s, 'a> Run<'s, 'a> {
                 // The value as the kind stores it, raw: an int32 for an
                 // integer kind (Uint8Clamped clamps it), a number for a
                 // float one. A value of unknown type is unboxed at run
-                // time, as bbv's typed-array store arm does; a miss (or a
+                // time; a miss (or a
                 // double into an integer kind) takes the generic op.
                 let ta = self.ta_elem(pc, recv, key).and_then(|(o, i, k)| match (k.is_float(), v.ty.num()) {
                     (true, Some(_)) => Some((o, i, k, Some(self.as_f64(v)))),
@@ -6279,7 +6272,7 @@ impl<'s, 'a> Run<'s, 'a> {
                         // A dense overwrite inline; else the generic op.
                         let v = self.demote_value_for_generic_arm(v);
                         // A double under a write claim that admits Double
-                        // goes in as the double it is (bbv's rule): every
+                        // goes in as the double it is: every
                         // read of the element admits the tag.
                         let y = if v.ty == Ty::F64
                             && self
@@ -6362,7 +6355,7 @@ impl<'s, 'a> Run<'s, 'a> {
                 // An object-literal stamp site: the layout idx with SLOTS
                 // (the inits land at the row's slots by construction).
                 if let Some(lid) = lid {
-                    let w = (lid + 1) | crate::wasm::bbv::abi::CLASS_WORD_SLOTS;
+                    let w = (lid + 1) | crate::wasm::mir::abi::CLASS_WORD_SLOTS;
                     self.inst(Opcode::StampFresh(w), vec![v], None);
                     self.val_cls.insert(v, lid);
                     if LIT_OPS {
@@ -6384,7 +6377,7 @@ impl<'s, 'a> Run<'s, 'a> {
             }
             InitProp | InitHiddenProp | InitLockedProp if RT_OPS => {
                 // [obj, v] -> [obj]
-                use crate::wasm::bbv::abi::{INIT_ATTR_ENUMERATE, INIT_ATTR_HIDDEN, INIT_ATTR_LOCKED};
+                use crate::wasm::mir::abi::{INIT_ATTR_ENUMERATE, INIT_ATTR_HIDDEN, INIT_ATTR_LOCKED};
                 let a = self.atom(p.next_uint32().unwrap())?;
                 let attrs = match op {
                     InitProp => INIT_ATTR_ENUMERATE,
@@ -6407,7 +6400,7 @@ impl<'s, 'a> Run<'s, 'a> {
             }
             InitElem | InitHiddenElem | InitLockedElem if RT_OPS => {
                 // [obj, key, v] -> [obj]
-                use crate::wasm::bbv::abi::{INIT_ATTR_ENUMERATE, INIT_ATTR_HIDDEN, INIT_ATTR_LOCKED};
+                use crate::wasm::mir::abi::{INIT_ATTR_ENUMERATE, INIT_ATTR_HIDDEN, INIT_ATTR_LOCKED};
                 let attrs = match op {
                     InitElem => INIT_ATTR_ENUMERATE,
                     InitHiddenElem => INIT_ATTR_HIDDEN,
@@ -6428,7 +6421,7 @@ impl<'s, 'a> Run<'s, 'a> {
                 let k = self.const_val(ConstVal::Int32(index as i32));
                 let r = self.ranges_duty(pc, v);
                 let (x, z) = (self.boxed(o), self.boxed(v));
-                let e = crate::wasm::bbv::abi::INIT_ATTR_ENUMERATE;
+                let e = crate::wasm::mir::abi::INIT_ATTR_ENUMERATE;
                 self.js_void(Opcode::JsRt(RtOp::InitElem(e, r)), vec![x, k, z]);
             }
             InitElemInc if RT_OPS => {
@@ -6442,7 +6435,7 @@ impl<'s, 'a> Run<'s, 'a> {
                 let o = self.top();
                 let r = self.ranges_duty(pc, v);
                 let (x, k, z) = (self.boxed(o), self.boxed(i), self.boxed(v));
-                let e = crate::wasm::bbv::abi::INIT_ATTR_ENUMERATE;
+                let e = crate::wasm::mir::abi::INIT_ATTR_ENUMERATE;
                 self.js_void(Opcode::JsRt(RtOp::InitElem(e, r)), vec![x, k, z]);
                 let iv = self.as_i32(i);
                 let one = self.const_i32(1);
@@ -6616,7 +6609,7 @@ impl<'s, 'a> Run<'s, 'a> {
                     [s] => Some(*s),
                     _ => None,
                 };
-                let nslots = crate::wasm::bbv::construct_nslots(self.s.ctx, mono, site);
+                let nslots = crate::wasm::mir::stamp::construct_nslots(self.s.ctx, mono, site);
                 let word = self.s.alloc_word(mono, site);
                 let callee = match mono {
                     Some(k) if INLINE_CONSTRUCT => {
@@ -6750,7 +6743,7 @@ impl<'s, 'a> Run<'s, 'a> {
                 let n = self.st.len();
                 let operands: Vec<Slot> = self.st.drain(n - argc - 3..).collect();
                 let vals: Vec<mir::Value> = operands.into_iter().map(|x| self.boxed(x)).collect();
-                let nslots = crate::wasm::bbv::abi::NO_NSLOTS;
+                let nslots = crate::wasm::mir::abi::NO_NSLOTS;
                 let r = self.js(Opcode::Construct(nslots, 0), vals, MType::val(TagSet::OBJECT));
                 self.push(r, Ty::Val(TagSet::OBJECT));
             }

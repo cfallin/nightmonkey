@@ -8,7 +8,7 @@
 //! compiler (`nightmonkey`).
 
 use crate::facts::{Claim, LikelyFacts};
-use crate::ids::{JsString, LayoutKey, NameId, Names, Pc, RegionRoot, ScriptId, Site, StampKey};
+use crate::ids::{JsString, LayoutKey, NameId, Names, RegionRoot, ScriptId, Site, StampKey};
 use crate::opsem::ValueRange;
 use waffle::{ExportKind, Func, FuncDecl, Module, Operator, SignatureData, Table, Type, ValueDef};
 
@@ -19,30 +19,28 @@ use rayon::prelude::*;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 pub mod baseline;
-pub(crate) mod bbv;
 pub mod mir;
 pub mod tier;
-pub use bbv::EARLY_KEY_MAX;
+pub use mir::abi::EARLY_KEY_MAX;
 
 /// The image-patch constants for snapshot-object stamping (nightmonkey's
 /// main patches the class word straight into the snapshot bytes): the
 /// likely-class word's byte offset in a JSObject, and the SLOTS validity
-/// bit. Values mirror `bbv::abi` (OBJ_CLASS_IDX_OFFSET, CLASS_WORD_SLOTS).
+/// bit. Values mirror `mir::abi` (OBJ_CLASS_IDX_OFFSET, CLASS_WORD_SLOTS).
 pub mod stamp {
     pub const WORD_OFFSET: u32 = 4;
     pub const SLOTS: u32 = 0x0002_0000;
     /// The TYPES (SHALLOW) validity bit.
-    pub const TYPES: u32 = super::bbv::abi::CLASS_WORD_SHALLOW;
-    pub const SHAPE_OFFSET: u32 = super::bbv::abi::SHAPE_OFFSET;
-    pub const SHAPE_IMMUTABLE_FLAGS_OFFSET: u32 = super::bbv::abi::SHAPE_IMMUTABLE_FLAGS_OFFSET;
-    pub const SHAPE_FIXED_SLOTS_SHIFT: u32 = super::bbv::abi::SHAPE_FIXED_SLOTS_SHIFT;
-    pub const SHAPE_FIXED_SLOTS_MASK_BITS: u32 = super::bbv::abi::SHAPE_FIXED_SLOTS_MASK_BITS;
+    pub const TYPES: u32 = super::mir::abi::CLASS_WORD_SHALLOW;
+    pub const SHAPE_OFFSET: u32 = super::mir::abi::SHAPE_OFFSET;
+    pub const SHAPE_IMMUTABLE_FLAGS_OFFSET: u32 = super::mir::abi::SHAPE_IMMUTABLE_FLAGS_OFFSET;
+    pub const SHAPE_FIXED_SLOTS_SHIFT: u32 = super::mir::abi::SHAPE_FIXED_SLOTS_SHIFT;
+    pub const SHAPE_FIXED_SLOTS_MASK_BITS: u32 = super::mir::abi::SHAPE_FIXED_SLOTS_MASK_BITS;
 }
-pub use bbv::{
+pub use mir::helpers::{
     build_call_classify_helper, build_elem_append_helper, build_elem_mega_helpers,
     build_ic_set_cold_helper,
 };
-pub(crate) mod effects;
 pub mod inprocess;
 pub mod regex;
 pub mod translate;
@@ -374,110 +372,6 @@ fn collect_likely_gname_fns(
         .collect()
 }
 
-/// Whether the static program text can never produce a BigInt value: any
-/// BigInt literal, any referenced name equal to a BigInt-family global, any
-/// eval op, or any referenced `eval` name (an indirect-eval alias compiles
-/// as a plain call, not an Eval op) makes it return false.
-///
-/// # Why this is answered statically rather than by a guard
-///
-/// The natural objection is that a guard should do this: test for an
-/// Int32/Number tag on the path that needs one, or read a fuse word. Both
-/// are already how the surrounding code works, and neither can produce the
-/// thing this answer is used for.
-///
-/// The claim is not a *guard*, it is a *type*. Its consumer is
-/// `bbv::emit::bigint_result`: the generic arithmetic arm's helper returns
-/// a boxed value whose type, by the spec of `+`, is `Int32|Double|BigInt`.
-/// The tag tests the reviewer would reach for already ran -- they are the
-/// arms this value fell out of, and it is the residue they did not claim.
-/// Testing its tag again would not remove a cost, it would add one, because
-/// a type is what the *next* op consumes: the BigInt bit is what makes
-/// `is_numeric` false, and `is_numeric` is what routes the next arithmetic
-/// op onto the unboxed f64 track instead of the fully generic tag-guarded
-/// ladder. So the price of not having this answer is not one test here, it
-/// is the typed continuation of the whole downstream chain. And this tier
-/// has no deopt landing, so the only recovery from a failed type claim is a
-/// second version -- which is precisely what `bigint_result` emits. Doing
-/// that per value instead of per module would mean a version split at every
-/// arithmetic result in the program.
-///
-/// A fuse word is the right shape, and half of the answer already is one.
-/// A fuse needs a chokepoint: one place the engine can blow it from, cheap
-/// enough that every JS program pays for it. "Unscanned source text has been
-/// compiled" has such a place -- `ScriptSource::assignSource` -- which is
-/// why that half *is* a fuse (`Helpers::dyncode_fuse_word`, blown by
-/// `js::night::NightBlowDynamicCodeFuse`), and why this function does not
-/// try to answer for `new Function("...1n...")` or an indirect eval reached
-/// without naming `eval`. "A BigInt exists somewhere reachable" has no such
-/// place. A BigInt is an ordinary heap value: a literal, `BigInt(x)`, a
-/// `BigInt64Array` read, `JS::NumberToBigInt` from an embedder. Blowing a
-/// fuse at each would put a store on every BigInt creation in SpiderMonkey
-/// -- a cost paid by all of JS to serve this tier -- and would still have to
-/// cover values arriving across the embedder boundary. Reading the program
-/// text costs nothing at runtime and answers the same question for the
-/// bundles this tier compiles.
-///
-/// # What it assumes
-///
-/// That the registered scripts are the whole program. A BigInt already
-/// sitting in the wizened heap, or one handed back by an embedder native
-/// the text calls without naming any BigInt global, is covered by neither
-/// this scan nor the dyncode fuse. That holds for the deployment this tier
-/// targets -- a bundle registered at wizen time, with the shell as the only
-/// embedder -- but it is an assumption about the embedding, not a proof
-/// about the language, and an embedder that hands BigInts to unscanned code
-/// would need a third mechanism.
-fn module_is_bigint_free(source: &Source, script_ids: &[SourceObjectId]) -> bool {
-    const NAMES: [&[u16]; 4] = [
-        &[66, 105, 103, 73, 110, 116], // "BigInt"
-        &[66, 105, 103, 73, 110, 116, 54, 52, 65, 114, 114, 97, 121], // "BigInt64Array"
-        &[
-            66, 105, 103, 85, 105, 110, 116, 54, 52, 65, 114, 114, 97, 121,
-        ], // "BigUint64Array"
-        &[101, 118, 97, 108],          // "eval"
-    ];
-    struct Scan {
-        found: bool,
-    }
-    impl crate::bytecode::OpcodeVisitor for Scan {
-        fn bigint(&mut self, _bigint_index: u32) {
-            self.found = true;
-        }
-        fn before_op(&mut self, _pc: Pc, op: crate::bytecode::JSOp, _u: usize, _d: usize) {
-            use crate::bytecode::JSOp;
-            if matches!(
-                op,
-                JSOp::Eval | JSOp::StrictEval | JSOp::SpreadEval | JSOp::StrictSpreadEval
-            ) {
-                self.found = true;
-            }
-        }
-    }
-    for &id in script_ids {
-        let SourceObject::Script(script) = source.object(id) else {
-            continue;
-        };
-        // A referenced name (GetGName / GetProp / String literal for computed
-        // access) appears as a String gcthing of the script.
-        for &g in &script.gcthings {
-            if g.is_other() {
-                continue;
-            }
-            if let SourceObject::String(s) = source.object(g) {
-                if NAMES.iter().any(|n| *n == s.chars()) {
-                    return false;
-                }
-            }
-        }
-        let scan = script.parser().visit(Scan { found: false });
-        if scan.found {
-            return false;
-        }
-    }
-    true
-}
-
 /// GetGName fuse: global names the root script assigns a compile-time
 /// constant number/boolean/null/undefined, with the predicted boxed literal.
 /// A tolerant linear constant-propagation walk of the root bytecode: literals
@@ -508,8 +402,7 @@ fn module_is_bigint_free(source: &Source, script_ids: &[SourceObjectId]) -> bool
 /// hence its size and the base of everything laid out after it, have to be
 /// final before any body is translated. Collecting it while compiling the
 /// root script would need the answer before the walk that produces it, and
-/// the root script is not translated first in any case: bodies come off the
-/// BBV workqueue in reachability order.
+/// the root script is not translated first in any case.
 fn collect_fused_gnames(
     source: &Source,
     root_id: SourceObjectId,
@@ -814,20 +707,7 @@ pub fn resolve_helpers(
     resolve: &mut dyn FnMut(&mut Module, &str) -> Result<Func, String>,
     pre: HelperPrebuilt,
     bases: HelperBases,
-    viz: bool,
 ) -> Result<translate::Helpers, String> {
-    // The function-index -> helper-name table, so the lowering view can name
-    // the calls an op emits instead of printing an index.
-    let mut resolve = |m: &mut Module, n: &str| -> Result<Func, String> {
-        let f = resolve(m, n)?;
-        if viz {
-            crate::diag_line!(
-                "night: viz helper {} {n}",
-                waffle::entity::EntityRef::index(f)
-            );
-        }
-        Ok(f)
-    };
     Ok(translate::Helpers {
         mem: pre.mem,
         ta_get_poly: pre.ta_get_poly,
@@ -844,7 +724,6 @@ pub fn resolve_helpers(
         night_abi_sig2: pre.night_abi_sig2,
         direct_call_stub2: pre.direct_call_stub2,
         census: resolve(m, "night_runtime_census").ok(),
-        callee_night_target: resolve(m, "night_runtime_callee_night_target")?,
         add: resolve(m, "night_runtime_add")?,
         concat: resolve(m, "night_runtime_concat")?,
         call: resolve(m, "night_runtime_call")?,
@@ -852,7 +731,6 @@ pub fn resolve_helpers(
         native_dispatch: resolve(m, "night_runtime_native_dispatch")?,
         apply_fwd: resolve(m, "night_runtime_apply_fwd")?,
         construct: resolve(m, "night_runtime_construct")?,
-        get_property: resolve(m, "night_runtime_get_property")?,
         set_property: resolve(m, "night_runtime_set_property")?,
         get_prop_ic_miss: resolve(m, "night_runtime_get_prop_ic_miss")?,
         set_prop_ic_miss: resolve(m, "night_runtime_set_prop_ic_miss")?,
@@ -864,7 +742,6 @@ pub fn resolve_helpers(
         string: resolve(m, "night_runtime_string")?,
         get_intrinsic: resolve(m, "night_runtime_get_intrinsic")?,
         get_intrinsic_cell: resolve(m, "night_runtime_get_intrinsic_cell")?,
-        strlit_verify: resolve(m, "night_runtime_strlit_verify")?,
         str_chars_eq: resolve(m, "night_runtime_str_chars_eq")?,
         tonumeric: resolve(m, "night_runtime_tonumeric")?,
         pos: resolve(m, "night_runtime_pos")?,
@@ -876,7 +753,6 @@ pub fn resolve_helpers(
         box_nonstrict_this: resolve(m, "night_runtime_box_nonstrict_this")?,
         get_mapped_arg: resolve(m, "night_runtime_get_mapped_arg")?,
         set_mapped_arg: resolve(m, "night_runtime_set_mapped_arg")?,
-        validate_this_layout: resolve(m, "night_runtime_validate_this_layout")?,
         in_: resolve(m, "night_runtime_in")?,
         has_own: resolve(m, "night_runtime_has_own")?,
         to_property_key: resolve(m, "night_runtime_to_property_key")?,
@@ -963,11 +839,8 @@ pub fn resolve_helpers(
         post_write_barrier: resolve(m, "night_runtime_post_write_barrier")?,
         post_write_barrier_elem: resolve(m, "night_runtime_post_write_barrier_elem")?,
         pre_write_barrier: resolve(m, "night_runtime_pre_write_barrier")?,
-        resolve_global_slot: resolve(m, "night_runtime_resolve_global_slot")?,
         resolve_global_slot_guarded: resolve(m, "night_runtime_resolve_global_slot_guarded")?,
-        set_global: resolve(m, "night_runtime_set_global")?,
         binding_written: resolve(m, "night_runtime_binding_written")?,
-        binding_value: resolve(m, "night_runtime_binding_value")?,
         global_slots_base: bases.global_slots_base,
         prop_ic_base: bases.prop_ic_base,
         mega_set_base: bases.mega_set_base,
@@ -992,7 +865,6 @@ pub fn resolve_helpers(
         // The args-metadata block's tail pad (+12) holds the night-owned
         // dynamic-code fuse word; NightRuntime startup mirrors this offset.
         // (This pad is the free word here, so using it costs no ABI change.)
-        dyncode_fuse_word: bases.args_class_base + shape::ARGS_DYN_CODE_FUSE_OFF,
         array_class_slot: bases.array_class_slot,
         args_class_base: bases.args_class_base,
         strlit_slot: bases.strlit_slot,
@@ -1026,7 +898,6 @@ pub fn resolve_helpers(
         take_dispose_capability: resolve(m, "night_runtime_take_dispose_capability")?,
         create_suppressed_error: resolve(m, "night_runtime_create_suppressed_error")?,
         resume: resolve(m, "night_runtime_resume")?,
-        no_extra_indexed: resolve(m, "night_runtime_no_extra_indexed")?,
         gen_is_closing: resolve(m, "night_runtime_gen_is_closing")?,
         mir_stress: resolve(m, "night_runtime_mir_stress")?,
         slots_covered: resolve(m, "night_runtime_slots_covered")?,
@@ -1049,21 +920,11 @@ pub fn resolve_helpers(
 pub struct EnvLayout {
     pub syn_gname_names: Vec<NameId>,
     pub syn_gnames: HashMap<NameId, u32>,
-    /// The bindings whose name is an own atom-keyed DATA property of the
-    /// snapshot's global object (the heap oracle records no other kind):
-    /// the population the per-binding value facts (`Ctx::gcells`) are
-    /// minted for. A global lexical, an accessor or an undeclared name is
-    /// never in it, so its reads keep the generic helper's Opt keep arm.
-    pub gcell_bids: HashSet<u32>,
-    pub likely_fns: HashMap<NameId, ScriptId>,
     /// The analysis output, carried whole: every table the translator reads
     /// unchanged lives here rather than as a renamed copy below.
     pub facts: LikelyFacts,
     /// Field-name rows per layout key: the view most layout consumers want.
     pub likely_class_layouts: HashMap<LayoutKey, Vec<NameId>>,
-    /// `facts.elem_sites` and `facts.field_sites` merged (one op per pc);
-    /// consumed identically by the loop-version planner and value guards.
-    pub likely_elems: HashMap<Site, Claim>,
     pub fused_list: Vec<(NameId, u64)>,
     pub stamp_ctors_tx: HashMap<ScriptId, translate::StampCtorIn>,
     /// Object-literal stamp sites (site -> layout id), fixed-slot rows only.
@@ -1080,11 +941,7 @@ pub struct EnvLayout {
     pub construct_sites_tx: HashMap<Site, translate::StampCtorIn>,
     pub this_layouts_tx: HashMap<ScriptId, translate::ThisLayoutIn>,
     pub prop_sites_tx: HashMap<Site, translate::PropSiteIn>,
-    /// Stamped class idx (`layout_id + 1`) -> field name -> value mask.
-    pub layout_field_masks_tx: HashMap<StampKey, HashMap<NameId, Claim>>,
     pub layout_field_types_tx: HashMap<StampKey, HashMap<NameId, Claim>>,
-    /// Same keying, the range claims (absent name = no claim).
-    pub layout_field_ranges_tx: HashMap<StampKey, HashMap<NameId, ValueRange>>,
     /// Array alloc site -> the stamp word to write at allocation.
     pub array_stamp_tx: HashMap<Site, u32>,
     /// Element site -> (stamp key, mask, lo, hi).
@@ -1187,7 +1044,9 @@ pub fn layout_env(
         .enumerate()
         .map(|(i, &n)| (n, u32::try_from(i).unwrap()))
         .collect();
-    let mut gcell_bids: HashSet<u32> = HashSet::default();
+    // The live global's own property names join the string table here, ahead
+    // of the analysis: their ids (and so the table's numbering) are fixed
+    // before anything else interns.
     if let Some(g) = source.global_object {
         if let SourceObject::Object(ObjectData { properties, .. }) = source.object(g) {
             for (k, _) in properties {
@@ -1195,10 +1054,7 @@ pub fn layout_env(
                     continue;
                 }
                 if let SourceObject::String(s) = source.object(*k) {
-                    let id = names.intern(s);
-                    if let Some(&bid) = syn_gnames.get(&id) {
-                        gcell_bids.insert(bid);
-                    }
+                    names.intern(s);
                 }
             }
         }
@@ -1210,15 +1066,6 @@ pub fn layout_env(
     let fused_list: Vec<(NameId, u64)> = collect_fused_gnames(source, root_id, &mut names);
     if opts.diagnostics.stats {
         crate::diag_line!("night: {} fused constant global(s)", fused_list.len());
-    }
-    if opts.diagnostics.bbv {
-        for &(n, bits) in &fused_list {
-            crate::diag_line!(
-                "night: fused-gname {} = {:#x}",
-                String::from_utf16_lossy(names.get(n)),
-                bits
-            );
-        }
     }
     if opts.diagnostics.stats {
         crate::diag_line!(
@@ -1249,15 +1096,6 @@ pub fn layout_env(
             facts.ta_elem_sites.len()
         );
     }
-    // The one table the translator wants that the analysis does not emit
-    // directly: elem and field sites merged. Both are keyed by pc (one op
-    // per pc) and the loop-version planner and the value guards consume
-    // them identically.
-    let likely_elems: HashMap<Site, Claim> = {
-        let mut m = facts.elem_sites.clone();
-        m.extend(facts.field_sites.iter().map(|(&k, &v)| (k, v)));
-        m
-    };
     // Field-name rows: the view most layout consumers want.
     let likely_class_layouts: HashMap<LayoutKey, Vec<NameId>> = facts
         .classes
@@ -1369,8 +1207,7 @@ pub fn layout_env(
     // Bit 8: the TYPES bit means every field holds its predicted type, any
     // type (MIR.md §4.6; the MIR and baseline tiers), so the runtime's set
     // helpers may keep it by the field claims serialized with the table.
-    // Legacy reads it by its numeric masks, and they never keep it.
-    let layout_mode: u32 = 2 | if opts.pipeline == crate::options::Pipeline::Legacy { 0 } else { LAYOUT_ANY_TYPES };
+    let layout_mode: u32 = 2 | LAYOUT_ANY_TYPES;
     let this_slots_base = this_cells_base + 8 * u32::try_from(layout_ctors.len()).unwrap();
     let masks_of = |ctor: LayoutKey| -> Vec<Claim> {
         facts.classes[&ctor]
@@ -1405,37 +1242,6 @@ pub fn layout_env(
             })
             .flatten()
     };
-    // Viz layout panel: one line per layout key, ids in the +1-biased
-    // stamped space (what cls facts show). Every column is something the
-    // codegen consumes -- the panel exists to show what the backend has, so
-    // an analysis detail with no emission consumer does not belong in it.
-    if opts.diagnostics.viz {
-        for &key in &layout_ctors {
-            let masks = masks_of(LayoutKey::new(key.get()));
-            let franges = ranges_of(LayoutKey::new(key.get()));
-            let fields: Vec<String> = likely_class_layouts[&key]
-                .iter()
-                .enumerate()
-                .map(|(i, f)| {
-                    format!(
-                        "{}=slot{}:{}:{}",
-                        bbv::viz_sanitize(&String::from_utf16_lossy(facts.names.get(*f))),
-                        i,
-                        bbv::viz_claim_str(masks.get(i).copied().unwrap_or(Claim::NONE)),
-                        match franges.get(i).copied().flatten() {
-                            Some(r) => format!("{}..{}", r.lo, r.hi),
-                            None => "-".to_string(),
-                        },
-                    )
-                })
-                .collect();
-            crate::diag_line!(
-                "night: viz layout id {} fields [{}]",
-                LayoutKey::new(ctor_layout_id[&key]).stamp(),
-                fields.join(" ")
-            );
-        }
-    }
     // Ctor-epilogue class-idx stamps: one per layout ctor; the stamped u16
     // index is `layout_id + 1` (0 = no likely class), so the id space must
     // fit a u16.
@@ -1560,27 +1366,6 @@ pub fn layout_env(
         }
         m
     };
-    // Per-layout field value masks, keyed by the stamped class idx
-    // (`layout_id + 1`, what a `cls` fact carries). The per-site
-    // `prop_sites` rows only exist where the analysis predicted a receiver
-    // for that pc; this table lets any receiver carrying a proven class
-    // fact answer "does field N of this layout hold a number claim?", which
-    // is what the store choke needs to know.
-    let layout_field_masks_tx: HashMap<StampKey, HashMap<NameId, Claim>> = layout_ctors
-        .iter()
-        .map(|&key| {
-            let masks = masks_of(LayoutKey::new(key.get()));
-            let fields = &likely_class_layouts[&key];
-            (
-                LayoutKey::new(ctor_layout_id[&key]).stamp(),
-                fields
-                    .iter()
-                    .enumerate()
-                    .map(|(i, &n)| (n, masks.get(i).copied().unwrap_or(Claim::NONE)))
-                    .collect(),
-            )
-        })
-        .collect();
     // The full-type parallel (MIR's TYPES): each field's predicted type,
     // any type.
     let layout_field_types_tx: HashMap<StampKey, HashMap<NameId, Claim>> = layout_ctors
@@ -1590,25 +1375,6 @@ pub fn layout_env(
             (
                 LayoutKey::new(ctor_layout_id[&key]).stamp(),
                 fields.iter().map(|f| (f.name, f.types)).collect(),
-            )
-        })
-        .collect();
-    // The range parallel, same keying: "does field N of this layout carry
-    // a range claim, and which?" -- what the store choke needs to decide
-    // between proving a store, checking it, and dropping the claim.
-    // Absent name = no claim, so only claiming rows are stored.
-    let layout_field_ranges_tx: HashMap<StampKey, HashMap<NameId, ValueRange>> = layout_ctors
-        .iter()
-        .map(|&key| {
-            let ranges = ranges_of(LayoutKey::new(key.get()));
-            let fields = &likely_class_layouts[&key];
-            (
-                LayoutKey::new(ctor_layout_id[&key]).stamp(),
-                fields
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(i, &n)| Some((n, (*ranges.get(i)?)?)))
-                    .collect(),
             )
         })
         .collect();
@@ -1640,7 +1406,7 @@ pub fn layout_env(
         .iter()
         .filter_map(|(&site, root)| {
             let k = array_keys.get(root)?;
-            Some((site, k | bbv::CLASS_WORD_SHALLOW | bbv::CLASS_WORD_RANGES))
+            Some((site, k | mir::abi::CLASS_WORD_SHALLOW | mir::abi::CLASS_WORD_RANGES))
         })
         .collect();
     // Element site -> (stamp key, mask, lo, hi): the read fold's target and
@@ -1666,34 +1432,6 @@ pub fn layout_env(
             Some(acc.map_or(r, |a| ValueRange::new(a.lo.max(r.lo), a.hi.min(r.hi))))
         })
         .filter(|r| r.lo <= r.hi);
-    // Viz array panel: one line per claiming population -- its stamp
-    // key, the R it claims, and where it is stamped and folded.
-    if opts.diagnostics.viz {
-        let mut roots: Vec<&RegionRoot> = facts.array_elem_claims.keys().collect();
-        roots.sort_unstable();
-        for r in roots {
-            let (m, range) = facts.array_elem_claims[r];
-            let (lo, hi) = (range.lo, range.hi);
-            let allocs: Vec<String> = {
-                let mut v: Vec<String> = facts
-                    .array_alloc_sites
-                    .iter()
-                    .filter(|(_, x)| *x == r)
-                    .map(|(site, _)| site.to_string())
-                    .collect();
-                v.sort();
-                v
-            };
-            let folds = facts.array_elem_recv.values().filter(|x| *x == r).count();
-            crate::diag_line!(
-                "night: viz arrclaim root {r} key {} mask {} lo {lo} hi {hi} \
-                 allocs [{}] elemsites {folds}",
-                array_keys.get(r).copied().unwrap_or(0),
-                bbv::viz_prims_str(m),
-                allocs.join(" ")
-            );
-        }
-    }
     if opts.diagnostics.stats && (!array_stamp_tx.is_empty() || !array_elem_tx.is_empty()) {
         crate::diag_line!(
             "night: array stamps: {} claiming populations, {} alloc sites, {} elem sites",
@@ -1875,11 +1613,8 @@ pub fn layout_env(
     Ok(EnvLayout {
         syn_gname_names,
         syn_gnames,
-        gcell_bids,
-        likely_fns,
         facts,
         likely_class_layouts,
-        likely_elems,
         fused_list,
         stamp_ctors_tx,
         lit_stamps_tx,
@@ -1892,9 +1627,7 @@ pub fn layout_env(
         construct_sites_tx,
         this_layouts_tx,
         prop_sites_tx,
-        layout_field_masks_tx,
         layout_field_types_tx,
-        layout_field_ranges_tx,
         array_stamp_tx,
         array_elem_tx,
         array_any_claim,
@@ -1975,10 +1708,6 @@ fn translate_for_pipeline(
     use tier::{Decline, Tier, TierStatus};
     let mut declines = vec![];
     let (first, outcome) = match ctx.opts.pipeline {
-        Pipeline::Legacy => (
-            Tier::Legacy,
-            bbv::translate_script(ctx, m, atoms, sid, script, is_global)?,
-        ),
         Pipeline::Mir => match mir::translate_script(
             ctx,
             m,
@@ -2075,22 +1804,12 @@ pub fn translate_all(
         .objects()
         .filter_map(|(id, obj)| matches!(obj, SourceObject::Script(_)).then_some(id))
         .collect();
-    // Whole-module BigInt-freedom (for the F64 arith fast track): a
-    // module that can never manufacture a BigInt lets Sub/Mul/Div carry their
-    // (then always-numeric) result on the unboxed f64 track soundly, even when
-    // the operand types are statically unknown.
-    let bigint_free = module_is_bigint_free(source, &script_ids);
-    let flag_demand = bbv::compute_flag_demand(source, &env.facts);
     let tx_ctx = translate::TranslateCtx {
         helpers,
         source,
         opts,
-        bigint_free,
         syn_gnames: &env.syn_gnames,
-        gcell_bids: &env.gcell_bids,
-        likely_fns: &env.likely_fns,
         facts: &env.facts,
-        flag_demand: &flag_demand,
         this_layouts_in: &env.this_layouts_tx,
         stamp_ctors_in: &env.stamp_ctors_tx,
         layout_addpred_in: &env.layout_addpred_tx,
@@ -2102,13 +1821,10 @@ pub fn translate_all(
         lit_stamps_in: &env.lit_stamps_tx,
         lit_nslots_in: &env.lit_nslots_tx,
         prop_sites_in: &env.prop_sites_tx,
-        layout_field_masks_in: &env.layout_field_masks_tx,
         layout_field_types_in: &env.layout_field_types_tx,
-        layout_field_ranges_in: &env.layout_field_ranges_tx,
         array_stamp_in: &env.array_stamp_tx,
         array_elem_in: &env.array_elem_tx,
         array_any_claim: env.array_any_claim,
-        likely_elems: &env.likely_elems,
         fused_gnames: &env.fused_gnames_tx,
     };
     let mut tier_census = tier::TierCensus::default();
@@ -2212,7 +1928,7 @@ pub fn translate_all(
                         format!("night_script_{}", id.id()),
                         body,
                     ));
-                    // Widened-ABI (BBV) bodies go in the table behind a
+                    // Widened-ABI bodies (MIR, baseline) go in the table behind a
                     // `night_abi_sig` adapter; direct-call patches still
                     // target the body itself (source_id_to_func). The body
                     // takes its own table slot now (the module's table order
@@ -2276,9 +1992,6 @@ pub fn translate_all(
                 }
                 translate::Outcome::Skipped(reason) => {
                     n_skipped += 1;
-                    if opts.diagnostics.bbv {
-                        crate::diag_line!("night: skip script#{} ({reason})", id.id());
-                    }
                     log::trace!("night: skip script#{} ({reason})", id.id());
                 }
             }

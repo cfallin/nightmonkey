@@ -29,9 +29,9 @@ use super::layout::{
 };
 use crate::bytecode::{BytecodeParser, JSOp, Script, TryNoteKind};
 use crate::ids::{Pc, ScriptId, Site};
-use crate::wasm::bbv::{construct_nslots, typed_alloc_word, typed_keep_bits, typed_restamp_args};
+use crate::wasm::mir::stamp::{construct_nslots, typed_alloc_word, typed_keep_bits, typed_restamp_args};
 use crate::source::{ScopeData, SourceObject};
-use crate::wasm::bbv::abi::{
+use crate::wasm::mir::abi::{
     BINOP_BITAND, BINOP_BITNOT, BINOP_BITOR, BINOP_BITXOR, BINOP_DEC, BINOP_DIV, BINOP_INC,
     BINOP_LSH, BINOP_MOD, BINOP_MUL, BINOP_RSH, BINOP_SUB, BINOP_URSH, CMP_EQ, CMP_GE, CMP_GT,
     CMP_LE, CMP_LT, CMP_NE, CMP_STRICTEQ, CMP_STRICTNE, ELEMENTS_INITLEN_BACK, FIXED_SLOTS_BASE,
@@ -453,8 +453,8 @@ impl<'a> Gen<'a> {
     /// conforming objects it writes, which would fail OPT's guards for good.
     fn vouch_types(&mut self, atom: u32, recv: Value, val: Value) -> Value {
         let name = self.atoms.name_of(atom);
-        let classes = crate::wasm::bbv::field_classes(self.ctx, name);
-        if classes.is_empty() || classes.len() > crate::wasm::bbv::MAX_STORE_CLASSES {
+        let classes = crate::wasm::mir::stamp::field_classes(self.ctx, name);
+        if classes.is_empty() || classes.len() > crate::wasm::mir::stamp::MAX_STORE_CLASSES {
             return self.i32c(0);
         }
         let is_obj = self.tag_eq(recv, TAG_OBJECT);
@@ -1534,7 +1534,7 @@ impl<'a> Gen<'a> {
         self.restamp(v, r);
     }
 
-    /// Write stamp word `w` into fresh object `r` (bbv's literal and array
+    /// Write stamp word `w` into fresh object `r` (the literal and array
     /// allocation stamps).
     fn stamp_fresh(&mut self, r: Value, w: Option<u32>) {
         if let Some(w) = w {
@@ -2295,8 +2295,9 @@ impl<'a> Gen<'a> {
             }
             New | NewContent | SuperCall => {
                 let argc = u32::from(p.next_uint16().unwrap());
-                // The construct site's sized allocation and early stamp word,
-                // as bbv computes them: the ctor's exit stamp needs both.
+                // The construct site's sized allocation and early stamp word
+                // (`construct_nslots`, `typed_alloc_word`): the ctor's exit
+                // stamp needs both.
                 let site = Site::new(self.sid, self.pc);
                 let mono = match self.ctx.facts.scripted_targets(site) {
                     [s] => Some(*s),

@@ -18,6 +18,12 @@ use crate::mir::module::{FieldDef, Module};
 use crate::mir::ops::Opcode;
 use crate::mir::types::{FactKind, StrInfo, Type};
 
+use crate::bytecode::{JSOp, OpcodeVisitor, Script};
+use crate::ids::{Pc, ScriptId, Site};
+use crate::source::SourceObject;
+use crate::wasm::translate::TranslateCtx;
+use rustc_hash::FxHashSet as HashSet;
+
 /// A callee built for inlining: its module and function, and its frame's
 /// deepest operand stack.
 pub(crate) struct Callee {
@@ -35,7 +41,7 @@ pub(crate) struct Callee {
     /// object guards it back to that state (`guard.ctor`).
     pub this_out: Option<(u32, u32, bool)>,
     /// The sites it spliced itself, its callees' included (the caller's
-    /// inlining budget counts them, as bbv's walk does).
+    /// inlining budget counts them).
     pub sites: u32,
     /// Whether it reads its actuals (`layout::reads_actuals`): a splice
     /// then passes every actual, and needs the call's count.
@@ -478,3 +484,103 @@ pub(crate) fn splice(
     f.inst_frame[jump] = parent;
     Ok(())
 }
+
+/// Estimated emitted cost of splicing `sid` (bytecode bytes, loops
+/// weighted, plus the dispatch its calls cost), for the MIR builder's
+/// inlining admission.
+pub(crate) fn splice_closure_cost(
+    ctx: &TranslateCtx,
+    sid: ScriptId,
+    depth_left: u32,
+    room: usize,
+    entry: Option<Site>,
+) -> usize {
+    const CALL_COST: usize = 300;
+    const APPLY_FWD_COST: usize = 40;
+    const RESOLVED_COST: usize = 60;
+    const LOOP_WEIGHT: usize = 3;
+    let SourceObject::Script(s) = ctx.source.object(sid.source()) else {
+        return 0;
+    };
+    // A loop in a spliced callee is the term no size budget can see: its
+    // interior is emitted once per version of the segment, and the
+    // relooper duplicates tails per skipped-header context on top of
+    // that. Measured across the corpus, a loop-bearing closure expands
+    // roughly three times the values per unit of un-weighted cost that a
+    // loop-free one does, and the loops are the whole difference.
+    let nloops = LOOP_WEIGHT * crate::wasm::translate::scan_loop_intervals(s).len();
+    let mut total = s.bytecode.len() * (1 + nloops);
+    if total > room {
+        return total;
+    }
+    for (cpc, op) in call_site_pcs(s) {
+        if !matches!(op, JSOp::Call | JSOp::CallIgnoresRv | JSOp::New) {
+            continue;
+        }
+        let site = Site::new(sid, Pc::new(cpc));
+        let fwd_target = entry
+            .and_then(|e| ctx.facts.apply_targets_in.get(&(e, site)))
+            .or_else(|| ctx.facts.apply_targets.get(&site))
+            .copied()
+            .filter(|_| {
+                op != JSOp::New && callee_apply_fwd_pcs(ctx, sid, s).contains(&Pc::new(cpc))
+            });
+        let targets: Vec<ScriptId> = match fwd_target {
+            Some(t) => {
+                total += APPLY_FWD_COST;
+                vec![t]
+            }
+            None => {
+                let ts = ctx.facts.scripted_targets(site).to_vec();
+                // A mono-resolved site splices behind one identity
+                // guard (a construct site adds its shape guards and
+                // the inline `this` creation); any other site costs
+                // the classify chain, which a spliced one emits too
+                // (guard + generic miss arm), on top of the callee
+                // body.
+                total += if ts.len() == 1 {
+                    RESOLVED_COST
+                } else {
+                    CALL_COST
+                };
+                ts
+            }
+        };
+        if depth_left > 0 {
+            for t in targets {
+                total += splice_closure_cost(
+                    ctx,
+                    t,
+                    depth_left - 1,
+                    room.saturating_sub(total),
+                    Some(site),
+                );
+                if total > room {
+                    return total;
+                }
+            }
+        }
+        if total > room {
+            return total;
+        }
+    }
+    total
+}
+
+fn callee_apply_fwd_pcs(ctx: &TranslateCtx, sid: ScriptId, callee: &Script) -> HashSet<Pc> {
+    crate::wasm::translate::compute_apply_fwd_pcs(callee, &ctx.facts.apply_sites, sid.get()).unwrap_or_default()
+}
+
+/// Every call/construct pc in `script` with its op, for closure pricing.
+fn call_site_pcs(script: &Script) -> Vec<(u32, JSOp)> {
+    struct Scan(Vec<(u32, JSOp)>);
+    impl OpcodeVisitor for Scan {
+        fn before_op(&mut self, pc: Pc, op: JSOp, _nuses: usize, _ndefs: usize) {
+            if matches!(op, JSOp::Call | JSOp::CallIgnoresRv | JSOp::New) {
+                self.0.push((pc.get(), op));
+            }
+        }
+    }
+    script.parser().visit(Scan(Vec::new())).0
+}
+

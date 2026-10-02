@@ -386,7 +386,6 @@ pub fn build_inprocess_batch(
             direct_call_stub2,
         },
         env.helper_bases(),
-        opts.diagnostics.viz,
     )?;
 
     let mut strlit_addr: u32 = 0;
@@ -554,7 +553,6 @@ mod tests {
     use crate::source::SourceObject;
 
     const HELPER_NAMES: &[&str] = &[
-        "night_runtime_callee_night_target",
         "night_runtime_add",
         "night_runtime_concat",
         "night_runtime_call",
@@ -562,7 +560,6 @@ mod tests {
         "night_runtime_native_dispatch",
         "night_runtime_apply_fwd",
         "night_runtime_construct",
-        "night_runtime_get_property",
         "night_runtime_set_property",
         "night_runtime_get_prop_ic_miss",
         "night_runtime_set_prop_ic_miss",
@@ -574,7 +571,6 @@ mod tests {
         "night_runtime_string",
         "night_runtime_get_intrinsic",
         "night_runtime_get_intrinsic_cell",
-        "night_runtime_strlit_verify",
         "night_runtime_str_chars_eq",
         "night_runtime_tonumeric",
         "night_runtime_pos",
@@ -586,7 +582,6 @@ mod tests {
         "night_runtime_box_nonstrict_this",
         "night_runtime_get_mapped_arg",
         "night_runtime_set_mapped_arg",
-        "night_runtime_validate_this_layout",
         "night_runtime_in",
         "night_runtime_has_own",
         "night_runtime_to_property_key",
@@ -673,11 +668,8 @@ mod tests {
         "night_runtime_post_write_barrier",
         "night_runtime_post_write_barrier_elem",
         "night_runtime_pre_write_barrier",
-        "night_runtime_resolve_global_slot",
         "night_runtime_resolve_global_slot_guarded",
-        "night_runtime_set_global",
         "night_runtime_binding_written",
-        "night_runtime_binding_value",
         "night_runtime_math_unary",
         "night_runtime_math_pow",
         "night_runtime_fmod",
@@ -689,7 +681,6 @@ mod tests {
         "night_runtime_obj_with_proto",
         "night_runtime_fun_with_proto",
         "night_runtime_set_fun_name",
-        "night_runtime_no_extra_indexed",
         "night_runtime_gen_is_closing",
         "night_runtime_mir_stress",
         "night_runtime_slots_covered",

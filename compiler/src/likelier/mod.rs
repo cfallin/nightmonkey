@@ -8,14 +8,12 @@ use crate::ids::{FormalIndex, ScriptId, Site, VarId};
 pub mod builtins;
 pub mod calls;
 pub mod dump;
-pub mod effects;
 pub mod emit;
 pub mod engine;
 pub mod heap;
 pub mod scan;
 pub mod stats;
 pub mod types;
-pub mod viz;
 
 use crate::facts::LikelyFacts;
 use crate::options::Options;

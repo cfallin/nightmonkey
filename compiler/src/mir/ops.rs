@@ -486,7 +486,7 @@ pub enum Opcode {
     Box,
     /// An f64 boxed as the double it is (NaN made canonical), not as an
     /// int32 where it is one: for a store whose readers all admit the
-    /// double tag (bbv's `elem_write_sites` rule).
+    /// double tag (the `elem_write_sites` rule).
     BoxDouble,
     Unbox(UnboxKind),
     I32ToInt,
@@ -529,7 +529,7 @@ pub enum Opcode {
     /// The receiver (boxed) has, for property `name`, the accessor the
     /// runtime's accessor-call cache recorded for its shape (a getter, or
     /// with the flag a setter), on a holder whose shape is still the one
-    /// recorded (bbv's accessor arm): ok with that accessor function.
+    /// recorded: ok with that accessor function.
     AccessorProbe(AtomId, bool),
 
     // Control.
@@ -790,7 +790,7 @@ pub enum Opcode {
     CallDirect,
     /// `new`: operands callee, `this` (the IS_CONSTRUCTING magic), args,
     /// new.target. The site's sized-allocation slot count and early stamp
-    /// word (`bbv::construct_nslots`/`construct_alloc_word`).
+    /// word (`stamp::construct_nslots`/`construct_alloc_word`).
     Construct(u32, u32),
     /// The `this` of a construct (`callee, new.target`): a fresh object
     /// sized `nslots` and seeded with the alloc word, as a direct construct
@@ -2243,7 +2243,7 @@ pub fn signature(op: &Opcode, args: &[Type], m: &Module) -> SigResult {
     })
 }
 
-/// The effect-flags contribution of an op (`bbv/abi.rs` names the bits).
+/// The effect-flags contribution of an op (`wasm/mir/abi.rs` names the bits).
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
 pub struct FlagBits(u8);
 

@@ -213,75 +213,6 @@ pub enum CallResolution {
     Scripted(Vec<ScriptId>),
 }
 
-/// Post-fixpoint per-script effect summary: what a call to this script,
-/// its resolved callees folded in transitively, may write to pre-existing
-/// heap. Produced from the solved state only, never fed into the solve.
-/// `top` means the walk met an op or a call edge it could not classify;
-/// the other fields are meaningless then. Call resolution is likely, not
-/// proven, so the summary shares the facts contract: a consumer keeps
-/// only guarded/recoverable state on its strength.
-#[derive(Clone, Debug, Default)]
-pub struct EffectSummary {
-    pub top: bool,
-    /// What saturated the summary (an op name, "cap", a call-edge reason).
-    /// Diagnostic only: excluded from equality, so the summary fixpoint
-    /// cannot churn on why-strings propagating around a recursive cycle.
-    pub top_why: Option<String>,
-    /// Property writes: the write-site receiver's layout-key range when
-    /// its receivers agreed on a planned class, else None = unknown
-    /// receiver.
-    pub field_writes: Vec<(Option<(LayoutKey, LayoutKey)>, NameId)>,
-    pub gname_writes: Vec<NameId>,
-    pub elems_write: bool,
-    pub env_write: bool,
-}
-
-impl PartialEq for EffectSummary {
-    fn eq(&self, other: &EffectSummary) -> bool {
-        self.top == other.top
-            && self.field_writes == other.field_writes
-            && self.gname_writes == other.gname_writes
-            && self.elems_write == other.elems_write
-            && self.env_write == other.env_write
-    }
-}
-impl Eq for EffectSummary {}
-
-impl EffectSummary {
-    pub fn saturate(&mut self, why: impl Into<String>) {
-        if !self.top {
-            self.top = true;
-            self.top_why = Some(why.into());
-        }
-    }
-
-    pub fn is_write_free(&self) -> bool {
-        !self.top
-            && self.field_writes.is_empty()
-            && self.gname_writes.is_empty()
-            && !self.elems_write
-            && !self.env_write
-    }
-
-    /// One-token diagnostic label: `wf`, `w:<fields>f/<gnames>g/<e>/<v>`,
-    /// or `top:<why>`.
-    pub fn label(&self) -> String {
-        if self.top {
-            format!("top:{}", self.top_why.as_deref().unwrap_or("?"))
-        } else if self.is_write_free() {
-            "wf".to_string()
-        } else {
-            format!(
-                "w:{}f/{}g/{}/{}",
-                self.field_writes.len(),
-                self.gname_writes.len(),
-                u8::from(self.elems_write),
-                u8::from(self.env_write),
-            )
-        }
-    }
-}
-
 /// Everything the analysis tells the translator: the whole contract
 /// between `likelier` and `wasm`, and the only channel between them.
 ///
@@ -355,9 +286,6 @@ pub struct LikelyFacts {
     /// Guarded by callee identity at runtime, so a wrong resolution is a
     /// missed fast path.
     pub apply_natives: HashMap<Site, ApplyNative>,
-    /// Per-script transitive effect summaries (see [`EffectSummary`]).
-    /// Every script the source carries has an entry.
-    pub script_effects: HashMap<ScriptId, EffectSummary>,
     /// Method script -> (lo key, hi key) of the predicted `this` class:
     /// lo == hi = an exact ctor-class home (the narrowed subclass view);
     /// lo < hi = a predictor-class home consumed with a range guard and
@@ -442,20 +370,6 @@ pub struct LikelyFacts {
     /// the consumer's per-read tag guard miss, never a miscompile -- so
     /// unlike the fused-literal machinery this table needs no fuses.
     pub gname_types: HashMap<NameId, Claim>,
-    /// Arith sites whose RESULT cell is fractional-reachable (double
-    /// evidence at range Top -- the i53 law's contrapositive): a real
-    /// runtime double population flows through the op, so its
-    /// both-number f64 arm keeps the Opt track (the numeric-category
-    /// policy). Sites absent here keep the track step: their f64 arm is
-    /// cold, and letting its numeric result join the successor would
-    /// degrade a pure-int32 chain's facts.
-    pub fractional_arith_sites: HashSet<Site>,
-    /// Arith (`+`) sites whose result cell carries string evidence: a real
-    /// string population flows through the op, so the both-string concat
-    /// arm keeps the Opt track (the string analog of the numeric-category
-    /// policy). Sites absent here keep the track step for the same
-    /// join-degradation reason as `fractional_arith_sites`.
-    pub string_arith_sites: HashSet<Site>,
     /// Per-element-site likely typed-array kind: at a GetElem/SetElem,
     /// the receiver class's element kind when it settled on a single one. Consumed as a guarded-monomorphic inline
     /// read/store arm (clasp guard + kind-specific access); a wrong prediction

@@ -70,18 +70,16 @@ Output
   --keep-names             keep the name and DWARF sections (stripped by default)
 
 Compilation
-  --force-interp           leave every script interpreted
   --pipeline <p>           which tiers compile scripts: mir (default; MIR
-                           over baseline), baseline (baseline only), or
-                           legacy (BBV); a script no tier takes is interpreted
+                           over baseline) or baseline (baseline only); a
+                           script no tier takes is interpreted
   --strict-coverage        fail if any script ends up interpreted for a
                            reason other than ForceInterpreter
+  --mir-stress <n>         fail every n-th MIR guard as well (exit testing)
 
 Diagnostics
   --stats                  report phase timings and counts
   --dump-opsize            per-op emitted-IR census (static code size)
-  --dump-ctxedge           per-continuation-edge ctx fact census
-  --dump-clsfact           per-consumer class-fact availability census
   --trace-cell <c>         trace every raise into one analysis cell,
                            arg:<sid>:<n> or local:<sid>:<n>
   --trace-field <name>     trace every heap read/write of one property name
@@ -90,34 +88,19 @@ Diagnostics
   --trace-site <sid>:<pc>  trace the per-context evaluation of one read site
   --dump-propgap           per-site census of why a property access got no
                            class-fact row (the coverage half of code size)
-  --dump-cfg               the CFG, dominator tree and loop nest over the
-                           unified pc space, with the loop-extent audit
-  --dump-peel              per loop header, the read slots whose single-
-                           version join is weaker than the back edge's
-                           arrival (the peel rule's census)
-  --dump-redundant         per-op census of box round trips, dead boxes and
-                           frame round trips in the emitted IR
   --dump-tiers             per-script tier coverage (the tier that compiled
                            it, or interp, and every decline) and a summary
-
-Instrumentation (CHANGES the generated code; never on in production)
-  --census                 emit night_runtime_census calls: per-track version
-                           entries and per-arm fork takes, dumped at exit
-  --guard-census           emit night_runtime_census calls on every arm of
-                           every property/arith speculation point: the
-                           per-site guard hit rate, dumped at exit
-  --block-census           emit night_runtime_census calls at the head of
-                           every block an op's lowering created, with a
-                           static per-block record: executed IR per op
-  --dump-bytecode[=IDS]    disassemble each script's bytecode; IDS is a
-                           comma-separated source-id list (default: all)
-  --dump-bbv               dump the per-version BBV state
+  --dump-mir               print each MIR body (and an invalid one in full)
   --dump-facts <path>      write the analysis fact tables to <path>
   --dump-graph             print the walked script graph and exit
-  --viz                    emit the speculation trace for tools/viz.py
-  --viz-lower              with --viz, also dump the per-op lowering
-  --viz-facts <path>       write the analysis half of the trace to <path>
-                           instead of stderr
+
+Instrumentation (CHANGES the generated code; never on in production)
+  --mir-exit-census        emit night_runtime_census calls at every MIR
+                           exit: per-exit take counts, dumped at exit
+  --block-census           emit night_runtime_census calls at the head of
+                           every MIR block: executed blocks, dumped at exit
+  --guard-census           bucket the dense-append helper's misses by
+                           reason, dumped at exit
   -h, --help               print this message
 "
     )
@@ -391,7 +374,7 @@ fn main() -> Result<()> {
             direct_call_stub2,
         },
         env.helper_bases(),
-        opts.diagnostics.viz,
+
     )
     .map_err(|e| anyhow!(e))?;
 
@@ -540,13 +523,11 @@ fn main() -> Result<()> {
                 snapshot_stamps_short += 1;
             }
             // TYPES (MIR.md §4.6, the any-type meaning of the MIR and
-            // baseline tiers; legacy reads the bit by its numeric masks):
-            // the image holds every field's value, so the stamp can check
+            // baseline tiers): the image holds every field's value, so the stamp can check
             // each against its layout's predicted type exactly, as a
             // conforming store would keep the bit.
             let key = env.layout_ctors[lid as usize];
-            let types = opts.pipeline != night_compiler::options::Pipeline::Legacy
-                && env.layout_field_types_tx.get(&key.stamp()).is_some_and(|claims| {
+            let types = env.layout_field_types_tx.get(&key.stamp()).is_some_and(|claims| {
                     let fields = &env.likely_class_layouts[&key];
                     claims.values().any(|c| !c.is_none())
                         && od.properties.iter().zip(fields).all(|(&(_, vid), n)| {

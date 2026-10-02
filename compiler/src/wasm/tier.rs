@@ -17,7 +17,6 @@ use crate::ids::ScriptId;
 pub enum Tier {
     Mir,
     Baseline,
-    Legacy,
     Interp,
 }
 
@@ -26,7 +25,6 @@ impl std::fmt::Display for Tier {
         f.write_str(match self {
             Tier::Mir => "mir",
             Tier::Baseline => "baseline",
-            Tier::Legacy => "legacy",
             Tier::Interp => "interp",
         })
     }
@@ -113,10 +111,9 @@ impl TierCensus {
     pub fn summary(&self) -> String {
         let n = |t| self.counts.get(&t).copied().unwrap_or(0);
         let mut s = format!(
-            "night: tier summary mir={} baseline={} legacy={} interp={}",
+            "night: tier summary mir={} baseline={} interp={}",
             n(Tier::Mir),
             n(Tier::Baseline),
-            n(Tier::Legacy),
             n(Tier::Interp)
         );
         for (class, count) in &self.declines {
@@ -182,19 +179,19 @@ mod tests {
         let st = TierStatus {
             tier: Tier::Interp,
             declines: vec![Decline::new(
-                Tier::Legacy,
+                Tier::Baseline,
                 "script too large (200000 bytecode bytes)",
             )],
         };
         assert_eq!(
             st.to_string(),
-            "interp [legacy: script too large (200000 bytecode bytes)]"
+            "interp [baseline: script too large (200000 bytecode bytes)]"
         );
         c.record(ScriptId::new(3), st, false);
         assert_eq!(
             c.summary(),
-            "night: tier summary mir=0 baseline=1 legacy=0 interp=2 \
-             [baseline: ForceInterpreter]=1 [legacy: script too large]=1 [mir: no builder]=1"
+            "night: tier summary mir=0 baseline=1 interp=2 \
+             [baseline: ForceInterpreter]=1 [baseline: script too large]=1 [mir: no builder]=1"
         );
         let e = c.check_strict().unwrap_err();
         assert!(

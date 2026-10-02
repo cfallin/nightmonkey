@@ -44,10 +44,7 @@ extern "C" {
 // rooted region). The leaf helpers (to_boolean, get_aliased/set_aliased,
 // get_exception_for_finally) take no `top`: they neither GC nor throw.
 
-// Generic property get/set by atom id (the property-IC fallback path).
-NIGHT_RUNTIME_EXPORT(night_runtime_get_property)
-bool night_runtime_get_property(JSContext* cx, uint32_t top, uint64_t recv,
-                                uint32_t atomId);
+// Generic property set by atom id (the property-IC fallback path).
 NIGHT_RUNTIME_EXPORT(night_runtime_set_property)
 bool night_runtime_set_property(JSContext* cx, uint32_t top, uint64_t recv,
                                 uint32_t atomId, uint64_t val, uint32_t flags);
@@ -139,20 +136,10 @@ NIGHT_RUNTIME_EXPORT(night_runtime_get_gname)
 bool night_runtime_get_gname(JSContext* cx, uint32_t top, uint32_t atomId,
                              uint32_t forTypeof);
 
-// Global binding resolution. `night_runtime_resolve_global_slot` is the
-// cold resolve-once path behind the inlined `GetGName`: on first access the
-// binding's `gGlobalSlots` entry is 0 (unresolved), so the inline code calls
-// this, which `lookupPure`s the pre-interned binding name on the global object
-// (non-allocating, never GCs), writes the encoded entry (`bit0` resolved,
-// `bit1` is-dynamic-slot, `bits[31:2]` slot index) into
-// `gGlobalSlots[bindingId]`, and returns it. A leaf -- no `top`, no rooting
-// handshake.
-NIGHT_RUNTIME_EXPORT(night_runtime_resolve_global_slot)
-uint32_t night_runtime_resolve_global_slot(JSContext* cx, uint32_t bindingId);
-
-// GUARDED variant for syntactically-collected (no-TI) bindings: unlike the
-// TI-proven resolve above, the name may be anything a `GetGName` can mention,
-// so resolution can fail. Caches (and returns) the encoded entry ONLY when the
+// Global binding resolution: the cold resolve-once path behind the inlined
+// `GetGName`. On first access the binding's `gGlobalSlots` entry is 0
+// (unresolved), so the inline code calls this; the name may be anything a
+// `GetGName` can mention, so resolution can fail. Caches (and returns) the encoded entry ONLY when the
 // name is an own plain data slot of the global object NOT shadowed by a global
 // lexical binding; also caches the global's shape word, which the inline read
 // guards against (any global-object reshape -- delete, redefine-as-accessor --
@@ -163,24 +150,10 @@ NIGHT_RUNTIME_EXPORT(night_runtime_resolve_global_slot_guarded)
 uint32_t night_runtime_resolve_global_slot_guarded(JSContext* cx,
                                                    uint32_t bindingId);
 
-// Inlined `SetGName` for a resolved global-object binding: store `valBits`
-// into the binding's slot with the engine's `setSlot` write barriers (a store +
-// barriers never move objects, so a leaf -- no rooting handshake). Also warms
-// the `gGlobalSlots` cache so a following inline read avoids the cold resolve.
-NIGHT_RUNTIME_EXPORT(night_runtime_set_global)
-void night_runtime_set_global(JSContext* cx, uint32_t bindingId,
-                              uint64_t valBits);
 // The inline `SetGName` store unarmed the binding's value-fuse cell (its
 // value changed): re-arm it from the stored value. A leaf.
 NIGHT_RUNTIME_EXPORT(night_runtime_binding_written)
 void night_runtime_binding_written(uint32_t bindingId);
-// The binding's current value for a compiled re-proof of a carried
-// per-binding value fact: the armed cell's bits, else the guarded resolve
-// (refilling the gGlobalSlots row and re-arming the cell) and the slot it
-// names; a name that is no longer an own plain data slot of the global
-// yields a magic Value. A leaf (lookupPure + slot read).
-NIGHT_RUNTIME_EXPORT(night_runtime_binding_value)
-uint64_t night_runtime_binding_value(JSContext* cx, uint32_t bindingId);
 
 // Direct construct: create the `this` object for a specialized `new` (the
 // callee is a single resolved scripted constructor, direct-called inline).
@@ -217,11 +190,6 @@ bool night_runtime_string(JSContext* cx, uint32_t top, uint32_t atomId);
 // lazily clone the intrinsic from the self-hosting zone (GC/throw).
 NIGHT_RUNTIME_EXPORT(night_runtime_get_intrinsic)
 bool night_runtime_get_intrinsic(JSContext* cx, uint32_t top, uint32_t atomId);
-
-// Validate an inline-materialized string literal (debug compiles only).
-NIGHT_RUNTIME_EXPORT(night_runtime_strlit_verify)
-bool night_runtime_strlit_verify(JSContext* cx, uint32_t strPtr,
-                                 uint32_t atomId);
 
 // Track census (diagnostic builds only): count one occurrence of (kind, id).
 // The compiler emits these calls only under its `--census` switch, so a
@@ -381,12 +349,6 @@ NIGHT_RUNTIME_EXPORT(night_runtime_set_fun_name)
 bool night_runtime_set_fun_name(JSContext* cx, uint32_t top, uint64_t fun,
                                 uint64_t name, uint32_t prefixKind);
 
-// `1` iff neither `obj` nor anything on its prototype chain may have extra
-// indexed properties (js::ObjectMayHaveExtraIndexedProperties): the inline
-// dense-append (Array.prototype.push) arm's proto guard. Leaf (pure walk).
-NIGHT_RUNTIME_EXPORT(night_runtime_no_extra_indexed)
-int32_t night_runtime_no_extra_indexed(uint32_t obj);
-
 // `1` iff every slot of native object `obj` below `n` holds a property: the
 // stamp gates' coverage test for a shape with permuted slots, whose span
 // alone does not say it (holes). Leaf (a walk of the shape, no GC).
@@ -477,7 +439,7 @@ uint32_t night_runtime_init_field(JSContext* cx, uint32_t top, uint64_t recv,
 NIGHT_RUNTIME_EXPORT(night_runtime_ctor_stamp)
 void night_runtime_ctor_stamp(uint64_t thisBits, uint32_t layoutId,
                               uint32_t nFields, uint32_t keepBits);
-// The two-phase restamp at an init delegate's returns (bbv's restamp form
+// The two-phase restamp at an init delegate's returns (the restamp form
 // of the ctor-exit stamp): advance `this` to layout `layoutId` when it is
 // already that layout (no-op), still under the CONSTRUCTING sentinel with
 // an early key of ours, a prefix layout's, or none, or stamped with a
@@ -743,8 +705,6 @@ NIGHT_RUNTIME_EXPORT(night_runtime_get_mapped_arg)
 uint64_t night_runtime_get_mapped_arg(uint64_t objBits, uint32_t i);
 NIGHT_RUNTIME_EXPORT(night_runtime_set_mapped_arg)
 void night_runtime_set_mapped_arg(uint64_t objBits, uint32_t i, uint64_t val);
-NIGHT_RUNTIME_EXPORT(night_runtime_validate_this_layout)
-void night_runtime_validate_this_layout(uint64_t thisBits, uint32_t layoutId);
 
 // `RegExp`: clone the regexp literal `gcthing[index]` of `script`. May GC.
 NIGHT_RUNTIME_EXPORT(night_runtime_regexp)
@@ -895,14 +855,6 @@ bool night_runtime_add(JSContext* cx, uint32_t top, uint64_t a, uint64_t b);
 
 NIGHT_RUNTIME_EXPORT(night_runtime_concat)
 bool night_runtime_concat(JSContext* cx, uint32_t top, uint64_t a, uint64_t b);
-
-// Call-site specialization: classify the runtime callee `calleeBits`
-// (a boxed Value). Returns `(JSScript* << 32) | nightFuncIndex` (non-zero low
-// half) when it is an interpreted JSFunction with a compiled AOT body, so the
-// caller can dispatch via `call_indirect`; returns 0 for native / not-compiled
-// callees (fall back to `night_runtime_call`). Leaf: no GC, no allocation.
-NIGHT_RUNTIME_EXPORT(night_runtime_callee_night_target)
-uint64_t night_runtime_callee_night_target(uint64_t calleeBits);
 
 // Generic call: invoke the callee in the frame at `sp` with `argc` args
 // Writes the return value to the out-slot at `top`.

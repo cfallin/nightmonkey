@@ -524,8 +524,8 @@ pub fn result(op: NumOp, a: &Opnd, b: Option<&Opnd>) -> (Prims, Range) {
     }
 }
 
-/// The mask an f64-track arithmetic result carries (the bbv lowering's
-/// per-arm instance of `num_part`'s double rule): both operands proven
+/// The mask an f64-track arithmetic result carries (a per-arm instance
+/// of `num_part`'s double rule): both operands proven
 /// exactly-Double claims a Double result. The claim is a TAG claim and
 /// is sound only because it rides with the exact-double boxing decision
 /// (`to_boxed` must not canonicalize what this says is exactly a
@@ -582,56 +582,10 @@ impl ValueRange {
 /// exactly (-0 + x == 0 + x whenever the result is not itself -0).
 pub(crate) type Iv = Option<(i64, i64, bool)>;
 
-/// The recorded (clean-only) form of an internal interval.
-pub(crate) fn iv_clean(iv: Iv) -> Option<ValueRange> {
-    match iv {
-        Some((lo, hi, false)) => Some(ValueRange::new(lo, hi)),
-        _ => None,
-    }
-}
-
 pub(crate) const IV_LIM: i64 = 1 << 53;
 pub(crate) const I32_LO: i64 = i32::MIN as i64;
 pub(crate) const I32_HI: i64 = i32::MAX as i64;
 pub(crate) const IV_I32: Iv = Some((I32_LO, I32_HI, false));
-/// Exact joins tolerated per stored slot before a growing bound snaps up
-/// the widening ladder -- keeps diamond joins exact while forcing loop
-/// accumulators to converge in a few rounds.
-pub(crate) const IV_WIDEN_JOINS: u8 = 3;
-
-/// Widening rungs for a growing lower bound: the nearest rung at or
-/// below. The intermediate rungs matter: am3-style carries stabilize
-/// near +-2^35 (the `>>28` collapse), and a ladder that jumps straight
-/// to +-2^53 pushes the dependent sums out of the domain before the
-/// fixpoint can settle. Beyond +-2^48 the interval gives up (headroom
-/// for further adds).
-pub(crate) fn widen_lo(lo: i64) -> Option<i64> {
-    if lo >= 0 {
-        Some(0)
-    } else if lo >= I32_LO {
-        Some(I32_LO)
-    } else if lo >= -(1 << 36) {
-        Some(-(1 << 36))
-    } else if lo >= -(1 << 48) {
-        Some(-(1 << 48))
-    } else {
-        None
-    }
-}
-
-pub(crate) fn widen_hi(hi: i64) -> Option<i64> {
-    if hi <= 0 {
-        Some(0)
-    } else if hi <= I32_HI {
-        Some(I32_HI)
-    } else if hi <= 1 << 36 {
-        Some(1 << 36)
-    } else if hi <= 1 << 48 {
-        Some(1 << 48)
-    } else {
-        None
-    }
-}
 
 /// Quantized bound domain for the heap-interval lattice (likelier cell
 /// component): magnitudes at most 8 stay exact, larger ones round
@@ -832,57 +786,6 @@ pub(crate) fn iv_bitnot(a: Iv) -> Iv {
     match a {
         Some((al, ah, _)) if al >= I32_LO && ah <= I32_HI => Some((-ah - 1, -al - 1, false)),
         _ => IV_I32,
-    }
-}
-
-/// Join (union) of a recorded interval into the stored fact it joins,
-/// with growth quantized to the widening rungs: a bound staying within
-/// the stored one keeps the exact union, a growing bound snaps up the
-/// ladder (None past the top rung). The raises per stored fact are
-/// bounded by the finite rung chain by construction -- the
-/// MAX_CELL_CHANGES discipline -- which is what keeps a derived-ctx
-/// fixpoint's interval component inside its round budget.
-/// `iv_join_recorded` with intra's join tolerance (IV_WIDEN_JOINS): the
-/// first few growths per stored slot keep the exact union -- which is
-/// what lets a self-bounded loop accumulator converge to its true range
-/// instead of snapping past it to a rung -- and only a slot that keeps
-/// growing widens. Returns the joined interval and the updated grow
-/// count; a missing side clears both (no claim, no history).
-pub(crate) fn iv_join_tolerant(
-    new: Option<ValueRange>,
-    stored: Option<ValueRange>,
-    grow: u8,
-) -> (Option<ValueRange>, u8) {
-    match (new, stored) {
-        (Some(n), Some(st)) => {
-            let u = n.hull(st);
-            if u == st {
-                (Some(st), grow)
-            } else if grow >= IV_WIDEN_JOINS {
-                (iv_join_recorded(n, st), grow)
-            } else {
-                (Some(u), grow + 1)
-            }
-        }
-        _ => (None, 0),
-    }
-}
-
-pub(crate) fn iv_join_recorded(new: ValueRange, stored: ValueRange) -> Option<ValueRange> {
-    let u = new.hull(stored);
-    let lo = if u.lo >= stored.lo {
-        Some(u.lo)
-    } else {
-        widen_lo(u.lo)
-    };
-    let hi = if u.hi <= stored.hi {
-        Some(u.hi)
-    } else {
-        widen_hi(u.hi)
-    };
-    match (lo, hi) {
-        (Some(a), Some(b)) => Some(ValueRange::new(a, b)),
-        _ => None,
     }
 }
 

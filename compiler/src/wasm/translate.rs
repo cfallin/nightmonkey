@@ -21,7 +21,7 @@ use waffle::{
 
 use crate::bytecode::{JSOp, OpcodeVisitor, Script};
 use crate::options::Options;
-use crate::source::{ScopeData, Source, SourceObject};
+use crate::source::Source;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 /// Resolved runtime-helper function indices in the merged module + the shared
@@ -39,10 +39,6 @@ pub struct Helpers {
     /// appended bodies live here; a specialized call dispatches through it with
     /// the callee's `nightFuncIndex`.
     pub indirect_table: Table,
-    /// `night_runtime_callee_night_target(callee) -> i64` (leaf): classify a call target;
-    /// non-zero packs `(JSScript* << 32) | nightFuncIndex` for a `call_indirect`,
-    /// zero means fall back to the generic helper.
-    pub callee_night_target: Func,
     /// An inert `night_abi_sig` function used as the initial target of a Direct
     /// call's emitted `call` instruction. After placement the caller rewrites the
     /// `function_index` to the resolved callee (and the constant-folded guard to
@@ -54,12 +50,12 @@ pub struct Helpers {
     /// part 2): same params, multivalue returns `(err, eff)` where `eff`
     /// is the effect-provenance flag (1 = this invocation provably ran no
     /// GC and no heap mutation, so the caller's facts survive; 0 = assume
-    /// everything). BBV-lane bodies carry this signature; the C-visible
+    /// everything). MIR and baseline bodies carry this signature; the C-visible
     /// funcref table holds per-script `night_abi_sig` adapters that call
     /// the body and drop `eff`, so runtime entries and `call_indirect`
     /// never see multivalue.
     pub night_abi_sig2: Signature,
-    /// Inert `night_abi_sig2` stub: the initial target of a BBV direct
+    /// Inert `night_abi_sig2` stub: the initial target of a widened direct
     /// call, rewritten at placement exactly as `direct_call_stub`.
     pub direct_call_stub2: Func,
     /// `night_runtime_add(cx, a, b, out) -> ok` (generic JS `+`).
@@ -84,9 +80,6 @@ pub struct Helpers {
     /// `night_runtime_construct(cx, sp, argc, out) -> ok` (generic `new`; the frame is
     /// `[callee, this_placeholder, arg0..arg_{argc-1}, newTarget]`).
     pub construct: Func,
-    /// `night_runtime_get_property(cx, recv, atomId, out) -> ok`: the generic
-    /// property get helper.
-    pub get_property: Func,
     /// `night_runtime_set_property(cx, recv, atomId, val) -> ok`: the generic
     /// property set helper.
     pub set_property: Func,
@@ -159,10 +152,6 @@ pub struct Helpers {
     /// `night_runtime_get_intrinsic(cx, atomId, out) -> ok` (self-hosted intrinsic
     /// value by name; may lazily clone from the self-hosting zone).
     pub get_intrinsic: Func,
-    /// `night_runtime_strlit_verify(cx, strPtr, atomId)` (leaf; debug only):
-    /// crash if the inline-materialized string mismatches the atom table
-    /// entry.
-    pub strlit_verify: Func,
     /// `night_runtime_str_chars_eq(aPtr, bPtr) -> 0/1` (pure leaf): char equality of
     /// two linear same-length strings (the inline compare arm's residual).
     pub str_chars_eq: Func,
@@ -345,11 +334,6 @@ pub struct Helpers {
     /// `night_runtime_set_mapped_arg(argsobj, i, value)`: mapped-arguments formal
     /// write through the args object (runs the GCPtr barriers). Leaf.
     pub set_mapped_arg: Func,
-    /// `night_runtime_validate_this_layout(this, layout_id)`: check every predicted
-    /// (field, fixed slot) of the layout against the live object's shape and
-    /// publish the shape word (or the invalid sentinel) into the layout's
-    /// guard cell. Leaf (lookupPure; no GC, no throw).
-    pub validate_this_layout: Func,
     /// `night_runtime_in(cx, top, id, obj) -> ok` (`key in obj`; boxed boolean out).
     pub in_: Func,
     /// `night_runtime_has_own(cx, top, id, val) -> ok` (boxed boolean out).
@@ -502,29 +486,11 @@ pub struct Helpers {
     /// logical `index` to the unshifted store-buffer index from the owner (so a
     /// post-`.shift()` array records the right edge). No rooting/err handshake.
     pub post_write_barrier_elem: Func,
-    /// `night_runtime_resolve_global_slot(cx, bindingId) -> u32` (leaf): the cold
-    /// resolve-once path for a global binding. On first access the inline read
-    /// finds the binding's `gGlobalSlots` entry unresolved (0) and calls this,
-    /// which `lookupPure`s the pre-interned binding name on the global object
-    /// (non-allocating, never GCs) and writes back + returns the encoded entry
-    /// (v2: `bit0` resolved, `bit1` is-dynamic-slot, `bit2` writable,
-    /// `bits[31:3]` slot index).
-    pub resolve_global_slot: Func,
     /// `night_runtime_resolve_global_slot_guarded(cx, bindingId) -> u32` (leaf): the
     /// no-TI variant -- caches `[entry, globalShape]` only for an own plain
     /// data slot of the global object (not lexically shadowed); returns 0
     /// ("not cacheable"), sending the site to the char-based helper.
     pub resolve_global_slot_guarded: Func,
-    /// `night_runtime_set_global(cx, bindingId, valBits)` (leaf): assign a
-    /// global-object binding by its resolved slot (shared `gGlobalSlots`), with
-    /// the generational/incremental write barriers (`NativeObject::setSlot`).
-    /// Leaf: the slot store + barriers never move objects.
-    pub set_global: Func,
-    /// `night_runtime_binding_value(cx, bindingId) -> i64` (leaf): the
-    /// binding's current value bits for a compiled re-proof of a carried
-    /// per-binding value fact (armed cell, else guarded resolve + slot);
-    /// a magic Value when the name is no longer an own plain data slot.
-    pub binding_value: Func,
     /// `night_runtime_binding_written(bindingId)` (leaf): the inline
     /// `SetGName` store unarmed the binding's value-fuse cell; re-arm it.
     pub binding_written: Func,
@@ -616,14 +582,6 @@ pub struct Helpers {
     /// 0 the loose-eq nullish and truthiness arms skip the per-operand
     /// clasp walk.
     pub dda_fuse_addr_slot: u32,
-    /// Linear-memory address of the dynamic-code fuse word itself (night-owned,
-    /// zero-init; `0` == no script has been compiled from source text since
-    /// startup). Unlike the two slots above it holds no address indirection --
-    /// one load, one compare -- because the engine has no such word to point
-    /// at: the C++ runtime blows this one from `EvalKernel` and the `Function`
-    /// constructor. The BigInt-freedom claims read it, since source the static
-    /// scan never saw can mint a BigInt.
-    pub dyncode_fuse_word: u32,
     /// Linear-memory slot holding &js::ArrayObject::class_ (startup-written;
     /// the inline array-length arm's clasp identity compare).
     pub array_class_slot: u32,
@@ -688,10 +646,6 @@ pub struct Helpers {
     /// funcIndex i32) -> ok`: `JSOp::FunWithProto` -- clone the function
     /// template with an explicit proto (class heritage). Boxed fn to out-slot.
     pub fun_with_proto: Func,
-    /// `night_runtime_no_extra_indexed(obj i32) -> i32` (leaf): `1` iff neither `obj`
-    /// nor its prototype chain may have extra indexed properties -- the inline
-    /// dense-append (push) arm's proto guard.
-    pub no_extra_indexed: Func,
     /// `night_runtime_gen_is_closing(cx) -> i32` (leaf): peek-only generator-closing
     /// check (the pending magic is not cleared) for the catch-pad split.
     pub gen_is_closing: Func,
@@ -921,11 +875,6 @@ impl AtomTable {
         self.intern(name)
     }
 
-    /// The `NameId` behind an atom id.
-    pub(crate) fn emitted_name(&self, id: u32) -> NameId {
-        self.emitted[id as usize]
-    }
-
     /// The emitted names, in `atomId` order -- what the module embeds.
     pub fn emitted_names(&self) -> impl Iterator<Item = &JsString> {
         self.emitted.iter().map(|&n| self.names.get(n))
@@ -1124,7 +1073,7 @@ pub(super) const MAGIC_UNINITIALIZED_LEXICAL: u64 = 10;
 /// `JS_GENERATOR_CLOSING`: staged by the interpreter's Resume hook in the
 /// frame `this` slot to mark a re-entry, and raised as a pending exception
 /// by a forced `.return()` so the enclosing finallys run (see
-/// `bbv/generator.rs` and runtime/NightGenerator.cpp).
+/// runtime/NightGenerator.cpp).
 pub(super) const MAGIC_GENERATOR_CLOSING: u64 = 2;
 
 // Fixed-slot object layout on wasm32 (JS_NUNBOX32). Consumed by the static
@@ -1272,10 +1221,9 @@ pub use crate::region_shape::{MEGA_SET_ENTRY_BYTES, MEGA_SET_SIZE};
 // Primitive-type bits (declaration order in `PrimType`); the canonical
 // definitions live in the op-semantics vocabulary.
 pub(crate) use crate::facts::{CallForm, Claim, LikelyFacts};
-pub(crate) use crate::ids::{ArgIndex, JsString, NameId, Names, Pc, ScriptId, Site, StampKey};
+pub(crate) use crate::ids::{JsString, NameId, Names, Pc, ScriptId, Site, StampKey};
 pub(crate) use crate::opsem::{
-    Prims, TaKind, ValueRange, PRIM_BIGINT, PRIM_BOOLEAN, PRIM_DOUBLE, PRIM_INT32, PRIM_NULL,
-    PRIM_STRING, PRIM_SYMBOL, PRIM_UNDEFINED,
+    Prims, TaKind, ValueRange,
 };
 
 /// Likely this-layout input for one method script (from the likely-facts
@@ -1457,61 +1405,14 @@ pub(crate) fn patch_call(body: &mut FunctionBody, v: Value, target: waffle::Func
     }
 }
 
-/// Every primitive bit set (`PRIM_INT32 .. PRIM_BIGINT`).
-pub(crate) use crate::opsem::ALL_PRIMS;
 
 /// The absolute target pc of a relative branch at `pc` with signed `off`.
 pub(crate) fn branch_target(pc: Pc, off: i32) -> Pc {
     pc.branch(off)
 }
 
-/// Number of frame local slots: the highest local index accessed by
-/// `GetLocal`/`SetLocal`/`InitLexical`, plus one (0 if none).
-pub(crate) fn max_locals(script: &Script) -> u32 {
-    struct Scan<'b> {
-        max: &'b mut u32,
-    }
-    impl Scan<'_> {
-        fn note(&mut self, n: u32) {
-            *self.max = (*self.max).max(n + 1);
-        }
-    }
-    impl OpcodeVisitor for Scan<'_> {
-        fn get_local(&mut self, n: u32) {
-            self.note(n);
-        }
-        fn set_local(&mut self, n: u32) {
-            self.note(n);
-        }
-        fn init_lexical(&mut self, n: u32) {
-            self.note(n);
-        }
-    }
-    let mut max = 0u32;
-    script.parser().visit(Scan { max: &mut max });
-    max
-}
-
 thread_local! {
     static EDGE_REBOX: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
-}
-
-/// Back edges whose target is not a `LoopHead`, as (branch pc, target pc).
-///
-/// SpiderMonkey emits a `LoopHead` at every loop header, so this is empty for
-/// any bytecode the parser produced. It is not empty for hand-written
-/// bytecode, and the difference matters: the loop-token discipline that makes
-/// the emitted version graph reducible (DESIGN.md section 4.9) is keyed on
-/// the loop intervals, and an unmarked header gets no interval, hence no
-/// token, hence no header re-labeling -- so the cycle can acquire a second
-/// entry. The driver refuses such a script rather than emitting a graph whose
-/// loop analysis it cannot run.
-pub(crate) fn unmarked_back_edges(script: &Script) -> Vec<(u32, u32)> {
-    let scan = loop_scan(script);
-    scan.back_edges
-        .into_iter()
-        .filter(|(_, target)| !scan.loopheads.contains(target))
-        .collect()
 }
 
 pub(crate) fn scan_loop_intervals(script: &Script) -> Vec<(u32, u32)> {
@@ -1913,183 +1814,6 @@ pub(crate) fn compute_args_reads(script: &Script, is_length: &dyn Fn(u32) -> boo
     (s.ok && !s.reads.is_empty()).then_some(s.reads)
 }
 
-/// Call pcs whose callee operand came from a `GetGName` of a syntactic
-/// global binding, mapped to that binding id. Carrying it on the operand
-/// instead does not work under per-op BBV, which loses operand-local state at
-/// every block boundary, so the pcs are pre-scanned.
-///
-/// Tracked over a straight-line run only: the symbolic stack is cleared at
-/// every `JumpTarget`/`LoopHead` (a merge point can be reached with different
-/// operands). Generic stack effects come from the visitor's nuses/ndefs, so a
-/// new opcode cannot silently desynchronize the model.
-///
-/// A wrong attribution is harmless, not unsound: the emitted arm still proves
-/// itself with the cell's own bits compare, and the reactor only ever arms a
-/// cell with a value whose AOT target is the expected callee. Getting it wrong
-/// can only cost a missed fast path (or a spurious binding conflict).
-/// Also returned: the call pcs whose callee is a property read off a
-/// `GetGName` value (`Global.method(...)`, the static-method shape, which
-/// on the benchmarks is almost always an engine native such as
-/// `String.fromCharCode`) -- the population the native-route keep arms
-/// beside the `.call`/`.apply` sites (call.rs `pre_native`).
-pub(crate) fn compute_gname_call_bids(
-    source: &Source,
-    script: &Script,
-    names: &Names,
-    syn_gnames: &HashMap<NameId, u32>,
-) -> (HashMap<Pc, u32>, HashSet<Pc>) {
-    #[derive(Clone, Copy)]
-    enum Sym {
-        Top,
-        /// A GetGName, with its syntactic binding when it has one.
-        GName(Option<u32>),
-        /// A GetProp off a GetGName.
-        Method,
-    }
-    struct Scan<'a> {
-        source: &'a Source,
-        script: &'a Script,
-        names: &'a Names,
-        syn_gnames: &'a HashMap<NameId, u32>,
-        /// Symbolic operand stack.
-        stack: Vec<Sym>,
-        /// Set by `before_op` for the `get_g_name` callback to consume.
-        pending_gname: bool,
-        out: HashMap<Pc, u32>,
-        methods: HashSet<Pc>,
-    }
-    impl OpcodeVisitor for Scan<'_> {
-        fn before_op(&mut self, pc: Pc, op: JSOp, nuses: usize, ndefs: usize) {
-            use JSOp::*;
-            self.pending_gname = false;
-            if matches!(op, JumpTarget | LoopHead) {
-                self.stack.clear();
-                return;
-            }
-            if let Call | CallContent | CallIgnoresRv | CallIter | CallContentIter = op {
-                // Frame is [callee, this, args..]; nuses covers all of it.
-                if self.stack.len() >= nuses {
-                    match self.stack[self.stack.len() - nuses] {
-                        Sym::GName(Some(bid)) => {
-                            self.out.insert(pc, bid);
-                        }
-                        Sym::Method => {
-                            self.methods.insert(pc);
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            if self.stack.len() < nuses {
-                // Desynchronized (a jump landed mid-expression): resync empty
-                // rather than guess -- every entry is a hint, never a proof.
-                self.stack.clear();
-            } else {
-                match op {
-                    // The shapes that carry a marker through: `Dup` copies
-                    // the top, `Swap` exchanges the top two, a `GetProp` off
-                    // a global value marks a method.
-                    Dup => {
-                        let top = *self.stack.last().unwrap();
-                        self.stack.push(top);
-                        return;
-                    }
-                    Swap => {
-                        let n = self.stack.len();
-                        self.stack.swap(n - 1, n - 2);
-                        return;
-                    }
-                    GetProp if nuses == 1 && ndefs == 1 => {
-                        let recv = self.stack.pop().unwrap();
-                        self.stack.push(match recv {
-                            Sym::GName(_) => Sym::Method,
-                            _ => Sym::Top,
-                        });
-                        return;
-                    }
-                    _ => {}
-                }
-                self.stack.truncate(self.stack.len() - nuses);
-            }
-            if op == GetGName && ndefs == 1 {
-                self.pending_gname = true;
-                return;
-            }
-            self.stack.extend((0..ndefs).map(|_| Sym::Top));
-        }
-        fn get_g_name(&mut self, name_index: u32) {
-            if !self.pending_gname {
-                return;
-            }
-            let bid = self
-                .script
-                .gcthings
-                .get(name_index as usize)
-                .and_then(|&gc| match self.source.object(gc) {
-                    SourceObject::String(s) => self
-                        .names
-                        .lookup(s.chars())
-                        .and_then(|n| self.syn_gnames.get(&n).copied()),
-                    _ => None,
-                });
-            self.stack.push(Sym::GName(bid));
-        }
-    }
-    let s = script.parser().visit(Scan {
-        source,
-        script,
-        names,
-        syn_gnames,
-        stack: Vec::new(),
-        pending_gname: false,
-        out: HashMap::default(),
-        methods: HashSet::default(),
-    });
-    (s.out, s.methods)
-}
-
-/// Capability gate for the environment model: the translator models a
-/// function's environment head as an optional single `CallObject` over the
-/// genuine `callee->environment()`. Returns `Some(reason)` (decline) when the
-/// function would instantiate environment objects we don't model -- currently
-/// a named-lambda environment (created in the prologue, inserting a chain link
-/// the runtime helpers' `hops` walk would otherwise miscount). Block/`with`/
-/// extra-body-var environments are gated separately by their (unsupported) ops
-/// (`PushLexicalEnv`/`EnterWith`/`InitAliasedLexical`/...).
-pub(crate) fn env_unsupported(source: &Source, script: &Script) -> Option<String> {
-    let bs_id = script.body_scope?;
-    let SourceObject::Scope(ScopeData {
-        kind, enclosing, ..
-    }) = source.object(bs_id)
-    else {
-        return Some("aliased vars but body scope is not a Scope".to_string());
-    };
-    // ScopeKind::Function == 0, ScopeKind::Global == 12 (js/src/vm/Scope.h).
-    // A Function body's env head is its (optional) CallObject over
-    // `callee->environment()`; a Global body's env head is the global lexical
-    // environment, which already exists at runtime (nothing is allocated) and is
-    // what `NightEnvSetup` returns for a global script. Any other body
-    // scope with aliased vars is an environment shape we don't model.
-    if *kind != 0 && *kind != 12 {
-        return Some(format!(
-            "aliased vars under non-Function body scope (kind {kind})"
-        ));
-    }
-    if let Some(enc_id) = enclosing {
-        if let SourceObject::Scope(ScopeData {
-            is_named_lambda,
-            has_environment,
-            ..
-        }) = source.object(*enc_id)
-        {
-            if *is_named_lambda && *has_environment {
-                return Some("named-lambda environment unsupported".to_string());
-            }
-        }
-    }
-    None
-}
-
 /// The stable per-module translation context threaded into every script's
 /// translation: the resolved helpers, the shared source, the module-wide
 /// switches (inline budget, night_compiler/bigint gates), and the read-only analysis
@@ -2100,18 +1824,11 @@ pub struct TranslateCtx<'a> {
     pub helpers: Helpers,
     pub source: &'a Source,
     pub opts: &'a Options,
-    pub bigint_free: bool,
     pub syn_gnames: &'a HashMap<NameId, u32>,
-    /// See `EnvLayout::gcell_bids`.
-    pub gcell_bids: &'a HashSet<u32>,
-    pub likely_fns: &'a HashMap<NameId, ScriptId>,
     /// The analysis output. Tables the translator reads unchanged are read
     /// straight off this; the `*_in` fields below are the ones the env
     /// layout DERIVES (address-bearing descriptors, merged views).
     pub facts: &'a LikelyFacts,
-    /// Sids whose returned flags word some caller can consume (bbv
-    /// compute_flag_demand); only these bodies pay accumulator ORs.
-    pub flag_demand: &'a rustc_hash::FxHashSet<ScriptId>,
     pub this_layouts_in: &'a HashMap<ScriptId, ThisLayoutIn>,
     pub stamp_ctors_in: &'a HashMap<ScriptId, StampCtorIn>,
     /// Per property name: every layout that predicts it, and where. The
@@ -2142,17 +1859,9 @@ pub struct TranslateCtx<'a> {
     /// every predicted field is a fixed slot, as the add check wants.
     pub lit_nslots_in: &'a HashMap<Site, u32>,
     pub prop_sites_in: &'a HashMap<Site, PropSiteIn>,
-    /// Stamp key -> field name -> value mask. Layout-wide, so a receiver
-    /// carrying a proven class fact can answer "does this field hold a
-    /// number claim?" at a site with no row of its own (see bbv's
-    /// store-choke elision).
-    pub layout_field_masks_in: &'a HashMap<StampKey, HashMap<NameId, Claim>>,
     /// Same keying, each field's full predicted type (`ClassFieldFacts::
     /// types`): what MIR's TYPES bit asserts, for any type.
     pub layout_field_types_in: &'a HashMap<StampKey, HashMap<NameId, Claim>>,
-    /// Same keying as `layout_field_masks_in`, the range claims (absent
-    /// name = no claim). Drives the store choke's range action.
-    pub layout_field_ranges_in: &'a HashMap<StampKey, HashMap<NameId, ValueRange>>,
     /// Array alloc site -> the whole class word a compiled allocation
     /// writes: the array's stamp key plus the validity bits that seed with
     /// it (`CLASS_WORD_*`), not a bare key.
@@ -2162,8 +1871,6 @@ pub struct TranslateCtx<'a> {
     pub array_elem_in: &'a HashMap<Site, ArrayElemIn>,
     /// Intersection of every array claim (see `EnvLayout`).
     pub array_any_claim: Option<ValueRange>,
-    /// `facts.elem_sites` merged with `facts.field_sites` (see `EnvLayout`).
-    pub likely_elems: &'a HashMap<Site, Claim>,
     /// Global names whose binding is fused to a constant.
     pub fused_gnames: &'a HashMap<NameId, FusedGname>,
 }
@@ -2213,11 +1920,11 @@ pub struct FuseCallPatch {
     pub callee: ScriptId,
 }
 
-/// The value-boxing forms that must agree between the synthetic helper
-/// bodies here and the inline lowerings in `bbv`: a NaN reaching the boxed
+/// The value-boxing forms of the synthetic helper bodies here, which the
+/// compiled tiers' inline boxing must agree with: a NaN reaching the boxed
 /// representation has to be canonical (a raw NaN payload aliases the nunbox
 /// tag space), and a double that is exactly an int32 -- but not -0 -- re-tags
-/// as int32. Two emitters, one definition.
+/// as int32.
 pub(super) trait BoxEmit {
     fn emit_un(&mut self, op: Operator, a: Value, result: Type) -> Value;
     fn emit_bin(&mut self, op: Operator, a: Value, b: Value, result: Type) -> Value;
@@ -2520,7 +2227,7 @@ const ORDER_TA_KINDS: [TaKind; 9] = [
 ];
 
 // Inline-IC way field offsets and the mega-table key/payload offsets, mirrored
-// from the layout note above (and from `bbv::abi`, which spells the same bytes
+// from the layout note above (and from `mir::abi`, which spells the same bytes
 // for the inlined arms).
 const IC_WAY_RECVSHAPE: u32 = 0;
 const IC_WAY_MONO_OFF: u32 = 4;
@@ -2528,7 +2235,7 @@ const IC_WAY_HOLDERPTR: u32 = 8;
 const MEGA_SHAPE: u32 = 0;
 const MEGA_ATOM: u32 = 4;
 const MEGA_HOLDERPTR: u32 = 8;
-/// `NativeObject::slots_`, the out-of-line slot vector (mirrors `bbv::abi`).
+/// `NativeObject::slots_`, the out-of-line slot vector (mirrors `mir::abi`).
 const NATIVE_SLOTS_OFFSET: u32 = 8;
 
 impl RawEmit {
@@ -2542,8 +2249,7 @@ impl RawEmit {
     }
 
     /// Load an object slot from a cache row's coordinate (`NightSlotEnc`:
-    /// byte offset | is-dynamic bit). The inline twin is
-    /// `Bbv::emit_slot_addr`.
+    /// byte offset | is-dynamic bit).
     fn slot_load(&mut self, obj: Value, slot_enc: Value) -> Value {
         let one = self.i32c(1);
         let is_dynamic = self.bin(Operator::I32And, slot_enc, one, Type::I32);
@@ -2684,7 +2390,7 @@ pub fn build_ic_get_helper(m: &mut Module, mem: Memory, mega_get_base: u32) -> F
     let mega_blk = e.body.add_block();
     e.condbr(last_empty, miss, mega_blk);
     e.cur = mega_blk;
-    // The hash mirrors `Bbv::emit_mega_probe` / NightRuntime.cpp's MegaGetSlot.
+    // The hash mirrors NightRuntime.cpp's MegaGetSlot.
     // Inlined, the atom half folds into an immediate; here the atom is a
     // parameter, so it costs one multiply on a path that is never hot.
     let three = e.i32c(3);
@@ -2884,8 +2590,7 @@ pub fn build_ta_poly_helpers(m: &mut Module, mem: Memory, ta_class_base: u32) ->
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::facts::CallResolution;
-    use crate::source::SourceObjectId;
+    use crate::source::{ScopeData, SourceObject, SourceObjectId};
     use waffle::entity::EntityRef;
     use waffle::SignatureData;
     use waffle::{MemoryData, Module};
@@ -2899,12 +2604,8 @@ mod tests {
             helpers,
             source,
             opts,
-            bigint_free: false,
             syn_gnames: empty_syn_gnames(),
-            gcell_bids: empty_gcell_bids(),
-            likely_fns: empty_likely_fns(),
             facts: empty_facts(),
-            flag_demand: empty_flag_demand(),
             this_layouts_in: empty_this_layouts(),
             stamp_ctors_in: empty_stamp_ctors(),
             layout_addpred_in: empty_layout_addpred(),
@@ -2916,20 +2617,16 @@ mod tests {
             lit_stamps_in: empty_lit_stamps(),
             lit_nslots_in: empty_lit_stamps(),
             prop_sites_in: empty_prop_sites(),
-            layout_field_masks_in: empty_layout_field_masks(),
-            layout_field_types_in: empty_layout_field_masks(),
-            layout_field_ranges_in: empty_layout_field_ranges(),
+            layout_field_types_in: empty_layout_field_types(),
             array_stamp_in: empty_array_stamp(),
             array_elem_in: empty_array_elem(),
             array_any_claim: None,
-            likely_elems: empty_elem_sites(),
             fused_gnames: empty_fused_gnames(),
         }
     }
 
-    /// Translate one script with no analysis input, through the production
-    /// entry point -- the engine calls `bbv::translate_script` directly, and
-    /// this must not become a second way in.
+    /// Translate one script with no analysis input with the baseline tier,
+    /// through its production entry point.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn translate_script(
         m: &mut Module,
@@ -2941,21 +2638,7 @@ mod tests {
         opts: &Options,
     ) -> Result<Outcome, String> {
         let ctx = empty_ctx(helpers, source, opts);
-        crate::wasm::bbv::translate_script(&ctx, m, atoms, ScriptId::new(source_id), script, false)
-    }
-
-    /// `translate_script` with inlining off and the night tier disabled.
-    pub(crate) fn translate_script_bbv(
-        m: &mut Module,
-        helpers: Helpers,
-        source: &Source,
-        atoms: &mut AtomTable,
-        source_id: u32,
-        script: &Script,
-    ) -> Result<Outcome, String> {
-        let opts = Options::default();
-        let ctx = empty_ctx(helpers, source, &opts);
-        crate::wasm::bbv::translate_script(&ctx, m, atoms, ScriptId::new(source_id), script, false)
+        crate::wasm::baseline::translate_script(&ctx, m, atoms, ScriptId::new(source_id), script, false)
     }
 
     /// Define a `fn $name() -> &'static $ty` returning a process-shared
@@ -2972,34 +2655,20 @@ mod tests {
 
     empty_table!(empty_facts, LikelyFacts);
 
-    /// A `LikelyFacts` with one table filled in.
-    fn facts_with(fill: impl FnOnce(&mut LikelyFacts)) -> LikelyFacts {
-        let mut f = LikelyFacts::default();
-        fill(&mut f);
-        f
-    }
     empty_table!(empty_construct_sites, HashMap<Site, StampCtorIn>);
     empty_table!(empty_lit_stamps, HashMap<Site, u32>);
     empty_table!(empty_fused_gnames, HashMap<NameId, FusedGname>);
     empty_table!(empty_prop_sites, HashMap<Site, PropSiteIn>);
-    empty_table!(empty_elem_sites, HashMap<Site, Claim>);
     empty_table!(empty_this_layouts, HashMap<ScriptId, ThisLayoutIn>);
     empty_table!(empty_stamp_ctors, HashMap<ScriptId, StampCtorIn>);
     empty_table!(empty_arg_restamps, HashMap<ScriptId, (u32, StampCtorIn)>);
     empty_table!(empty_local_restamps, HashMap<Site, (u32, StampCtorIn)>);
     empty_table!(empty_layout_addpred, HashMap<NameId, Vec<AddPred>>);
     empty_table!(empty_ctor_nslots, HashMap<ScriptId, u32>);
-    empty_table!(empty_likely_fns, HashMap<NameId, ScriptId>);
-    empty_table!(empty_gcell_bids, HashSet<u32>);
-    empty_table!(empty_layout_field_masks, HashMap<StampKey, HashMap<NameId, Claim>>);
-    empty_table!(
-        empty_layout_field_ranges,
-        HashMap<StampKey, HashMap<NameId, ValueRange>>
-    );
+    empty_table!(empty_layout_field_types, HashMap<StampKey, HashMap<NameId, Claim>>);
     empty_table!(empty_array_stamp, HashMap<Site, u32>);
     empty_table!(empty_array_elem, HashMap<Site, ArrayElemIn>);
     empty_table!(empty_syn_gnames, HashMap<NameId, u32>);
-    empty_table!(empty_flag_demand, rustc_hash::FxHashSet<ScriptId>);
     fn op_byte(o: JSOp) -> u8 {
         o as u16 as u8
     }
@@ -3080,12 +2749,6 @@ mod tests {
             max: None,
             func_elements: Some(vec![waffle::Func::invalid()]),
         });
-        // callee_night_target: (callee i64) -> i64.
-        let cat_sig = m.signatures.push(SignatureData {
-            params: vec![Type::I64],
-            returns: vec![Type::I64],
-        });
-        let callee_night_target = stub_i64(&mut m, cat_sig, "night_runtime_callee_night_target");
         let direct_call_stub = stub(&mut m, night_abi_sig, true, "night_direct_stub");
         let night_abi_sig2 = m.signatures.push(SignatureData {
             params: vec![
@@ -3203,7 +2866,6 @@ mod tests {
             params: vec![Type::I32; 5],
             returns: vec![Type::I32],
         });
-        let get_property = stub(&mut m, getp_sig, true, "night_runtime_get_property");
         let set_property = stub(&mut m, setp_sig, true, "night_runtime_set_property");
         // IC get: (cx i32, top i32, recv i64, atomId i32, cacheIdx i32) -> i32.
         let getic_sig = m.signatures.push(SignatureData {
@@ -3252,7 +2914,6 @@ mod tests {
             returns: vec![Type::I32],
         });
         let get_intrinsic_cell = stub(&mut m, gic_sig, true, "night_runtime_get_intrinsic_cell");
-        let strlit_verify = stub(&mut m, getg_sig, true, "night_runtime_strlit_verify");
         let chars_eq_sig = m.signatures.push(SignatureData {
             params: vec![Type::I32, Type::I32],
             returns: vec![Type::I32],
@@ -3711,24 +3372,12 @@ mod tests {
             params: vec![Type::I32, Type::I32],
             returns: vec![Type::I32],
         });
-        let resolve_global_slot = stub(&mut m, rgs_sig, true, "night_runtime_resolve_global_slot");
         let resolve_global_slot_guarded = stub(
             &mut m,
             rgs_sig,
             true,
             "night_runtime_resolve_global_slot_guarded",
         );
-        let bv_sig = m.signatures.push(SignatureData {
-            params: vec![Type::I32, Type::I32],
-            returns: vec![Type::I64],
-        });
-        let binding_value = stub_i64(&mut m, bv_sig, "night_runtime_binding_value");
-        // set_global: (cx i32, bindingId i32, valBits i64) -> void.
-        let setg_sig = m.signatures.push(SignatureData {
-            params: vec![Type::I32, Type::I32, Type::I64],
-            returns: vec![],
-        });
-        let set_global = stub(&mut m, setg_sig, false, "night_runtime_set_global");
         let bw_sig = m.signatures.push(SignatureData {
             params: vec![Type::I32],
             returns: vec![],
@@ -3817,7 +3466,6 @@ mod tests {
             params: vec![Type::I32],
             returns: vec![Type::I32],
         });
-        let no_extra_indexed = stub(&mut m, nei_sig, true, "night_runtime_no_extra_indexed");
         let gen_is_closing = stub(&mut m, nei_sig, true, "night_runtime_gen_is_closing");
         let mir_stress = stub(&mut m, nei_sig, true, "night_runtime_mir_stress");
         // slots_covered: (obj i32, n i32) -> i32 (leaf).
@@ -3924,13 +3572,6 @@ mod tests {
             returns: vec![],
         });
         let set_mapped_arg = stub(&mut m, sma_sig, false, "night_runtime_set_mapped_arg");
-        // validate_this_layout: (this i64, layout_id i32) -> ().
-        let vtl_sig = m.signatures.push(SignatureData {
-            params: vec![Type::I64, Type::I32],
-            returns: vec![],
-        });
-        let validate_this_layout =
-            stub(&mut m, vtl_sig, false, "night_runtime_validate_this_layout");
         // iter: (cx, top, val i64) -> i32; more_iter: (cx, iter i64) -> i64;
         // end_iter: (cx, iter i64) -> ().
         let iter_sig = m.signatures.push(SignatureData {
@@ -4032,7 +3673,6 @@ mod tests {
                 direct_call_stub,
                 night_abi_sig2,
                 direct_call_stub2,
-                callee_night_target,
                 add,
                 concat,
                 call,
@@ -4040,7 +3680,6 @@ mod tests {
                 native_dispatch,
                 apply_fwd,
                 construct,
-                get_property,
                 set_property,
                 get_prop_ic_miss,
                 set_prop_ic_miss,
@@ -4052,7 +3691,6 @@ mod tests {
                 string,
                 get_intrinsic,
                 get_intrinsic_cell,
-                strlit_verify,
                 str_chars_eq,
                 tonumeric,
                 pos,
@@ -4064,7 +3702,6 @@ mod tests {
                 box_nonstrict_this,
                 get_mapped_arg,
                 set_mapped_arg,
-                validate_this_layout,
                 iter_,
                 more_iter,
                 end_iter,
@@ -4151,11 +3788,8 @@ mod tests {
                 post_write_barrier,
                 post_write_barrier_elem,
                 pre_write_barrier,
-                resolve_global_slot,
                 resolve_global_slot_guarded,
-                set_global,
                 binding_written,
-                binding_value,
                 global_slots_base: 0,
                 prop_ic_base: 0,
                 prop_ic_gen_base: 0,
@@ -4176,7 +3810,6 @@ mod tests {
                 str_fcc_cell: 48,
                 str_fuse_addr_slot: 56,
                 dda_fuse_addr_slot: 57,
-                dyncode_fuse_word: 64 + 8 * BC_COUNT + 40 + 12,
                 array_class_slot: 60,
                 args_class_base: 64 + 8 * BC_COUNT + 40,
                 strlit_slot: 64 + 8 * BC_COUNT + 40 + 16,
@@ -4208,7 +3841,6 @@ mod tests {
                 take_dispose_capability,
                 create_suppressed_error,
                 resume,
-                no_extra_indexed,
                 gen_is_closing,
                 mir_stress,
                 slots_covered,
@@ -4285,2025 +3917,6 @@ mod tests {
         m.funcs
             .push(waffle::FuncDecl::Body(sig, "leaf".to_string(), body));
 
-        let bytes = m.to_wasm_bytes().expect("serialize");
-        if let Some(dir) = std::env::var_os("NIGHT_TEST_DUMP") {
-            let _ = std::fs::write(std::path::Path::new(&dir).join("test.wasm"), &bytes);
-        }
-        waffle::wasmparser::validate(&bytes).expect("emitted module validates");
-    }
-
-    /// The BBV driver compiles the same leaf, GEN-only, and the module
-    /// validates end to end.
-    #[test]
-    fn bbv_leaf_add_one_compiles_and_validates() {
-        let code = vec![
-            op_byte(JSOp::GetArg),
-            0,
-            0,
-            op_byte(JSOp::One),
-            op_byte(JSOp::Add),
-            op_byte(JSOp::Return),
-        ];
-        let s = script(code, 1);
-        let (mut m, helpers) = module_with_helpers();
-        let source = Source {
-            objects: vec![],
-            global_object: None,
-            selfhosted: Vec::new(),
-            regex_programs: Vec::new(),
-        };
-        let mut atoms = AtomTable::new(Names::default());
-        let outcome =
-            translate_script_bbv(&mut m, helpers, &source, &mut atoms, 7, &s).expect("translate");
-        let (sig, body) = match outcome {
-            Outcome::Compiled { sig, body, .. } => (sig, body),
-            Outcome::Skipped(op) => panic!("unexpectedly skipped on {op:?}"),
-        };
-        m.funcs
-            .push(waffle::FuncDecl::Body(sig, "leaf".to_string(), body));
-        let bytes = m.to_wasm_bytes().expect("serialize");
-        if let Some(dir) = std::env::var_os("NIGHT_TEST_DUMP") {
-            let _ = std::fs::write(std::path::Path::new(&dir).join("test.wasm"), &bytes);
-        }
-        waffle::wasmparser::validate(&bytes).expect("emitted module validates");
-    }
-
-    /// The BBV driver handles branchy control flow (a JumpIfFalse diamond
-    /// merging through the version table) and a call frame.
-    #[test]
-    fn bbv_branch_and_call_validate() {
-        // GetArg 0; JumpIfFalse +14; GetArg 0; Undefined; Call 0; Return;
-        // fall-through: Zero; Return
-        let code = vec![
-            op_byte(JSOp::GetArg),
-            0,
-            0,
-            op_byte(JSOp::JumpIfFalse),
-            13,
-            0,
-            0,
-            0,
-            op_byte(JSOp::GetArg),
-            0,
-            0,
-            op_byte(JSOp::Undefined),
-            op_byte(JSOp::Call),
-            0,
-            0,
-            op_byte(JSOp::Return),
-            op_byte(JSOp::Zero),
-            op_byte(JSOp::Return),
-        ];
-        let s = script(code, 1);
-        let (mut m, helpers) = module_with_helpers();
-        let source = Source {
-            objects: vec![],
-            global_object: None,
-            selfhosted: Vec::new(),
-            regex_programs: Vec::new(),
-        };
-        let mut atoms = AtomTable::new(Names::default());
-        let outcome =
-            translate_script_bbv(&mut m, helpers, &source, &mut atoms, 8, &s).expect("translate");
-        let (sig, body) = match outcome {
-            Outcome::Compiled { sig, body, .. } => (sig, body),
-            Outcome::Skipped(op) => panic!("unexpectedly skipped on {op:?}"),
-        };
-        m.funcs
-            .push(waffle::FuncDecl::Body(sig, "f".to_string(), body));
-        let bytes = m.to_wasm_bytes().expect("serialize");
-        if let Some(dir) = std::env::var_os("NIGHT_TEST_DUMP") {
-            let _ = std::fs::write(std::path::Path::new(&dir).join("test.wasm"), &bytes);
-        }
-        waffle::wasmparser::validate(&bytes).expect("emitted module validates");
-    }
-
-    /// An int32 counter loop through the BBV version table. Exercises
-    /// literal facts, SetLocal strong update, the theta OPT join on the back
-    /// edge (the header's int32 ctx is preserved by the body), the i32
-    /// compare form, and the Add int arm's per-arm overflow continuation.
-    #[test]
-    fn bbv_int_loop_versions_validate() {
-        // pc0: Zero; pc1: SetLocal 0; pc5: Pop;
-        // pc6: LoopHead; pc12: GetLocal 0; pc16: Int8 10; pc18: Lt;
-        // pc19: JumpIfFalse +21 (-> pc40);
-        // pc24: GetLocal 0; pc28: One; pc29: Add; pc30: SetLocal 0;
-        // pc34: Pop; pc35: Goto -29 (-> pc6);
-        // pc40: Zero; pc41: Return
-        let code = vec![
-            op_byte(JSOp::Zero),
-            op_byte(JSOp::SetLocal),
-            0,
-            0,
-            0,
-            op_byte(JSOp::Pop),
-            op_byte(JSOp::LoopHead),
-            0,
-            0,
-            0,
-            0,
-            0,
-            op_byte(JSOp::GetLocal),
-            0,
-            0,
-            0,
-            op_byte(JSOp::Int8),
-            10,
-            op_byte(JSOp::Lt),
-            op_byte(JSOp::JumpIfFalse),
-            21,
-            0,
-            0,
-            0,
-            op_byte(JSOp::GetLocal),
-            0,
-            0,
-            0,
-            op_byte(JSOp::One),
-            op_byte(JSOp::Add),
-            op_byte(JSOp::SetLocal),
-            0,
-            0,
-            0,
-            op_byte(JSOp::Pop),
-            op_byte(JSOp::Goto),
-            (-29i32 as u32 & 0xFF) as u8,
-            0xFF,
-            0xFF,
-            0xFF,
-            op_byte(JSOp::Zero),
-            op_byte(JSOp::Return),
-        ];
-        let s = script(code, 0);
-        let (mut m, helpers) = module_with_helpers();
-        let source = Source {
-            objects: vec![],
-            global_object: None,
-            selfhosted: Vec::new(),
-            regex_programs: Vec::new(),
-        };
-        let mut atoms = AtomTable::new(Names::default());
-        let outcome =
-            translate_script_bbv(&mut m, helpers, &source, &mut atoms, 9, &s).expect("translate");
-        let (sig, body) = match outcome {
-            Outcome::Compiled { sig, body, .. } => (sig, body),
-            Outcome::Skipped(op) => panic!("unexpectedly skipped on {op:?}"),
-        };
-        m.funcs
-            .push(waffle::FuncDecl::Body(sig, "loop".to_string(), body));
-        let bytes = m.to_wasm_bytes().expect("serialize");
-        if let Some(dir) = std::env::var_os("NIGHT_TEST_DUMP") {
-            let _ = std::fs::write(std::path::Path::new(&dir).join("test.wasm"), &bytes);
-        }
-        waffle::wasmparser::validate(&bytes).expect("emitted module validates");
-    }
-
-    /// Mixed-type arith arms validate -- an argument of unknown type
-    /// through Add/Mul/compare exercises the tag-tested per-arm
-    /// continuations (int fall-through, f64 and helper side arms).
-    #[test]
-    fn bbv_unknown_type_arith_arms_validate() {
-        // GetArg 0; One; Add; GetArg 0; Mul; GetArg 0; Lt; Return
-        let code = vec![
-            op_byte(JSOp::GetArg),
-            0,
-            0,
-            op_byte(JSOp::One),
-            op_byte(JSOp::Add),
-            op_byte(JSOp::GetArg),
-            0,
-            0,
-            op_byte(JSOp::Mul),
-            op_byte(JSOp::GetArg),
-            0,
-            0,
-            op_byte(JSOp::Lt),
-            op_byte(JSOp::Return),
-        ];
-        let s = script(code, 1);
-        let (mut m, helpers) = module_with_helpers();
-        let source = Source {
-            objects: vec![],
-            global_object: None,
-            selfhosted: Vec::new(),
-            regex_programs: Vec::new(),
-        };
-        let mut atoms = AtomTable::new(Names::default());
-        let outcome =
-            translate_script_bbv(&mut m, helpers, &source, &mut atoms, 10, &s).expect("translate");
-        let (sig, body) = match outcome {
-            Outcome::Compiled { sig, body, .. } => (sig, body),
-            Outcome::Skipped(op) => panic!("unexpectedly skipped on {op:?}"),
-        };
-        m.funcs
-            .push(waffle::FuncDecl::Body(sig, "arms".to_string(), body));
-        let bytes = m.to_wasm_bytes().expect("serialize");
-        if let Some(dir) = std::env::var_os("NIGHT_TEST_DUMP") {
-            let _ = std::fs::write(std::path::Path::new(&dir).join("test.wasm"), &bytes);
-        }
-        waffle::wasmparser::validate(&bytes).expect("emitted module validates");
-    }
-
-    /// The elem fast arms validate -- a GetElem (dense read +
-    /// string arm + hole fall-through) and a SetElem (dense overwrite +
-    /// careful arm + inline append/hole arm) on an unknown-type receiver.
-    #[test]
-    fn bbv_elem_arms_validate() {
-        // GetArg 0; One; GetElem; Pop; GetArg 0; One; GetArg 0; SetElem;
-        // Return
-        let code = vec![
-            op_byte(JSOp::GetArg),
-            0,
-            0,
-            op_byte(JSOp::One),
-            op_byte(JSOp::GetElem),
-            op_byte(JSOp::Pop),
-            op_byte(JSOp::GetArg),
-            0,
-            0,
-            op_byte(JSOp::One),
-            op_byte(JSOp::GetArg),
-            0,
-            0,
-            op_byte(JSOp::SetElem),
-            op_byte(JSOp::Return),
-        ];
-        let s = script(code, 1);
-        let (mut m, helpers) = module_with_helpers();
-        let source = Source {
-            objects: vec![],
-            global_object: None,
-            selfhosted: Vec::new(),
-            regex_programs: Vec::new(),
-        };
-        let mut atoms = AtomTable::new(Names::default());
-        let outcome =
-            translate_script_bbv(&mut m, helpers, &source, &mut atoms, 11, &s).expect("translate");
-        let (sig, body) = match outcome {
-            Outcome::Compiled { sig, body, .. } => (sig, body),
-            Outcome::Skipped(op) => panic!("unexpectedly skipped on {op:?}"),
-        };
-        m.funcs
-            .push(waffle::FuncDecl::Body(sig, "elem".to_string(), body));
-        let bytes = m.to_wasm_bytes().expect("serialize");
-        if let Some(dir) = std::env::var_os("NIGHT_TEST_DUMP") {
-            let _ = std::fs::write(std::path::Path::new(&dir).join("test.wasm"), &bytes);
-        }
-        waffle::wasmparser::validate(&bytes).expect("emitted module validates");
-    }
-
-    /// The gname inline arms validate -- a GetGName through the
-    /// fused-literal arm + guarded syntactic arm, an inline
-    /// BindUnqualifiedGName, and a SetGName through the guarded store arm
-    /// (barriers + fuse maintenance).
-    #[test]
-    fn bbv_gname_inline_arms_validate() {
-        let source = Source {
-            objects: vec![SourceObject::String(JsString::from("g"))],
-            global_object: None,
-            selfhosted: Vec::new(),
-            regex_programs: Vec::new(),
-        };
-        // GetGName g; Pop; BindUnqualifiedGName g; GetArg 0; SetGName g;
-        // Return
-        let code = vec![
-            op_byte(JSOp::GetGName),
-            0,
-            0,
-            0,
-            0,
-            op_byte(JSOp::Pop),
-            op_byte(JSOp::BindUnqualifiedGName),
-            0,
-            0,
-            0,
-            0,
-            op_byte(JSOp::GetArg),
-            0,
-            0,
-            op_byte(JSOp::SetGName),
-            0,
-            0,
-            0,
-            0,
-            op_byte(JSOp::Return),
-        ];
-        let mut s = script(code, 1);
-        s.gcthings = vec![SourceObjectId::new(0)];
-        let (mut m, helpers) = module_with_helpers();
-        let mut atoms = AtomTable::new(Names::default());
-        let name = atoms.names.intern_str("g");
-        let mut syn: HashMap<NameId, u32> = HashMap::default();
-        syn.insert(name, 0);
-        let mut fused: HashMap<NameId, FusedGname> = HashMap::default();
-        fused.insert(
-            name,
-            FusedGname {
-                fuse_addr: 4096,
-                boxed: (TAG_INT32 << 32) | 42,
-            },
-        );
-        let opts = Options::default();
-        let ctx = TranslateCtx {
-            helpers,
-            source: &source,
-            opts: &opts,
-            bigint_free: false,
-            syn_gnames: &syn,
-            gcell_bids: empty_gcell_bids(),
-            likely_fns: empty_likely_fns(),
-            facts: empty_facts(),
-            flag_demand: empty_flag_demand(),
-            this_layouts_in: empty_this_layouts(),
-            stamp_ctors_in: empty_stamp_ctors(),
-            layout_addpred_in: empty_layout_addpred(),
-            ctor_nslots_in: empty_ctor_nslots(),
-            deleg_restamps_in: empty_stamp_ctors(),
-            arg_restamps_in: empty_arg_restamps(),
-            local_restamps_in: empty_local_restamps(),
-            construct_sites_in: empty_construct_sites(),
-            lit_stamps_in: empty_lit_stamps(),
-            lit_nslots_in: empty_lit_stamps(),
-            prop_sites_in: empty_prop_sites(),
-            layout_field_masks_in: empty_layout_field_masks(),
-            layout_field_types_in: empty_layout_field_masks(),
-            layout_field_ranges_in: empty_layout_field_ranges(),
-            array_stamp_in: empty_array_stamp(),
-            array_elem_in: empty_array_elem(),
-            array_any_claim: None,
-            likely_elems: empty_elem_sites(),
-            fused_gnames: &fused,
-        };
-        let outcome = crate::wasm::bbv::translate_script(
-            &ctx,
-            &mut m,
-            &mut atoms,
-            ScriptId::new(12),
-            &s,
-            false,
-        )
-        .expect("translate");
-        let (sig, body) = match outcome {
-            Outcome::Compiled { sig, body, .. } => (sig, body),
-            Outcome::Skipped(op) => panic!("unexpectedly skipped on {op:?}"),
-        };
-        m.funcs
-            .push(waffle::FuncDecl::Body(sig, "gname".to_string(), body));
-        let bytes = m.to_wasm_bytes().expect("serialize");
-        if let Some(dir) = std::env::var_os("NIGHT_TEST_DUMP") {
-            let _ = std::fs::write(std::path::Path::new(&dir).join("test.wasm"), &bytes);
-        }
-        waffle::wasmparser::validate(&bytes).expect("emitted module validates");
-    }
-
-    /// The stamp-guarded fixed-slot GetProp arms + the ctor-return
-    /// stamp validate under bbv -- a plain (range) guard, a typed
-    /// (SHALLOW-word) guard, and a stamping ctor's return.
-    #[test]
-    fn bbv_durable_cls_fact_elides_second_guard_validate() {
-        // The first class-fact guard's pass writes a durable cls
-        // fact back to the arg slot; the second access at a same-range
-        // site is fact-implied (identity guard and object test elided --
-        // untyped sites go straight to the slot load).
-        let source = Source {
-            objects: vec![SourceObject::String(JsString::from("f"))],
-            global_object: None,
-            selfhosted: Vec::new(),
-            regex_programs: Vec::new(),
-        };
-        // GetArg 0; GetProp f; Pop; GetArg 0; GetProp f; Return
-        let code = vec![
-            op_byte(JSOp::GetArg),
-            0,
-            0,
-            op_byte(JSOp::GetProp),
-            0,
-            0,
-            0,
-            0,
-            op_byte(JSOp::Pop),
-            op_byte(JSOp::GetArg),
-            0,
-            0,
-            op_byte(JSOp::GetProp),
-            0,
-            0,
-            0,
-            0,
-            op_byte(JSOp::Return),
-        ];
-        let mut s = script(code, 1);
-        s.gcthings = vec![SourceObjectId::new(0)];
-        let (mut m, helpers) = module_with_helpers();
-        let mut atoms = AtomTable::new(Names::default());
-        let mut sites: HashMap<Site, PropSiteIn> = HashMap::default();
-        for pc in [3, 12] {
-            sites.insert(
-                Site::from_raw(21, pc),
-                PropSiteIn {
-                    shallow_possible: true,
-                    cell_addr: 4096,
-                    slot: 0,
-                    layout_id: 3,
-                    hi_layout_id: 5,
-                    claim: Claim::NONE,
-                    range: None,
-                },
-            );
-        }
-        let opts = Options::default();
-        let ctx = TranslateCtx {
-            helpers,
-            source: &source,
-            opts: &opts,
-            bigint_free: false,
-            syn_gnames: empty_syn_gnames(),
-            gcell_bids: empty_gcell_bids(),
-            likely_fns: empty_likely_fns(),
-            facts: empty_facts(),
-            flag_demand: empty_flag_demand(),
-            this_layouts_in: empty_this_layouts(),
-            stamp_ctors_in: empty_stamp_ctors(),
-            layout_addpred_in: empty_layout_addpred(),
-            ctor_nslots_in: empty_ctor_nslots(),
-            deleg_restamps_in: empty_stamp_ctors(),
-            arg_restamps_in: empty_arg_restamps(),
-            local_restamps_in: empty_local_restamps(),
-            construct_sites_in: empty_construct_sites(),
-            lit_stamps_in: empty_lit_stamps(),
-            lit_nslots_in: empty_lit_stamps(),
-            prop_sites_in: &sites,
-            layout_field_masks_in: empty_layout_field_masks(),
-            layout_field_types_in: empty_layout_field_masks(),
-            layout_field_ranges_in: empty_layout_field_ranges(),
-            array_stamp_in: empty_array_stamp(),
-            array_elem_in: empty_array_elem(),
-            array_any_claim: None,
-            likely_elems: empty_elem_sites(),
-            fused_gnames: empty_fused_gnames(),
-        };
-        let outcome = crate::wasm::bbv::translate_script(
-            &ctx,
-            &mut m,
-            &mut atoms,
-            ScriptId::new(21),
-            &s,
-            false,
-        )
-        .expect("translate");
-        let (sig, body) = match outcome {
-            Outcome::Compiled { sig, body, .. } => (sig, body),
-            Outcome::Skipped(op) => panic!("unexpectedly skipped on {op:?}"),
-        };
-        m.funcs
-            .push(waffle::FuncDecl::Body(sig, "clsfact".to_string(), body));
-        let bytes = m.to_wasm_bytes().expect("serialize");
-        if let Some(dir) = std::env::var_os("NIGHT_TEST_DUMP") {
-            let _ = std::fs::write(std::path::Path::new(&dir).join("test.wasm"), &bytes);
-        }
-        waffle::wasmparser::validate(&bytes).expect("emitted module validates");
-    }
-
-    #[test]
-    fn bbv_class_fact_get_and_stamp_validate() {
-        let source = Source {
-            objects: vec![SourceObject::String(JsString::from("f"))],
-            global_object: None,
-            selfhosted: Vec::new(),
-            regex_programs: Vec::new(),
-        };
-        // GetArg 0; GetProp f; Pop; GetArg 0; GetProp f; Return
-        let code = vec![
-            op_byte(JSOp::GetArg),
-            0,
-            0,
-            op_byte(JSOp::GetProp),
-            0,
-            0,
-            0,
-            0,
-            op_byte(JSOp::Pop),
-            op_byte(JSOp::GetArg),
-            0,
-            0,
-            op_byte(JSOp::GetProp),
-            0,
-            0,
-            0,
-            0,
-            op_byte(JSOp::Return),
-        ];
-        let mut s = script(code, 1);
-        s.gcthings = vec![SourceObjectId::new(0)];
-        let (mut m, helpers) = module_with_helpers();
-        let mut atoms = AtomTable::new(Names::default());
-        let mut sites: HashMap<Site, PropSiteIn> = HashMap::default();
-        // pc 3: plain range guard (mask 0); pc 12: typed numeric mask.
-        sites.insert(
-            Site::from_raw(13, 3),
-            PropSiteIn {
-                shallow_possible: true,
-                cell_addr: 4096,
-                slot: 0,
-                layout_id: 3,
-                hi_layout_id: 5,
-                claim: Claim::NONE,
-                range: None,
-            },
-        );
-        sites.insert(
-            Site::from_raw(13, 12),
-            PropSiteIn {
-                shallow_possible: true,
-                cell_addr: 4096,
-                slot: 1,
-                layout_id: 7,
-                hi_layout_id: 7,
-                claim: Claim::of_prims(PRIM_INT32 | PRIM_DOUBLE),
-                range: None,
-            },
-        );
-        let mut ctors: HashMap<ScriptId, StampCtorIn> = HashMap::default();
-        ctors.insert(
-            ScriptId::new(13),
-            StampCtorIn {
-                cell_addr: 8192,
-                layout_id: 3,
-                fields: vec![],
-                masks: vec![],
-                ranges: vec![],
-                prefix_keys: vec![],
-                ext_bound: 0,
-            },
-        );
-        let opts = Options::default();
-        let ctx = TranslateCtx {
-            helpers,
-            source: &source,
-            opts: &opts,
-            bigint_free: false,
-            syn_gnames: empty_syn_gnames(),
-            gcell_bids: empty_gcell_bids(),
-            likely_fns: empty_likely_fns(),
-            facts: empty_facts(),
-            flag_demand: empty_flag_demand(),
-            this_layouts_in: empty_this_layouts(),
-            stamp_ctors_in: &ctors,
-            layout_addpred_in: empty_layout_addpred(),
-            ctor_nslots_in: empty_ctor_nslots(),
-            deleg_restamps_in: empty_stamp_ctors(),
-            arg_restamps_in: empty_arg_restamps(),
-            local_restamps_in: empty_local_restamps(),
-            construct_sites_in: empty_construct_sites(),
-            lit_stamps_in: empty_lit_stamps(),
-            lit_nslots_in: empty_lit_stamps(),
-            prop_sites_in: &sites,
-            layout_field_masks_in: empty_layout_field_masks(),
-            layout_field_types_in: empty_layout_field_masks(),
-            layout_field_ranges_in: empty_layout_field_ranges(),
-            array_stamp_in: empty_array_stamp(),
-            array_elem_in: empty_array_elem(),
-            array_any_claim: None,
-            likely_elems: empty_elem_sites(),
-            fused_gnames: empty_fused_gnames(),
-        };
-        let outcome = crate::wasm::bbv::translate_script(
-            &ctx,
-            &mut m,
-            &mut atoms,
-            ScriptId::new(13),
-            &s,
-            false,
-        )
-        .expect("translate");
-        let (sig, body) = match outcome {
-            Outcome::Compiled { sig, body, .. } => (sig, body),
-            Outcome::Skipped(op) => panic!("unexpectedly skipped on {op:?}"),
-        };
-        m.funcs
-            .push(waffle::FuncDecl::Body(sig, "clsget".to_string(), body));
-        let bytes = m.to_wasm_bytes().expect("serialize");
-        if let Some(dir) = std::env::var_os("NIGHT_TEST_DUMP") {
-            let _ = std::fs::write(std::path::Path::new(&dir).join("test.wasm"), &bytes);
-        }
-        waffle::wasmparser::validate(&bytes).expect("emitted module validates");
-    }
-
-    /// Typed-load continuations validate -- a double-evidence GetElem
-    /// (dbl-first ladder), a no-evidence GetElem (int-first ladder), and
-    /// an int32-only-mask class-fact GetProp (the int-tag split on the
-    /// SHALLOW-guarded hit arm), all feeding an Add whose lineages join
-    /// through theta.
-    #[test]
-    fn bbv_typed_load_continuations_validate() {
-        let source = Source {
-            objects: vec![SourceObject::String(JsString::from("f"))],
-            global_object: None,
-            selfhosted: Vec::new(),
-            regex_programs: Vec::new(),
-        };
-        // pc0: GetArg 0; pc3: GetProp f; pc8: Pop;
-        // pc9: GetArg 0; pc12: One; pc13: GetElem;
-        // pc14: GetArg 0; pc17: Int8 2; pc19: GetElem;
-        // pc20: Add; pc21: Return
-        let code = vec![
-            op_byte(JSOp::GetArg),
-            0,
-            0,
-            op_byte(JSOp::GetProp),
-            0,
-            0,
-            0,
-            0,
-            op_byte(JSOp::Pop),
-            op_byte(JSOp::GetArg),
-            0,
-            0,
-            op_byte(JSOp::One),
-            op_byte(JSOp::GetElem),
-            op_byte(JSOp::GetArg),
-            0,
-            0,
-            op_byte(JSOp::Int8),
-            2,
-            op_byte(JSOp::GetElem),
-            op_byte(JSOp::Add),
-            op_byte(JSOp::Return),
-        ];
-        let mut s = script(code, 1);
-        s.gcthings = vec![SourceObjectId::new(0)];
-        let (mut m, helpers) = module_with_helpers();
-        let mut atoms = AtomTable::new(Names::default());
-        let mut sites: HashMap<Site, PropSiteIn> = HashMap::default();
-        sites.insert(
-            Site::from_raw(14, 3),
-            PropSiteIn {
-                shallow_possible: true,
-                cell_addr: 4096,
-                slot: 0,
-                layout_id: 7,
-                hi_layout_id: 7,
-                claim: Claim::of_prims(PRIM_INT32),
-                range: None,
-            },
-        );
-        let mut elems: HashMap<Site, Claim> = HashMap::default();
-        elems.insert(Site::from_raw(14, 13), Claim::of_prims(PRIM_DOUBLE));
-        let opts = Options::default();
-        let ctx = TranslateCtx {
-            helpers,
-            source: &source,
-            opts: &opts,
-            bigint_free: false,
-            syn_gnames: empty_syn_gnames(),
-            gcell_bids: empty_gcell_bids(),
-            likely_fns: empty_likely_fns(),
-            facts: empty_facts(),
-            flag_demand: empty_flag_demand(),
-            this_layouts_in: empty_this_layouts(),
-            stamp_ctors_in: empty_stamp_ctors(),
-            layout_addpred_in: empty_layout_addpred(),
-            ctor_nslots_in: empty_ctor_nslots(),
-            deleg_restamps_in: empty_stamp_ctors(),
-            arg_restamps_in: empty_arg_restamps(),
-            local_restamps_in: empty_local_restamps(),
-            construct_sites_in: empty_construct_sites(),
-            lit_stamps_in: empty_lit_stamps(),
-            lit_nslots_in: empty_lit_stamps(),
-            prop_sites_in: &sites,
-            layout_field_masks_in: empty_layout_field_masks(),
-            layout_field_types_in: empty_layout_field_masks(),
-            layout_field_ranges_in: empty_layout_field_ranges(),
-            array_stamp_in: empty_array_stamp(),
-            array_elem_in: empty_array_elem(),
-            array_any_claim: None,
-            likely_elems: &elems,
-            fused_gnames: empty_fused_gnames(),
-        };
-        let outcome = crate::wasm::bbv::translate_script(
-            &ctx,
-            &mut m,
-            &mut atoms,
-            ScriptId::new(14),
-            &s,
-            false,
-        )
-        .expect("translate");
-        let (sig, body) = match outcome {
-            Outcome::Compiled { sig, body, .. } => (sig, body),
-            Outcome::Skipped(op) => panic!("unexpectedly skipped on {op:?}"),
-        };
-        m.funcs
-            .push(waffle::FuncDecl::Body(sig, "typedload".to_string(), body));
-        let bytes = m.to_wasm_bytes().expect("serialize");
-        if let Some(dir) = std::env::var_os("NIGHT_TEST_DUMP") {
-            let _ = std::fs::write(std::path::Path::new(&dir).join("test.wasm"), &bytes);
-        }
-        waffle::wasmparser::validate(&bytes).expect("emitted module validates");
-    }
-
-    /// A two-target poly guard chain validates -- both callees spliced
-    /// (distinct bodies), each claiming its own funcidx guard patch, the
-    /// final miss falling to the generic dispatch.
-    #[test]
-    fn bbv_inline_poly_chain_validates() {
-        // Callee 0 (nargs 1): GetArg 0; One; Add; Return
-        // Callee 1 (nargs 1): GetArg 0; Int8 2; Mul; Return
-        let c0 = script(
-            vec![
-                op_byte(JSOp::GetArg),
-                0,
-                0,
-                op_byte(JSOp::One),
-                op_byte(JSOp::Add),
-                op_byte(JSOp::Return),
-            ],
-            1,
-        );
-        let c1 = script(
-            vec![
-                op_byte(JSOp::GetArg),
-                0,
-                0,
-                op_byte(JSOp::Int8),
-                2,
-                op_byte(JSOp::Mul),
-                op_byte(JSOp::Return),
-            ],
-            1,
-        );
-        let source = Source {
-            objects: vec![SourceObject::Script(c0), SourceObject::Script(c1)],
-            global_object: None,
-            selfhosted: Vec::new(),
-            regex_programs: Vec::new(),
-        };
-        // Caller: GetArg 0 (fn); Undefined (this); GetArg 0 (arg);
-        // Call 1 @pc7; Return
-        let code = vec![
-            op_byte(JSOp::GetArg),
-            0,
-            0,
-            op_byte(JSOp::Undefined),
-            op_byte(JSOp::GetArg),
-            0,
-            0,
-            op_byte(JSOp::Call),
-            1,
-            0,
-            op_byte(JSOp::Return),
-        ];
-        let s = script(code, 1);
-        let (mut m, helpers) = module_with_helpers();
-        let mut atoms = AtomTable::new(Names::default());
-        let mut lc: HashMap<Site, CallResolution> = HashMap::default();
-        lc.insert(
-            Site::from_raw(98, 7),
-            CallResolution::Scripted(vec![ScriptId::new(0), ScriptId::new(1)]),
-        );
-        let opts = Options::default();
-        let ctx = TranslateCtx {
-            helpers,
-            source: &source,
-            opts: &opts,
-            bigint_free: false,
-            syn_gnames: empty_syn_gnames(),
-            gcell_bids: empty_gcell_bids(),
-            likely_fns: empty_likely_fns(),
-            facts: &facts_with(|f| f.call_sites = lc.clone()),
-            flag_demand: empty_flag_demand(),
-            this_layouts_in: empty_this_layouts(),
-            stamp_ctors_in: empty_stamp_ctors(),
-            layout_addpred_in: empty_layout_addpred(),
-            ctor_nslots_in: empty_ctor_nslots(),
-            deleg_restamps_in: empty_stamp_ctors(),
-            arg_restamps_in: empty_arg_restamps(),
-            local_restamps_in: empty_local_restamps(),
-            construct_sites_in: empty_construct_sites(),
-            lit_stamps_in: empty_lit_stamps(),
-            lit_nslots_in: empty_lit_stamps(),
-            prop_sites_in: empty_prop_sites(),
-            layout_field_masks_in: empty_layout_field_masks(),
-            layout_field_types_in: empty_layout_field_masks(),
-            layout_field_ranges_in: empty_layout_field_ranges(),
-            array_stamp_in: empty_array_stamp(),
-            array_elem_in: empty_array_elem(),
-            array_any_claim: None,
-            likely_elems: empty_elem_sites(),
-            fused_gnames: empty_fused_gnames(),
-        };
-        let outcome = crate::wasm::bbv::translate_script(
-            &ctx,
-            &mut m,
-            &mut atoms,
-            ScriptId::new(98),
-            &s,
-            false,
-        )
-        .expect("translate");
-        let (sig, body, likely_patches) = match outcome {
-            Outcome::Compiled {
-                sig,
-                body,
-                likely_patches,
-                ..
-            } => (sig, body, likely_patches),
-            Outcome::Skipped(op) => panic!("unexpectedly skipped on {op:?}"),
-        };
-        let mut sids: Vec<u32> = likely_patches.iter().map(|p| p.2).collect();
-        sids.sort_unstable();
-        assert_eq!(sids, vec![0, 1]);
-        m.funcs
-            .push(waffle::FuncDecl::Body(sig, "polyinline".to_string(), body));
-        let bytes = m.to_wasm_bytes().expect("serialize");
-        if let Some(dir) = std::env::var_os("NIGHT_TEST_DUMP") {
-            let _ = std::fs::write(std::path::Path::new(&dir).join("test.wasm"), &bytes);
-        }
-        waffle::wasmparser::validate(&bytes).expect("emitted module validates");
-    }
-
-    /// Args as ctx slots + guard-pass write-back validate -- two GetElem
-    /// accesses on the same argument (the second sees the first's
-    /// written-back object-receiver/int32-key proofs), their results
-    /// feeding an Add.
-    #[test]
-    fn bbv_arg_facts_writeback_validate() {
-        // GetArg 0; One; GetElem; GetArg 0; Int8 2; GetElem; Add; Return
-        let code = vec![
-            op_byte(JSOp::GetArg),
-            0,
-            0,
-            op_byte(JSOp::One),
-            op_byte(JSOp::GetElem),
-            op_byte(JSOp::GetArg),
-            0,
-            0,
-            op_byte(JSOp::Int8),
-            2,
-            op_byte(JSOp::GetElem),
-            op_byte(JSOp::Add),
-            op_byte(JSOp::Return),
-        ];
-        let s = script(code, 1);
-        let (mut m, helpers) = module_with_helpers();
-        let source = Source {
-            objects: vec![],
-            global_object: None,
-            selfhosted: Vec::new(),
-            regex_programs: Vec::new(),
-        };
-        let mut atoms = AtomTable::new(Names::default());
-        let outcome =
-            translate_script_bbv(&mut m, helpers, &source, &mut atoms, 15, &s).expect("translate");
-        let (sig, body) = match outcome {
-            Outcome::Compiled { sig, body, .. } => (sig, body),
-            Outcome::Skipped(op) => panic!("unexpectedly skipped on {op:?}"),
-        };
-        m.funcs
-            .push(waffle::FuncDecl::Body(sig, "argfacts".to_string(), body));
-        let bytes = m.to_wasm_bytes().expect("serialize");
-        if let Some(dir) = std::env::var_os("NIGHT_TEST_DUMP") {
-            let _ = std::fs::write(std::path::Path::new(&dir).join("test.wasm"), &bytes);
-        }
-        waffle::wasmparser::validate(&bytes).expect("emitted module validates");
-    }
-
-    /// A counter loop containing a guarded gname read validates after
-    /// LICM (the prologue's engine-table/shape loads hoist to the split
-    /// preheader; the guard diamond stays).
-    #[test]
-    fn bbv_licm_gname_loop_validates() {
-        let source = Source {
-            objects: vec![SourceObject::String(JsString::from("g"))],
-            global_object: None,
-            selfhosted: Vec::new(),
-            regex_programs: Vec::new(),
-        };
-        // pc0: Zero; SetLocal 0; Pop;
-        // pc6: LoopHead; pc12: GetGName g; pc17: Pop;
-        // pc18: GetLocal 0; Int8 10; Lt; JumpIfFalse +21 (-> pc46);
-        // pc30: GetLocal 0; One; Add; SetLocal 0; Pop; Goto -35 (-> pc6);
-        // pc46: Zero; Return
-        let code = vec![
-            op_byte(JSOp::Zero),
-            op_byte(JSOp::SetLocal),
-            0,
-            0,
-            0,
-            op_byte(JSOp::Pop),
-            op_byte(JSOp::LoopHead),
-            0,
-            0,
-            0,
-            0,
-            0,
-            op_byte(JSOp::GetGName),
-            0,
-            0,
-            0,
-            0,
-            op_byte(JSOp::Pop),
-            op_byte(JSOp::GetLocal),
-            0,
-            0,
-            0,
-            op_byte(JSOp::Int8),
-            10,
-            op_byte(JSOp::Lt),
-            op_byte(JSOp::JumpIfFalse),
-            21,
-            0,
-            0,
-            0,
-            op_byte(JSOp::GetLocal),
-            0,
-            0,
-            0,
-            op_byte(JSOp::One),
-            op_byte(JSOp::Add),
-            op_byte(JSOp::SetLocal),
-            0,
-            0,
-            0,
-            op_byte(JSOp::Pop),
-            op_byte(JSOp::Goto),
-            (-35i32 as u32 & 0xFF) as u8,
-            0xFF,
-            0xFF,
-            0xFF,
-            op_byte(JSOp::Zero),
-            op_byte(JSOp::Return),
-        ];
-        let mut s = script(code, 0);
-        s.gcthings = vec![SourceObjectId::new(0)];
-        let (mut m, helpers) = module_with_helpers();
-        let mut atoms = AtomTable::new(Names::default());
-        // The id has to come from the table the translator will use.
-        let name = atoms.names.intern_str("g");
-        let mut syn: HashMap<NameId, u32> = HashMap::default();
-        syn.insert(name, 0);
-        let opts = Options::default();
-        let ctx = TranslateCtx {
-            helpers,
-            source: &source,
-            opts: &opts,
-            bigint_free: false,
-            syn_gnames: &syn,
-            gcell_bids: empty_gcell_bids(),
-            likely_fns: empty_likely_fns(),
-            facts: empty_facts(),
-            flag_demand: empty_flag_demand(),
-            this_layouts_in: empty_this_layouts(),
-            stamp_ctors_in: empty_stamp_ctors(),
-            layout_addpred_in: empty_layout_addpred(),
-            ctor_nslots_in: empty_ctor_nslots(),
-            deleg_restamps_in: empty_stamp_ctors(),
-            arg_restamps_in: empty_arg_restamps(),
-            local_restamps_in: empty_local_restamps(),
-            construct_sites_in: empty_construct_sites(),
-            lit_stamps_in: empty_lit_stamps(),
-            lit_nslots_in: empty_lit_stamps(),
-            prop_sites_in: empty_prop_sites(),
-            layout_field_masks_in: empty_layout_field_masks(),
-            layout_field_types_in: empty_layout_field_masks(),
-            layout_field_ranges_in: empty_layout_field_ranges(),
-            array_stamp_in: empty_array_stamp(),
-            array_elem_in: empty_array_elem(),
-            array_any_claim: None,
-            likely_elems: empty_elem_sites(),
-            fused_gnames: empty_fused_gnames(),
-        };
-        let outcome = crate::wasm::bbv::translate_script(
-            &ctx,
-            &mut m,
-            &mut atoms,
-            ScriptId::new(14),
-            &s,
-            false,
-        )
-        .expect("translate");
-        let (sig, body) = match outcome {
-            Outcome::Compiled { sig, body, .. } => (sig, body),
-            Outcome::Skipped(op) => panic!("unexpectedly skipped on {op:?}"),
-        };
-        m.funcs
-            .push(waffle::FuncDecl::Body(sig, "licm".to_string(), body));
-        let bytes = m.to_wasm_bytes().expect("serialize");
-        if let Some(dir) = std::env::var_os("NIGHT_TEST_DUMP") {
-            let _ = std::fs::write(std::path::Path::new(&dir).join("test.wasm"), &bytes);
-        }
-        waffle::wasmparser::validate(&bytes).expect("emitted module validates");
-    }
-
-    /// An elem access with mixed Int32|Double evidence inside a loop
-    /// admits dirty-arm forks (the elem slow arm is a may-GC side arm);
-    /// the post-call back edge routes into a twin header version and the
-    /// emitted graph must stay reducible (Compiled, not Skipped) and
-    /// validate.
-    #[test]
-    fn bbv_post_call_twin_headers_validate() {
-        // pc0: Zero; pc1: SetLocal 0; pc5: Pop;
-        // pc6: LoopHead; pc12: GetLocal 0; pc16: Int8 10; pc18: Lt;
-        // pc19: JumpIfFalse +30 (-> pc49);
-        // pc24: GetArg 0; pc27: GetLocal 0; pc31: GetElem; pc32: Pop;
-        // pc33: GetLocal 0; pc37: One; pc38: Add; pc39: SetLocal 0;
-        // pc43: Pop; pc44: Goto -38 (-> pc6);
-        // pc49: Zero; pc50: Return
-        let code = vec![
-            op_byte(JSOp::Zero),
-            op_byte(JSOp::SetLocal),
-            0,
-            0,
-            0,
-            op_byte(JSOp::Pop),
-            op_byte(JSOp::LoopHead),
-            0,
-            0,
-            0,
-            0,
-            0,
-            op_byte(JSOp::GetLocal),
-            0,
-            0,
-            0,
-            op_byte(JSOp::Int8),
-            10,
-            op_byte(JSOp::Lt),
-            op_byte(JSOp::JumpIfFalse),
-            30,
-            0,
-            0,
-            0,
-            op_byte(JSOp::GetArg),
-            0,
-            0,
-            op_byte(JSOp::GetLocal),
-            0,
-            0,
-            0,
-            op_byte(JSOp::GetElem),
-            op_byte(JSOp::Pop),
-            op_byte(JSOp::GetLocal),
-            0,
-            0,
-            0,
-            op_byte(JSOp::One),
-            op_byte(JSOp::Add),
-            op_byte(JSOp::SetLocal),
-            0,
-            0,
-            0,
-            op_byte(JSOp::Pop),
-            op_byte(JSOp::Goto),
-            (-38i32 as u32 & 0xFF) as u8,
-            0xFF,
-            0xFF,
-            0xFF,
-            op_byte(JSOp::Zero),
-            op_byte(JSOp::Return),
-        ];
-        let s = script(code, 1);
-        let (mut m, helpers) = module_with_helpers();
-        let source = Source {
-            objects: vec![],
-            global_object: None,
-            selfhosted: Vec::new(),
-            regex_programs: Vec::new(),
-        };
-        let mut atoms = AtomTable::new(Names::default());
-        let mut elems: HashMap<Site, Claim> = HashMap::default();
-        elems.insert(
-            Site::from_raw(9, 31),
-            Claim::of_prims(PRIM_INT32 | PRIM_DOUBLE),
-        );
-        let opts = Options::default();
-        let ctx = TranslateCtx {
-            helpers,
-            source: &source,
-            opts: &opts,
-            bigint_free: false,
-            syn_gnames: empty_syn_gnames(),
-            gcell_bids: empty_gcell_bids(),
-            likely_fns: empty_likely_fns(),
-            facts: empty_facts(),
-            flag_demand: empty_flag_demand(),
-            this_layouts_in: empty_this_layouts(),
-            stamp_ctors_in: empty_stamp_ctors(),
-            layout_addpred_in: empty_layout_addpred(),
-            ctor_nslots_in: empty_ctor_nslots(),
-            deleg_restamps_in: empty_stamp_ctors(),
-            arg_restamps_in: empty_arg_restamps(),
-            local_restamps_in: empty_local_restamps(),
-            construct_sites_in: empty_construct_sites(),
-            lit_stamps_in: empty_lit_stamps(),
-            lit_nslots_in: empty_lit_stamps(),
-            prop_sites_in: empty_prop_sites(),
-            layout_field_masks_in: empty_layout_field_masks(),
-            layout_field_types_in: empty_layout_field_masks(),
-            layout_field_ranges_in: empty_layout_field_ranges(),
-            array_stamp_in: empty_array_stamp(),
-            array_elem_in: empty_array_elem(),
-            array_any_claim: None,
-            likely_elems: &elems,
-            fused_gnames: empty_fused_gnames(),
-        };
-        let outcome = crate::wasm::bbv::translate_script(
-            &ctx,
-            &mut m,
-            &mut atoms,
-            ScriptId::new(9),
-            &s,
-            false,
-        )
-        .expect("translate");
-        let (sig, body) = match outcome {
-            Outcome::Compiled { sig, body, .. } => (sig, body),
-            Outcome::Skipped(op) => panic!("unexpectedly skipped on {op:?}"),
-        };
-        m.funcs
-            .push(waffle::FuncDecl::Body(sig, "twins".to_string(), body));
-        let bytes = m.to_wasm_bytes().expect("serialize");
-        if let Some(dir) = std::env::var_os("NIGHT_TEST_DUMP") {
-            let _ = std::fs::write(std::path::Path::new(&dir).join("test.wasm"), &bytes);
-        }
-        waffle::wasmparser::validate(&bytes).expect("emitted module validates");
-    }
-
-    /// An inlined leaf callee inside a caller loop keeps the caller's loop
-    /// tokens and frame facts through the splice (segment-site mapping), so
-    /// the return-tail back edge rejoins the caller's own header lineage
-    /// rather than eroding through a TOK_SIDE entry.
-    #[test]
-    fn bbv_inline_in_loop_token_continuity_validates() {
-        // Callee (objects[0], nargs 1): GetArg 0; One; Add; Return
-        let callee = script(
-            vec![
-                op_byte(JSOp::GetArg),
-                0,
-                0,
-                op_byte(JSOp::One),
-                op_byte(JSOp::Add),
-                op_byte(JSOp::Return),
-            ],
-            1,
-        );
-        let source = Source {
-            objects: vec![SourceObject::Script(callee)],
-            global_object: None,
-            selfhosted: Vec::new(),
-            regex_programs: Vec::new(),
-        };
-        // Caller: same loop shape as the twin test, Call at pc32 with the
-        // mono likely-callee evidence.
-        let code = vec![
-            op_byte(JSOp::Zero),
-            op_byte(JSOp::SetLocal),
-            0,
-            0,
-            0,
-            op_byte(JSOp::Pop),
-            op_byte(JSOp::LoopHead),
-            0,
-            0,
-            0,
-            0,
-            0,
-            op_byte(JSOp::GetLocal),
-            0,
-            0,
-            0,
-            op_byte(JSOp::Int8),
-            10,
-            op_byte(JSOp::Lt),
-            op_byte(JSOp::JumpIfFalse),
-            33,
-            0,
-            0,
-            0,
-            op_byte(JSOp::GetArg),
-            0,
-            0,
-            op_byte(JSOp::Undefined),
-            op_byte(JSOp::GetLocal),
-            0,
-            0,
-            0,
-            op_byte(JSOp::Call),
-            1,
-            0,
-            op_byte(JSOp::Pop),
-            op_byte(JSOp::GetLocal),
-            0,
-            0,
-            0,
-            op_byte(JSOp::One),
-            op_byte(JSOp::Add),
-            op_byte(JSOp::SetLocal),
-            0,
-            0,
-            0,
-            op_byte(JSOp::Pop),
-            op_byte(JSOp::Goto),
-            (-41i32 as u32 & 0xFF) as u8,
-            0xFF,
-            0xFF,
-            0xFF,
-            op_byte(JSOp::Zero),
-            op_byte(JSOp::Return),
-        ];
-        let s = script(code, 1);
-        let (mut m, helpers) = module_with_helpers();
-        let mut atoms = AtomTable::new(Names::default());
-        let mut lc: HashMap<Site, CallResolution> = HashMap::default();
-        lc.insert(
-            Site::from_raw(98, 32),
-            CallResolution::Scripted(vec![ScriptId::new(0)]),
-        );
-        let opts = Options::default();
-        let ctx = TranslateCtx {
-            helpers,
-            source: &source,
-            opts: &opts,
-            bigint_free: false,
-            syn_gnames: empty_syn_gnames(),
-            gcell_bids: empty_gcell_bids(),
-            likely_fns: empty_likely_fns(),
-            facts: &facts_with(|f| f.call_sites = lc.clone()),
-            flag_demand: empty_flag_demand(),
-            this_layouts_in: empty_this_layouts(),
-            stamp_ctors_in: empty_stamp_ctors(),
-            layout_addpred_in: empty_layout_addpred(),
-            ctor_nslots_in: empty_ctor_nslots(),
-            deleg_restamps_in: empty_stamp_ctors(),
-            arg_restamps_in: empty_arg_restamps(),
-            local_restamps_in: empty_local_restamps(),
-            construct_sites_in: empty_construct_sites(),
-            lit_stamps_in: empty_lit_stamps(),
-            lit_nslots_in: empty_lit_stamps(),
-            prop_sites_in: empty_prop_sites(),
-            layout_field_masks_in: empty_layout_field_masks(),
-            layout_field_types_in: empty_layout_field_masks(),
-            layout_field_ranges_in: empty_layout_field_ranges(),
-            array_stamp_in: empty_array_stamp(),
-            array_elem_in: empty_array_elem(),
-            array_any_claim: None,
-            likely_elems: empty_elem_sites(),
-            fused_gnames: empty_fused_gnames(),
-        };
-        let outcome = crate::wasm::bbv::translate_script(
-            &ctx,
-            &mut m,
-            &mut atoms,
-            ScriptId::new(98),
-            &s,
-            false,
-        )
-        .expect("translate");
-        let (sig, body, likely_patches) = match outcome {
-            Outcome::Compiled {
-                sig,
-                body,
-                likely_patches,
-                ..
-            } => (sig, body, likely_patches),
-            Outcome::Skipped(op) => panic!("unexpectedly skipped on {op:?}"),
-        };
-        assert!(
-            likely_patches.iter().any(|p| p.2 == 0),
-            "callee spliced (funcidx guard patch present)"
-        );
-        m.funcs
-            .push(waffle::FuncDecl::Body(sig, "inloop".to_string(), body));
-        let bytes = m.to_wasm_bytes().expect("serialize");
-        if let Some(dir) = std::env::var_os("NIGHT_TEST_DUMP") {
-            let _ = std::fs::write(std::path::Path::new(&dir).join("test.wasm"), &bytes);
-        }
-        waffle::wasmparser::validate(&bytes).expect("emitted module validates");
-    }
-
-    /// Nested depth -- f(g) is spliced at the root site, and f's interior
-    /// call of its argument is resolved via the (callee_sid, local_pc)
-    /// evidence translation and spliced at depth 2 (both funcidx guard
-    /// patches present).
-    #[test]
-    fn bbv_nested_inline_validates() {
-        // f (objects[0], nargs 1): GetArg 0; Undefined; Int8 5; Call 1
-        //   @local pc6; Return
-        let f = script(
-            vec![
-                op_byte(JSOp::GetArg),
-                0,
-                0,
-                op_byte(JSOp::Undefined),
-                op_byte(JSOp::Int8),
-                5,
-                op_byte(JSOp::Call),
-                1,
-                0,
-                op_byte(JSOp::Return),
-            ],
-            1,
-        );
-        // g (objects[1], nargs 1): GetArg 0; One; Add; Return
-        let g = script(
-            vec![
-                op_byte(JSOp::GetArg),
-                0,
-                0,
-                op_byte(JSOp::One),
-                op_byte(JSOp::Add),
-                op_byte(JSOp::Return),
-            ],
-            1,
-        );
-        let source = Source {
-            objects: vec![SourceObject::Script(f), SourceObject::Script(g)],
-            global_object: None,
-            selfhosted: Vec::new(),
-            regex_programs: Vec::new(),
-        };
-        // Root (nargs 2): GetArg 0 (f); Undefined; GetArg 1 (g);
-        // Call 1 @pc7; Return
-        let code = vec![
-            op_byte(JSOp::GetArg),
-            0,
-            0,
-            op_byte(JSOp::Undefined),
-            op_byte(JSOp::GetArg),
-            1,
-            0,
-            op_byte(JSOp::Call),
-            1,
-            0,
-            op_byte(JSOp::Return),
-        ];
-        let s = script(code, 2);
-        let (mut m, helpers) = module_with_helpers();
-        let mut atoms = AtomTable::new(Names::default());
-        let mut lc: HashMap<Site, CallResolution> = HashMap::default();
-        lc.insert(
-            Site::from_raw(98, 7),
-            CallResolution::Scripted(vec![ScriptId::new(0)]),
-        );
-        lc.insert(
-            Site::from_raw(0, 6),
-            CallResolution::Scripted(vec![ScriptId::new(1)]),
-        );
-        let opts = Options::default();
-        let ctx = TranslateCtx {
-            helpers,
-            source: &source,
-            opts: &opts,
-            bigint_free: false,
-            syn_gnames: empty_syn_gnames(),
-            gcell_bids: empty_gcell_bids(),
-            likely_fns: empty_likely_fns(),
-            facts: &facts_with(|f| f.call_sites = lc.clone()),
-            flag_demand: empty_flag_demand(),
-            this_layouts_in: empty_this_layouts(),
-            stamp_ctors_in: empty_stamp_ctors(),
-            layout_addpred_in: empty_layout_addpred(),
-            ctor_nslots_in: empty_ctor_nslots(),
-            deleg_restamps_in: empty_stamp_ctors(),
-            arg_restamps_in: empty_arg_restamps(),
-            local_restamps_in: empty_local_restamps(),
-            construct_sites_in: empty_construct_sites(),
-            lit_stamps_in: empty_lit_stamps(),
-            lit_nslots_in: empty_lit_stamps(),
-            prop_sites_in: empty_prop_sites(),
-            layout_field_masks_in: empty_layout_field_masks(),
-            layout_field_types_in: empty_layout_field_masks(),
-            layout_field_ranges_in: empty_layout_field_ranges(),
-            array_stamp_in: empty_array_stamp(),
-            array_elem_in: empty_array_elem(),
-            array_any_claim: None,
-            likely_elems: empty_elem_sites(),
-            fused_gnames: empty_fused_gnames(),
-        };
-        let outcome = crate::wasm::bbv::translate_script(
-            &ctx,
-            &mut m,
-            &mut atoms,
-            ScriptId::new(98),
-            &s,
-            false,
-        )
-        .expect("translate");
-        let (sig, body, likely_patches) = match outcome {
-            Outcome::Compiled {
-                sig,
-                body,
-                likely_patches,
-                ..
-            } => (sig, body, likely_patches),
-            Outcome::Skipped(op) => panic!("unexpectedly skipped on {op:?}"),
-        };
-        let mut sids: Vec<u32> = likely_patches.iter().map(|p| p.2).collect();
-        sids.sort_unstable();
-        sids.dedup();
-        assert_eq!(sids, vec![0, 1], "both splice guards present");
-        m.funcs
-            .push(waffle::FuncDecl::Body(sig, "nested".to_string(), body));
-        let bytes = m.to_wasm_bytes().expect("serialize");
-        if let Some(dir) = std::env::var_os("NIGHT_TEST_DUMP") {
-            let _ = std::fs::write(std::path::Path::new(&dir).join("test.wasm"), &bytes);
-        }
-        waffle::wasmparser::validate(&bytes).expect("emitted module validates");
-    }
-
-    /// Under-application -- argc 1 into a nargs-2 callee pads the missing
-    /// formal with undefined and still splices.
-    #[test]
-    fn bbv_inline_argc_padding_validates() {
-        // Callee (objects[0], nargs 2): GetArg 1; Return
-        let callee = script(vec![op_byte(JSOp::GetArg), 1, 0, op_byte(JSOp::Return)], 2);
-        let source = Source {
-            objects: vec![SourceObject::Script(callee)],
-            global_object: None,
-            selfhosted: Vec::new(),
-            regex_programs: Vec::new(),
-        };
-        // Root: GetArg 0; Undefined; GetArg 0; Call 1 @pc7; Return
-        let code = vec![
-            op_byte(JSOp::GetArg),
-            0,
-            0,
-            op_byte(JSOp::Undefined),
-            op_byte(JSOp::GetArg),
-            0,
-            0,
-            op_byte(JSOp::Call),
-            1,
-            0,
-            op_byte(JSOp::Return),
-        ];
-        let s = script(code, 1);
-        let (mut m, helpers) = module_with_helpers();
-        let mut atoms = AtomTable::new(Names::default());
-        let mut lc: HashMap<Site, CallResolution> = HashMap::default();
-        lc.insert(
-            Site::from_raw(98, 7),
-            CallResolution::Scripted(vec![ScriptId::new(0)]),
-        );
-        let opts = Options::default();
-        let ctx = TranslateCtx {
-            helpers,
-            source: &source,
-            opts: &opts,
-            bigint_free: false,
-            syn_gnames: empty_syn_gnames(),
-            gcell_bids: empty_gcell_bids(),
-            likely_fns: empty_likely_fns(),
-            facts: &facts_with(|f| f.call_sites = lc.clone()),
-            flag_demand: empty_flag_demand(),
-            this_layouts_in: empty_this_layouts(),
-            stamp_ctors_in: empty_stamp_ctors(),
-            layout_addpred_in: empty_layout_addpred(),
-            ctor_nslots_in: empty_ctor_nslots(),
-            deleg_restamps_in: empty_stamp_ctors(),
-            arg_restamps_in: empty_arg_restamps(),
-            local_restamps_in: empty_local_restamps(),
-            construct_sites_in: empty_construct_sites(),
-            lit_stamps_in: empty_lit_stamps(),
-            lit_nslots_in: empty_lit_stamps(),
-            prop_sites_in: empty_prop_sites(),
-            layout_field_masks_in: empty_layout_field_masks(),
-            layout_field_types_in: empty_layout_field_masks(),
-            layout_field_ranges_in: empty_layout_field_ranges(),
-            array_stamp_in: empty_array_stamp(),
-            array_elem_in: empty_array_elem(),
-            array_any_claim: None,
-            likely_elems: empty_elem_sites(),
-            fused_gnames: empty_fused_gnames(),
-        };
-        let outcome = crate::wasm::bbv::translate_script(
-            &ctx,
-            &mut m,
-            &mut atoms,
-            ScriptId::new(98),
-            &s,
-            false,
-        )
-        .expect("translate");
-        let (sig, body, likely_patches) = match outcome {
-            Outcome::Compiled {
-                sig,
-                body,
-                likely_patches,
-                ..
-            } => (sig, body, likely_patches),
-            Outcome::Skipped(op) => panic!("unexpectedly skipped on {op:?}"),
-        };
-        assert!(likely_patches.iter().any(|p| p.2 == 0), "splice happened");
-        m.funcs
-            .push(waffle::FuncDecl::Body(sig, "argcpad".to_string(), body));
-        let bytes = m.to_wasm_bytes().expect("serialize");
-        if let Some(dir) = std::env::var_os("NIGHT_TEST_DUMP") {
-            let _ = std::fs::write(std::path::Path::new(&dir).join("test.wasm"), &bytes);
-        }
-        waffle::wasmparser::validate(&bytes).expect("emitted module validates");
-    }
-
-    /// Construct splice: a mono resolved `new` site splices the ctor body
-    /// (inline `this` allocation + the ctor-exit stamp + the
-    /// `is_object(ret) ? ret : this` completion at the segment return),
-    /// and the ctor's construct-`this` cell is claimed.
-    #[test]
-    fn bbv_inline_construct_validates() {
-        // Ctor (objects[0], nargs 1): GetArg 0; Pop; RetRval
-        let ctor = script(
-            vec![
-                op_byte(JSOp::GetArg),
-                0,
-                0,
-                op_byte(JSOp::Pop),
-                op_byte(JSOp::RetRval),
-            ],
-            1,
-        );
-        let source = Source {
-            objects: vec![SourceObject::Script(ctor)],
-            global_object: None,
-            selfhosted: Vec::new(),
-            regex_programs: Vec::new(),
-        };
-        // Root: GetArg 0 (the ctor); IsConstructing; GetArg 1 (the arg);
-        // DupAt 2 (newTarget = the ctor); New 1 @pc8; Return
-        let code = vec![
-            op_byte(JSOp::GetArg),
-            0,
-            0,
-            op_byte(JSOp::IsConstructing),
-            op_byte(JSOp::GetArg),
-            1,
-            0,
-            op_byte(JSOp::DupAt),
-            2,
-            0,
-            0,
-            op_byte(JSOp::New),
-            1,
-            0,
-            op_byte(JSOp::Return),
-        ];
-        let s = script(code, 2);
-        let (mut m, helpers) = module_with_helpers();
-        let mut atoms = AtomTable::new(Names::default());
-        let mut lc: HashMap<Site, CallResolution> = HashMap::default();
-        lc.insert(
-            Site::from_raw(98, 11),
-            CallResolution::Scripted(vec![ScriptId::new(0)]),
-        );
-        let opts = Options::default();
-        let ctx = TranslateCtx {
-            helpers,
-            source: &source,
-            opts: &opts,
-            bigint_free: false,
-            syn_gnames: empty_syn_gnames(),
-            gcell_bids: empty_gcell_bids(),
-            likely_fns: empty_likely_fns(),
-            facts: &facts_with(|f| f.call_sites = lc.clone()),
-            flag_demand: empty_flag_demand(),
-            this_layouts_in: empty_this_layouts(),
-            stamp_ctors_in: empty_stamp_ctors(),
-            layout_addpred_in: empty_layout_addpred(),
-            ctor_nslots_in: empty_ctor_nslots(),
-            deleg_restamps_in: empty_stamp_ctors(),
-            arg_restamps_in: empty_arg_restamps(),
-            local_restamps_in: empty_local_restamps(),
-            construct_sites_in: empty_construct_sites(),
-            lit_stamps_in: empty_lit_stamps(),
-            lit_nslots_in: empty_lit_stamps(),
-            prop_sites_in: empty_prop_sites(),
-            layout_field_masks_in: empty_layout_field_masks(),
-            layout_field_types_in: empty_layout_field_masks(),
-            layout_field_ranges_in: empty_layout_field_ranges(),
-            array_stamp_in: empty_array_stamp(),
-            array_elem_in: empty_array_elem(),
-            array_any_claim: None,
-            likely_elems: empty_elem_sites(),
-            fused_gnames: empty_fused_gnames(),
-        };
-        let outcome = crate::wasm::bbv::translate_script(
-            &ctx,
-            &mut m,
-            &mut atoms,
-            ScriptId::new(98),
-            &s,
-            false,
-        )
-        .expect("translate");
-        let (sig, body, likely_patches, construct_cell_patches) = match outcome {
-            Outcome::Compiled {
-                sig,
-                body,
-                likely_patches,
-                construct_cell_patches,
-                ..
-            } => (sig, body, likely_patches, construct_cell_patches),
-            Outcome::Skipped(op) => panic!("unexpectedly skipped on {op:?}"),
-        };
-        assert!(
-            likely_patches.iter().any(|p| p.2 == 0),
-            "ctor body spliced (funcidx guard patch present)"
-        );
-        assert!(
-            !construct_cell_patches.is_empty(),
-            "construct-this cell claimed"
-        );
-        m.funcs
-            .push(waffle::FuncDecl::Body(sig, "newsplice".to_string(), body));
-        let bytes = m.to_wasm_bytes().expect("serialize");
-        if let Some(dir) = std::env::var_os("NIGHT_TEST_DUMP") {
-            let _ = std::fs::write(std::path::Path::new(&dir).join("test.wasm"), &bytes);
-        }
-        waffle::wasmparser::validate(&bytes).expect("emitted module validates");
-    }
-
-    /// A proven `T.apply(this, arguments)`
-    /// site forwards the caller's actuals through `night_runtime_apply_fwd`
-    /// and the arguments object is never built.
-    #[test]
-    fn bbv_apply_forward_validates() {
-        // nargs 0 (the `Class.create` forwarder shape):
-        //   Arguments; SetLocal 0; Pop; Undefined x3; GetLocal 0;
-        //   Call 2 @pc13; Return
-        let code = vec![
-            op_byte(JSOp::Arguments),
-            op_byte(JSOp::SetLocal),
-            0,
-            0,
-            0,
-            op_byte(JSOp::Pop),
-            op_byte(JSOp::Undefined),
-            op_byte(JSOp::Undefined),
-            op_byte(JSOp::Undefined),
-            op_byte(JSOp::GetLocal),
-            0,
-            0,
-            0,
-            op_byte(JSOp::Call),
-            2,
-            0,
-            op_byte(JSOp::Return),
-        ];
-        let s = script(code, 0);
-        let source = Source {
-            objects: vec![],
-            global_object: None,
-            selfhosted: Vec::new(),
-            regex_programs: Vec::new(),
-        };
-        let (mut m, helpers) = module_with_helpers();
-        let mut atoms = AtomTable::new(Names::default());
-        // kind 2 == a `.apply` property read feeding this call site.
-        let mut apply_sites: HashMap<Site, CallForm> = HashMap::default();
-        apply_sites.insert(Site::from_raw(97, 13), CallForm::Apply);
-        assert_eq!(
-            compute_apply_fwd_pcs(&s, &apply_sites, 97),
-            Some([Pc::new(13)].into_iter().collect()),
-            "the flow check proves the forward"
-        );
-        let opts = Options::default();
-        let ctx = TranslateCtx {
-            helpers,
-            source: &source,
-            opts: &opts,
-            bigint_free: false,
-            syn_gnames: empty_syn_gnames(),
-            gcell_bids: empty_gcell_bids(),
-            likely_fns: empty_likely_fns(),
-            facts: &facts_with(|f| f.apply_sites = apply_sites.clone()),
-            flag_demand: empty_flag_demand(),
-            this_layouts_in: empty_this_layouts(),
-            stamp_ctors_in: empty_stamp_ctors(),
-            layout_addpred_in: empty_layout_addpred(),
-            ctor_nslots_in: empty_ctor_nslots(),
-            deleg_restamps_in: empty_stamp_ctors(),
-            arg_restamps_in: empty_arg_restamps(),
-            local_restamps_in: empty_local_restamps(),
-            construct_sites_in: empty_construct_sites(),
-            lit_stamps_in: empty_lit_stamps(),
-            lit_nslots_in: empty_lit_stamps(),
-            prop_sites_in: empty_prop_sites(),
-            layout_field_masks_in: empty_layout_field_masks(),
-            layout_field_types_in: empty_layout_field_masks(),
-            layout_field_ranges_in: empty_layout_field_ranges(),
-            array_stamp_in: empty_array_stamp(),
-            array_elem_in: empty_array_elem(),
-            array_any_claim: None,
-            likely_elems: empty_elem_sites(),
-            fused_gnames: empty_fused_gnames(),
-        };
-        let outcome = crate::wasm::bbv::translate_script(
-            &ctx,
-            &mut m,
-            &mut atoms,
-            ScriptId::new(97),
-            &s,
-            false,
-        )
-        .expect("translate");
-        let (sig, body) = match outcome {
-            Outcome::Compiled { sig, body, .. } => (sig, body),
-            Outcome::Skipped(op) => panic!("unexpectedly skipped on {op:?}"),
-        };
-        let calls = |f: Func| {
-            body.values.entries().any(|(_, d)| {
-                matches!(
-                    d,
-                    ValueDef::Operator(Operator::Call { function_index }, ..)
-                        if *function_index == f
-                )
-            })
-        };
-        assert!(calls(helpers.apply_fwd), "the forward helper is emitted");
-        assert!(
-            !calls(helpers.arguments_) && !calls(helpers.arguments_env),
-            "the arguments object is elided"
-        );
-        m.funcs
-            .push(waffle::FuncDecl::Body(sig, "applyfwd".to_string(), body));
-        let bytes = m.to_wasm_bytes().expect("serialize");
-        if let Some(dir) = std::env::var_os("NIGHT_TEST_DUMP") {
-            let _ = std::fs::write(std::path::Path::new(&dir).join("test.wasm"), &bytes);
-        }
-        waffle::wasmparser::validate(&bytes).expect("emitted module validates");
-    }
-
-    /// Inlining: a mono likely call splices the callee body through the
-    /// pc-space segment machinery (guard + child frame + return edge) and
-    /// the module validates.
-    #[test]
-    fn bbv_inline_call_validates() {
-        // Callee (objects[0], nargs 1): GetArg 0; One; Add; Return
-        let callee_code = vec![
-            op_byte(JSOp::GetArg),
-            0,
-            0,
-            op_byte(JSOp::One),
-            op_byte(JSOp::Add),
-            op_byte(JSOp::Return),
-        ];
-        let callee = script(callee_code, 1);
-        let source = Source {
-            objects: vec![SourceObject::Script(callee)],
-            global_object: None,
-            selfhosted: Vec::new(),
-            regex_programs: Vec::new(),
-        };
-        // Caller: GetArg 0 (fn); Undefined (this); GetArg 0 (arg);
-        // Call 1 @pc7; Return
-        let code = vec![
-            op_byte(JSOp::GetArg),
-            0,
-            0,
-            op_byte(JSOp::Undefined),
-            op_byte(JSOp::GetArg),
-            0,
-            0,
-            op_byte(JSOp::Call),
-            1,
-            0,
-            op_byte(JSOp::Return),
-        ];
-        let s = script(code, 1);
-        let (mut m, helpers) = module_with_helpers();
-        let mut atoms = AtomTable::new(Names::default());
-        let mut lc: HashMap<Site, CallResolution> = HashMap::default();
-        lc.insert(
-            Site::from_raw(99, 7),
-            CallResolution::Scripted(vec![ScriptId::new(0)]),
-        );
-        let opts = Options::default();
-        let ctx = TranslateCtx {
-            helpers,
-            source: &source,
-            opts: &opts,
-            bigint_free: false,
-            syn_gnames: empty_syn_gnames(),
-            gcell_bids: empty_gcell_bids(),
-            likely_fns: empty_likely_fns(),
-            facts: &facts_with(|f| f.call_sites = lc.clone()),
-            flag_demand: empty_flag_demand(),
-            this_layouts_in: empty_this_layouts(),
-            stamp_ctors_in: empty_stamp_ctors(),
-            layout_addpred_in: empty_layout_addpred(),
-            ctor_nslots_in: empty_ctor_nslots(),
-            deleg_restamps_in: empty_stamp_ctors(),
-            arg_restamps_in: empty_arg_restamps(),
-            local_restamps_in: empty_local_restamps(),
-            construct_sites_in: empty_construct_sites(),
-            lit_stamps_in: empty_lit_stamps(),
-            lit_nslots_in: empty_lit_stamps(),
-            prop_sites_in: empty_prop_sites(),
-            layout_field_masks_in: empty_layout_field_masks(),
-            layout_field_types_in: empty_layout_field_masks(),
-            layout_field_ranges_in: empty_layout_field_ranges(),
-            array_stamp_in: empty_array_stamp(),
-            array_elem_in: empty_array_elem(),
-            array_any_claim: None,
-            likely_elems: empty_elem_sites(),
-            fused_gnames: empty_fused_gnames(),
-        };
-        let outcome = crate::wasm::bbv::translate_script(
-            &ctx,
-            &mut m,
-            &mut atoms,
-            ScriptId::new(99),
-            &s,
-            false,
-        )
-        .expect("translate");
-        let (sig, body, likely_patches) = match outcome {
-            Outcome::Compiled {
-                sig,
-                body,
-                likely_patches,
-                ..
-            } => (sig, body, likely_patches),
-            Outcome::Skipped(op) => panic!("unexpectedly skipped on {op:?}"),
-        };
-        // Two patches, both naming the callee: the splice's own funcidx
-        // guard const, and the likely-callee direct arm its generic miss
-        // path arms (a guard const plus the static stub `call` to rewrite).
-        assert_eq!(likely_patches.len(), 2);
-        assert!(likely_patches.iter().all(|p| p.2 == 0));
-        assert_eq!(
-            likely_patches.iter().filter(|p| p.0 != p.1).count(),
-            1,
-            "exactly one patch carries a distinct stub call to rewrite"
-        );
-        m.funcs
-            .push(waffle::FuncDecl::Body(sig, "inline".to_string(), body));
-        let bytes = m.to_wasm_bytes().expect("serialize");
-        if let Some(dir) = std::env::var_os("NIGHT_TEST_DUMP") {
-            let _ = std::fs::write(std::path::Path::new(&dir).join("test.wasm"), &bytes);
-        }
-        waffle::wasmparser::validate(&bytes).expect("emitted module validates");
-    }
-
-    /// Locals-into-SSA: an int-typed hot local live across an inline call
-    /// inside a loop exercises the carrier machinery end to end -- the
-    /// typed block param at the loop versions, the raw-i32 carrier
-    /// surviving the CallGc kill sweep (numbers are GC-immune), and the
-    /// cross-frame return edge reloading the caller's slot under the
-    /// restored caller facts.
-    #[test]
-    fn bbv_local_carrier_across_inline_call_validates() {
-        // Callee (objects[0], nargs 1): GetArg 0; One; Add; Return
-        let callee_code = vec![
-            op_byte(JSOp::GetArg),
-            0,
-            0,
-            op_byte(JSOp::One),
-            op_byte(JSOp::Add),
-            op_byte(JSOp::Return),
-        ];
-        let callee = script(callee_code, 1);
-        let source = Source {
-            objects: vec![SourceObject::Script(callee)],
-            global_object: None,
-            selfhosted: Vec::new(),
-            regex_programs: Vec::new(),
-        };
-        // pc0: Zero; pc1: SetLocal 0; pc5: Pop;
-        // pc6: LoopHead (6 bytes);
-        // pc12: GetArg 0 (fn); pc15: Undefined (this); pc16: GetArg 0;
-        // pc19: Call 1; pc22: Pop;
-        // pc23: GetLocal 0; pc27: One; pc28: Add; pc29: SetLocal 0;
-        // pc33: Pop;
-        // pc34: GetLocal 0; pc38: Int8 10; pc40: Lt;
-        // pc41: JumpIfFalse +10 (-> pc51); pc46: Goto -40 (-> pc6);
-        // pc51: GetLocal 0; pc55: Return
-        let code = vec![
-            op_byte(JSOp::Zero),
-            op_byte(JSOp::SetLocal),
-            0,
-            0,
-            0,
-            op_byte(JSOp::Pop),
-            op_byte(JSOp::LoopHead),
-            0,
-            0,
-            0,
-            0,
-            0,
-            op_byte(JSOp::GetArg),
-            0,
-            0,
-            op_byte(JSOp::Undefined),
-            op_byte(JSOp::GetArg),
-            0,
-            0,
-            op_byte(JSOp::Call),
-            1,
-            0,
-            op_byte(JSOp::Pop),
-            op_byte(JSOp::GetLocal),
-            0,
-            0,
-            0,
-            op_byte(JSOp::One),
-            op_byte(JSOp::Add),
-            op_byte(JSOp::SetLocal),
-            0,
-            0,
-            0,
-            op_byte(JSOp::Pop),
-            op_byte(JSOp::GetLocal),
-            0,
-            0,
-            0,
-            op_byte(JSOp::Int8),
-            10,
-            op_byte(JSOp::Lt),
-            op_byte(JSOp::JumpIfFalse),
-            10,
-            0,
-            0,
-            0,
-            op_byte(JSOp::Goto),
-            (-40i32 as u32 & 0xFF) as u8,
-            0xFF,
-            0xFF,
-            0xFF,
-            op_byte(JSOp::GetLocal),
-            0,
-            0,
-            0,
-            op_byte(JSOp::Return),
-        ];
-        let s = script(code, 1);
-        let (mut m, helpers) = module_with_helpers();
-        let mut atoms = AtomTable::new(Names::default());
-        let mut lc: HashMap<Site, CallResolution> = HashMap::default();
-        lc.insert(
-            Site::from_raw(98, 19),
-            CallResolution::Scripted(vec![ScriptId::new(0)]),
-        );
-        let opts = Options::default();
-        let ctx = TranslateCtx {
-            helpers,
-            source: &source,
-            opts: &opts,
-            bigint_free: false,
-            syn_gnames: empty_syn_gnames(),
-            gcell_bids: empty_gcell_bids(),
-            likely_fns: empty_likely_fns(),
-            facts: &facts_with(|f| f.call_sites = lc.clone()),
-            flag_demand: empty_flag_demand(),
-            this_layouts_in: empty_this_layouts(),
-            stamp_ctors_in: empty_stamp_ctors(),
-            layout_addpred_in: empty_layout_addpred(),
-            ctor_nslots_in: empty_ctor_nslots(),
-            deleg_restamps_in: empty_stamp_ctors(),
-            arg_restamps_in: empty_arg_restamps(),
-            local_restamps_in: empty_local_restamps(),
-            construct_sites_in: empty_construct_sites(),
-            lit_stamps_in: empty_lit_stamps(),
-            lit_nslots_in: empty_lit_stamps(),
-            prop_sites_in: empty_prop_sites(),
-            layout_field_masks_in: empty_layout_field_masks(),
-            layout_field_types_in: empty_layout_field_masks(),
-            layout_field_ranges_in: empty_layout_field_ranges(),
-            array_stamp_in: empty_array_stamp(),
-            array_elem_in: empty_array_elem(),
-            array_any_claim: None,
-            likely_elems: empty_elem_sites(),
-            fused_gnames: empty_fused_gnames(),
-        };
-        let outcome = crate::wasm::bbv::translate_script(
-            &ctx,
-            &mut m,
-            &mut atoms,
-            ScriptId::new(98),
-            &s,
-            false,
-        )
-        .expect("translate");
-        let (sig, body, likely_patches) = match outcome {
-            Outcome::Compiled {
-                sig,
-                body,
-                likely_patches,
-                ..
-            } => (sig, body, likely_patches),
-            Outcome::Skipped(op) => panic!("unexpectedly skipped on {op:?}"),
-        };
-        assert!(likely_patches.iter().any(|p| p.2 == 0), "splice happened");
-        // The carriers engaged: some version block carries a raw-i32 local
-        // param at a stack-empty pc (the loop-header lineage's int
-        // counter) -- without carriers every stack-empty version had zero
-        // params.
-        let has_i32_param_block = body
-            .blocks
-            .values()
-            .any(|b| !b.params.is_empty() && b.params.iter().all(|&(t, _)| t == waffle::Type::I32));
-        assert!(has_i32_param_block, "no i32-only-param version minted");
-        m.funcs
-            .push(waffle::FuncDecl::Body(sig, "carrier".to_string(), body));
         let bytes = m.to_wasm_bytes().expect("serialize");
         if let Some(dir) = std::env::var_os("NIGHT_TEST_DUMP") {
             let _ = std::fs::write(std::path::Path::new(&dir).join("test.wasm"), &bytes);
@@ -7044,63 +4657,6 @@ mod tests {
                 waffle::wasmparser::validate(&bytes).expect("emitted module validates");
             }
             Outcome::Skipped(reason) => panic!("unexpectedly skipped: {reason}"),
-        }
-    }
-
-    /// A function with aliased vars under a named-lambda environment is declined
-    /// (the env model doesn't insert the named-lambda chain link).
-    #[test]
-    fn named_lambda_env_is_skipped() {
-        let code = vec![
-            op_byte(JSOp::GetAliasedVar),
-            0,
-            0,
-            2,
-            0,
-            0,
-            op_byte(JSOp::Return),
-        ];
-        let mut source = Source {
-            objects: vec![],
-            global_object: None,
-            selfhosted: Vec::new(),
-            regex_programs: Vec::new(),
-        };
-        let nl = source.push(SourceObject::Scope(ScopeData {
-            kind: 5, // ScopeKind::NamedLambda
-            has_environment: true,
-            enclosing: None,
-            bindings: vec![],
-            is_named_lambda: true,
-            env_nfixed: None,
-            env_slot_values: vec![],
-        }));
-        let fscope = source.push(SourceObject::Scope(ScopeData {
-            kind: 0,
-            has_environment: false,
-            enclosing: Some(nl),
-            bindings: vec![],
-            is_named_lambda: false,
-            env_nfixed: None,
-            env_slot_values: vec![],
-        }));
-        let mut s = script(code, 0);
-        s.body_scope = Some(fscope);
-        let (mut m, helpers) = module_with_helpers();
-        let mut atoms = AtomTable::new(Names::default());
-        match translate_script(
-            &mut m,
-            helpers,
-            &source,
-            &mut atoms,
-            51,
-            &s,
-            &Options::default(),
-        )
-        .expect("translate")
-        {
-            Outcome::Skipped(reason) => assert!(reason.contains("named-lambda"), "{reason}"),
-            Outcome::Compiled { .. } => panic!("named-lambda env should be declined"),
         }
     }
 

@@ -68,7 +68,9 @@ Block Versioning, but that did not converge well.)
 | `compiler/src/likelier/` | The speculative likely-types analysis (`scan`/`heap`/`calls`/`engine`/`emit`/`dump`). |
 | `compiler/src/opsem.rs` | Interval algebra and op semantics; the vocabulary shared by analysis and codegen. |
 | `compiler/src/facts.rs` | `LikelyFacts`: the analysis-to-codegen fact contract. |
-| `compiler/src/wasm/bbv.rs` | The workqueue-BBV bytecode-to-Wasm codegen driver. |
+| `compiler/src/mir/` | MIR: the typed SSA IR, its validator and optimizer (`docs/MIR.md`). |
+| `compiler/src/wasm/mir/` | The MIR tier: building MIR from bytecode, lowering it to Wasm, inlining, plus the shared ABI constants (`abi.rs`), class-word rules (`stamp.rs`) and out-of-line runtime helpers (`helpers.rs`). |
+| `compiler/src/wasm/baseline/` | The baseline tier: the generic one-op-at-a-time lowering MIR exits to (`docs/BASELINE.md`). |
 | `compiler/src/wasm/translate.rs` | Shared translation substrate: `Helpers`/`AtomTable`/`Outcome`/ctx types, layout constants. |
 | `compiler/src/wasm/regex.rs` | The regex AOT compiler (irregexp bytecode to Wasm matchers). |
 | `compiler/src/wasm/mod.rs` | The `layout_env` / `translate_all` seams: analysis prepass, reserved linear-memory region layout, body translation, table patching. |
@@ -83,7 +85,7 @@ Block Versioning, but that did not converge well.)
 | `wasm-jit-runner/` | Wasmtime-based runner for the in-process flow: the `night_compile` hostcall runs the compiler over the shell's live heap and injects the bodies. |
 | `configs/` | Benchmark-lane mozconfigs for the SpiderMonkey tree (`mozconfig-native`/`-ion`/`-wasm`/`-weval`); the NightMonkey build itself uses `spidermonkey/mozconfig`. |
 | `docs/` | `DESIGN.md`, `INTEGRATION.md` (the SpiderMonkey hook surface), `TODO`. |
-| `tools/` | Profiling, benchmarking, and visualization helpers (`viz.py`, `opprof.py`, `pairab.sh`, ...). |
+| `tools/` | Profiling and benchmarking helpers (`opprof.py`, `hotloop.py`, `pairab.sh`, ...). |
 
 ## Building
 
@@ -194,12 +196,10 @@ nightmonkey --shell build/bin/js program.js --keep-snapshot snap.wasm -o out.was
 nightmonkey snap.wasm -o out.wasm      # recompile without re-wizening
 ```
 
-`nightmonkey --help` lists the diagnostics (`--stats`, `--dump-bytecode`,
-`--dump-bbv`, `--dump-facts`, `--dump-graph`, `--viz`, `--viz-lower`,
-`--viz-facts`) and the compilation options (`--force-interp`,
-`--keep-names`, `--pipeline`, `--strict-coverage`). `--dump-bytecode`
-takes an optional comma-separated source-id list
-(`--dump-bytecode=145,153`); a whole-bundle disassembly is megabytes.
+`nightmonkey --help` lists the diagnostics (`--stats`, `--dump-tiers`,
+`--dump-mir`, `--dump-facts`, `--dump-graph`, ...), the instrumentation
+switches (`--mir-exit-census`, `--block-census`) and the compilation
+options (`--keep-names`, `--pipeline`, `--strict-coverage`).
 Debug sections are stripped by default; `--keep-names` retains them.
 
 ## Flow 2: in-process (drop-in shell for jit-tests)
@@ -233,8 +233,7 @@ NIGHT_INPROCESS_OFF=1 scripts/run-jit-tests.sh /path/to/firefox build -- -j16
 
 Compiler flags for the in-process batch (the same ones `nightmonkey`
 takes) go in `NIGHT_OPTIONS`, which the wrapper passes to the shell as
-`--night-options`. `--pipeline legacy` selects the BBV lane, kept for
-comparison. For example, the baseline-tier lane, failing any test
+`--night-options`. For example, the baseline-tier lane, failing any test
 whose script ends up interpreted:
 
 ```
@@ -281,10 +280,13 @@ For performance work, the benchmark-lane configs
 ## Documentation
 
 - **[`docs/DESIGN.md`](docs/DESIGN.md)**: the design of record: the
-  soundness model and the object stamp, the BBV emission strategy, the
-  layered lowerings for the common opcodes, the analysis (data structures,
+  soundness model and the object stamp, the MIR and baseline tiers, the
+  analysis (data structures,
   lattices, abstract interpretation), the runtime ABI, and the known
   limitations and rough edges.
+- **[`docs/MIR.md`](docs/MIR.md)** and **[`docs/BASELINE.md`](docs/BASELINE.md)**:
+  the two compiled tiers: MIR's IR, types, exits and onramps, and the
+  baseline tier MIR exits to.
 - **[`docs/INTEGRATION.md`](docs/INTEGRATION.md)**: the SpiderMonkey side:
   the `--enable-external-compiler-hooks` surface NightMonkey plugs into,
   organized by mechanism, and how to port it to another SpiderMonkey.

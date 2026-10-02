@@ -24,8 +24,8 @@
 //! vp+O+8k         operand stack, k < depth(pc)    O = R + 24
 //! ```
 //!
-//! The optional slots exist only where the script uses them, as bbv's
-//! frame has it: a slot nothing reads would cost every entry a store (the
+//! The optional slots exist only where the script uses them: a slot
+//! nothing reads would cost every entry a store (the
 //! GC scans the whole frame, so each slot must hold a valid Value).
 
 use std::collections::BTreeMap;
@@ -36,7 +36,7 @@ use crate::opcodes::JSOp;
 
 /// `argc` flag: enter the baseline body at the pc in the frame's resume
 /// word instead of at its start. The frame is already complete.
-/// (`0x8000_0000` is BBV's typed-entry selector, `ctx.rs` `ARGC_SEL_BIT`.)
+/// (`0x8000_0000` stays reserved: it was the typed-entry selector.)
 pub const ARGC_RESUME_BIT: u32 = 0x4000_0000;
 /// `argc` flag: enter a MIR body at the onramp root of the loop header
 /// named by the resume word, from a baseline frame.
@@ -125,7 +125,7 @@ impl FrameLayout {
     pub const THIS: u32 = 8;
     pub const ARGS: u32 = 16;
     /// Fixed slots after the locals: env, arguments object and new.target
-    /// where the script uses them (bbv's compact frame), then rval, resume
+    /// where the script uses them, then rval, resume
     /// word and onramp backoff, always.
     pub fn of(script: &Script) -> FrameLayout {
         FrameLayout {
@@ -234,8 +234,8 @@ impl FrameLayout {
 }
 
 /// Whether the script reads actuals beyond its formals, so the variable
-/// region must start above them (`vp` rebase). The same predicate as BBV's
-/// (`translate::uses_arguments`, `uses_actual_args`, mapped args), stated
+/// region must start above them (`vp` rebase). The same predicate as
+/// `translate::uses_arguments`, `uses_actual_args` and mapped args, stated
 /// once here for the frame contract.
 pub fn reads_actuals(script: &Script) -> bool {
     script.has_mapped_args

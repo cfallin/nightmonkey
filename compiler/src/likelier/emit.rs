@@ -1490,10 +1490,9 @@ impl LayoutPlan {
 
     /// Per-method this-layouts: for each script that is not itself a
     /// constructor, the layout key (or key range) its `this` is predicted
-    /// to carry. The lowering consumes this at method entry --
-    /// `wasm::bbv::facts` primes the shape/generation cell from it, and
-    /// `wasm::bbv::property` serves fixed-slot reads off `this` against it
-    /// without a per-site class check. Two keys because a two-phase
+    /// to carry. The lowering consumes this at method entry -- MIR guards
+    /// `this` once to it (`guard_this_layout`), and the field accesses off
+    /// `this` fold their own guards into that one. Two keys because a two-phase
     /// constructor stamps a prefix key at its own exit and the full key at
     /// its init delegate's, so a method that may see either guards the
     /// range.
@@ -1804,21 +1803,12 @@ impl Solver<'_> {
         facts.omitted_formals = self.omitted_formals.clone();
         let deleg = self.emit_call_sites(&mut facts, &mut caps);
         self.emit_getter_names(&mut facts);
-        // The analysis half of the speculation trace (see `viz`).
-        if let Some(mut out) = super::viz::stream(self.opts) {
-            super::viz::write_arg_types(self, &mut out);
-            super::viz::write_gname_cells(self, &self.names, &mut out);
-            super::viz::write_field_cells(self, &self.names, &mut out);
-            super::viz::write_regions(self, &mut out);
-            super::viz::write_arith_dsts(self, &mut out);
-        }
         let plan = LayoutPlan::build(self, &mut facts, &deleg);
         caps.add(&plan.caps);
         let totals = self.emit_site_facts(&mut facts, &plan);
         self.emit_arg_cls(&mut facts, &plan);
         self.emit_class_rows(&mut facts, &plan, &totals.typed_read_positions);
         self.emit_array_claims(&mut facts, &totals);
-        super::effects::emit_effect_summaries(self, &mut facts, &plan);
         facts.n_classes = self.heap.classes.len();
         facts.n_cons = self.engine.cons.len();
         // Drops the fixpoint recorded but never reported, plus everything
@@ -1965,35 +1955,6 @@ impl Solver<'_> {
                 continue;
             }
             facts.call_types.insert(Site::new(sid, pc), m);
-        }
-        // Fractional-reachable arith sites: the result var of each arith
-        // constraint, joined over live ctxs -- double evidence at range Top
-        // means a real double population flows through the op, and its
-        // both-number arm may keep the Opt track (the numeric-category
-        // policy). See LikelyFacts::fractional_arith_sites.
-        for ci in 0..self.engine.cons.len() {
-            let Constraint::Arith { dst, pc, .. } = &self.engine.cons[ci] else {
-                continue;
-            };
-            let CKey::Var(def) = *dst else { continue };
-            let pc = *pc;
-            let sid = self.engine.con_script[ci];
-            let Some(ctxs) = self.engine.live_ctxs.get(&sid) else {
-                continue;
-            };
-            let Some(j) = self.engine.join_over_ctxs(ctxs, |ctx| CellKey::Var {
-                script: sid,
-                var: def,
-                ctx,
-            }) else {
-                continue;
-            };
-            if j.fractional_reachable() {
-                facts.fractional_arith_sites.insert(Site::new(sid, pc));
-            }
-            if j.string_reachable() {
-                facts.string_arith_sites.insert(Site::new(sid, pc));
-            }
         }
         // Aliased-var per-site claims (the closure-scope analog of the
         // elem value claims): each statically resolved GetAliasedVar site

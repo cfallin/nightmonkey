@@ -610,7 +610,7 @@ static inline size_t MegaGetSlot(uint32_t shape, uint32_t atomId) {
 static inline MegaGetEntry* MegaGet(uint32_t shape, uint32_t atomId) {
   return LinMem<MegaGetEntry>(gEnv.megaGetPtr) + MegaGetSlot(shape, atomId);
 }
-// The poly-site marker in a SET site's way-0 recvShape (bbv/abi.rs
+// The poly-site marker in a SET site's way-0 recvShape (wasm/mir/abi.rs
 // IC_POLY_SENTINEL); never a valid shape pointer. Get sites have no
 // sentinel: their ways fill in turn and the mega table takes the rest.
 static constexpr uint32_t kIcPolySentinel = 1;
@@ -1996,27 +1996,6 @@ static inline void WriteNightOut(uint32_t top, uint64_t bits) {
   *LinMem<uint64_t>(top) = bits;
 }
 
-bool night_runtime_get_property(JSContext* cx, uint32_t top, uint64_t recv,
-                                uint32_t atomId) {
-  SetNightTop(cx, top);
-  JS::HandleId id = AtomIdChecked(atomId);
-  JS::RootedObject obj(cx, ReceiverObjectAtom(cx, recv, "", atomId));
-  if (!obj) {
-    return false;
-  }
-  // By pre-interned PropertyKey: skips the per-access atomization that
-  // JS_GetUCProperty would do. The ORIGINAL (possibly primitive) receiver is
-  // forwarded so a scripted getter's `this` is the primitive, not its
-  // wrapper (GetPropertyOperation semantics).
-  JS::RootedValue recvv(cx, JS::Value::fromRawBits(recv));
-  JS::RootedValue res(cx);
-  if (!JS_ForwardGetPropertyTo(cx, obj, id, recvv, &res)) {
-    return false;
-  }
-  WriteNightOut(top, res.get().asRawBits());
-  return true;
-}
-
 // Generic receiver-aware set with the interpreter's SetPropertyOperation
 // semantics: the original (possibly primitive) receiver flows through, and a
 // refused write throws in strict mode / is silently ignored otherwise.
@@ -2659,7 +2638,6 @@ uint32_t night_runtime_set_prop_ic_miss(JSContext* cx, uint32_t top,
                        vouched);
 }
 
-
 // Whether a set of `id` on `obj` runs no code and calls back into nothing:
 // a native object (not the global, not a typed array, no Watchtower
 // watch: a prototype, a fuse's holder) with `id` an own writable data
@@ -2725,7 +2703,6 @@ static bool DemotedForMir(uint32_t before, uint32_t after) {
          (((before & claims) & ~after) != 0 ||
           ((before & 0xFFFF) != 0 && (after & 0xFFFF) == 0));
 }
-
 
 uint32_t night_runtime_get_elem_pure(JSContext* cx, uint32_t top,
                                      uint64_t recv, uint64_t key) {
@@ -3516,50 +3493,6 @@ void night_runtime_binding_written(uint32_t bindingId) {
                       (*gNames.bindingKeys)[bindingId].get());
 }
 
-uint64_t night_runtime_binding_value(JSContext* cx, uint32_t bindingId) {
-  if (!gNames.bindingKeys || bindingId >= gNames.bindingKeys->size()) {
-    MOZ_CRASH("night_runtime_binding_value: bindingId out of range");
-  }
-  if (gState.globalValsBase) {
-    uint32_t* cell = BindingFuseCell(bindingId);
-    if (cell[2] == 1) {
-      return *reinterpret_cast<uint64_t*>(cell);
-    }
-  }
-  JS::PropertyKey id = (*gNames.bindingKeys)[bindingId].get();
-  uint32_t shape = 0;
-  uint32_t entry = js::night::NightResolveGlobalSlotGuarded(cx, id, &shape);
-  uint32_t* row = LinMem<uint32_t>(gEnv.gslotsPtr + 8 * bindingId);
-  row[0] = entry;
-  row[1] = shape;
-  if (!entry) {
-    return JS::MagicValue(JS_GENERIC_MAGIC).asRawBits();
-  }
-  MaybeArmBindingFuse(cx, bindingId, id);
-  // The entry encoding (NightResolveGlobalSlotGuarded): bit1 dynamic,
-  // bit2 writable, the fixed-or-dynamic index at bits[31:3].
-  js::NativeObject* global = &cx->global()->as<js::NativeObject>();
-  uint32_t idx = entry >> 3;
-  const JS::Value& v =
-      (entry & 2) ? global->getDynamicSlot(idx) : global->getFixedSlot(idx);
-  return v.asRawBits();
-}
-
-// Cold resolve-once path behind the inlined `GetGName`. `lookupPure`s the
-// pre-interned binding name on the global object (non-allocating, never GCs),
-// caches the encoded entry in `gGlobalSlots[bindingId]`, and returns it. A
-// leaf: no `SetNightTop`, no rooting handshake.
-uint32_t night_runtime_resolve_global_slot(JSContext* cx, uint32_t bindingId) {
-  if (!gNames.bindingKeys || bindingId >= gNames.bindingKeys->size()) {
-    MOZ_CRASH("night_runtime_resolve_global_slot: bindingId out of range");
-  }
-  JS::PropertyKey id = (*gNames.bindingKeys)[bindingId].get();
-  uint32_t entry = js::night::NightResolveGlobalSlot(cx, id);
-  *LinMem<uint32_t>(gEnv.gslotsPtr + 8 * bindingId) = entry;
-  MaybeArmBindingFuse(cx, bindingId, id);
-  return entry;
-}
-
 // The guarded (no-TI) resolve: cache [entry, globalShape] for an own plain
 // data slot of the global object (not lexically shadowed); return 0 when not
 // cacheable so the inline read falls back to the generic char-based helper.
@@ -3580,24 +3513,6 @@ uint32_t night_runtime_resolve_global_slot_guarded(JSContext* cx,
     MaybeArmBindingFuse(cx, bindingId, id);
   }
   return entry;
-}
-
-// Inlined `SetGName` for a resolved global-object binding. `lookupPure`s
-// the binding's slot and stores `valBits` via `NativeObject::setSlot` (which
-// runs the write barriers); also warms the slot cache. A leaf (setSlot +
-// barriers never move objects), so no rooting handshake.
-void night_runtime_set_global(JSContext* cx, uint32_t bindingId,
-                              uint64_t valBits) {
-  if (!gNames.bindingKeys || bindingId >= gNames.bindingKeys->size()) {
-    MOZ_CRASH("night_runtime_set_global: bindingId out of range");
-  }
-  JS::PropertyKey id = (*gNames.bindingKeys)[bindingId].get();
-  MaybeBlowBindingFuseId(bindingId, valBits);
-  js::night::NightSetGlobalSlot(cx, id, valBits);
-  // Warm the read cache so a following inline read skips the cold resolve.
-  *LinMem<uint32_t>(gEnv.gslotsPtr + 8 * bindingId) =
-      js::night::NightResolveGlobalSlot(cx, id);
-  MaybeArmBindingFuse(cx, bindingId, id);
 }
 
 // `BindUnqualifiedGName atomId`: push the binding object for a global-name
@@ -3643,7 +3558,7 @@ bool night_runtime_set_name(JSContext* cx, uint32_t top, uint64_t env,
 static bool TryPureElementRead(JSContext* cx, uint32_t top, uint64_t recv,
                                uint64_t key) {
   // In-bounds, non-hole dense element of a native object: an own data
-  // property, so the read is the element itself. BBV and baseline inline
+  // property, so the read is the element itself. Baseline inlines
   // this arm; the MIR tier's generic element read reaches it here.
   {
     JS::Value rv = JS::Value::fromRawBits(recv);
@@ -3837,7 +3752,7 @@ bool night_runtime_set_element(JSContext* cx, uint32_t top, uint64_t recv,
   }
   // In-bounds overwrite of a dense element: an own, writable data property
   // (not a hole, elements not frozen), so [[Set]] is the store itself, with
-  // its barriers. BBV's inline arm does this without a call; the baseline
+  // its barriers. MIR's inline arm does this without a call; the baseline
   // tier reaches it here. Same receiver gate as the append path below.
   {
     JS::Value rv = JS::Value::fromRawBits(recv);
@@ -4357,7 +4272,7 @@ struct NightDepartCells {
   uint64_t epochAtPush;
 };
 std::vector<NightDepartCells>* gNightDepart = nullptr;
-// Kind 70 (the per-block execution census, bbv/blockcen.rs) ticks once per
+// Kind 70 (the per-block execution census, MIR's `block_census`) ticks once per
 // executed lowered block -- several per bytecode op -- so it keeps a flat
 // per-id counter instead of paying the map on every tick.
 std::vector<uint64_t>* gNightBlockCensus = nullptr;
@@ -4582,39 +4497,6 @@ void NightNoteEpochBump(uint32_t site, uint32_t oldWord) {
 }
 }  // namespace js
 }  // extern "C++"
-
-// Validate an inline-materialized string literal against the atom table
-// entry; crash loudly on mismatch. Not on any current codegen path; kept
-// for diagnostic use.
-bool night_runtime_strlit_verify(JSContext* cx, uint32_t strPtr,
-                                 uint32_t atomId) {
-  JSString* str = LinMem<JSString>(strPtr);
-  const std::u16string& want = gNames.atoms[atomId];
-  if (!js::gc::IsInsideNursery(str)) {
-    MOZ_CRASH("strlit-verify: not nursery");
-  }
-  if (!str->isLinear() || !str->isInline() ||
-      !str->asLinear().hasLatin1Chars()) {
-    fprintf(stderr, "strlit-verify: atom %u flags %x\n", atomId,
-            unsigned(str->flags()));
-    MOZ_CRASH("strlit-verify: wrong kind");
-  }
-  if (str->length() != want.size()) {
-    fprintf(stderr, "strlit-verify: atom %u len %zu want %zu\n", atomId,
-            str->length(), want.size());
-    MOZ_CRASH("strlit-verify: wrong length");
-  }
-  JS::AutoCheckCannotGC nogc;
-  const JS::Latin1Char* chars = str->asLinear().latin1Chars(nogc);
-  for (size_t i = 0; i < want.size(); i++) {
-    if (chars[i] != want[i]) {
-      fprintf(stderr, "strlit-verify: atom %u char %zu got %u want %u\n",
-              atomId, i, unsigned(chars[i]), unsigned(want[i]));
-      MOZ_CRASH("strlit-verify: wrong chars");
-    }
-  }
-  return true;
-}
 
 // Self-hosted intrinsic value by name (JSOp::GetIntrinsic). Mirrors the
 // interpreter's GetIntrinsicOperation; the lookup may lazily clone the
@@ -5044,7 +4926,7 @@ int32_t night_runtime_mir_stress(uint32_t period) {
   return period != 0 && ++count % period == 0 ? 1 : 0;
 }
 
-// The compiled bbv tier's `emit_class_idx_stamp_impl` (first-stamp form),
+// The ctor-exit stamp's first-stamp form (MIR's `ctor_stamp_inline`),
 // as a helper: the same ownership and span gates, the same new word, no
 // epoch bump (a sentinel word carries no facts).
 void night_runtime_ctor_stamp(uint64_t thisBits, uint32_t layoutId,
@@ -5069,7 +4951,7 @@ void night_runtime_ctor_stamp(uint64_t thisBits, uint32_t layoutId,
   obj->setExternalWord((layoutId + 1) | (w0 & keepBits));
 }
 
-// bbv's `emit_class_idx_stamp_impl` restamp form, as a helper. No epoch
+// The restamp form (MIR's inline `restamp`), as a helper. No epoch
 // bump: the only stamped words the gates admit are prefix-stamped ones,
 // and advancing those falsifies nothing a caller carries.
 void night_runtime_ctor_restamp(uint64_t thisBits, uint32_t layoutId,
@@ -5757,13 +5639,6 @@ bool night_runtime_set_fun_name(JSContext* cx, uint32_t top, uint64_t fun,
                              static_cast<js::FunctionPrefixKind>(prefixKind));
 }
 
-// Whether a dense append on `obj` can skip the prototype consult: the inline
-// push arm's proto guard. Leaf (a pure proto-chain walk, no GC).
-int32_t night_runtime_no_extra_indexed(uint32_t obj) {
-  JSObject* o = reinterpret_cast<JSObject*>(uintptr_t(obj));
-  return NoExtraIndexedFast(o) ? 1 : 0;
-}
-
 int32_t night_runtime_slots_covered(uint32_t obj, uint32_t n) {
   JSObject* o = reinterpret_cast<JSObject*>(uintptr_t(obj));
   return js::night::NightSlotsCovered(&o->as<js::NativeObject>(), n) ? 1 : 0;
@@ -5783,14 +5658,6 @@ void night_runtime_set_mapped_arg(uint64_t objBits, uint32_t i, uint64_t val) {
   js::ArgumentsObject& obj =
       JS::Value::fromRawBits(objBits).toObject().as<js::ArgumentsObject>();
   obj.setArg(i, JS::Value::fromRawBits(val));
-}
-
-// Stamp-execution ping helper. The two-bit stamp validates via num-props plus
-// the class word's SLOTS/TYPES history, so no production compile emits a call
-// here; the entry point stays for ABI compatibility with the helper table.
-void night_runtime_validate_this_layout(uint64_t thisBits, uint32_t layoutId) {
-  (void)thisBits;
-  (void)layoutId;
 }
 
 bool night_runtime_in(JSContext* cx, uint32_t top, uint64_t id,
@@ -6096,16 +5963,6 @@ bool night_runtime_add(JSContext* cx, uint32_t top, uint64_t a, uint64_t b) {
   }
   WriteNightOut(top, res.get().asRawBits());
   return true;
-}
-
-// Call-site specialization: classify the runtime callee. Leaf (no GC); a
-// compiled body calls this before a specialized call op and, on a non-zero
-// result, dispatches via `call_indirect` (low 32 bits = funcref index, high 32
-// bits = the callee `JSScript*`), bypassing the engine. A zero result means the
-// callee is native / not-compiled, and the body falls back to
-// `night_runtime_call`.
-uint64_t night_runtime_callee_night_target(uint64_t calleeBits) {
-  return js::night::NightCalleeNightTarget(calleeBits);
 }
 
 bool night_runtime_call_iter(JSContext* cx, uint32_t top, uint32_t sp,
@@ -6979,7 +6836,6 @@ void js::night::NightAddPropCheck(JSObject* obj, JS::PropertyKey id,
     js::night::NightClearSlotsBit(obj, js::night::NightBumpSite::SlotsAddMismatch4);
   }
 }
-
 
 // --- baseline-tier helpers -------------------------------------------------
 //
