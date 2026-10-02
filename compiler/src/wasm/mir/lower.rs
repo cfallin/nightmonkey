@@ -310,12 +310,29 @@ struct Lower<'a> {
     home: BTreeMap<mir::Value, u32>,
     nslots: u32,
     slotted: BTreeSet<mir::Value>,
-    /// Home slots that may hold a stale frame's bits (not written since
-    /// entry): cleared at the next may-GC call, whose scan must see only
-    /// valid Values. A slot once written stays valid (the GC updates it),
-    /// so a value that dies is not cleared: it stays alive until its slot
-    /// is reused or the activation returns (§4.4).
+    /// Home slots that may hold invalid bits: not written since entry
+    /// (a dead frame's), or at or above the top of a may-GC call since
+    /// (unscanned, so possibly stale, and possibly overwritten by the
+    /// call's frame or out-slot). Those below the next may-GC call's top
+    /// are cleared there, as its scan must see only valid Values. A slot
+    /// written and scanned since stays valid (the GC updates it), so a
+    /// value that dies is not cleared: it stays alive until its slot is
+    /// reused, falls above a top, or the activation returns (§4.4).
     dirty: BTreeSet<u32>,
+    /// The rooting slots a may-GC call scans, per strongly connected
+    /// component of the CFG (by block): in a cycle, every frame-0 call
+    /// scans the most any of its calls needs, so a loop's slots below
+    /// that stay valid around it (`enter_block`). Absent: no cycle.
+    scc_top: BTreeMap<mir::Block, u32>,
+    /// Per inline frame inlined into the function's own frame (by frame
+    /// id; 0 elsewhere): the rooting slots its region (it and the frames
+    /// inlined into it) keeps -- one past the highest home of a value
+    /// live anywhere in it. The frame sits right above them, over the
+    /// rest, which nothing live in the region occupies.
+    inline_k: Vec<u32>,
+    /// The scan limit (offset from `sp`) of the last `root`: the top a
+    /// may-GC call passes (`top_off`).
+    gc_top: u32,
     /// Per (frame, slot): the value a `frame.store` put there, along the
     /// emission path; a store of the same value again is dropped.
     framed: BTreeMap<(u32, u32), mir::Value>,
@@ -542,6 +559,9 @@ pub fn lower<'a>(
         home: BTreeMap::new(),
         nslots: 0,
         slotted: BTreeSet::new(),
+        scc_top: BTreeMap::new(),
+        inline_k: vec![],
+        gc_top: root_base,
         dirty: BTreeSet::new(),
         framed: BTreeMap::new(),
         pending_retain: vec![],
@@ -1013,6 +1033,21 @@ impl<'a> Lower<'a> {
         self.homes(&reach, &order);
         self.frame_end[0] = self.root_base + 8 * self.nslots;
         self.frame_top[0] = self.frame_end[0];
+        self.inline_ks();
+        self.scc_tops(&order);
+        // A region in a cycle overlays only what the cycle's calls do not
+        // scan: else each entry of it would dirty slots the cycle's other
+        // calls then clear again, every iteration.
+        for b in f.blocks.keys() {
+            let Some(&top) = self.scc_top.get(&b) else { continue };
+            for &i in &f.blocks[b].insts {
+                let fr = f.inst_frame[i];
+                if fr != 0 {
+                    let o = self.outer_frame(fr) as usize;
+                    self.inline_k[o] = self.inline_k[o].max(top);
+                }
+            }
+        }
         if self.inline {
             self.inline_layout();
         }
@@ -1396,13 +1431,16 @@ impl<'a> Lower<'a> {
         // A loop that may GC starts clean: its entry edges clear what they
         // may leave dead (`conform`), so its GC points do not clear them
         // on every iteration.
+        // (Only the slots its calls scan, `scc_top`: those above stay
+        // unscanned inside the loop, and are dirty again past each call.)
         if !later.is_empty() && !dirty.is_empty() && self.loop_may_gc(b, &later) {
             let kept: BTreeSet<u32> = plan
                 .iter()
                 .filter(|&&(_, loc, es)| loc == Loc::Slot || es)
                 .filter_map(|(v, _, _)| self.home.get(v).copied())
                 .collect();
-            dirty.retain(|s| kept.contains(s));
+            let scanned = self.scc_top.get(&b).copied().unwrap_or(self.nslots).min(self.block_slots(b));
+            dirty.retain(|&s| kept.contains(&s) || s >= scanned);
         }
         // What the frame holds on every edge. Where back edges are still
         // to come, only slots the loop never stores a different value into
@@ -1502,11 +1540,13 @@ impl<'a> Lower<'a> {
             .filter(|&&(_, loc, es)| loc == Loc::Slot || es)
             .filter_map(|(v, _, _)| self.home.get(v).copied())
             .collect();
+        // (Never one an inline frame overlays: `block_slots`.)
+        let limit = self.block_slots(b);
         let extra: Vec<u32> = p
             .dirty
             .iter()
             .copied()
-            .filter(|s| !self.entry_dirty[&b].contains(s) && !kept.contains(s))
+            .filter(|&s| s < limit && !self.entry_dirty[&b].contains(&s) && !kept.contains(&s))
             .collect();
         if !extra.is_empty() {
             let undef = self.i64c(UNDEF);
@@ -1708,10 +1748,10 @@ impl<'a> Lower<'a> {
             self.enter_entry_root(root, &vals)?;
             self.cur = slow;
             self.dirty = dirty;
-            // Every slot is valid: the GC may run. Failing, the throw has
+            // The GC may run: nothing is live yet, so its scan stops at the
+            // fixed frame, below every rooting slot. Failing, the throw has
             // no handler (baseline's prologue: pc 0, depth 0).
-            self.init_root_area();
-            self.dirty.clear();
+            self.gc_top = self.root_base;
             let top = self.add_off(self.vp, self.top_off(0));
             let script = self.script_ptr();
             let ok = self.call1(self.h.env_setup, &[self.cx, top, self.sp, script, cell], Type::I32);
@@ -1962,18 +2002,176 @@ impl<'a> Lower<'a> {
         Ok((ok, result))
     }
 
-    /// The first free byte above everything this instruction's frame
-    /// chain holds, as an offset from `sp`: where a helper's out-slot and
-    /// GC scan limit, and a real call's frame, go. That is past the
-    /// instruction's own frame, which is past the rooting area and every
+    /// The first free byte above everything a may-GC call's frame chain
+    /// holds, as an offset from `sp`: where its helper's out-slot and GC
+    /// scan limit, and a real call's frame, go -- as a native stack pointer
+    /// would be. Set by the call's `root`: in the function's own frame,
+    /// past the rooting slots its live values occupy (`root_top`); in an
+    /// inline frame, past that frame, so past every rooting slot and every
     /// enclosing inline frame. (`live` no longer matters: kept for the
     /// callers' shape.)
     fn top_off(&self, _live: usize) -> u32 {
-        self.frame_top[self.cur_frame as usize]
+        self.gc_top
     }
 
-    /// Lay out the inline frames (§5.5): each at its parent's end, the
-    /// function's own frame ending past the rooting area.
+    /// How many rooting slots a may-GC call with `live` live across it
+    /// scans: in the function's own frame, past the highest home slot of
+    /// `live`, and at least its cycle's (`scc_top`); in an inline frame,
+    /// all of them (its frame is above them).
+    fn root_top(&self, live: &[mir::Value]) -> u32 {
+        if self.cur_frame != 0 {
+            return self.inline_k[self.outer_frame(self.cur_frame) as usize];
+        }
+        let need = live.iter().filter_map(|v| self.home.get(v)).map(|&k| k + 1).max().unwrap_or(0);
+        need.max(self.scc_top.get(&self.cur_mblock).copied().unwrap_or(0))
+    }
+
+    /// `scc_top`: the CFG's strongly connected components (Tarjan), and
+    /// per component with a cycle, the most rooting slots any may-GC
+    /// instruction in it needs (all of them for one in an inline frame).
+    fn scc_tops(&mut self, order: &[mir::Block]) {
+        let f = self.f;
+        let blocks: Vec<mir::Block> = order.to_vec();
+        let idx: BTreeMap<mir::Block, usize> = blocks.iter().enumerate().map(|(i, &b)| (b, i)).collect();
+        let succs: Vec<Vec<usize>> = blocks
+            .iter()
+            .map(|&b| f.succs(b).into_iter().filter_map(|s| idx.get(&s).copied()).collect())
+            .collect();
+        let n = blocks.len();
+        let (mut index, mut low, mut on) = (vec![usize::MAX; n], vec![0usize; n], vec![false; n]);
+        let (mut stack, mut comps, mut next) = (vec![], vec![], 0usize);
+        for root in 0..n {
+            if index[root] != usize::MAX {
+                continue;
+            }
+            // Iterative Tarjan: (node, next successor to visit).
+            let mut work = vec![(root, 0usize)];
+            index[root] = next;
+            low[root] = next;
+            next += 1;
+            stack.push(root);
+            on[root] = true;
+            while let Some(&mut (v, ref mut k)) = work.last_mut() {
+                if *k < succs[v].len() {
+                    let w = succs[v][*k];
+                    *k += 1;
+                    if index[w] == usize::MAX {
+                        index[w] = next;
+                        low[w] = next;
+                        next += 1;
+                        stack.push(w);
+                        on[w] = true;
+                        work.push((w, 0));
+                    } else if on[w] {
+                        low[v] = low[v].min(index[w]);
+                    }
+                } else {
+                    work.pop();
+                    if let Some(&(u, _)) = work.last() {
+                        low[u] = low[u].min(low[v]);
+                    }
+                    if low[v] == index[v] {
+                        let mut comp = vec![];
+                        loop {
+                            let w = stack.pop().unwrap();
+                            on[w] = false;
+                            comp.push(w);
+                            if w == v {
+                                break;
+                            }
+                        }
+                        comps.push(comp);
+                    }
+                }
+            }
+        }
+        for comp in comps {
+            let cyclic = comp.len() > 1 || succs[comp[0]].contains(&comp[0]);
+            if !cyclic {
+                continue;
+            }
+            let mut top = 0;
+            for &c in &comp {
+                for &i in &f.blocks[blocks[c]].insts {
+                    if !self.may_gc(i) {
+                        continue;
+                    }
+                    let need = if f.inst_frame[i] != 0 {
+                        self.inline_k[self.outer_frame(f.inst_frame[i]) as usize]
+                    } else {
+                        self.live_across(i)
+                            .iter()
+                            .filter_map(|v| self.home.get(v))
+                            .map(|&k| k + 1)
+                            .max()
+                            .unwrap_or(0)
+                    };
+                    top = top.max(need);
+                }
+            }
+            for &c in &comp {
+                self.scc_top.insert(blocks[c], top);
+            }
+        }
+    }
+
+    /// How many rooting slots a block's code may scan, so may clear: in an
+    /// inline frame's region, those below the frame (`inline_k`), which
+    /// overlays the rest; elsewhere all of them.
+    fn block_slots(&self, b: mir::Block) -> u32 {
+        match self.f.blocks[b].insts.first().map(|&i| self.f.inst_frame[i]) {
+            Some(fr) if fr != 0 => self.inline_k[self.outer_frame(fr) as usize],
+            _ => self.nslots,
+        }
+    }
+
+    /// The inline frame inlined into the function's own frame that `fid`
+    /// is in (itself, or an ancestor).
+    fn outer_frame(&self, mut fid: u32) -> u32 {
+        loop {
+            let parent = self.f.inline_frames[fid as usize - 1].parent;
+            if parent == 0 {
+                return fid;
+            }
+            fid = parent;
+        }
+    }
+
+    /// `inline_k`: per outermost inline frame, one past the highest home
+    /// of a managed value live into a block of its region or across a
+    /// may-GC instruction in it.
+    fn inline_ks(&mut self) {
+        let f = self.f;
+        let mut k = vec![0u32; f.inline_frames.len() + 1];
+        let homed = |l: &Lower, vs: &mut dyn Iterator<Item = mir::Value>| -> u32 {
+            vs.filter_map(|v| l.home.get(&v)).map(|&h| h + 1).max().unwrap_or(0)
+        };
+        for b in f.blocks.keys() {
+            let mut outers = BTreeSet::new();
+            for &i in &f.blocks[b].insts {
+                let fr = f.inst_frame[i];
+                if fr == 0 {
+                    continue;
+                }
+                let o = self.outer_frame(fr);
+                outers.insert(o);
+                let n = homed(self, &mut self.live_across(i).into_iter());
+                k[o as usize] = k[o as usize].max(n);
+            }
+            if outers.is_empty() {
+                continue;
+            }
+            let n = self.live_in.get(&b).map_or(0, |l| homed(self, &mut l.iter().copied()));
+            for o in outers {
+                k[o as usize] = k[o as usize].max(n);
+            }
+        }
+        self.inline_k = k;
+    }
+
+    /// Lay out the inline frames (§5.5): one inlined into the function's
+    /// own frame right above the rooting slots its region keeps
+    /// (`inline_k`), one inlined into another at its parent's end.
     fn inline_layout(&mut self) {
         for (i, fr) in self.f.inline_frames.iter().enumerate() {
             // The callee's own layout (its baseline body resumes on the
@@ -1983,7 +2181,11 @@ impl<'a> Lower<'a> {
                 None => FrameLayout::full(fr.shape.formals, fr.shape.locals),
             };
             debug_assert!(lay.nargs == fr.shape.formals && lay.nlocals == fr.shape.locals);
-            let off = self.frame_top[fr.parent as usize];
+            let off = if fr.parent == 0 {
+                self.root_base + 8 * self.inline_k[i + 1]
+            } else {
+                self.frame_top[fr.parent as usize]
+            };
             let voff = off + 8 * fr.argc.map_or(0, |n| n.saturating_sub(fr.shape.formals));
             let fid = u32::try_from(self.frame_off.len()).unwrap();
             let nact = fr.argc.map_or(lay.nargs, |n| n.max(lay.nargs)) as usize;
@@ -2118,10 +2320,18 @@ impl<'a> Lower<'a> {
             self.store_i64(self.vp, off, b);
             self.slotted.insert(v);
         }
-        // Slots holding what is live now; any other slot not written since
-        // entry may hold a stale frame's bits, which the GC must not see.
+        // The scan: the rooting slots below `top`, and the frame below
+        // them. Slots there holding what is live now are valid; any other
+        // dirty one may hold a dead frame's or stale bits, which the GC
+        // must not see.
+        let top = self.root_top(live);
+        self.gc_top = if self.cur_frame != 0 {
+            self.frame_top[self.cur_frame as usize]
+        } else {
+            self.root_base + 8 * top
+        };
         let holding: BTreeSet<u32> = live.iter().filter_map(|v| self.home.get(v).copied()).collect();
-        let stale: Vec<u32> = self.dirty.difference(&holding).copied().collect();
+        let stale: Vec<u32> = self.dirty.iter().copied().filter(|&s| s < top && !holding.contains(&s)).collect();
         if !stale.is_empty() {
             let undef = self.i64c(UNDEF);
             for s in &stale {
@@ -2129,8 +2339,10 @@ impl<'a> Lower<'a> {
             }
             stores += u32::try_from(stale.len()).unwrap();
         }
-        // Every slot is valid now; a dead value may stay in its slot.
-        self.dirty.clear();
+        // Every slot below `top` is valid now (a dead value may stay in
+        // its slot); those above are unscanned, and the call's frame or
+        // out-slot may overwrite them.
+        self.dirty = (top..self.nslots).collect();
         self.slotted.retain(|v| live.contains(v));
         let e = self.opsize.entry("(root sites / stores)".into()).or_default();
         e.0 += 1;
@@ -7753,6 +7965,15 @@ impl<'a> Lower<'a> {
     fn inline_enter(&mut self, d: &mir::func::InstData, a: &[Value]) -> R<()> {
         let fid = self.cur_frame as usize;
         self.framed.retain(|&(f, _), _| f as usize != fid);
+        if self.f.inline_frames[fid - 1].parent == 0 {
+            // The frame overlays the rooting slots from `inline_k` up,
+            // which no value live in its region has: what they hold is
+            // gone, and they are dirty again from here.
+            let k = self.inline_k[fid];
+            let home = &self.home;
+            self.slotted.retain(|v| home.get(v).is_some_and(|&h| h < k));
+            self.dirty.extend(k..self.nslots);
+        }
         let (base, vbase, l) = (self.frame_off[fid], self.frame_voff[fid], self.frame_layouts[fid]);
         // Every actual for a callee reading them, else every formal.
         let nact = self.f.inline_frames[fid - 1].argc.map_or(l.nargs, |n| n.max(l.nargs));
