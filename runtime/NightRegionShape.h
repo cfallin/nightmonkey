@@ -100,14 +100,15 @@ namespace night {
   _(argsDynCodeFuseOff, 12)                                                    \
   /* Inline string-literal block, right after the args metadata:           */  \
   /* [emptyString @0, thin replay triple @4, fat triple @16, stamp-epoch   */  \
-  /* address @28, binding-write epoch address @32, pad @36]. The major-GC  */  \
-  /* purge zeroes exactly the triples ([@4, @28)): the two epoch addresses */  \
-  /* are host constants and must survive it.                               */  \
+  /* address @28, binding-write epoch address @32, &PlainObject::class_    */  \
+  /* @36]. The major-GC purge zeroes exactly the triples ([@4, @28)): the  */  \
+  /* words after them are host constants and must survive it.              */  \
   _(strlitBlockBytes, 40)                                                      \
   _(strlitEmptyStringOff, 0)                                                   \
   _(strlitTriplesEnd, 28)                                                      \
   _(strlitStampEpochAddrOff, 28)                                               \
   _(strlitBindEpochAddrOff, 32)                                                \
+  _(strlitPlainClassOff, 36)                                                   \
   /* Math native-pointer slots (gEnv.mathNativesPtr), 4 bytes per MN_*.    */  \
   _(mathNativeSlots, 16)                                                       \
   /* Inline-alloc and construct cell rows: the compiler sizes the regions  */  \
@@ -137,6 +138,8 @@ static_assert(Night_strlitStampEpochAddrOff + 4 <= Night_strlitBlockBytes,
               "the stamp-epoch address must fit the strlit block");
 static_assert(Night_strlitBindEpochAddrOff + 4 <= Night_strlitBlockBytes,
               "the binding-epoch address must fit the strlit block");
+static_assert(Night_strlitPlainClassOff + 4 <= Night_strlitBlockBytes,
+              "the plain-object class must fit the strlit block");
 static_assert(Night_strlitTriplesEnd <= Night_strlitStampEpochAddrOff,
               "the purge must not zero the published epoch addresses");
 

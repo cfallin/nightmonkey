@@ -1669,6 +1669,12 @@ bool night_runtime_install_env(JSContext* cx,
       *LinMem<uint32_t>(gState.strLitBase +
                         js::night::Night_strlitBindEpochAddrOff) =
           static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&gBindEpoch));
+      // The plain-object class: MIR's `guard.kind Plain` compares a
+      // receiver's clasp against it.
+      *LinMem<uint32_t>(gState.strLitBase +
+                        js::night::Night_strlitPlainClassOff) =
+          static_cast<uint32_t>(
+              reinterpret_cast<uintptr_t>(&js::PlainObject::class_));
       MOZ_RELEASE_ASSERT(JSString::offsetOfFlags() == 0);
       MOZ_RELEASE_ASSERT(JSString::offsetOfLength() == 4);
       MOZ_RELEASE_ASSERT(JSThinInlineString::MAX_LENGTH_LATIN1 == 8);

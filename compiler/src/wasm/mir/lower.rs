@@ -2827,6 +2827,15 @@ impl<'a> Lower<'a> {
                 let len = self.load_i32(a[0], TA_LENGTH_PAYLOAD_OFFSET);
                 self.def(inst, len);
             }
+            Opcode::GuardKind(ObjKind::Plain) => {
+                let shape = self.load_i32(a[0], SHAPE_OFFSET);
+                let base = self.load_i32(shape, SHAPE_BASESHAPE_OFFSET);
+                let clasp = self.load_i32(base, BASESHAPE_CLASP_OFFSET);
+                let pslot = self.i32c(self.h.strlit_slot + crate::region_shape::STRLIT_PLAIN_CLASS_OFF);
+                let plain_class = self.load_i32(pslot, 0);
+                let is_plain = self.bin(Operator::I32Eq, clasp, plain_class, Type::I32);
+                self.guard(inst, is_plain, &[a[0]])?;
+            }
             Opcode::GuardKind(ObjKind::Native) => {
                 let shape = self.load_i32(a[0], SHAPE_OFFSET);
                 let flags = self.load_i32(shape, SHAPE_IMMUTABLE_FLAGS_OFFSET);
@@ -3800,6 +3809,26 @@ impl<'a> Lower<'a> {
                 self.def(inst, v);
             }
             Opcode::StoreField(name) => self.field_op(inst, name, a[0], Some(a[1]))?,
+            Opcode::StoreSlot(name) => {
+                // `field_op`'s store with TYPES kept by type: RANGES dropped
+                // (no MIR claim reads it), the barriers unless a number.
+                let d = &self.f.insts[inst];
+                let t = self.ty(d.args[0]);
+                let num = matches!(self.ty(d.args[1]), MType::Val(s) if s.tags.subset_of(TagSet::NUMBER));
+                let o = t.obj_info().ok_or("lowering: store_slot of a non-object")?;
+                let slot = mir::ops::slot_of(o, name, self.mm).ok_or("lowering: store_slot without a proven slot")?;
+                let off = FIXED_SLOTS_BASE + 8 * slot;
+                let w = self.load_i32(a[0], OBJ_CLASS_IDX_OFFSET);
+                self.clear_bits(a[0], w, CLASS_WORD_RANGES);
+                if !num {
+                    self.pre_barrier(a[0], off);
+                }
+                self.store_i64(a[0], off, a[1]);
+                if !num {
+                    let sv = self.i32c(slot);
+                    self.post_barrier(self.h.post_write_barrier, a[0], sv, a[1]);
+                }
+            }
             Opcode::JsBoxThis => {
                 // Allocates (a primitive's wrapper); runs no user code.
                 let live = self.live_across(inst);

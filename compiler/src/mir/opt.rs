@@ -74,14 +74,14 @@ fn guard_arg(f: &Func, d: &crate::mir::func::InstData) -> Value {
 
 /// Predecessors, reverse postorder from the roots, and immediate
 /// dominators (over a virtual root above every root).
-pub(super) struct Cfg {
-    pub(super) rpo: Vec<Block>,
+pub(crate) struct Cfg {
+    pub(crate) rpo: Vec<Block>,
     /// Pre/post numbers in the dominator tree.
     dom: BTreeMap<Block, (u32, u32)>,
 }
 
 impl Cfg {
-    pub(super) fn new(f: &Func) -> Cfg {
+    pub(crate) fn new(f: &Func) -> Cfg {
         let mut preds: BTreeMap<Block, Vec<Block>> = BTreeMap::new();
         for &b in &f.layout {
             preds.entry(b).or_default();
@@ -189,11 +189,11 @@ impl Cfg {
     }
 
     /// Whether `b` is reachable from a root.
-    pub(super) fn reachable(&self, b: Block) -> bool {
+    pub(crate) fn reachable(&self, b: Block) -> bool {
         self.dom.contains_key(&b)
     }
 
-    pub(super) fn dominates(&self, a: Block, b: Block) -> bool {
+    pub(crate) fn dominates(&self, a: Block, b: Block) -> bool {
         match (self.dom.get(&a), self.dom.get(&b)) {
             (Some(&(ap, aq)), Some(&(bp, bq))) => ap <= bp && bq <= aq,
             _ => false,
@@ -202,7 +202,7 @@ impl Cfg {
 }
 
 /// Where a value is defined: its block.
-pub(super) fn def_block(f: &Func, v: Value, inst_block: &BTreeMap<Inst, Block>) -> Option<Block> {
+pub(crate) fn def_block(f: &Func, v: Value, inst_block: &BTreeMap<Inst, Block>) -> Option<Block> {
     match f.values[v].def {
         ValueDef::Param(b, _) => Some(b),
         ValueDef::Result(i, _) => inst_block.get(&i).copied(),
@@ -212,7 +212,7 @@ pub(super) fn def_block(f: &Func, v: Value, inst_block: &BTreeMap<Inst, Block>) 
 
 /// The value a guard's `ok` edge hands its successor as output 0: the
 /// param receiving it.
-pub(super) fn ok_output(f: &Func, ok: &Edge) -> Option<Value> {
+pub(crate) fn ok_output(f: &Func, ok: &Edge) -> Option<Value> {
     let k = ok.args.iter().position(|a| *a == EdgeArg::Out(0))?;
     Some(f.blocks[ok.block].params[k])
 }
@@ -532,11 +532,13 @@ pub fn optimize(m: &Module, f: &mut Func) -> usize {
             }
         }
     }
+    let mut promoted = false;
+    let mut pea_done = false;
     loop {
         // Before the passes that value-number and hoist reads: a receiver
         // proven by an earlier round's folding makes more loads slot
         // reads.
-        total += canon_loads(m, f);
+        total += canon_loads(m, f) + if CANON_STORES { canon_stores(m, f) } else { 0 };
         // First: a loop's invariant values reach its body through params
         // until forwarded, and `hoist_guards` needs them as they are.
         forward_params(m, f);
@@ -553,10 +555,35 @@ pub fn optimize(m: &Module, f: &mut Func) -> usize {
         let threaded = if THREAD_JUMPS { thread_jumps(f) } else { 0 };
         total += n;
         if n == 0 && threaded == 0 {
+            // Then, once each, partial escape analysis and loop-carried
+            // caching (neither must see its own materializations,
+            // write-backs and reloads as accesses), and the passes again.
+            if PEA && !pea_done {
+                pea_done = true;
+                let p = crate::mir::pea::pea(m, f);
+                if p > 0 {
+                    total += p;
+                    continue;
+                }
+            }
+            if PROMOTE && !promoted {
+                promoted = true;
+                let p = crate::mir::promote::promote_all(m, f);
+                if p > 0 {
+                    total += p;
+                    continue;
+                }
+            }
             return total;
         }
     }
 }
+
+/// `store_field`s that cannot demote become `store_slot`s.
+const CANON_STORES: bool = true;
+
+/// Loop-carried caching of closure variables (`promote`).
+const PROMOTE: bool = true;
 
 /// `load_field` through a receiver whose type proves the field's slot
 /// (`ops::slot_of`) lowers to one load and a branch to `ok_clean`; its
@@ -606,11 +633,48 @@ pub fn canon_loads(m: &Module, f: &mut Func) -> usize {
     n
 }
 
+/// `store_field` of a value conforming to its field's claim through a
+/// receiver whose type proves the slot and TYPES cannot demote: its dirty
+/// and err edges are dead. It becomes `store_slot` and a jump to the clean
+/// successor, a plain write of its field (as `canon_loads` for reads).
+/// Returns how many it rewrote.
+pub fn canon_stores(m: &Module, f: &mut Func) -> usize {
+    let mut n = 0;
+    for b in f.layout.clone() {
+        let Some(t) = f.terminator(b) else { continue };
+        let Opcode::StoreField(name) = f.insts[t].op else { continue };
+        let d = f.insts[t].clone();
+        let tys: Vec<Type> = d.args.iter().map(|&v| f.values[v].ty).collect();
+        if signature(&Opcode::StoreSlot(name), &tys, m).is_err() {
+            continue;
+        }
+        let frame = f.inst_frame[t];
+        f.blocks[b].insts.pop();
+        // Its retaining stores (`retain_locals`): a slot write has no GC
+        // point.
+        while let Some(&i) = f.blocks[b].insts.last() {
+            if !matches!(f.insts[i].op, Opcode::FrameStore(_)) {
+                break;
+            }
+            f.blocks[b].insts.pop();
+        }
+        let (s, _) = f.add_inst(b, Opcode::StoreSlot(name), d.args.clone(), &[], vec![]);
+        let (j, _) = f.add_inst(b, Opcode::Jump, vec![], &[], vec![d.succs[0].clone()]);
+        f.inst_frame[s] = frame;
+        f.inst_frame[j] = frame;
+        n += 1;
+    }
+    n
+}
+
 /// Whether `mem::mem_vn` runs.
 const MEM_VN: bool = true;
 
 /// Whether `mem::sroa` runs.
 const SROA: bool = true;
+
+/// Whether `pea::pea` runs (literal objects virtual until they escape).
+const PEA: bool = true;
 
 /// `unbox` of a `box` (through `weaken`s) is the boxed value itself,
 /// where its type is the unbox's result or stronger and has no killable
@@ -1232,7 +1296,7 @@ pub fn fold_guards(m: &Module, f: &mut Func) -> usize {
 /// Replace each value `subst` maps by its image (to a fixpoint), and
 /// drop the instructions whose results are all replaced. Returns how many
 /// instructions it dropped.
-pub(super) fn replace_values(f: &mut Func, subst: &BTreeMap<Value, Value>) -> usize {
+pub(crate) fn replace_values(f: &mut Func, subst: &BTreeMap<Value, Value>) -> usize {
     if subst.is_empty() {
         return 0;
     }

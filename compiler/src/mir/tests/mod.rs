@@ -972,3 +972,56 @@ fn element_loads_do_not_number_across_a_store() {
     ));
     assert_eq!(text.matches("load_elem").count(), 2, "{text}");
 }
+
+/// A loop that reads and writes slot 4 of the frame's environment, with
+/// `body` after the write (which ends by jumping to b4 with the counter).
+fn env_loop(body: &str) -> String {
+    format!(
+        "module {{}}\n\
+func @s1 (formals=1, locals=0, depths={{0:0}}) {{\n  root entry b0\n  loop b2 preheader=b1\n\
+b0(v0: obj{{Function(s1)}}, v1: val, v2: val):\n  v3 = env.current\n  jump b1\n\
+b1:\n  v5 = const.i32 0\n  jump b2(v5)\n\
+b2(v6: i32):\n  v7 = env.load v3 4\n  v8 = box v6\n  env.store v3, v8 4\n  jump b3\n\
+b3:\n{body}\
+b4(v11: i32):\n  v12 = const.i32 100\n  v13 = i32.cmp.lt v11, v12\n  br v13 -> then b2(v11), else b8\n\
+b8:\n  return v1\n\
+b9:\n  exit pc=0 this=v1 args=[v2] locals=[] rval=v1 stack=[]\n}}\n"
+    )
+}
+
+/// The blocks of `text` whose label is one of `labels`, joined.
+fn blocks_named(text: &str, labels: &[&str]) -> String {
+    text.split("\n\n")
+        .filter(|b| labels.iter().any(|l| b.starts_with(&format!("{l}:")) || b.starts_with(&format!("{l}("))))
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+#[test]
+fn env_slot_is_carried_around_the_loop() {
+    let text = optimized(&env_loop(
+        "  v10 = const.i32 1\n  i32.add.ovf v6, v10 -> ok b4(v11: i32), fail b9\n",
+    ));
+    let lp = blocks_named(&text, &["b2", "b3", "b4"]);
+    assert!(!lp.contains("env.load") && !lp.contains("env.store"), "memory traffic left in the loop:\n{text}");
+    assert!(blocks_named(&text, &["b1"]).contains("env.load"), "no load in the preheader:\n{text}");
+    // Written back on the way out: to the return, and to the exit.
+    assert_eq!(text.matches("env.store").count(), 2, "{text}");
+}
+
+#[test]
+fn env_slot_is_written_back_around_a_call() {
+    let text = optimized(&env_loop(
+        "  v20 = const.val undefined\n  call v1, v20 -> ok_clean b5(v21: val), ok_dirty b9, err b9\n\
+b5(v21: val):\n  v10 = const.i32 1\n  i32.add.ovf v6, v10 -> ok b4(v11: i32), fail b9\n",
+    ));
+    // Before the call (it may read the slot) and a reload after it (it
+    // may write it).
+    let call_blk = text.split("\n\n").find(|b| b.contains("call v1")).unwrap_or("");
+    assert!(call_blk.contains("env.store"), "no write-back before the call:\n{text}");
+    let preheader = blocks_named(&text, &["b1"]);
+    assert!(
+        text.split("\n\n").any(|b| b.contains("env.load") && b != preheader),
+        "no reload after the call:\n{text}"
+    );
+}

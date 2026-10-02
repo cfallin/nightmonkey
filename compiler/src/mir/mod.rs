@@ -22,7 +22,9 @@ pub mod module;
 pub mod ops;
 pub mod opt;
 pub mod parse;
+pub mod pea;
 pub mod print;
+pub mod promote;
 pub mod types;
 pub mod verify;
 

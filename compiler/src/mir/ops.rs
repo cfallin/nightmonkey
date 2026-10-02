@@ -725,6 +725,11 @@ pub enum Opcode {
     /// it cannot miss, GC, throw or run JS (MIR-MEMORY.md §1.1), so
     /// value numbering and LICM treat it as a pure read of its field.
     LoadSlot(AtomId),
+    /// `store_field` through a receiver whose type proves the field's slot
+    /// and TYPES, of a value conforming to the field's claim: the slot
+    /// written (RANGES dropped, as every store does). Not a terminator: it
+    /// cannot miss, demote, GC, throw or run JS.
+    StoreSlot(AtomId),
     StoreField(AtomId),
     InitField(AtomId),
     PublishLayout,
@@ -1936,6 +1941,21 @@ pub fn signature(op: &Opcode, args: &[Type], m: &Module) -> SigResult {
             })?;
             Sig::result(signature(&LoadField(*name), args, m)?.outputs[0])
         }
+        StoreSlot(name) => {
+            arity(args, 2)?;
+            let o = obj(&args[0], "store_slot")?;
+            want(slot_of(&o, *name, m).is_some(), || {
+                "store_slot: the receiver's type does not prove the slot".into()
+            })?;
+            let (c, claims) = field_claims(&o, *name, m, "store_slot")?;
+            want(c.types, || "store_slot: the receiver's claim has no TYPES".into())?;
+            for claim in &claims {
+                want(is_subtype(&args[1], claim), || {
+                    "store_slot: value does not conform to the field's claim".into()
+                })?;
+            }
+            Sig::none()
+        }
         StoreField(name) => {
             arity(args, 2)?;
             let o = obj(&args[0], "store_field")?;
@@ -2472,6 +2492,10 @@ pub fn effects(op: &Opcode, args: &[Type], m: &Module) -> Effects {
             fx.flags = FlagsEffect::Dynamic;
         }
         LoadSlot(name) => fx.reads = vec![field_region(recv, *name)],
+        StoreSlot(name) => {
+            fx.writes = vec![field_region(recv, *name)];
+            fx.flags = FlagsEffect::Bits(FlagBits::MUT_THIS.union(FlagBits::MUT_OTHER));
+        }
         GetPropData(name) => fx.reads = prop_regions(*name, m),
         // A field (never the global's), or an array's length (which may
         // drop elements): an add may grow the slots; a demotion takes the

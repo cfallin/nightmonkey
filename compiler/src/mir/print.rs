@@ -467,6 +467,7 @@ pub fn mnemonic(op: &Opcode) -> String {
         JsSetName(_, true) => "js.setname.strict".into(),
         LoadField(_) => "load_field".into(),
         LoadSlot(_) => "load_slot".into(),
+        StoreSlot(_) => "store_slot".into(),
         GetPropData(_) => "getprop.data".into(),
         GetElemData => "getelem.data".into(),
         SetElemData(false) => "setelem.data".into(),
@@ -549,6 +550,7 @@ fn immediates(m: &Module, op: &Opcode) -> Option<String> {
         | JsSetName(a, _)
         | LoadField(a)
         | LoadSlot(a)
+        | StoreSlot(a)
         | GetPropData(a)
         | SetPropData(a)
         | StoreField(a)

@@ -14,8 +14,13 @@
 - AOT output is not reproducible: two compiles of one input differ in the
   data segment (the wizened heap), not in code (checked 2026-10-01 on
   richards and crypto: code sections byte-identical, MIR dumps identical).
-  The wizening run executes the benchmark's top-level `main()`, and
-  Octane's harness runs for a fixed time, so iteration counts and heap
-  contents vary. Options: a deterministic clock during wizening (a fixed
-  `Date.now`/`performance.now` sequence), or no timed run at wizen time
-  (as `prof7/octane/` already does for box2d and mandreel).
+  Most of it was the wizening run executing Octane's top-level `main()`
+  (fixed time, so iteration counts and heap contents vary); the nm-bench
+  skill now wizens without that call. What remains is 608 bytes (richards):
+  the top of the shadow stack (63 MiB) and early heap allocations
+  (65-68 MiB), most likely values the runtime seeds at startup from WASI
+  `random_get` and the clocks (hash-code scramblers, Math.random state,
+  startup timestamps). Fix: wizen with a seeded random source and a fixed
+  clock. wizer 9 builds its WasiCtx internally with no hook for either (and
+  its custom-linker option excludes WASI), so this needs a wizer option
+  (upstream) or a WASI shim in front of the shell.

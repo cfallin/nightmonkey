@@ -129,6 +129,7 @@ impl Maps {
             JsSetName(a, s) => JsSetName(self.atom(a), s),
             LoadField(a) => LoadField(self.atom(a)),
             LoadSlot(a) => LoadSlot(self.atom(a)),
+            StoreSlot(a) => StoreSlot(self.atom(a)),
             GetPropData(a) => GetPropData(self.atom(a)),
             SetPropData(a) => SetPropData(self.atom(a)),
             LitInit(a, k) => LitInit(self.atom(a), k),

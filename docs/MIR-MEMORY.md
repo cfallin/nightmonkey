@@ -431,3 +431,66 @@ with forwarding and loop-carried promotion (item 4):
   of `Unknown` or of `Field(*, name)` reloads the cache, a reader of
   `Unknown` gets the write-back first. The same state then serves objects
   that are not fresh allocations (load once, carry, write back).
+
+## 11. Materialize once, then cache: what landed (2026-10-01)
+
+Two passes, run once each after `optimize`'s fixpoint converges (then
+the fixpoint again). Neither may see its own output as input: `pea` would
+virtualize its own materializations, `promote` would count its own
+write-backs and reloads as accesses.
+
+**`pea` (`mir/pea.rs`), partial escape of `lit.new` objects.** The
+object is virtual until, on each path, its first escape (`exit.inline`,
+a call, a store, any use that is not an init, stamp, slot load or store,
+guard, conversion or frame store). There it is materialized: `lit.new`,
+`stamp.fresh`, `lit.init` of the fields' current values, then
+`guard.unbox.obj`/`guard.kind Plain`/`guard.layout`, whose fail edges are
+`unreachable` (asserts: the object was just made with that layout),
+giving a typed view. From there every block of the real part carries
+(value, view) as params; a virtual edge into a real block materializes
+on the edge. In the virtual part loads are the values last stored,
+guards pass, and exits that do not return rebuild the object (as
+`sroa`'s do). The view is typed until an op or a fence edge kills a
+component of it (the call the object escaped into may reshape it):
+before that op a `weaken` gives `obj{Plain}`, and a real block any such
+path reaches carries that view instead.
+
+**`promote` (`mir/promote.rs`), loop-carried caching.** An env slot,
+or a `store_slot`-able field of an object defined before the loop that
+the loop both reads and writes, is loaded in the preheader and carried
+as a header param. Memory is written back before any op that may read
+the location (its effects say so) and on edges leaving the loop while
+dirty. It is reloaded after any op that may write it, and on the edges
+of terminators that write it. Cost rule: those barriers must be fewer
+than the accesses they replace.
+
+**Limits, each a design item:**
+
+- A pass cannot add an exit: it has no frame state at an arbitrary
+  point. So every op it inserts is infallible (the asserts above), and
+  the owner's maybe-null reference, materialized lazily at the first
+  escape *inside* a loop, is not built. That needs frame states the
+  builder keeps for every point a pass may want to exit at.
+- `pea` declines objects whose fields differ by path where needed (no
+  field params at merges yet), objects that escape before every field is
+  added, and objects that meet another value at a param. It handles
+  `lit.new` only; `new_this` constructs are next.
+- `promote` caches nothing that polymorphic stores reach, since those
+  cannot become `store_slot`. Most of what it caches is env slots.
+
+**Compile time.** A jit-test with hundreds of literals in one 16k-instruction
+function (`basic/testComparisons.js`) went from 1 s to more than 10 minutes.
+Three fixes:
+
+- `sroa` plans every candidate against one snapshot per round (the CFG,
+  preds, uses), then applies every plan that doesn't collide with another.
+  Before, it rebuilt everything after each replacement.
+- `pea`'s exit rebuilds are `sroa`'s own form, with no view asserts, so
+  `sroa` leaves them alone.
+- `pea` examines at most 64 allocations per function, keeping its CFG
+  across declined ones.
+
+The test now compiles in 6 s. What remains is size: each virtualized object
+is rebuilt before every exit in its virtual region, so that function grows
+from 16k to 36k instructions. Sharing one rebuild among exits with the same
+fields would fix that.

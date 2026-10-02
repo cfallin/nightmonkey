@@ -68,7 +68,7 @@ pub(crate) fn writes_on(f: &Func, m: &Module, i: Inst, fx: &Effects, role: Optio
 /// `unbox`, `box`, `weaken`, and a guard's output (a param of a block
 /// whose only way in is that guard's `ok` edge). Two values with one root
 /// are one object.
-fn root(f: &Func, mut v: Value, preds: &BTreeMap<Block, Vec<Inst>>) -> Value {
+pub(crate) fn root(f: &Func, mut v: Value, preds: &BTreeMap<Block, Vec<Inst>>) -> Value {
     for _ in 0..64 {
         match f.values[v].def {
             ValueDef::Result(i, 0) if matches!(f.insts[i].op, Opcode::Unbox(_) | Opcode::Box | Opcode::Weaken) => {
@@ -258,7 +258,7 @@ pub fn mem_vn(m: &Module, f: &mut Func) -> usize {
                         let Version::Inst(s) = v else { break };
                         let sd = &f.insts[s];
                         let stored = match sd.op {
-                            Opcode::StoreField(n) | Opcode::InitField(n) if n == name => {
+                            Opcode::StoreField(n) | Opcode::StoreSlot(n) | Opcode::InitField(n) if n == name => {
                                 let slotted = f.values[sd.args[0]].ty.obj_info().is_some_and(|o| slot_of(o, n, m).is_some());
                                 slotted.then(|| (sd.args[0], sd.args[1]))
                             }
@@ -379,7 +379,7 @@ fn uses_of(f: &Func, cfg: &Cfg) -> HashMap<Value, Vec<Use>> {
 
 /// Remove param `k` of block `b`, and the argument each edge into `b`
 /// passes for it.
-fn drop_param(f: &mut Func, b: Block, k: usize) {
+pub(crate) fn drop_param(f: &mut Func, b: Block, k: usize) {
     let p = f.blocks[b].params.remove(k);
     f.values[p].def = ValueDef::Unused;
     for (n, &q) in f.blocks[b].params.clone().iter().enumerate() {
@@ -423,47 +423,119 @@ fn meet_fields(a: &[FieldState], b: &[FieldState]) -> Vec<FieldState> {
 pub fn sroa(m: &Module, f: &mut Func) -> usize {
     let mut n = 0;
     loop {
+        // One snapshot per round: every candidate is planned against it
+        // (plans name instructions and values, which rewriting keeps), and
+        // every plan that does not collide with another is applied.
         let cfg = Cfg::new(f);
-        let allocs: Vec<Inst> = cfg
+        let mut preds: BTreeMap<Block, Vec<Inst>> = BTreeMap::new();
+        let mut inst_block: BTreeMap<Inst, Block> = BTreeMap::new();
+        for &b in &cfg.rpo {
+            for &i in &f.blocks[b].insts {
+                inst_block.insert(i, b);
+            }
+            if let Some(tt) = f.terminator(b) {
+                for e in &f.insts[tt].succs {
+                    preds.entry(e.block).or_default().push(tt);
+                }
+            }
+        }
+        let snap = Snapshot {
+            uses: uses_of(f, &cfg),
+            rpo_pos: cfg.rpo.iter().enumerate().map(|(i, &b)| (b, i)).collect(),
+            cfg,
+            preds,
+            inst_block,
+        };
+        let allocs: Vec<Inst> = snap
+            .cfg
             .rpo
             .iter()
             .filter_map(|&b| f.terminator(b))
             .filter(|&t| matches!(f.insts[t].op, Opcode::LitNew(_)))
             .collect();
-        let mut any = false;
+        // A plan clears the blocks only its guards' failures reach; no
+        // other plan may touch those.
+        let mut plans: Vec<Plan> = vec![];
+        let (mut touched, mut cleared) = (BTreeSet::new(), BTreeSet::new());
         for t in allocs {
-            if replace_one(m, f, &cfg, t) {
-                n += 1;
-                any = true;
-                // The CFG changed under the rest.
-                break;
+            let Some(p) = plan_one(m, f, &snap, t) else { continue };
+            if p.touched.iter().any(|b| cleared.contains(b)) || p.dead.iter().any(|b| touched.contains(b)) {
+                continue;
             }
+            touched.extend(p.touched.iter().copied());
+            cleared.extend(p.dead.iter().copied());
+            plans.push(p);
         }
-        if !any {
+        if plans.is_empty() {
             return n;
+        }
+        n += plans.len();
+        let mut inst_block = snap.inst_block;
+        let unreachable = f.add_block();
+        f.add_inst(unreachable, Opcode::Unreachable, vec![], &[], vec![]);
+        // Loads' replacements last, all at once: one object's field may
+        // be another's load (chains resolve).
+        let mut subst: BTreeMap<Value, Value> = BTreeMap::new();
+        for p in &plans {
+            apply_plan(f, p, &mut inst_block, unreachable);
+            subst.extend(p.subst.iter().map(|(&a, &b)| (a, b)));
+        }
+        replace_values(f, &subst);
+        // What only the guards' failures reached is dead, and may still
+        // name the objects' values: nothing left in it.
+        for b in cleared {
+            f.blocks[b].insts.clear();
+            f.add_inst(b, Opcode::Unreachable, vec![], &[], vec![]);
         }
     }
 }
 
-/// `sroa` for the object allocation `t` makes, if it does not escape.
-fn replace_one(m: &Module, f: &mut Func, cfg: &Cfg, t: Inst) -> bool {
+/// What every `sroa` candidate of a round is planned against.
+struct Snapshot {
+    cfg: Cfg,
+    preds: BTreeMap<Block, Vec<Inst>>,
+    uses: HashMap<Value, Vec<Use>>,
+    inst_block: BTreeMap<Inst, Block>,
+    rpo_pos: BTreeMap<Block, usize>,
+}
+
+/// One object's replacement, in instructions and values.
+struct Plan {
+    t: Inst,
+    nslots: u32,
+    word: u32,
+    key: crate::ids::LayoutKey,
+    row: Vec<crate::mir::entity::AtomId>,
+    vals: BTreeSet<Value>,
+    stamps: Vec<Inst>,
+    inits: Vec<Inst>,
+    stores: Vec<Inst>,
+    loads: Vec<Inst>,
+    guards: Vec<Inst>,
+    convs: Vec<Inst>,
+    fstores: Vec<Inst>,
+    /// Exits that rebuild the object, with the fields added by then.
+    mats: Vec<(Inst, Vec<Value>)>,
+    subst: BTreeMap<Value, Value>,
+    /// The blocks the rewrite edits, and those it clears.
+    touched: BTreeSet<Block>,
+    dead: BTreeSet<Block>,
+}
+
+/// `sroa`'s plan for the object allocation `t` makes, if it does not
+/// escape.
+#[allow(clippy::too_many_lines)]
+fn plan_one(m: &Module, f: &Func, snap: &Snapshot, t: Inst) -> Option<Plan> {
+    let (cfg, preds, uses, inst_block) = (&snap.cfg, &snap.preds, &snap.uses, &snap.inst_block);
     use crate::mir::ops::UnboxKind;
     use crate::mir::types::{ObjKind, TagSet};
     let d = f.insts[t].clone();
-    let Opcode::LitNew(nslots) = d.op else { return false };
+    let Opcode::LitNew(nslots) = d.op else { return None };
     let ok = d.succs[0].clone();
-    let Some(k0) = ok.args.iter().position(|a| *a == EdgeArg::Out(0)) else { return false };
+    let Some(k0) = ok.args.iter().position(|a| *a == EdgeArg::Out(0)) else { return None };
     let obj = f.blocks[ok.block].params[k0];
-    let mut preds: BTreeMap<Block, Vec<Inst>> = BTreeMap::new();
-    for &b in &cfg.rpo {
-        if let Some(tt) = f.terminator(b) {
-            for e in &f.insts[tt].succs {
-                preds.entry(e.block).or_default().push(tt);
-            }
-        }
-    }
     if preds.get(&ok.block).map(Vec::as_slice) != Some(&[t]) {
-        return false;
+        return None;
     }
     // An allocation on an exit's path (one this pass rebuilt) is where it
     // is needed already: every path from it only inits and leaves.
@@ -485,9 +557,8 @@ fn replace_one(m: &Module, f: &mut Func, cfg: &Cfg, t: Inst) -> bool {
         }
     }
     if exit_only {
-        return false;
+        return None;
     }
-    let uses = uses_of(f, cfg);
     // The object's values and uses, classified; any other use escapes it.
     let mut vals: BTreeSet<Value> = BTreeSet::from([obj]);
     let mut work = vec![obj];
@@ -543,7 +614,7 @@ fn replace_one(m: &Module, f: &mut Func, cfg: &Cfg, t: Inst) -> bool {
                             key = Some(k);
                             inits.push(i);
                         }
-                        Opcode::StoreField(name)
+                        Opcode::StoreField(name) | Opcode::StoreSlot(name)
                             if idx == 0
                                 && f.values[di.args[0]].ty.obj_info().is_some_and(|o| slot_of(o, name, m).is_some()) =>
                         {
@@ -570,21 +641,15 @@ fn replace_one(m: &Module, f: &mut Func, cfg: &Cfg, t: Inst) -> bool {
             }
         }
     }
-    let (Some(word), Some(key)) = (word, key) else { return false };
+    let (Some(word), Some(key)) = (word, key) else { return None };
     if layout_guards.iter().any(|(_, keys)| !keys.contains(&crate::mir::types::KeyRange::one(key))) {
-        return false;
+        return None;
     }
     // Where the code can go if the object does not escape: its guards
     // pass (the class word its allocation wrote is the one they test, and
     // nothing else can reach the object to change it). Uses only their
     // failures reach do not count; if none of the rest escapes it, the
     // assumption holds.
-    let mut inst_block: BTreeMap<Inst, Block> = BTreeMap::new();
-    for &b in &cfg.rpo {
-        for &i in &f.blocks[b].insts {
-            inst_block.insert(i, b);
-        }
-    }
     let mut reach: BTreeSet<Block> = BTreeSet::new();
     let mut work: Vec<Block> = f.roots.iter().map(|r| r.block).collect();
     while let Some(b) = work.pop() {
@@ -598,7 +663,7 @@ fn replace_one(m: &Module, f: &mut Func, cfg: &Cfg, t: Inst) -> bool {
     }
     let live = |i: &Inst| reach.contains(&inst_block[i]);
     if escapes.iter().any(live) {
-        return false;
+        return None;
     }
     for v in [&mut stamps, &mut inits, &mut stores, &mut loads, &mut guards, &mut convs, &mut fstores] {
         v.retain(live);
@@ -612,7 +677,7 @@ fn replace_one(m: &Module, f: &mut Func, cfg: &Cfg, t: Inst) -> bool {
                 continue;
             }
             if f.roots.iter().any(|r| r.block == b) {
-                return false;
+                return None;
             }
             for &p in preds.get(&b).map(Vec::as_slice).unwrap_or(&[]) {
                 if !live(&p) {
@@ -622,24 +687,24 @@ fn replace_one(m: &Module, f: &mut Func, cfg: &Cfg, t: Inst) -> bool {
                     match e.args[k as usize] {
                         EdgeArg::Value(x) if vals.contains(&x) => {}
                         EdgeArg::Out(_) if is_guard(&f.insts[p].op) && guards.contains(&p) => {}
-                        _ => return false,
+                        _ => return None,
                     }
                 }
             }
         }
     }
     if f.loops.iter().any(|l| l.entry.as_ref().is_some_and(|e| e.state.iter().any(|v| vals.contains(v)))) {
-        return false;
+        return None;
     }
     // The row: the inits' names, in order; each once.
     let mut row: Vec<crate::mir::entity::AtomId> = vec![];
-    let rpo_pos: BTreeMap<Block, usize> = cfg.rpo.iter().enumerate().map(|(i, &b)| (b, i)).collect();
+    let rpo_pos = &snap.rpo_pos;
     let mut ordered_inits = inits.clone();
     ordered_inits.sort_by_key(|i| rpo_pos[&inst_block[i]]);
     for &i in &ordered_inits {
         let Opcode::LitInit(name, _) = f.insts[i].op else { unreachable!() };
         if row.contains(&name) {
-            return false;
+            return None;
         }
         row.push(name);
     }
@@ -654,6 +719,14 @@ fn replace_one(m: &Module, f: &mut Func, cfg: &Cfg, t: Inst) -> bool {
             _ => None,
         }
     };
+    // What a non-terminator adds: a `store_slot`'s value.
+    let slot_def = |f: &Func, i: Inst| -> Option<(usize, Value)> {
+        let di = &f.insts[i];
+        match di.op {
+            Opcode::StoreSlot(name) if stores.contains(&i) => field_ix(name).map(|x| (x, di.args[1])),
+            _ => None,
+        }
+    };
     let mut ins: BTreeMap<Block, Vec<FieldState>> = BTreeMap::new();
     ins.insert(ok.block, vec![FieldState::Absent; row.len()]);
     let mut changed = true;
@@ -663,8 +736,11 @@ fn replace_one(m: &Module, f: &mut Func, cfg: &Cfg, t: Inst) -> bool {
             if !cfg.dominates(ok.block, b) || !reach.contains(&b) {
                 continue;
             }
-            let Some(st) = ins.get(&b).cloned() else { continue };
+            let Some(mut st) = ins.get(&b).cloned() else { continue };
             for &i in &f.blocks[b].insts {
+                if let Some((x, v)) = slot_def(f, i) {
+                    st[x] = FieldState::Val(v);
+                }
                 for (s, e) in f.insts[i].succs.iter().enumerate() {
                     let mut s2 = st.clone();
                     if let Some((x, v)) = edge_def(f, i, s) {
@@ -690,14 +766,18 @@ fn replace_one(m: &Module, f: &mut Func, cfg: &Cfg, t: Inst) -> bool {
             continue;
         }
         let Some(st) = ins.get(&b) else { continue };
+        let mut st = st.clone();
         for &i in &f.blocks[b].insts {
+            if let Some((x, v)) = slot_def(f, i) {
+                st[x] = FieldState::Val(v);
+            }
             let di = &f.insts[i];
             if loads.contains(&i) {
                 let Opcode::LoadSlot(name) = di.op else { unreachable!() };
-                let Some(FieldState::Val(v)) = field_ix(name).map(|x| st[x]) else { return false };
+                let Some(FieldState::Val(v)) = field_ix(name).map(|x| st[x]) else { return None };
                 let r = di.results[0];
                 if !(is_subtype(&f.values[v].ty, &f.values[r].ty) || f.values[v].ty == f.values[r].ty) {
-                    return false;
+                    return None;
                 }
                 subst.insert(r, v);
             }
@@ -711,16 +791,54 @@ fn replace_one(m: &Module, f: &mut Func, cfg: &Cfg, t: Inst) -> bool {
                     })
                     .collect();
                 if st[fv.len()..].iter().any(|s| *s != FieldState::Absent) {
-                    return false;
+                    return None;
                 }
                 mats.push((i, fv));
             }
         }
     }
-    // Rewrite. Exits first: they read the fields.
-    let unreachable = f.add_block();
-    f.add_inst(unreachable, Opcode::Unreachable, vec![], &[], vec![]);
+    let mut touched: BTreeSet<Block> = BTreeSet::new();
+    for i in stamps.iter().chain(&inits).chain(&stores).chain(&loads).chain(&guards).chain(&convs).chain(&fstores)
+        .chain(mats.iter().map(|(e, _)| e)).chain(std::iter::once(&t))
+    {
+        touched.insert(inst_block[i]);
+    }
+    for &v in &vals {
+        if let ValueDef::Param(b, _) = f.values[v].def {
+            touched.insert(b);
+        }
+    }
+    let dead = cfg.rpo.iter().copied().filter(|b| !reach.contains(b)).collect();
+    Some(Plan {
+        t,
+        nslots,
+        word,
+        key,
+        row,
+        vals,
+        stamps,
+        inits,
+        stores,
+        loads,
+        guards,
+        convs,
+        fstores,
+        mats,
+        subst,
+        touched,
+        dead,
+    })
+}
+
+/// Rewrite one planned object away. `inst_block` follows the moves (an
+/// exit two objects rebuild before moves twice).
+fn apply_plan(f: &mut Func, p: &Plan, inst_block: &mut BTreeMap<Inst, Block>, unreachable: Block) {
+    use crate::mir::types::TagSet;
+    let Plan { t, nslots, word, key, row, vals, stamps, inits, stores, loads, guards, convs, fstores, mats, .. } = p;
+    let (t, nslots, word, key) = (*t, *nslots, *word, *key);
+    // Exits first: they read the fields.
     for (e, fv) in mats {
+        let e = *e;
         let b = inst_block[&e];
         let pos = f.blocks[b].insts.iter().position(|&x| x == e).unwrap();
         let tail: Vec<Inst> = f.blocks[b].insts.split_off(pos);
@@ -750,6 +868,7 @@ fn replace_one(m: &Module, f: &mut Func, cfg: &Cfg, t: Inst) -> bool {
             }
         }
         f.blocks[cur].insts.push(e);
+        inst_block.insert(e, cur);
         for k in first..f.insts.len() {
             f.inst_frame[Inst::from_u32(u32::try_from(k).unwrap())] = frame;
         }
@@ -768,7 +887,8 @@ fn replace_one(m: &Module, f: &mut Func, cfg: &Cfg, t: Inst) -> bool {
         }
     }
     // Terminators through the object become jumps to their success edge.
-    for &i in inits.iter().chain(&stores).chain(&guards).chain(std::iter::once(&t)) {
+    let term_stores: Vec<Inst> = stores.iter().copied().filter(|&i| f.insts[i].op.is_terminator()).collect();
+    for &i in inits.iter().chain(&term_stores).chain(guards.iter()).chain(std::iter::once(&t)) {
         let b = inst_block[&i];
         let e = f.insts[i].succs[0].clone();
         let frame = f.inst_frame[i];
@@ -778,21 +898,13 @@ fn replace_one(m: &Module, f: &mut Func, cfg: &Cfg, t: Inst) -> bool {
         f.inst_frame[j] = frame;
     }
     // And the rest of its uses go.
-    let dead: BTreeSet<Inst> = stamps.iter().chain(&convs).chain(&fstores).chain(&loads).copied().collect();
+    let slot_stores = stores.iter().copied().filter(|&i| !f.insts[i].op.is_terminator());
+    let dead: BTreeSet<Inst> =
+        stamps.iter().chain(convs.iter()).chain(fstores.iter()).chain(loads.iter()).copied().chain(slot_stores).collect();
     for b in f.layout.clone() {
         f.blocks[b].insts.retain(|i| !dead.contains(i));
     }
-    replace_values(f, &subst);
-    for &v in &vals {
+    for &v in vals {
         f.values[v].def = ValueDef::Unused;
     }
-    // What only the guards' failures reached is dead, and may still name
-    // the object's values: nothing left in it.
-    for b in f.layout.clone() {
-        if cfg.reachable(b) && !reach.contains(&b) {
-            f.blocks[b].insts.clear();
-            f.add_inst(b, Opcode::Unreachable, vec![], &[], vec![]);
-        }
-    }
-    true
 }
