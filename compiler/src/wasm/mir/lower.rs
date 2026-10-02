@@ -422,6 +422,10 @@ struct Lower<'a> {
     block_census: Option<Func>,
     /// The census helper, when rooting stores are counted (`--root-census`).
     root_census: Option<Func>,
+    /// The census helper, when Wasm blocks are counted (`--value-census`),
+    /// and the emitter of each Wasm value range: (first value, tag).
+    value_census: Option<Func>,
+    value_tags: Vec<(usize, String)>,
     /// The instruction being lowered, for the root census's labels.
     cur_inst: Option<mir::Inst>,
     /// Per frame (0 the function's own, then the inline frames): whether
@@ -493,6 +497,9 @@ pub struct LowerOpts {
     pub block_census: bool,
     /// Count every executed rooting site (`--root-census`).
     pub root_census: bool,
+    /// Count every executed Wasm block, by the MIR ops in it
+    /// (`--value-census`).
+    pub value_census: bool,
     /// Strict-mode code: a field store's generic fallback throws on failure.
     pub strict: bool,
     /// The activation's environment is its callee's (`baseline::env_is_plain`).
@@ -605,6 +612,8 @@ pub fn lower<'a>(
         exit_census: if o.exit_census { h.census } else { None },
         block_census: if o.block_census { h.census } else { None },
         root_census: if o.root_census { h.census } else { None },
+        value_census: if o.value_census { h.census } else { None },
+        value_tags: vec![],
         cur_inst: None,
         frame_gc: None,
         block_enters: None,
@@ -1065,19 +1074,23 @@ impl<'a> Lower<'a> {
             }
             self.blocks.insert(b, wb);
         }
+        self.value_tag("(entry)");
         self.entry()?;
         // In reverse postorder, so a block's dominators, which define the
         // unmanaged values it uses directly, are lowered before it.
         for b in order {
             self.cur_mblock = b;
+            self.value_tag("(edges)");
             self.enter_block(b)?;
             if let Some(census) = self.block_census {
+                self.value_tag("(census)");
                 static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
                 let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let ops: Vec<String> = f.blocks[b].insts.iter().map(|&i| mir::print::mnemonic(&f.insts[i].op)).collect();
                 crate::diag_line!("night: mir block {id} sid#{} {b} {}", self.f.script, ops.join(" "));
                 let (k, i) = (self.i32c(crate::options::MIR_BLOCK_CENSUS_KIND), self.i32c(id));
                 self.call1(census, &[k, i], Type::I32);
+                self.value_tag("(edges)");
             }
             self.block_enters = None;
             for &inst in &f.blocks[b].insts {
@@ -1127,6 +1140,17 @@ impl<'a> Lower<'a> {
                     self.pending_retain.clear();
                 }
                 let before = self.body.values.len();
+                if self.value_census.is_some() {
+                    let mut tag = mir::print::mnemonic(&f.insts[inst].op);
+                    if let Some(site) = f.insts[inst].attach.and_then(|a| f.attachments[a].site) {
+                        tag = format!("{tag}@{site}");
+                    } else if let Some(pc) = self.exit_pc(inst) {
+                        let fr = f.inst_frame[inst];
+                        let script = if fr == 0 { f.script } else { f.inline_frames[fr as usize - 1].script };
+                        tag = format!("{tag}@{script}:{pc}");
+                    }
+                    self.value_tag(&tag);
+                }
                 self.inst(inst)?;
                 if self.may_gc(inst) {
                     self.pending_retain.clear();
@@ -1142,6 +1166,7 @@ impl<'a> Lower<'a> {
         if let Some((b, _)) = self.pending.iter().find(|(_, v)| !v.is_empty()) {
             return Err(format!("lowering: an edge into {b} was never placed"));
         }
+        self.value_tag("(hubs)");
         // Each `exit.inline` hub continues at its site's tail.
         for (_, last, site, err, same, tails) in std::mem::take(&mut self.inline_hubs).into_values() {
             let targets: Vec<BlockTarget> = tails
@@ -1162,7 +1187,63 @@ impl<'a> Lower<'a> {
             );
         }
         waffle::passes::empty_blocks::run(&mut self.body);
+        self.instrument_values();
         Ok(())
+    }
+
+    /// The pc an instruction exits at on failure, where a successor is an
+    /// exit block (the op's own bytecode pc): for `--value-census` tags.
+    fn exit_pc(&self, inst: mir::Inst) -> Option<crate::ids::Pc> {
+        self.f.insts[inst].succs.iter().find_map(|e| {
+            let t = self.f.terminator(e.block)?;
+            match self.f.insts[t].op {
+                Opcode::Exit { pc, .. } | Opcode::ExitThrow { pc, .. } | Opcode::ExitInline { pc, .. } => Some(pc),
+                _ => None,
+            }
+        })
+    }
+
+    /// `--value-census`: the Wasm values from here on are `tag`'s.
+    fn value_tag(&mut self, tag: &str) {
+        if self.value_census.is_some() {
+            self.value_tags.push((self.body.values.len(), tag.to_string()));
+        }
+    }
+
+    /// `--value-census`: a census tick at the head of every Wasm block,
+    /// and its static record of the values in it, by emitter.
+    fn instrument_values(&mut self) {
+        let Some(census) = self.value_census else { return };
+        let tags = std::mem::take(&mut self.value_tags);
+        let tag_of = |v: Value| -> &str {
+            let i = v.index();
+            match tags.partition_point(|&(s, _)| s <= i) {
+                0 => "(other)",
+                k => &tags[k - 1].1,
+            }
+        };
+        static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let blocks: Vec<Block> = self.body.blocks.iter().collect();
+        for b in blocks {
+            let mut n: BTreeMap<&str, u32> = BTreeMap::new();
+            for &v in &self.body.blocks[b].insts {
+                *n.entry(tag_of(v)).or_default() += 1;
+            }
+            if n.is_empty() {
+                continue;
+            }
+            let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let rec: Vec<String> = n.iter().map(|(t, c)| format!("{t}:{c}")).collect();
+            crate::diag_line!("night: mir vblock {id} sid#{} {}", self.f.script, rec.join(" "));
+            let len = self.body.blocks[b].insts.len();
+            let saved = self.cur;
+            self.cur = b;
+            let (k, i) = (self.i32c(crate::options::MIR_VALUE_CENSUS_KIND), self.i32c(id));
+            self.call1(census, &[k, i], Type::I32);
+            self.cur = saved;
+            // The tick first, before the block's own instructions.
+            self.body.blocks[b].insts.rotate_left(len);
+        }
     }
 
     /// Whether an instruction in the loop through header `h` (back-edge

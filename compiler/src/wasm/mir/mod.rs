@@ -177,6 +177,7 @@ pub fn translate_script(
             exit_census: ctx.opts.instrument.mir_exits,
             block_census: ctx.opts.instrument.blocks,
             root_census: ctx.opts.instrument.roots,
+            value_census: ctx.opts.instrument.values,
             strict: script.strict,
             plain_env: baseline::needs_env(script) && baseline::env_is_plain(ctx.source, script),
             own_env: baseline::needs_env(script) && !baseline::env_is_plain(ctx.source, script),
