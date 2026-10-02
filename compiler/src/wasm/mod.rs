@@ -4,8 +4,8 @@
 //! linear-memory region layout; `translate_all` compiles every compilable
 //! script (and regex program) into a Wasm function body (see `translate`);
 //! the rest run interpreted. Consumed by the in-process batch builder
-//! (`inprocess`, via the `night_inproc_build` FFI) and by the external
-//! snapshot compiler (`js/src/night/nightmonkey`).
+//! (`inprocess`, driven by `wasm-jit-runner`) and by the external snapshot
+//! compiler (`nightmonkey`).
 
 use crate::facts::{Claim, LikelyFacts};
 use crate::ids::{JsString, LayoutKey, NameId, Names, Pc, RegionRoot, ScriptId, Site, StampKey};
@@ -15,6 +15,7 @@ use waffle::{ExportKind, Func, FuncDecl, Module, Operator, SignatureData, Table,
 use crate::options::Options;
 use crate::region_shape as shape;
 use crate::source::{ObjectData, ObjectKind, Source, SourceObject, SourceObjectId};
+use rayon::prelude::*;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 pub mod baseline;
@@ -1968,6 +1969,7 @@ fn translate_for_pipeline(
     sid: ScriptId,
     script: &crate::bytecode::Script,
     is_global: bool,
+    mir_pre: Option<mir::Prebuilt>,
 ) -> Result<(translate::Outcome, tier::TierStatus), String> {
     use crate::options::Pipeline;
     use tier::{Decline, Tier, TierStatus};
@@ -1977,7 +1979,15 @@ fn translate_for_pipeline(
             Tier::Legacy,
             bbv::translate_script(ctx, m, atoms, sid, script, is_global)?,
         ),
-        Pipeline::Mir => match mir::translate_script(ctx, m, atoms, sid, script, is_global)? {
+        Pipeline::Mir => match mir::translate_script(
+            ctx,
+            m,
+            atoms,
+            sid,
+            script,
+            is_global,
+            mir_pre.expect("a MIR script is prebuilt"),
+        )? {
             Ok(outcome) => (Tier::Mir, outcome),
             Err(reason) => {
                 declines.push(Decline::new(Tier::Mir, reason));
@@ -2121,131 +2131,156 @@ pub fn translate_all(
     } else {
         HashMap::default()
     };
+    let script_of = |id: SourceObjectId| match source.object(id) {
+        SourceObject::Script(script) => script,
+        _ => unreachable!(),
+    };
+    let mut work = Vec::with_capacity(script_ids.len());
     for id in script_ids {
-        let SourceObject::Script(script) = source.object(id) else {
-            unreachable!()
-        };
         if skip(id) {
             n_skipped += 1;
-            continue;
+        } else {
+            work.push(id);
         }
-        let sid = ScriptId::new(id.id());
-        let (outcome, status) =
-            translate_for_pipeline(&tx_ctx, m, &mut atoms, sid, script, id == root_id)?;
-        if let Some(n) = fn_names.get(&id.id()) {
-            crate::diag_line!("night: script sid#{sid} {n}");
-        }
-        tier_census.record(sid, status, opts.diagnostics.tiers);
-        match outcome {
-            translate::Outcome::Compiled {
-                sig,
-                body,
-                likely_patches: lp,
-                fuse_call_patches: fcp,
-                call_cell_patches: ccp,
-                alloc_cell_patches: acp,
-                iof_cell_patches: icp,
-                construct_cell_patches: xcp,
-                strlit_patches: slp,
-                intrinsic_cell_patches: gicp,
-                prop_ic_patches: icp2,
-                body_off_patches: bop,
-                ctor_nslots_patches: cnp,
-                extra_bodies,
-                extra_call_patches,
-            } => {
-                if opts.diagnostics.stats {
-                    let (mut calls, mut stores) = (0, 0);
-                    for (_, d) in body.values.entries() {
-                        match d {
-                            waffle::ValueDef::Operator(
-                                waffle::Operator::Call { .. } | waffle::Operator::CallIndirect { .. },
-                                ..,
-                            ) => calls += 1,
-                            waffle::ValueDef::Operator(waffle::Operator::I64Store { .. }, ..) => stores += 1,
-                            _ => {}
-                        }
-                    }
-                    crate::diag_line!(
-                        "night: body sid#{} blocks {} values {} calls {calls} i64stores {stores}",
-                        id.id(),
-                        body.blocks.len(),
-                        body.values.len()
-                    );
-                }
-                let f = m.funcs.push(FuncDecl::Body(
-                    sig,
-                    format!("night_script_{}", id.id()),
-                    body,
-                ));
-                // Widened-ABI (BBV) bodies go in the table behind a
-                // `night_abi_sig` adapter; direct-call patches still
-                // target the body itself (source_id_to_func). The body
-                // takes its own table slot now (the module's table order
-                // must stay exactly the blob order -- the in-process
-                // runner appends every blob to the funcref table) and the
-                // adapters are emitted as one contiguous block after the
-                // loop, because interleaving them with bodies measurably
-                // worsens instruction-cache behaviour. `body slot ==
-                // adapter slot - count`
-                // holds because bodies and adapters keep the same order.
-                if sig == tx_ctx.helpers.night_abi_sig2 {
-                    place_in_table(m, f)?;
-                    pending_adapters.push((id, f));
-                } else {
-                    let index = place_in_table(m, f)?;
-                    on_compiled(id, index);
-                    source_id_to_table_func.insert(id.id(), f);
-                    sid_to_index.insert(id.id(), index);
-                }
-                source_id_to_func.insert(id.id(), f);
-                if opts.diagnostics.stats {
-                    crate::diag_line!("night: body sid#{} func {}", id.id(), waffle::entity::EntityRef::index(f));
-                }
-                for (expected, call, callee_sid) in lp {
-                    likely_patches.push((f, expected, call, callee_sid));
-                }
-                for p in fcp {
-                    fuse_call_patches.push((f, p));
-                }
-                for (addr, idx) in ccp {
-                    call_cell_patches.push((f, addr, idx));
-                }
-                for (addr, idx) in acp {
-                    alloc_cell_patches.push((f, addr, idx));
-                }
-                for (addr, idx) in icp {
-                    iof_cell_patches.push((f, addr, idx));
-                }
-                for (addr, idx) in xcp {
-                    construct_cell_patches.push((f, addr, idx));
-                }
-                for (addr, off) in slp {
-                    strlit_patches.push((f, addr, off));
-                }
-                for (addr, row) in gicp {
-                    intrinsic_cell_patches.push((f, addr, row));
-                }
-                for (addr, off) in icp2 {
-                    prop_ic_patches.push((f, addr, off));
-                }
-                for v in bop {
-                    body_off_patch_sites.push((f, v));
-                }
-                for v in cnp {
-                    ctor_nslots_patch_sites.push((f, v, 0));
-                }
-                if !extra_bodies.is_empty() {
-                    pending_extras.push((id, f, extra_bodies, extra_call_patches));
-                }
-                n_compiled += 1;
+    }
+    // MIR's front half (build, optimize, verify) reads only the analysis,
+    // so it runs in parallel a chunk at a time, ahead of the serial loop
+    // that lowers into the module and grows the atom table. It reads the
+    // analysis-time names, never the table codegen interns into. A chunk
+    // bounds how many built functions are held at once.
+    let mir_names = (opts.pipeline == crate::options::Pipeline::Mir).then(|| atoms.names.clone());
+    const MIR_CHUNK: usize = 256;
+    for chunk in work.chunks(MIR_CHUNK) {
+        let mut prebuilt: Vec<Option<mir::Prebuilt>> = match &mir_names {
+            Some(names) => chunk
+                .par_iter()
+                .map(|&id| {
+                    let sid = ScriptId::new(id.id());
+                    Some(mir::prebuild(&tx_ctx, names, sid, script_of(id), id == root_id))
+                })
+                .collect(),
+            None => chunk.iter().map(|_| None).collect(),
+        };
+        for (&id, pre) in chunk.iter().zip(prebuilt.drain(..)) {
+            let script = script_of(id);
+            let sid = ScriptId::new(id.id());
+            let (outcome, status) =
+                translate_for_pipeline(&tx_ctx, m, &mut atoms, sid, script, id == root_id, pre)?;
+            if let Some(n) = fn_names.get(&id.id()) {
+                crate::diag_line!("night: script sid#{sid} {n}");
             }
-            translate::Outcome::Skipped(reason) => {
-                n_skipped += 1;
-                if opts.diagnostics.bbv {
-                    crate::diag_line!("night: skip script#{} ({reason})", id.id());
+            tier_census.record(sid, status, opts.diagnostics.tiers);
+            match outcome {
+                translate::Outcome::Compiled {
+                    sig,
+                    body,
+                    likely_patches: lp,
+                    fuse_call_patches: fcp,
+                    call_cell_patches: ccp,
+                    alloc_cell_patches: acp,
+                    iof_cell_patches: icp,
+                    construct_cell_patches: xcp,
+                    strlit_patches: slp,
+                    intrinsic_cell_patches: gicp,
+                    prop_ic_patches: icp2,
+                    body_off_patches: bop,
+                    ctor_nslots_patches: cnp,
+                    extra_bodies,
+                    extra_call_patches,
+                } => {
+                    if opts.diagnostics.stats {
+                        let (mut calls, mut stores) = (0, 0);
+                        for (_, d) in body.values.entries() {
+                            match d {
+                                waffle::ValueDef::Operator(
+                                    waffle::Operator::Call { .. } | waffle::Operator::CallIndirect { .. },
+                                    ..,
+                                ) => calls += 1,
+                                waffle::ValueDef::Operator(waffle::Operator::I64Store { .. }, ..) => stores += 1,
+                                _ => {}
+                            }
+                        }
+                        crate::diag_line!(
+                            "night: body sid#{} blocks {} values {} calls {calls} i64stores {stores}",
+                            id.id(),
+                            body.blocks.len(),
+                            body.values.len()
+                        );
+                    }
+                    let f = m.funcs.push(FuncDecl::Body(
+                        sig,
+                        format!("night_script_{}", id.id()),
+                        body,
+                    ));
+                    // Widened-ABI (BBV) bodies go in the table behind a
+                    // `night_abi_sig` adapter; direct-call patches still
+                    // target the body itself (source_id_to_func). The body
+                    // takes its own table slot now (the module's table order
+                    // must stay exactly the blob order -- the in-process
+                    // runner appends every blob to the funcref table) and the
+                    // adapters are emitted as one contiguous block after the
+                    // loop, because interleaving them with bodies measurably
+                    // worsens instruction-cache behaviour. `body slot ==
+                    // adapter slot - count`
+                    // holds because bodies and adapters keep the same order.
+                    if sig == tx_ctx.helpers.night_abi_sig2 {
+                        place_in_table(m, f)?;
+                        pending_adapters.push((id, f));
+                    } else {
+                        let index = place_in_table(m, f)?;
+                        on_compiled(id, index);
+                        source_id_to_table_func.insert(id.id(), f);
+                        sid_to_index.insert(id.id(), index);
+                    }
+                    source_id_to_func.insert(id.id(), f);
+                    if opts.diagnostics.stats {
+                        crate::diag_line!("night: body sid#{} func {}", id.id(), waffle::entity::EntityRef::index(f));
+                    }
+                    for (expected, call, callee_sid) in lp {
+                        likely_patches.push((f, expected, call, callee_sid));
+                    }
+                    for p in fcp {
+                        fuse_call_patches.push((f, p));
+                    }
+                    for (addr, idx) in ccp {
+                        call_cell_patches.push((f, addr, idx));
+                    }
+                    for (addr, idx) in acp {
+                        alloc_cell_patches.push((f, addr, idx));
+                    }
+                    for (addr, idx) in icp {
+                        iof_cell_patches.push((f, addr, idx));
+                    }
+                    for (addr, idx) in xcp {
+                        construct_cell_patches.push((f, addr, idx));
+                    }
+                    for (addr, off) in slp {
+                        strlit_patches.push((f, addr, off));
+                    }
+                    for (addr, row) in gicp {
+                        intrinsic_cell_patches.push((f, addr, row));
+                    }
+                    for (addr, off) in icp2 {
+                        prop_ic_patches.push((f, addr, off));
+                    }
+                    for v in bop {
+                        body_off_patch_sites.push((f, v));
+                    }
+                    for v in cnp {
+                        ctor_nslots_patch_sites.push((f, v, 0));
+                    }
+                    if !extra_bodies.is_empty() {
+                        pending_extras.push((id, f, extra_bodies, extra_call_patches));
+                    }
+                    n_compiled += 1;
                 }
-                log::trace!("night: skip script#{} ({reason})", id.id());
+                translate::Outcome::Skipped(reason) => {
+                    n_skipped += 1;
+                    if opts.diagnostics.bbv {
+                        crate::diag_line!("night: skip script#{} ({reason})", id.id());
+                    }
+                    log::trace!("night: skip script#{} ({reason})", id.id());
+                }
             }
         }
     }

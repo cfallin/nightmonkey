@@ -13,13 +13,17 @@
 #                    (configs/mozconfig-weval)
 #   aot              this build, --pipeline mir
 #   aot-legacy       this build, --pipeline legacy (BBV)
+#   aot-base         another build's nightmonkey and js (BASE_NIGHTMONKEY,
+#                    BASE_JS), with its default pipeline unless BASE_PIPE
+#                    names one: e.g. a branch that predates --pipeline
 #
 # Every score is Octane's (higher is better; react's harness prints the
 # same format), so every ratio column reads "A is Nx faster than B" and
 # the geomean row covers all benches.
 #
 # Env: LANES, BENCHES, CORE (default 10), SYS_JS, WASM_JS, WEVAL_JS, WEVAL,
-#      NIGHTMONKEY / NIGHT_JS (default this checkout's build/bin).
+#      NIGHTMONKEY / NIGHT_JS (default this checkout's build/bin),
+#      BASE_NIGHTMONKEY / BASE_JS / BASE_PIPE (the aot-base lane).
 set -uo pipefail
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 N=${1:-3}
@@ -32,6 +36,9 @@ WEVAL_JS=${WEVAL_JS:-$HOME/work/firefox/obj-weval/dist/bin/js}
 WEVAL=${WEVAL:-$HOME/.cargo/bin/weval}
 NIGHTMONKEY=${NIGHTMONKEY:-$ROOT/build/bin/nightmonkey}
 NIGHT_JS=${NIGHT_JS:-$ROOT/build/bin/js}
+BASE_NIGHTMONKEY=${BASE_NIGHTMONKEY:-}
+BASE_JS=${BASE_JS:-}
+BASE_PIPE=${BASE_PIPE:-}
 RATIO_COLS=${RATIO_COLS:-"aot/wasm-interp aot/weval native-ion/aot native-baseline/aot"}
 O=$W/lanes; rm -rf "$O"; mkdir -p "$O"
 pin() { taskset -c "$CORE" "$@"; }
@@ -44,6 +51,9 @@ module() {
     aot|aot-legacy)
       local p=mir; [ "$lane" = aot-legacy ] && p=legacy
       "$NIGHTMONKEY" --shell "$NIGHT_JS" "$W/src/$b.js" -o "$m.wasm" --pipeline $p >/dev/null 2>&1 || return 1 ;;
+    aot-base)
+      [ -n "$BASE_NIGHTMONKEY" ] && [ -n "$BASE_JS" ] || return 1
+      "$BASE_NIGHTMONKEY" --shell "$BASE_JS" "$W/src/$b.js" -o "$m.wasm" ${BASE_PIPE:+--pipeline "$BASE_PIPE"} >/dev/null 2>&1 || return 1 ;;
     weval)
       # The init function's name has a dot, unlike weval's default.
       "$WEVAL" weval -w --init-func wizer.initialize -i "$WEVAL_JS" -o "$m.wasm" < "$W/src/$b.js" >/dev/null 2>&1 || return 1 ;;

@@ -46,11 +46,15 @@ Two deployment modes use the same analysis and translator.
 
 ### In-process flow
 
-1. The wasm shell captures live scripts and heap objects into `Source`.
-2. The NightMonkey compiler, inside the Wasm instance, builds a temporary
-   module with imported runtime helpers and serializes its defined functions as
-   runner blobs.
-3. `wasm-jit-runner` injects the functions into the running instance.
+1. The wasm shell registers the script tree and records the self-hosted roots
+   and regex programs in the registration block, as the snapshot flow does,
+   then makes one hostcall (`night_compile`).
+2. `wasm-jit-runner`, the host, walks the instance's live memory into
+   `Source` with the snapshot reader, and runs the NightMonkey compiler
+   natively: it builds a temporary module with imported runtime helpers and
+   serializes its defined functions as blobs.
+3. The runner injects the functions into the running instance and returns the
+   environment descriptor and the script map in guest memory.
 4. The shell installs the environment descriptor and patches scripts to their
    injected table entries.
 
@@ -61,8 +65,8 @@ describe exactly the module that receives the blobs.
 
 `compiler/src/source.rs` owns the compiler input. `SourceObject` variants
 describe scripts, scopes, objects, strings, symbols, and primitive values.
-`source/ffi.rs` builds the graph in-process; the snapshot crate builds it from
-the captured image.
+The snapshot crate builds the graph from linear memory: a captured image
+(`nightmonkey`) or a live instance (`wasm-jit-runner`).
 
 Typed identifiers in `ids.rs` distinguish scripts, bytecode PCs, program
 sites, names, layout keys, and their biased runtime stamp keys. Traversal of

@@ -1333,18 +1333,11 @@ name = "night-compiler"
 version = "0.1.0"
 dependencies = [
  "log",
+ "rayon",
  "rustc-hash",
  "waffle",
  "wasm-encoder 0.248.0",
  "wasmparser 0.248.0",
-]
-
-[[package]]
-name = "night-guest"
-version = "0.1.0"
-dependencies = [
- "night-compiler",
- "night-snapshot",
 ]
 
 [[package]]
@@ -1364,6 +1357,7 @@ dependencies = [
  "libc",
  "night-compiler",
  "night-snapshot",
+ "rayon",
  "waffle",
  "wizer",
 ]
@@ -2294,7 +2288,11 @@ name = "wasm-jit-runner"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "night-compiler",
+ "night-snapshot",
+ "rayon",
  "sha2",
+ "waffle",
  "wasm-encoder 0.252.0",
  "wasmparser 0.252.0",
  "wasmtime 45.0.3",

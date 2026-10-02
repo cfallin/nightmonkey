@@ -17,6 +17,8 @@ ff147 = []
 # the runtime reactor module (weval-style).
 waffle = "0.3.2"
 log = "0.4"
+# MIR's per-script front half runs in parallel (`translate_all`).
+rayon = "1"
 # Fast non-SipHash maps: the translator/merge keys are small integers (pcs,
 # entity ids), and profile showed SipHash dominating large-input translation.
 rustc-hash = "2"

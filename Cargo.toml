@@ -5,7 +5,6 @@ members = [
     "snapshot",
     "nightmonkey",
     "wasm-jit-runner",
-    "guest",
 ]
 
 [workspace.package]

@@ -2800,8 +2800,14 @@ impl<'s, 'a> Run<'s, 'a> {
         if !FIELD_MASKS {
             return None;
         }
-        let n = self.s.names?.lookup(self.mm.atoms[name].chars())?;
-        let all = self.s.name_classes(n);
+        // A name the analysis never interned is a field no class types.
+        // Spelled out rather than declined: whether a lookup succeeds must
+        // not depend on what codegen interned before this build, which
+        // reads the analysis-time names (and runs in parallel).
+        let all = match self.s.names?.lookup(self.mm.atoms[name].chars()) {
+            Some(n) => self.s.name_classes(n),
+            None => std::rc::Rc::new(vec![]),
+        };
         if all.len() <= MAX_STORE_CLASSES {
             return Some((all.to_vec(), true));
         }

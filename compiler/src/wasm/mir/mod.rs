@@ -48,8 +48,59 @@ pub(crate) fn inline_eligible(ctx: &TranslateCtx, script: &Script) -> bool {
         && (!baseline::needs_env(script) || baseline::env_is_plain(ctx.source, script))
 }
 
-/// Compile `script` as a MIR body plus its baseline body. `Ok(Err(reason))`
-/// is a decline: the caller falls back to baseline alone.
+/// A script's MIR, built, optimized and verified: the front half of
+/// [`translate_script`]. `diag` holds the diagnostic lines it produced, for
+/// the serial back half to print in script order.
+pub struct Prebuilt {
+    built: Result<(crate::mir::Module, crate::mir::Func), String>,
+    diag: Vec<String>,
+}
+
+/// Build, optimize and verify `script`'s MIR. Reads only the analysis: the
+/// context and the analysis-time `names` (`build` never sees what codegen
+/// interns), so scripts run it in parallel and in any order.
+pub fn prebuild(
+    ctx: &TranslateCtx,
+    names: &crate::ids::Names,
+    sid: ScriptId,
+    script: &Script,
+    is_global: bool,
+) -> Prebuilt {
+    let mut diag = vec![];
+    let built = (|| {
+        let (mm, mut f) = build::build(ctx, names, sid, script, is_global)?;
+        // Past a size, the body (at tens of bytes of wasm per instruction)
+        // would approach wasm's function size limit: baseline alone.
+        if f.insts.len() > MAX_MIR_INSTS {
+            return Err("too large for MIR after inlining".to_string());
+        }
+        // Guard folding (§10.1). The builder guards locally at every use;
+        // this merges them, and the validator checks the result.
+        let folded = crate::mir::opt::optimize(&mm, &mut f);
+        if ctx.opts.diagnostics.stats && folded > 0 {
+            diag.push(format!("night: mir sid#{sid} folded {folded} guards"));
+        }
+        if let Err(es) = crate::mir::verify(&mm, &f) {
+            let first = es.first().map(|e| e.to_string()).unwrap_or_default();
+            if ctx.opts.diagnostics.mir {
+                diag.push(format!(
+                    "night: invalid MIR for sid#{sid}:\n{}",
+                    crate::mir::print::print_func(&mm, &f)
+                ));
+            }
+            return Err(format!(
+                "BUG: invalid MIR ({} errors; {first})",
+                es.len()
+            ));
+        }
+        Ok((mm, f))
+    })();
+    Prebuilt { built, diag }
+}
+
+/// Compile `script` as a MIR body plus its baseline body, from its
+/// [`prebuild`]. `Ok(Err(reason))` is a decline: the caller falls back to
+/// baseline alone.
 pub fn translate_script(
     ctx: &TranslateCtx,
     m: &mut Module,
@@ -57,35 +108,15 @@ pub fn translate_script(
     sid: ScriptId,
     script: &Script,
     is_global: bool,
+    pre: Prebuilt,
 ) -> Result<Result<Outcome, String>, String> {
-    let (mm, mut f) = match build::build(ctx, &atoms.names, sid, script, is_global) {
+    for line in &pre.diag {
+        crate::diag_line!("{line}");
+    }
+    let (mm, f) = match pre.built {
         Ok(x) => x,
         Err(reason) => return Ok(Err(reason)),
     };
-    // Past a size, the body (at tens of bytes of wasm per instruction)
-    // would approach wasm's function size limit: baseline alone.
-    if f.insts.len() > MAX_MIR_INSTS {
-        return Ok(Err("too large for MIR after inlining".into()));
-    }
-    // Guard folding (§10.1). The builder guards locally at every use;
-    // this merges them, and the validator checks the result.
-    let folded = crate::mir::opt::optimize(&mm, &mut f);
-    if ctx.opts.diagnostics.stats && folded > 0 {
-        crate::diag_line!("night: mir sid#{sid} folded {folded} guards");
-    }
-    if let Err(es) = crate::mir::verify(&mm, &f) {
-        let first = es.first().map(|e| e.to_string()).unwrap_or_default();
-        if ctx.opts.diagnostics.mir {
-            crate::diag_line!(
-                "night: invalid MIR for sid#{sid}:\n{}",
-                crate::mir::print::print_func(&mm, &f)
-            );
-        }
-        return Ok(Err(format!(
-            "BUG: invalid MIR ({} errors; {first})",
-            es.len()
-        )));
-    }
     if ctx.opts.diagnostics.mir {
         crate::diag_line!("{}", crate::mir::print::print_func(&mm, &f));
     }

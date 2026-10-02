@@ -19,7 +19,7 @@ cmake_minimum_required(VERSION 3.20)
 
 set(SPIDERMONKEY_DIST "" CACHE PATH
     "dist/ directory of a SpiderMonkey build with --enable-external-compiler-hooks")
-option(NIGHT_INPROCESS "Build the in-process test lane (guest compiler, wasm-jit-runner)" ON)
+option(NIGHT_INPROCESS "Build the in-process test lane (js-inproc, wasm-jit-runner)" ON)
 option(NIGHT_DEBUG "Runtime diagnostics and crash-on-failure in the in-process lane" OFF)
 set(NIGHT_CARGO "cargo" CACHE STRING "cargo executable")
 set(NIGHT_STACK_SIZE "67108864" CACHE STRING "linear-memory stack size of the shells, in bytes")
@@ -186,23 +186,12 @@ add_custom_target(nightmonkey_host ALL
 add_dependencies(nightmonkey_host night_opcodes_check)
 
 if(NIGHT_INPROCESS)
-  # The guest compiler: night-compiler and night-snapshot as one staticlib
-  # for the shell's target, linked into the shell next to libjsrust.a.
-  set(NIGHT_GUEST_LIB "${CARGO_TARGET_DIR}/${SM_RUST_TARGET}/release/libnight_guest.a")
-  add_custom_target(night_guest ALL
-    COMMAND ${CMAKE_COMMAND} -E env ${CARGO_ENV} RUSTFLAGS=-Cdebuginfo=0
-            ${NIGHT_CARGO} build --release -p night-guest ${CARGO_ENGINE_FEATURES} --target ${SM_RUST_TARGET}
-    WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
-    BYPRODUCTS "${NIGHT_GUEST_LIB}"
-    COMMENT "cargo: night-guest (${SM_RUST_TARGET})"
-    VERBATIM)
-  add_dependencies(night_guest night_opcodes_check)
-
-  # The host that runs the in-process lane (hostcalls that inject compiled
-  # bodies into the running shell instance).
+  # The host that runs the in-process lane. The compiler runs in it: the
+  # shell's night_compile hostcall walks the instance's memory, compiles,
+  # and injects the bodies into the running shell instance.
   add_custom_target(wasm_jit_runner ALL
     COMMAND ${CMAKE_COMMAND} -E env ${CARGO_ENV} RUSTFLAGS=-Cdebuginfo=0
-            ${NIGHT_CARGO} build --release -p wasm-jit-runner
+            ${NIGHT_CARGO} build --release -p wasm-jit-runner ${CARGO_ENGINE_FEATURES}
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
             "${CARGO_TARGET_DIR}/release/wasm-jit-runner" "${NIGHT_BIN_DIR}/wasm-jit-runner"
     WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
@@ -219,9 +208,10 @@ endforeach()
 
 # Links a NightMonkey shell: the runtime, SpiderMonkey's shell/engine
 # archives and the libs. The memory and funcref table are exported (and the
-# table growable) so appended and injected code can share them; the deep
-# stack is for the in-process compiler's lowering, which recurses on the main
-# stack. The linker driver needs the same sysroot/target as the compiler.
+# table growable) so appended and injected code can share them. The deep
+# stack dates from when the in-process compiler ran in the shell; it stays so
+# the lanes' recursion behaviour is unchanged. The linker driver needs the
+# same sysroot/target as the compiler.
 function(night_shell name)
   add_executable(${name} shell/nightshell.cpp)
   night_engine_target(${name})
@@ -238,16 +228,10 @@ endfunction()
 night_shell(js)
 
 if(NIGHT_INPROCESS)
-  # The test lane's shell, with the guest compiler linked in. Two Rust static
-  # libraries meet here: SpiderMonkey's libjsrust.a, whose LTO-merged object
-  # carries its own copy of std's unmangled runtime symbols
-  # (rust_eh_personality, the panic and allocator shims), and the guest
-  # compiler with the prebuilt std. The first definition wins and every copy
-  # routes through the same allocator shim.
-  night_shell(js-inproc "${NIGHT_GUEST_LIB}")
+  # The test lane's shell: the snapshot shell plus the --night-inprocess
+  # driver, a stub whose one hostcall has wasm-jit-runner compile.
+  night_shell(js-inproc)
   night_inprocess_target(js-inproc)
-  add_dependencies(js-inproc night_guest)
-  target_link_options(js-inproc PRIVATE -Wl,--allow-multiple-definition)
 
   # The harness wrapper: runs js-inproc under wasm-jit-runner.
   configure_file(scripts/inproc-shell.sh.in "${NIGHT_BIN_DIR}/inproc-shell.sh" @ONLY)

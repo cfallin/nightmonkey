@@ -426,7 +426,7 @@ pub struct NameId(pub u32);
 /// filled by the analysis, handed to the translator in `LikelyFacts`, and
 /// finally owned by the `AtomTable`, which adds the emitted table's dense
 /// numbering on top without a second copy of the strings.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct Names {
     by_val: std::collections::HashMap<JsString, NameId, rustc_hash::FxBuildHasher>,
     vals: Vec<JsString>,

@@ -5,7 +5,17 @@ edition = "2021"
 authors.workspace = true
 license.workspace = true
 
+[features]
+# Engine version (see compiler/src/opcodes/): exactly one.
+default = ["ff147"]
+ff147 = ["night-compiler/ff147", "night-snapshot/ff147"]
+
 [dependencies]
+# The in-process lane's compiler (the `night_compile` hostcall).
+night-compiler = { path = "../compiler", default-features = false }
+night-snapshot = { path = "../snapshot", default-features = false }
+waffle = { version = "0.3.2", features = ["parallel"] }
+rayon = "1"
 anyhow = "1"
 wasmtime = "45"
 wasmtime-wasi = "45"

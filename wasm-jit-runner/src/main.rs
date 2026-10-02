@@ -10,6 +10,9 @@
 //! wasm-jit-runner <module.wasm> [guest args...]
 //! ```
 //!
+//! It also exposes `env.night_compile`, which runs the NightMonkey compiler
+//! in the host over the guest's live heap (see `compile.rs`).
+//!
 //! `WJR_JITDUMP=1` writes a jitdump for `perf inject --jit` (instruction-
 //! level annotation of the compiled code).
 //! `WJR_PERFMAP=1` writes a `/tmp/perf-<pid>.map` for the compiled code
@@ -17,6 +20,7 @@
 
 mod addfuncs;
 mod cache;
+mod compile;
 mod modedit;
 
 use anyhow::{Context, Result};
@@ -158,6 +162,7 @@ fn run() -> Result<()> {
         .anyhow()
         .context("adding WASI to linker")?;
     addfuncs::add_to_linker(&mut linker).context("adding wasm_add_funcs to linker")?;
+    compile::add_to_linker(&mut linker).context("adding night_compile to linker")?;
 
     // Build the WASI context: inherit stdio/env, preopen dirs, pass argv.
     let mut builder = WasiCtxBuilder::new();

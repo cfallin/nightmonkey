@@ -15,6 +15,7 @@ wizen = ["dep:wizer", "dep:libc"]
 night-compiler = { path = "../compiler", default-features = false }
 night-snapshot = { path = "../snapshot", default-features = false }
 waffle = { version = "0.3.2", features = ["parallel"] }
+rayon = "1"
 anyhow = "1"
 wizer = { version = "9", optional = true }
 libc = { version = "0.2", optional = true }

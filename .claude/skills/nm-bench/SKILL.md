@@ -76,6 +76,7 @@ LANES="native-ion aot aot-legacy" .claude/skills/nm-bench/lanes.sh 3
 | weval | weval + PBL over the wizer shell: the peer wasm AOT | `WEVAL_JS` (`configs/mozconfig-weval`), `weval`; init function `wizer.initialize` (with a dot) |
 | aot | this checkout, `--pipeline mir` | `make -C build` |
 | aot-legacy | this checkout, `--pipeline legacy` (BBV) | same |
+| aot-base | another build's `nightmonkey` and `js`, its default pipeline (or `BASE_PIPE`) | `BASE_NIGHTMONKEY`, `BASE_JS` |
 
 The ratio columns are A/B speedups: aot over wasm-interp and weval, and ion
 and baseline over aot. The geomean row covers every bench, since react

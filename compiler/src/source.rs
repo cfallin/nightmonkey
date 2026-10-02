@@ -12,16 +12,15 @@
 //! translator compiles the scripts reachable from it, together with a
 //! snapshot of the heap they build.
 //!
-//! This source is built on the SpiderMonkey side before translation runs.
-//! The `Source` struct below is the sole input; we do not accept any other
-//! information via side-paths.
+//! This source is read out of the engine's linear memory (`night-snapshot`)
+//! before translation runs. The `Source` struct below is the sole input; we
+//! do not accept any other information via side-paths.
 
 use crate::bytecode;
 use crate::ids::JsString;
 use crate::ids::ScriptId;
 
 pub mod dump;
-pub mod ffi;
 
 /// Program source (including object graph and nested scripts) for
 /// analysis.
@@ -261,8 +260,7 @@ impl SourceObject {
 
 /// The class of an object gcthing, as far as the analysis needs to
 /// distinguish: it determines the object's `[[Prototype]]` and exotic
-/// behaviors. Mirrors the `NIGHT_OBJECT_KIND_*` constants in
-/// night_compiler.h.
+/// behaviors.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ObjectKind {
     /// Any class we don't model (Date, RegExp, Proxy, ...):

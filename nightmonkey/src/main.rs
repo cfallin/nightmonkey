@@ -26,7 +26,7 @@ use night_compiler::wasm::{
 };
 use night_compiler::Options;
 use night_snapshot::registration::{OFF_COMPILED, OFF_REGION_TABLE, OFF_TOOL_VERSION};
-use night_snapshot::{walk, Field, Registration, SliceMem};
+use night_snapshot::{walk, walk_compile_input, Field, Registration, SliceMem};
 use std::path::PathBuf;
 use waffle::{
     FrontendOptions, FuncDecl, FunctionBody, Module, Operator, SignatureData, Type, ValueDef,
@@ -180,6 +180,13 @@ fn parse_args() -> Result<Args> {
 }
 
 fn main() -> Result<()> {
+    // Rayon workers run MIR's per-script front half and waffle's backend,
+    // both recursive over nested code: give them the main thread's stack
+    // budget rather than the 2 MiB default. First thing, before wizer's
+    // wasmtime can build the global pool.
+    let _ = rayon::ThreadPoolBuilder::new()
+        .stack_size(64 << 20)
+        .build_global();
     let args = parse_args()?;
     let opts = args.opts;
     let stats = opts.diagnostics.stats;
@@ -241,25 +248,14 @@ fn main() -> Result<()> {
     let output = args.output.context("-o <out.wasm> is required")?;
 
     // Walk the user roots plus the engine-recorded self-hosted roots.
-    let n_reg_roots = reg.roots.len();
     let mut wreg = reg;
-    for &(addr, _) in &wreg.selfhosted {
-        wreg.roots.push(addr);
-    }
+    let n_regex = wreg.regex_programs.len();
     let walk_out = {
         let mem = SliceMem(&img.bytes);
-        walk(&mem, &wreg)?
+        walk_compile_input(&mem, &mut wreg)?
     };
-    let mut source: Source = walk_out.source;
+    let source: Source = walk_out.source;
     let root_id = walk_out.root_ids[0];
-    for (i, (_, name)) in wreg.selfhosted.iter().enumerate() {
-        let id = walk_out.root_ids[n_reg_roots + i];
-        if !source.selfhosted.iter().any(|(sid, _)| *sid == id) {
-            source.selfhosted.push((id, name.clone()));
-        }
-    }
-    let n_regex = wreg.regex_programs.len();
-    source.regex_programs = std::mem::take(&mut wreg.regex_programs);
     if stats {
         eprintln!(
             "nightmonkey: walked {} objects ({} selfhosted roots, {} regex programs), \

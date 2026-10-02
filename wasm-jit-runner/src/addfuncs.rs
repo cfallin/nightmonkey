@@ -246,8 +246,6 @@ fn add_funcs_impl(
         return Ok(());
     }
 
-    let layout = caller.data().layout;
-
     // The guest's main memory (WASI exports it as "memory").
     let memory: Memory = caller
         .get_export("memory")
@@ -284,6 +282,36 @@ fn add_funcs_impl(
         (blobs, extern_indices)
     };
 
+    let base = add_funcs_core(caller, &blobs, &extern_indices)?;
+
+    // Write the resulting funcptrs back to the guest's `out` array.
+    {
+        let data = memory.data_mut(&mut *caller);
+        for i in 0..n {
+            let funcptr = (base + i as u64) as u32;
+            let addr = elem_addr(out_ptr, i as u32)? as usize;
+            let slot = data
+                .get_mut(addr..addr + 4)
+                .context("out pointer out of bounds")?;
+            slot.copy_from_slice(&funcptr.to_le_bytes());
+        }
+    }
+
+    Ok(())
+}
+
+/// Assemble `blobs` into one module whose function imports are the live
+/// table-0 entries at `extern_indices`, instantiate it into the store, and
+/// append its functions to table 0. Returns the table index of blob 0; blob
+/// `i` lands at that index plus `i`.
+pub fn add_funcs_core(
+    caller: &mut Caller<'_, Host>,
+    blobs: &[Vec<u8>],
+    extern_indices: &[u32],
+) -> Result<u64> {
+    let layout = caller.data().layout;
+    let n = blobs.len();
+    let n_extern = extern_indices.len();
     let funcs: Vec<ParsedFunc> = blobs
         .iter()
         .enumerate()
@@ -434,27 +462,14 @@ fn add_funcs_impl(
             .context("setting funcptr table entry")?;
     }
 
-    // Write the resulting funcptrs back to the guest's `out` array.
-    {
-        let data = memory.data_mut(&mut *caller);
-        for i in 0..n {
-            let funcptr = (base + i as u64) as u32;
-            let addr = elem_addr(out_ptr, i as u32)? as usize;
-            let slot = data
-                .get_mut(addr..addr + 4)
-                .context("out pointer out of bounds")?;
-            slot.copy_from_slice(&funcptr.to_le_bytes());
-        }
-    }
-
-    Ok(())
+    Ok(base)
 }
 
 /// The current size of table 0 (the funcptr table). Because added functions
 /// are appended contiguously, a guest that queries this before calling
 /// `wasm_add_funcs*` can predict the returned indices: blob i lands at
 /// `size + i`. This contiguity is an API guarantee.
-fn table_size_impl(caller: &mut Caller<'_, Host>) -> Result<u32> {
+pub fn table_size_impl(caller: &mut Caller<'_, Host>) -> Result<u32> {
     let t0 = caller
         .get_export(&format!("{TABLE_PREFIX}0"))
         .and_then(Extern::into_table)

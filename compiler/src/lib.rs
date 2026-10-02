@@ -33,10 +33,9 @@
 //!
 //! The pipeline, in order:
 //!
-//! - [`source`] -- the input object graph, built on the SpiderMonkey side
-//!   and handed over through the FFI in [`source::ffi`]. The sole input:
-//!   the compiler reads no other channel, and in particular takes no
-//!   profiling data.
+//! - [`source`] -- the input object graph, read out of the engine's linear
+//!   memory by `night-snapshot`. The sole input: the compiler reads no
+//!   other channel, and in particular takes no profiling data.
 //! - [`bytecode`] -- the SpiderMonkey bytecode reader ([`disasm`] dumps it).
 //! - [`likelier`] -- the likely-types analysis: one incremental fixpoint
 //!   over constraints generated once per function, with calling context as
@@ -52,9 +51,9 @@
 //!   so both reason about `+` in the same words.
 //!
 //! Output is either an in-process batch of function bodies compiled into a
-//! live engine ([`wasm::inprocess`], entered at [`night_inproc_build`]) or a
-//! standalone module produced by the snapshot compiler in
-//! `js/src/night/nightmonkey`.
+//! live engine ([`wasm::inprocess`], driven by `wasm-jit-runner`'s
+//! `night_compile` hostcall) or a standalone module produced by the
+//! snapshot compiler, `nightmonkey`.
 
 pub mod bytecode;
 pub mod constants;
@@ -73,187 +72,3 @@ pub mod view;
 pub mod wasm;
 
 pub use options::{Diagnostics, Options, Pipeline};
-
-/// Build an in-process AOT batch for the `Source` graph at `analysis_source`
-/// (root `root_id`): compiled function blobs in wasm-jit-runner format, the
-/// extern (helper) table-index array, the compiled-script map, and the
-/// serialized environment descriptor. `helper_*` describe the engine helpers
-/// (parallel arrays of length `n_helpers`): NUL-terminated name,
-/// NUL-terminated signature string (see night_compiler.h), and live funcref-table
-/// index. `table_base` is the current table size (`wasm_table_size()`);
-/// blob `i` is predicted at `table_base + i`. `alloc` is called exactly
-/// twice and must return zeroed, 8-aligned, non-null memory (calloc-style;
-/// it may be called with size 0). `options` is null or a NUL-terminated,
-/// whitespace-separated string of compiler flags, as the `nightmonkey` CLI
-/// takes them (`Options::parse_str`). Returns null on failure (message on
-/// stderr); free with `night_inproc_delete`. Under `--strict-coverage` a
-/// failed build aborts the process instead, so a test lane cannot pass by
-/// silently interpreting.
-///
-/// # Safety
-/// `helper_names`/`helper_sigs` must point to `n_helpers` valid
-/// NUL-terminated strings and `helper_funcptrs` to `n_helpers` u32s;
-/// `options` must be null or a valid NUL-terminated string.
-#[no_mangle]
-pub unsafe extern "C" fn night_inproc_build(
-    analysis_source: &source::Source,
-    root_id: u32,
-    helper_names: *const *const core::ffi::c_char,
-    helper_sigs: *const *const core::ffi::c_char,
-    helper_funcptrs: *const u32,
-    n_helpers: u32,
-    table_base: u32,
-    alloc: extern "C" fn(usize) -> u32,
-    options: *const core::ffi::c_char,
-) -> *mut wasm::inprocess::InprocOut {
-    let n = usize::try_from(n_helpers).unwrap();
-    let mut specs = Vec::with_capacity(n);
-    for i in 0..n {
-        let name = match core::ffi::CStr::from_ptr(*helper_names.add(i)).to_str() {
-            Ok(s) => s.to_string(),
-            Err(e) => {
-                log::error!("night_inproc_build: helper name {i}: {e}");
-                return core::ptr::null_mut();
-            }
-        };
-        let sig_str = match core::ffi::CStr::from_ptr(*helper_sigs.add(i)).to_str() {
-            Ok(s) => s,
-            Err(e) => {
-                log::error!("night_inproc_build: helper sig {i}: {e}");
-                return core::ptr::null_mut();
-            }
-        };
-        let sig = match wasm::inprocess::parse_sig_str(sig_str) {
-            Ok(s) => s,
-            Err(e) => {
-                log::error!("night_inproc_build: helper `{name}`: {e}");
-                return core::ptr::null_mut();
-            }
-        };
-        specs.push(wasm::inprocess::HelperImportSpec {
-            name,
-            sig,
-            table_index: *helper_funcptrs.add(i),
-        });
-    }
-    let root_id = source::SourceObjectId::new(root_id);
-    let opts = if options.is_null() {
-        Options::default()
-    } else {
-        let parsed = core::ffi::CStr::from_ptr(options)
-            .to_str()
-            .map_err(|e| e.to_string())
-            .and_then(Options::parse_str);
-        match parsed {
-            Ok(o) => o,
-            Err(e) => {
-                crate::diag_line!("night: inprocess: bad options: {e}");
-                return core::ptr::null_mut();
-            }
-        }
-    };
-    let strict = opts.strict_coverage;
-    let build = move || {
-        wasm::inprocess::build_inprocess_batch(
-            analysis_source,
-            root_id,
-            &opts,
-            &specs,
-            table_base,
-            &mut |size: u32| {
-                let p = alloc(usize::try_from(size).unwrap());
-                if p == 0 {
-                    Err("in-process arena allocation failed".to_string())
-                } else {
-                    Ok(p)
-                }
-            },
-        )
-    };
-    // Big-stack discipline: waffle's Wasm backend lowers nested blocks
-    // recursively, and a large program overflows the default 8 MB main
-    // stack -- a silent sigsegv. On wasm32-wasi there are no threads; run
-    // inline on the main stack, which the shell link sizes accordingly
-    // (-z stack-size).
-    #[cfg(target_family = "wasm")]
-    let result = build();
-    #[cfg(not(target_family = "wasm"))]
-    let result = std::thread::scope(|s| {
-        std::thread::Builder::new()
-            .name("night_compiler-inproc-build".to_string())
-            .stack_size(1 << 30)
-            .spawn_scoped(s, build)
-            .expect("spawn night_compiler-inproc-build thread")
-            .join()
-            .expect("night_compiler-inproc-build thread panicked")
-    });
-    match result {
-        Ok(out) => Box::into_raw(Box::new(out)),
-        Err(e) => {
-            // First line only: a waffle validation failure appends the whole
-            // function body, which is megabytes. The C++ side reports only
-            // "batch build failed", so without this a failure has no reason
-            // attached at all.
-            let head = e.lines().next().unwrap_or("");
-            crate::diag_line!("night: inprocess: {head}");
-            log::error!("night_inproc_build: {e}");
-            if strict {
-                std::process::abort();
-            }
-            core::ptr::null_mut()
-        }
-    }
-}
-
-#[no_mangle]
-pub extern "C" fn night_inproc_num_blobs(out: &wasm::inprocess::InprocOut) -> u32 {
-    u32::try_from(out.blobs.len()).unwrap()
-}
-
-#[no_mangle]
-pub extern "C" fn night_inproc_blob_ptr(out: &wasm::inprocess::InprocOut, i: u32) -> *const u8 {
-    out.blobs[i as usize].as_ptr()
-}
-
-#[no_mangle]
-pub extern "C" fn night_inproc_blob_len(out: &wasm::inprocess::InprocOut, i: u32) -> u32 {
-    u32::try_from(out.blobs[i as usize].len()).unwrap()
-}
-
-#[no_mangle]
-pub extern "C" fn night_inproc_num_externs(out: &wasm::inprocess::InprocOut) -> u32 {
-    u32::try_from(out.extern_table_indices.len()).unwrap()
-}
-
-#[no_mangle]
-pub extern "C" fn night_inproc_extern_indices(out: &wasm::inprocess::InprocOut) -> *const u32 {
-    out.extern_table_indices.as_ptr()
-}
-
-#[no_mangle]
-pub extern "C" fn night_inproc_num_scripts(out: &wasm::inprocess::InprocOut) -> u32 {
-    u32::try_from(out.scripts.len()).unwrap()
-}
-
-#[no_mangle]
-pub extern "C" fn night_inproc_script_source_id(out: &wasm::inprocess::InprocOut, i: u32) -> u32 {
-    out.scripts[i as usize].0
-}
-
-#[no_mangle]
-pub extern "C" fn night_inproc_script_blob(out: &wasm::inprocess::InprocOut, i: u32) -> u32 {
-    out.scripts[i as usize].1
-}
-
-#[no_mangle]
-pub extern "C" fn night_inproc_env_desc_ptr(out: &wasm::inprocess::InprocOut) -> *const u8 {
-    out.env_desc.as_ptr()
-}
-
-#[no_mangle]
-pub extern "C" fn night_inproc_env_desc_len(out: &wasm::inprocess::InprocOut) -> u32 {
-    u32::try_from(out.env_desc.len()).unwrap()
-}
-
-#[no_mangle]
-pub extern "C" fn night_inproc_delete(_out: Box<wasm::inprocess::InprocOut>) {}

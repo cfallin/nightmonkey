@@ -5,7 +5,7 @@
 // resolves: the resolve_helpers list in js/src/night/compiler/src/wasm/mod.rs
 // (in order), plus night_runtime_regex_ci_compare (resolved separately in
 // translate_all). The in-process driver expands it into the {name, funcptr,
-// sig} import table passed to night_inproc_build; the signature string is
+// sig} import table the night_compile hostcall reads; the signature string is
 // derived from the helper's real C++ type (see NightHelperSig), so the table
 // can never drift from the declarations in NightRuntime.h.
 
@@ -187,8 +187,8 @@
 namespace js {
 namespace night {
 
-// Wasm value-type letter for a C ABI type (the night-compiler.h
-// signature-string encoding: i=i32, j=i64, f=f32, d=f64, v=void return).
+// Wasm value-type letter for a C ABI type (the signature-string encoding
+// `parse_sig_str` reads: i=i32, j=i64, f=f32, d=f64, v=void return).
 template <typename T>
 struct NightSigChar;
 template <typename T>
