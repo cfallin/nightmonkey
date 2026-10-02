@@ -393,15 +393,22 @@ bool NightEnvSetup(JSContext* cx, void* spPtr, void* scriptPtr, uint64_t* out) {
   }
   if (callee->needsCallObject()) {
     RootedScript script(cx, callee->nonLazyScript());
-    // createTemplateObject builds the CallObject with the FunctionScope's
-    // environment shape (bindings undefined); the callee slot and the aliased
-    // formals are filled below / by the body's bytecode, as createForFrame and
-    // the interpreter prologue do.
-    CallObject* callobj =
-        CallObject::createTemplateObject(cx, script, enclosing);
+    // The CallObject with the FunctionScope's environment shape (bindings
+    // undefined), allocated where the JITs' NewCallObject allocates it: the
+    // nursery. (createTemplateObject would allocate it tenured, and every
+    // store of a nursery value into it -- the callee below, the aliased
+    // formals and vars the body writes -- would be a store-buffer edge; on
+    // closure-heavy code those filled the slot buffer and forced minor GCs
+    // long before the nursery was full.) The callee slot and the aliased
+    // formals are filled below / by the body's bytecode, as createForFrame
+    // and the interpreter prologue do.
+    Rooted<SharedShape*> shape(
+        cx, script->bodyScope()->as<FunctionScope>().environmentShape());
+    CallObject* callobj = CallObject::createWithShape(cx, shape);
     if (!callobj) {
       return false;
     }
+    callobj->initEnclosingEnvironment(enclosing);
     callobj->initFixedSlot(CallObject::calleeSlot(), ObjectValue(*callee));
     *out = ObjectValue(*callobj).asRawBits();
   } else {
