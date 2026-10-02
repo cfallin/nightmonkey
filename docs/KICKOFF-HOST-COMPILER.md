@@ -133,20 +133,15 @@ What already helps:
 - **Thread safety:** `TranslateCtx` holds only shared references, but
   check that everything it reaches is `Sync`.
 
-**waffle `validate`:** the owner's call (2026-10-01).
-- waffle 0.3.2 runs `FunctionBody::validate` at the top of every
-  `WasmFuncBackend::compile`. Its dominance check walks the idom chain, so
-  validation is quadratic: 34.6 s of pdfjs's 46.4 s compile.
-- The owner is upstreaming an O(1) dominance check and wants `validate`
-  off the production path. The local fix (branch
-  `cfallin/fast-dominates` in `~/work/waffle`) took pdfjs's backend phase
-  from 34.6 s to 0.8 s with byte-identical code.
-- Keep the check where testing needs it. Invalid SSA (a use its definition
-  doesn't dominate) does not always fail later: wasm locals are
-  zero-initialized, so the module validates and the use reads 0. So call
-  `body.validate()` from NightMonkey in the lanes, both for MIR (already
-  under `--strict-coverage`/`--mir-stress`) and for baseline bodies.
-- NightMonkey stays on crates.io waffle 0.3.2 until a release has the fix.
+**waffle `validate`:** decided (owner, 2026-10-01): keep it.
+- waffle's backend runs `FunctionBody::validate` on every function. It
+  guards a real hole: invalid SSA (a use its definition doesn't dominate)
+  validates as wasm, because locals start at zero, and silently reads 0.
+- It used to be quadratic: 34.6 s of pdfjs's 46.4 s compile. waffle 0.3.3
+  makes dominance queries O(1), and the backend phase takes 0.8 s, with
+  byte-identical code.
+- NightMonkey points at the `cfallin/release-0.3.3` branch through
+  `[patch.crates-io]` in `Cargo.toml` until 0.3.3 is published.
 
 ## Steps
 
