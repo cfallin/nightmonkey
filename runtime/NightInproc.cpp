@@ -109,10 +109,10 @@ static bool InstallAndArm(JSContext* cx, const uint8_t* desc, uint32_t descLen,
   if (!night_runtime_install_env(cx, env)) {
     return false;
   }
-  // In-process mode always has interpreter coverage (skipped scripts, eval,
-  // shell evaluate, -f prologues): interpreted global writes bypass the
-  // compiled fuse hooks, so the value fuses cannot be trusted.
-  night_runtime_distrust_global_fuses();
+  // Interpreted code (skipped scripts, eval, shell evaluate, -f prologues)
+  // writes globals through the engine's own property paths, which run the
+  // fuse hooks (NightGlobalDataStore / NightGlobalKeyBlow), so the value
+  // fuses are as trustworthy here as in a snapshot (NightRegistration.cpp).
 
   for (uint32_t i = 0; i < nscripts; i++) {
     auto* base = reinterpret_cast<js::BaseScript*>(

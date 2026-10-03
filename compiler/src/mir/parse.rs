@@ -640,12 +640,15 @@ impl Parser {
             "raw.tadata" => Type::Raw(RawKind::TaData),
             "w32" => Type::W32,
             "w64" => Type::W64,
-            "fact.fuse" | "fact.binding" | "fact.native" => {
+            "fact.fuse" | "fact.binding" | "fact.binding_fn" | "fact.native" => {
                 self.expect_punct("(")?;
                 let k = match w.as_str() {
                     "fact.fuse" => FactKind::Fuse(FuseId::from_u32(self.prefixed("F", "a fuse")?)),
                     "fact.binding" => {
                         FactKind::Binding(BindingId::from_u32(self.prefixed("G", "a binding")?))
+                    }
+                    "fact.binding_fn" => {
+                        FactKind::BindingFn(BindingId::from_u32(self.prefixed("G", "a binding")?))
                     }
                     _ => {
                         FactKind::NativeIntact(NativeId::from_u32(self.prefixed("N", "a native")?))
@@ -818,7 +821,13 @@ impl Parser {
                     } else {
                         0
                     };
-                    self.m.bindings.push(BindingDef { name, claim, slot });
+                    let pred = if self.eat_word("pred") {
+                        self.expect_punct("=")?;
+                        Some(self.script()?)
+                    } else {
+                        None
+                    };
+                    self.m.bindings.push(BindingDef { name, claim, slot, pred });
                 }
                 "native" => {
                     self.decl_id("N", "native", self.m.natives.len())?;
@@ -1549,8 +1558,9 @@ fn template(mn: &str) -> Option<Opcode> {
         F64ToIntExact,
         IntToI32,
         CheckFuse(FuseId::from_u32(0)),
-        CheckBinding(BindingId::from_u32(0), false),
-        CheckBinding(BindingId::from_u32(0), true),
+        CheckBinding(BindingId::from_u32(0), BindingCheck::Read),
+        CheckBinding(BindingId::from_u32(0), BindingCheck::Write),
+        CheckBinding(BindingId::from_u32(0), BindingCheck::Fn),
         CheckNative(NativeId::from_u32(0)),
         AccessorProbe(AtomId::from_u32(0), false),
         Jump,
@@ -1712,6 +1722,7 @@ fn template(mn: &str) -> Option<Opcode> {
         StrCharCodeAt,
         LoadGName(BindingId::from_u32(0)),
         StoreGName(BindingId::from_u32(0)),
+        GlobalObject,
         EnvCurrent,
         EnvParent,
         EnvLoad(EnvSlot::new(0)),

@@ -370,6 +370,13 @@ pub struct LikelyFacts {
     /// the consumer's per-read tag guard miss, never a miscompile -- so
     /// unlike the fused-literal machinery this table needs no fuses.
     pub gname_types: HashMap<NameId, Claim>,
+    /// Per-global-name predicted function: the names whose GName cell
+    /// (the snapshot global's value joined with every statically-seen
+    /// write) holds exactly one scripted function and nothing else. A
+    /// prediction: the runtime arms the binding's value fuse to its
+    /// "predicted" state only while the binding holds a function of that
+    /// script, and a read compiled against it tests that state.
+    pub gname_fns: HashMap<NameId, ScriptId>,
     /// Per-element-site likely typed-array kind: at a GetElem/SetElem,
     /// the receiver class's element kind when it settled on a single one. Consumed as a guarded-monomorphic inline
     /// read/store arm (clasp guard + kind-specific access); a wrong prediction

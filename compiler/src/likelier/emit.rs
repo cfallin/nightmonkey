@@ -1998,6 +1998,15 @@ impl Solver<'_> {
             .collect();
         for (name, cid) in self.engine.gname_cells() {
             let ts = self.engine.ts(cid);
+            // One scripted function and nothing else: the read's value is
+            // predicted (`gname_fns`), whatever claim follows.
+            if let ([f], false, true, false, ObjType::Empty) =
+                (ts.fns.ids(), ts.fns.is_multi(), ts.prims.is_empty(), ts.unknown, ts.obj)
+            {
+                if let Some(k) = f.as_script() {
+                    facts.gname_fns.insert(name, k);
+                }
+            }
             let Some(m) = ts.value_claim_full().or_else(|| ts.object_claim_nullish()) else {
                 continue;
             };
@@ -2012,6 +2021,19 @@ impl Solver<'_> {
                 _ => m,
             };
             facts.gname_types.insert(name, m);
+        }
+        // A top-level function declaration no script rewrites (the
+        // `gname_fns` input): its reads are that function as a constant,
+        // so its cell is empty where no snapshot value seeds it (the
+        // in-process flow compiles before the declaration runs).
+        for (&name, &k) in self.gname_fns {
+            let empty = self
+                .engine
+                .existing_cell(CellKey::GName(name))
+                .is_none_or(|c| self.engine.ts(c).is_empty());
+            if empty {
+                facts.gname_fns.entry(name).or_insert(k);
+            }
         }
     }
 

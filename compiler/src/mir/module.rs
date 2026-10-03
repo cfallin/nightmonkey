@@ -4,7 +4,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::ids::{EnvSlot, JsString, LayoutKey, RegionRoot};
+use crate::ids::{EnvSlot, JsString, LayoutKey, RegionRoot, ScriptId};
 use crate::mir::entity::{AtomId, BindingId, EntityVec, FuseId, NativeId, RegionId, SnapObj};
 use crate::mir::func::Func;
 use crate::mir::types::{KeyRange, ObjKind, Type};
@@ -67,6 +67,10 @@ pub struct BindingDef {
     pub claim: Type,
     /// The runtime's binding row (its syntactic global id, `syn_gnames`).
     pub slot: u32,
+    /// The script whose function the analysis predicts the binding holds
+    /// (`gname_fns`): `check.binding.fn` tests that it does, and a read
+    /// under that check is the function, typed.
+    pub pred: Option<ScriptId>,
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)]

@@ -569,7 +569,6 @@ fn main() -> Result<()> {
     let TranslateOut {
         mut atoms,
         sid_to_index,
-        fuse_binding_index,
         strlit_patches,
         regex_entries,
         prop_ic_base,
@@ -603,7 +602,7 @@ fn main() -> Result<()> {
     }
     let atom_bytes = serialize_atom_table(&atoms);
     let gbind_bytes =
-        serialize_global_binding_table(&atoms.names, &env.syn_gname_names, &fuse_binding_index);
+        serialize_global_binding_table(&atoms.names, &env.syn_gname_names, &env.binding_preds);
     let fuse_bytes = serialize_fuse_table(&env, &mut atoms);
     let regex_bytes = serialize_regex_table(&regex_entries);
     let strlit_bytes = atoms.strlit_blob().to_vec();

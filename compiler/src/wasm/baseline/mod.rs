@@ -42,7 +42,6 @@ pub fn translate_script(
                 sig: b.sig,
                 body: b.body,
                 likely_patches: vec![],
-                fuse_call_patches: vec![],
                 call_cell_patches: vec![],
                 alloc_cell_patches: vec![],
                 iof_cell_patches: vec![],

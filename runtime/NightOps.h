@@ -102,6 +102,11 @@ bool NightArgumentsEnv(JSContext* cx, uint64_t calleeBits,
 // non-zero), else 0. Leaf.
 uint64_t NightCalleeNightTarget(uint64_t calleeBits);
 
+// Whether `bits` is a JSFunction whose script is the BaseScript at
+// `scriptAddr` and has a compiled AOT body: what compiled code's callee
+// guard on that script tests (`guard.script`). Leaf.
+bool NightIsCompiledFunctionOf(uint64_t bits, uint32_t scriptAddr);
+
 // Build the `new` from the compiled-body frame at `spPtr`. A sized construct
 // site (`nSlots != UINT32_MAX`) creates an empty fixed-slot-sized `this` and
 // constructs on it (no CreateThis hook); else an ordinary `js::Construct`.

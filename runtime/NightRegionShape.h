@@ -100,7 +100,7 @@ namespace night {
   _(argsDynCodeFuseOff, 12)                                                    \
   /* Inline string-literal block, right after the args metadata:           */  \
   /* [emptyString @0, thin replay triple @4, fat triple @16, stamp-epoch   */  \
-  /* address @28, binding-write epoch address @32, &PlainObject::class_    */  \
+  /* address @28, unused (0) @32, &PlainObject::class_                   */  \
   /* @36]. The major-GC purge zeroes exactly the triples ([@4, @28)): the  */  \
   /* words after them are host constants and must survive it.              */  \
   _(strlitBlockBytes, 40)                                                      \
@@ -117,7 +117,17 @@ namespace night {
   /* are written only by compiled code and read back only by it, so their   */ \
   /* sizes are not shared and stay in translate.rs.)                        */ \
   _(allocCellBytes, 32)                                                        \
-  _(constructCellBytes, 40)
+  _(constructCellBytes, 40)                                                    \
+  /* Per-binding value-fuse cells (gGlobalVals, after the slot rows):      */  \
+  /* [bits u64 @0][fuse word u32 @8][pad]. Fuse states: 0 unarmed, 1       */  \
+  /* armed (bits are the value), 2 blown, 3 armed with the binding's       */  \
+  /* predicted function (a compiled function of the script the binding    */  \
+  /* table names). Armed is bit 0.                                         */  \
+  _(bindingCellBytes, 16)                                                      \
+  _(bindingCellFuseOff, 8)                                                     \
+  _(bindingFuseArmed, 1)                                                       \
+  _(bindingFuseBlown, 2)                                                       \
+  _(bindingFusePredicted, 3)
 
 #define NIGHT_REGION_SHAPE_CONST(name, value) \
   static constexpr uint32_t Night_##name = (value);
@@ -138,6 +148,9 @@ static_assert(Night_strlitStampEpochAddrOff + 4 <= Night_strlitBlockBytes,
               "the stamp-epoch address must fit the strlit block");
 static_assert(Night_strlitBindEpochAddrOff + 4 <= Night_strlitBlockBytes,
               "the binding-epoch address must fit the strlit block");
+static_assert((Night_bindingFuseArmed & 1) && (Night_bindingFusePredicted & 1) &&
+                  !(Night_bindingFuseBlown & 1),
+              "a binding fuse is armed exactly when bit 0 is set");
 static_assert(Night_strlitPlainClassOff + 4 <= Night_strlitBlockBytes,
               "the plain-object class must fit the strlit block");
 static_assert(Night_strlitTriplesEnd <= Night_strlitStampEpochAddrOff,

@@ -549,7 +549,9 @@ fn plan_one(m: &Module, f: &Func, snap: &Snapshot, t: Inst) -> Option<Plan> {
         match f.terminator(b).map(|x| f.insts[x].op) {
             // (Another object's rebuild may precede the same exit.)
             Some(Opcode::LitNew(_) | Opcode::LitInit(..) | Opcode::Jump) => work.extend(f.succs(b)),
-            Some(Opcode::Exit { .. } | Opcode::ExitThrow { .. } | Opcode::Unreachable) => {}
+            // (An inlined callee's exit, which this pass rebuilds before as
+            // well: what follows it is the caller's, past the object.)
+            Some(Opcode::Exit { .. } | Opcode::ExitThrow { .. } | Opcode::ExitInline { .. } | Opcode::Unreachable) => {}
             _ => {
                 exit_only = false;
                 break;

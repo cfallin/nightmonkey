@@ -221,6 +221,10 @@ lowering drops them. Initial kinds:
   constant.
 - `Binding(id)`: the global binding slot is resolved and the global
   shape matches. Consumed by the global get/set fast paths.
+- `BindingFn(id)`: the binding holds a compiled function of the script
+  the analysis predicts for it (`check.binding.fn`, M5p); a
+  `load_gname` through it is that function, typed. A subtype of
+  `Binding(id)`.
 - `NativeIntact(which)`: for example, the string-method fuse behind the
   `charCodeAt` fast path.
 
@@ -1952,6 +1956,87 @@ would (`demote_for_generic_arm`): every `Obj` and `Ctor` slot where the arm
 cannot keep, else the `Ctor` slots when no `Obj` slot is live. MIR now
 compiles every Octane script but the global scripts and four of mandreel's
 (too large).
+
+**M5p. Predicted-function globals (2026-10-02; KICKOFF-9 item 1).**
+Ion compiles a global never rewritten since its initialization as a
+constant, behind a fuse its invalidation watches. MIR has no
+invalidation, so the fuse is tested at run time, once per read:
+- **Prediction.** `gname_fns`: a global whose GName cell (the snapshot's
+  value joined with every write the analysis sees) holds exactly one
+  scripted function, or a top-level function declaration no script
+  rewrites whose cell is empty (the in-process flow compiles before the
+  declaration runs). Class constructors are left out (their call
+  throws). The binding table carries each binding's predicted script
+  address (`EnvLayout::binding_preds`; it replaces BBV's dead
+  expected-callee word, and `FuseCallPatch` is gone).
+- **Runtime.** A binding's value-fuse word gains a state: 3, armed with a
+  compiled function of the predicted script (`NightIsCompiledFunctionOf`,
+  what `guard.script` tests); armed is bit 0 everywhere (the states are
+  in `NIGHT_REGION_SHAPE`). A major GC refreshes armed cells from the
+  global in place instead of zeroing them (`RefreshBindingCells`; the
+  others it resets, as the zeroing did): a value outlives any GC (the
+  binding keeps it) and only a compacting GC moves it, so a cell tested
+  before a GC still holds the value after it. The in-process flow now
+  trusts the value fuses as the snapshot flow does: it distrusted them
+  all at install ("interpreted global writes bypass the compiled fuse
+  hooks"), which the engine's global hooks have long made untrue, and
+  every predicted read in the jit-test lanes exited.
+- **MIR.** `check.binding.fn G` (fuse word == 3; a miss resolves once,
+  re-arming a cell a GC zeroed outside a realm, before it exits) yields
+  `fact.binding_fn(G)`, and `load_gname` through it is
+  `val{object, Function(K)}`: one load from the cell. The callee's
+  `guard.unbox.obj`/`guard.script` fold by type, so an inlined call
+  through it has no callee guard, and a call not inlined
+  (`js_call_proven`) has no native arms and no classify: the script's
+  table index and the site's static call. A `store_gname` to a predicted
+  binding kills binding facts. A call kills them, as before: whether the
+  callee wrote G is a prediction, and its dynamic report would be the
+  4-value fuse test the next read makes anyway (the per-script write
+  summaries of `bcc8439^` were therefore not restored).
+- **Writes.** `BindUnqualifiedGName` of a syntactic global is
+  `check.binding.write` and the global object (`global.object`, pure,
+  sunk into the exits that use it); the store's own check folds into it.
+  `store_gname` resolves its slot once and runs the post-barrier only for
+  a value that may be a GC thing (the global is tenured, and the slot
+  index is computed on the record path alone). The bind epoch the
+  compiled store bumped is gone (nothing has read it since BBV). A write
+  check's fast path is an armed fuse and a writable resolved row.
+- **Fixes on the way.** `fold_guards` folded a `check.binding.write` into
+  a dominating read check (a read's fact is a write's), skipping the
+  writable test: now a check folds only into one that implies it
+  (`BindingCheck::implies`). It also refused an available guard whose
+  output is a param of the guard's own block; allowing that exposed a
+  third: a fold into another guard's stronger output (a layout with
+  `types`) made a `store_field` through it demand a conforming value, so
+  such an output goes on weakened to the folded guard's type. The rows of
+  `binding_slot` are resolved again where a GC since the check zeroed
+  them (a store or an unarmed read after an allocation). `sroa` replanned
+  its own rebuild before an `exit.inline` forever (its exit-only test
+  stopped at `exit` and `exit.throw` alone).
+- **Open: retention on exits.** mir-rooting.js's contract (a local's
+  value stays alive until the local is overwritten, and no longer) holds
+  on MIR's own paths through the retaining stores, but not across an
+  exit at a pc where the local is dead: the exit leaves the frame slot as
+  the last retaining store left it, which may be an older value (kept
+  too long) or none (a value rooted only in its home slot, dropped).
+  `--mir-stress 2` shows the second. Writing such locals at exits fixes
+  both, but keeps their values live to the exits, so rooted in home
+  slots that hold them past their overwrite (weak-marking-01.js): exact
+  retention there needs dead slots cleared, which §4.4 measured and
+  declined.
+- **Also.** `guard.script`'s per-op cell learns only callees that passed
+  the whole test, so a hit is one 32-bit compare (MIR.md §10 asked for
+  it): deltablue -5.5%, richards -4.6% executed values.
+  `sink_to_exits` (§10.4) moves a `box` (of a value no fence can weaken)
+  or `global.object` only exits use into those exits.
+- Fixed-work value census (Octane deterministic mode, 1/20 of its
+  iterations; `nm-bench/vcensus.sh`), executed Wasm values against the
+  session's start: earley-boyer -10.3% (its global-binding ops 13.2% ->
+  11.6% of the work, `guard.script` 2.5% -> 0, calls -3.4%), deltablue
+  -5.6%, richards -4.6%, raytrace -2.0%.
+- Night test: mir-predicted-gnames.js (rewrites the analysis cannot see,
+  to another function, a non-function and back; a class in a global);
+  it fails against a mutant that skips the fuse test.
 
 **M6. The rest of §10**: box/unbox cleanup, memory optimizations, and
 numeric optimizations, each with its guard-count and instruction-count

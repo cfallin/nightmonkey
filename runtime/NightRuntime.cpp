@@ -213,13 +213,12 @@ struct NightNameTables {
   // set_property) to the binding cells.
   std::vector<uint32_t> bindingOfAtom;
   std::unordered_map<std::u16string, uint32_t> bindingIdOfName;
-  // Per binding: predicted callee funcref-table index + 1 for the
-  // value-fuse fuse-guarded direct-call arm (0 = no call prediction), from
-  // the merge-embedded binding table. Arm-time validation compares the
-  // armed value's NightCalleeNightTarget low word against it and caches
-  // the callee's JSScript* in the fuse cell's word 3 for the compiled-body
-  // ABI.
-  std::vector<uint32_t> bindingExpectedIndex;
+  // Per binding: the address of the script whose function the compiler
+  // predicts the binding holds (0 = none), from the binding table. Arming
+  // with a compiled function of that script arms the predicted state
+  // (Night_bindingFusePredicted), which compiled reads typed as that
+  // function test.
+  std::vector<uint32_t> bindingPredictedScript;
 
   std::vector<GnameFuse> fuses;
 };
@@ -741,20 +740,12 @@ static bool IsActiveGlobal(JSObject* obj) {
 }
 
 // Per-binding value fuses (definitions after the gGlobalVals globals
-// below): fuseWord 0 = unarmed, 1 = armed, 2 = blown.
+// below): fuseWord 0 = unarmed, 1 = armed, 2 = blown, 3 = armed with the
+// binding's predicted function (NightRegionShape.h). Armed is bit 0.
 static void MaybeBlowBindingFuseAtom(uint32_t atomId, uint64_t newBits);
 static void BlowBindingFuseAtom(uint32_t atomId);
 static void BlowBindingFuseKey(JS::PropertyKey id);
 static void BlowAllBindingFuses();
-
-// The binding-write epoch: bumped on every path that can change a global
-// binding's value or retire its cell (the runtime's value-change and blow
-// paths here; the compiled inline `SetGName` store bumps it in wasm). Its
-// address is published in the strlit block (Night_strlitBindEpochAddrOff);
-// compiled code compares the low word across a call to keep its carried
-// per-binding value facts without re-proving them.
-static uint64_t gBindEpoch = 0;
-static inline void BumpBindEpoch() { gBindEpoch++; }
 
 extern "C" void night_runtime_distrust_global_fuses() {
   BlowAllGnameFuses();
@@ -1194,8 +1185,8 @@ static void BlowBindingFuseId(uint32_t bindingId) {
     return;
   }
   uint32_t* cell = BindingFuseCell(bindingId);
-  if (cell[2] == 1) {
-    cell[2] = 2;
+  if (cell[2] & 1) {
+    cell[2] = js::night::Night_bindingFuseBlown;
   }
 }
 
@@ -1207,12 +1198,11 @@ static void BlowBindingFuseId(uint32_t bindingId) {
 // every run would otherwise put every one of its global reads on the
 // slower slot prologue instead of the fuse arm.
 static void MaybeBlowBindingFuseId(uint32_t bindingId, uint64_t newBits) {
-  BumpBindEpoch();
   if (!gState.globalValsBase) {
     return;
   }
   uint32_t* cell = BindingFuseCell(bindingId);
-  if (cell[2] == 1 && *reinterpret_cast<uint64_t*>(cell) != newBits) {
+  if ((cell[2] & 1) && *reinterpret_cast<uint64_t*>(cell) != newBits) {
     cell[2] = 0;
   }
 }
@@ -1247,7 +1237,6 @@ static void BlowBindingFuseAtom(uint32_t atomId) {
 // Cold (defineProperty intercept): match a runtime jsid against the
 // pre-interned binding keys.
 static void BlowBindingFuseKey(JS::PropertyKey id) {
-  BumpBindEpoch();
   if (!gState.globalValsBase || !gNames.bindingKeys) {
     return;
   }
@@ -1260,7 +1249,6 @@ static void BlowBindingFuseKey(JS::PropertyKey id) {
 }
 
 static void BlowAllBindingFuses() {
-  BumpBindEpoch();
   if (!gState.globalValsBase || !gNames.bindingKeys) {
     return;
   }
@@ -1270,7 +1258,7 @@ static void BlowAllBindingFuses() {
 }
 
 // Build `gNames.bindingKeys` from the merge-embedded binding table: per
-// entry the UTF-16 name (like the atom table) plus a u32 expected-callee
+// entry the UTF-16 name (like the atom table) plus a u32 predicted-script
 // word. Must run with `cx` in a realm.
 static bool BuildGlobalBindingKeys(JSContext* cx, uint32_t gbind_ptr,
                                    uint32_t gbind_len) {
@@ -1292,14 +1280,14 @@ static bool BuildGlobalBindingKeys(JSContext* cx, uint32_t gbind_ptr,
     s.resize(clen);
     memcpy(s.data(), br.p, size_t(clen) * 2);
     br.p += size_t(clen) * 2;
-    uint32_t expected = br.u32();
+    uint32_t predicted = br.u32();
     JS::RootedId id(cx);
     JS::TwoByteChars chars(s.data(), s.size());
     if (!JS_CharsToId(cx, chars, &id)) {
       return false;
     }
     gNames.bindingIdOfName.emplace(std::move(s), i);
-    gNames.bindingExpectedIndex.push_back(expected);
+    gNames.bindingPredictedScript.push_back(predicted);
     gNames.bindingKeys->emplace_back(cx, id);
   }
   return true;
@@ -1666,9 +1654,10 @@ bool night_runtime_install_env(JSContext* cx,
                         js::night::Night_strlitStampEpochAddrOff) =
           static_cast<uint32_t>(
               reinterpret_cast<uintptr_t>(&js::gNightStampEpoch));
+      // (Night_strlitBindEpochAddrOff is unused: nothing reads a binding
+      // epoch since MIR re-tests a binding's fuse word instead.)
       *LinMem<uint32_t>(gState.strLitBase +
-                        js::night::Night_strlitBindEpochAddrOff) =
-          static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&gBindEpoch));
+                        js::night::Night_strlitBindEpochAddrOff) = 0;
       // The plain-object class: MIR's `guard.kind Plain` compares a
       // receiver's clasp against it.
       *LinMem<uint32_t>(gState.strLitBase +
@@ -3232,6 +3221,44 @@ uint32_t night_runtime_init_field(JSContext* cx, uint32_t top, uint64_t recv,
 // waiting to happen. Nothing here is traced -- the rows are u32s in the
 // module's own memory with no type tag -- so dropping them is the whole
 // invalidation strategy, and every populate path refills lazily.
+// The binding value cells (n*16, after the rows) cache raw value bits a
+// compacting GC can move. The values themselves outlive any GC (the binding
+// keeps each alive) and a write disarms its cell, so an armed cell is
+// refreshed from the global in place, keeping its state: compiled code that
+// tested a cell before the GC (a `check.binding.fn` whose `load_gname`
+// follows a may-GC op) reads the value there after it. Outside a realm (no
+// compiled frame is running) the cells are zeroed and re-arm at resolve.
+static void RefreshBindingCells() {
+  if (!gState.globalValsBase || !gNames.bindingKeys) {
+    return;
+  }
+  size_t n = gNames.bindingKeys->size();
+  JSContext* cx = gState.cx;
+  if (!cx || !JS::CurrentGlobalOrNull(cx)) {
+    ZeroRegion(gState.globalValsBase, n * 16);
+    return;
+  }
+  for (size_t i = 0; i < n; i++) {
+    uint32_t* cell = BindingFuseCell(uint32_t(i));
+    if (!(cell[2] & 1)) {
+      // Unarmed or blown: reset, as the zeroing this replaces did, so the
+      // next resolve may arm it again.
+      ZeroRegion(gState.globalValsBase + 16 * uint32_t(i), 16);
+      continue;
+    }
+    // A nursery value (armed so, and listed for the nursery's end, which
+    // re-arms it once moved) is kept as it is.
+    uint64_t bits;
+    bool nursery = false;
+    if (js::night::NightTryBindingValue(cx, (*gNames.bindingKeys)[i].get(),
+                                        &bits, &nursery)) {
+      *reinterpret_cast<uint64_t*>(cell) = bits;
+    } else {
+      cell[2] = 0;
+    }
+  }
+}
+
 static void NightPurgeMovableCaches() {
   if (gEnv.propicGenPtr) {
     *LinMem<uint32_t>(gEnv.propicGenPtr + js::night::Night_hostGenOff) += 1;
@@ -3267,9 +3294,9 @@ static void NightPurgeMovableCaches() {
   // the guard. Zero the whole region: every entry re-resolves on next read
   // (the TI-proven entries re-resolve too -- harmless, one leaf call each).
   if (gEnv.gslotsPtr && gNames.bindingKeys) {
-    // Rows (n*8) plus the constant-binding value cells (n*16): the cells
-    // cache raw value bits a compacting GC can move; re-resolve re-arms.
-    ZeroRegion(gEnv.gslotsPtr, gNames.bindingKeys->size() * 24);
+    // The rows (n*8) cache raw shape pointers: zeroed, re-resolved on use.
+    ZeroRegion(gEnv.gslotsPtr, gNames.bindingKeys->size() * 8);
+    RefreshBindingCells();
   }
   // This region holds the STATIC per-layout add-check bound table (filled
   // at install): it must survive GC, so no zeroing here.
@@ -3363,7 +3390,7 @@ static void NightNurseryEndCallback(JSContext* cx,
     pending.swap(gState.nurseryArmedBindings);
     for (uint32_t bid : pending) {
       uint32_t* cell = BindingFuseCell(bid);
-      if (cell[2] == 1) {
+      if (cell[2] & 1) {
         cell[2] = 0;
         MaybeArmBindingFuse(cx, bid, (*gNames.bindingKeys)[bid].get());
       }
@@ -3447,22 +3474,16 @@ static void MaybeArmBindingFuse(JSContext* cx, uint32_t bindingId,
   if (!js::night::NightTryBindingValue(cx, id, &bits, &nursery)) {
     return;
   }
-  // Call prediction: only arm when the value's AOT target matches the
-  // compile-time expected body -- the fuse-guarded call arm dispatches to
-  // that body with no classify. Cache the callee's JSScript* (word 3) for
-  // the compiled-body ABI's script argument.
-  uint32_t expected = bindingId < gNames.bindingExpectedIndex.size()
-                          ? gNames.bindingExpectedIndex[bindingId]
-                          : 0;
-  if (expected != 0) {
-    uint64_t packed = js::night::NightCalleeNightTarget(bits);
-    if (uint32_t(packed) != expected - 1) {
-      return;
-    }
-    cell[3] = uint32_t(packed >> 32);
-  }
+  // A compiled function of the predicted script arms the predicted state,
+  // which compiled reads typed as that function test; anything else arms
+  // plainly.
+  uint32_t predicted = bindingId < gNames.bindingPredictedScript.size()
+                           ? gNames.bindingPredictedScript[bindingId]
+                           : 0;
+  bool isPredicted =
+      predicted && js::night::NightIsCompiledFunctionOf(bits, predicted);
   *reinterpret_cast<uint64_t*>(cell) = bits;
-  cell[2] = 1;
+  cell[2] = isPredicted ? js::night::Night_bindingFusePredicted : js::night::Night_bindingFuseArmed;
   if (nursery) {
     gState.nurseryArmedBindings.push_back(bindingId);
   }

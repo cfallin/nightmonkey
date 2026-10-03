@@ -430,7 +430,6 @@ pub fn build_inprocess_batch(
         source_id_to_func: _,
         source_id_to_table_func,
         sid_to_index,
-        fuse_binding_index,
         strlit_patches,
         regex_entries,
         prop_ic_base,
@@ -455,7 +454,7 @@ pub fn build_inprocess_batch(
     }
     let atom_bytes = serialize_atom_table(&atoms);
     let gbind_bytes =
-        serialize_global_binding_table(&atoms.names, &env.syn_gname_names, &fuse_binding_index);
+        serialize_global_binding_table(&atoms.names, &env.syn_gname_names, &env.binding_preds);
     let fuse_bytes = serialize_fuse_table(&env, &mut atoms);
     let regex_bytes = serialize_regex_table(&regex_entries);
 

@@ -63,6 +63,16 @@ pub(super) fn is_guard(op: &Opcode) -> bool {
     )
 }
 
+/// Whether an available check `a` proves `b` where their facts' types
+/// agree: a binding's checks differ in what they prove of it, not in
+/// their fact (a read's fact is a write's).
+fn check_implies(a: &Opcode, b: &Opcode) -> bool {
+    match (a, b) {
+        (Opcode::CheckBinding(x, ka), Opcode::CheckBinding(y, kb)) => x == y && ka.implies(*kb),
+        _ => true,
+    }
+}
+
 /// The operand a guard is keyed by: its operand up to unboxing, or, for
 /// an operand-less check (`check.fuse`), a stand-in.
 fn guard_arg(f: &Func, d: &crate::mir::func::InstData) -> Value {
@@ -573,6 +583,9 @@ pub fn optimize(m: &Module, f: &mut Func) -> usize {
                     total += p;
                     continue;
                 }
+            }
+            if SINK_TO_EXITS {
+                total += sink_to_exits(f);
             }
             return total;
         }
@@ -1226,6 +1239,7 @@ pub fn fold_guards(m: &Module, f: &mut Func) -> usize {
             Err(_) => None,
             },
         };
+        let from_type = by_type.is_some() && x.is_some();
         let known: Option<(Option<Opcode>, Value, Type)> = match (by_type, x) {
             (Some((op, t)), Some(x)) => Some((op, x, t)),
             _ => {
@@ -1242,14 +1256,17 @@ pub fn fold_guards(m: &Module, f: &mut Func) -> usize {
                         *y == cx
                             && (*op == d.op
                                 || (std::mem::discriminant(op) == std::mem::discriminant(&d.op)
-                                    && is_subtype(&f.values[**v1].ty, &want)))
+                                    && is_subtype(&f.values[**v1].ty, &want)
+                                    && check_implies(op, &d.op)))
                     })
                     .map(|(_, &v1)| v1)
                     .collect();
                 hits.sort();
+                // (Not this guard's own output, which a loop can bring
+                // back to its block.)
                 hits.into_iter().find_map(|v1| {
                     let db = def_block(f, v1, &inst_block);
-                    (db.is_some_and(|db| db != b && cfg.dominates(db, b)))
+                    (v1 != outp && db.is_some_and(|db| cfg.dominates(db, b)))
                         .then(|| (None, v1, f.values[v1].ty))
                 })
             }
@@ -1268,6 +1285,16 @@ pub fn fold_guards(m: &Module, f: &mut Func) -> usize {
                 rs[0]
             }
             _ => v,
+        };
+        // Another guard's stronger output (a layout with `types` for one
+        // without) goes on as this guard's type: an op's rule need not be
+        // monotone in its operands' (a `store_field` through a `types`
+        // receiver demands a conforming value).
+        let v = if !from_type && matches!(want, Type::Obj(_)) && f.values[v].ty != want {
+            let (_, rs) = f.add_inst(b, Opcode::Weaken, vec![v], &[want], vec![]);
+            rs[0]
+        } else {
+            v
         };
         let args = ok
             .args
@@ -1341,6 +1368,86 @@ pub(crate) fn replace_values(f: &mut Func, subst: &BTreeMap<Value, Value>) -> us
     dropped
 }
 
+/// Whether `sink_to_exits` runs.
+const SINK_TO_EXITS: bool = true;
+
+/// §10.4: a value only exits use (a `box` of a value no fence can weaken,
+/// the global object) is made on their paths, not on the hot one: a copy
+/// at the head of each exit block that uses it, and none where it was.
+/// Its operands dominated the original, and so every exit block it
+/// reached; a value with killable type components is left alone (its
+/// live range would cross the fences the original's ended before).
+pub fn sink_to_exits(f: &mut Func) -> usize {
+    let is_exit = |f: &Func, b: Block| {
+        f.terminator(b).is_some_and(|t| {
+            matches!(f.insts[t].op, Opcode::Exit { .. } | Opcode::ExitThrow { .. } | Opcode::ExitInline { .. })
+        })
+    };
+    // Every use, by block; a use on an edge disqualifies.
+    let mut use_blocks: BTreeMap<Value, BTreeSet<Block>> = BTreeMap::new();
+    let mut edge_used: BTreeSet<Value> = BTreeSet::new();
+    for &b in &f.layout {
+        for &i in &f.blocks[b].insts {
+            let d = &f.insts[i];
+            for &a in &d.args {
+                use_blocks.entry(a).or_default().insert(b);
+            }
+            for e in &d.succs {
+                for a in &e.args {
+                    if let EdgeArg::Value(v) = a {
+                        edge_used.insert(*v);
+                    }
+                }
+            }
+        }
+    }
+    let mut sunk = 0;
+    for b in f.layout.clone() {
+        for i in f.blocks[b].insts.clone() {
+            let d = f.insts[i].clone();
+            let sinkable = match d.op {
+                Opcode::GlobalObject => true,
+                Opcode::Box => d
+                    .args
+                    .iter()
+                    .all(|&a| !matches!(f.values[a].ty, Type::Raw(_)) && f.values[a].ty.killable_components().is_empty()),
+                _ => false,
+            };
+            let [r] = d.results[..] else { continue };
+            if !sinkable || edge_used.contains(&r) {
+                continue;
+            }
+            let Some(ub) = use_blocks.get(&r) else { continue };
+            if ub.contains(&b) || !ub.iter().all(|&u| is_exit(f, u)) {
+                continue;
+            }
+            let ty = f.values[r].ty;
+            for &u in ub.clone().iter() {
+                let (j, rs) = f.add_inst(u, d.op, d.args.clone(), &[ty], vec![]);
+                f.inst_frame[j] = f.inst_frame[i];
+                let insts = &mut f.blocks[u].insts;
+                insts.pop();
+                insts.insert(0, j);
+                for &k in &f.blocks[u].insts.clone() {
+                    for a in f.insts[k].args.iter_mut() {
+                        if *a == r {
+                            *a = rs[0];
+                        }
+                    }
+                }
+                // The copy's operands are used here now.
+                for &a in &d.args {
+                    use_blocks.entry(a).or_default().insert(u);
+                }
+            }
+            f.blocks[b].insts.retain(|&k| k != i);
+            f.values[r].def = ValueDef::Unused;
+            sunk += 1;
+        }
+    }
+    sunk
+}
+
 /// Whether `gvn` runs.
 const GVN: bool = true;
 
@@ -1352,6 +1459,7 @@ fn gvn_op(op: &Opcode) -> bool {
     matches!(
         op,
         Opcode::EnvCurrent
+            | Opcode::GlobalObject
             | Opcode::EnvCallee(_)
             | Opcode::EnvParent
             | Opcode::EnvLoad(_)

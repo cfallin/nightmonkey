@@ -529,6 +529,20 @@ uint64_t NightCalleeNightTarget(uint64_t calleeBits) {
          uint64_t(index);
 }
 
+bool NightIsCompiledFunctionOf(uint64_t bits, uint32_t scriptAddr) {
+  JS::Value v = JS::Value::fromRawBits(bits);
+  if (!v.isObject() || !v.toObject().is<JSFunction>()) {
+    return false;
+  }
+  JSFunction* fun = &v.toObject().as<JSFunction>();
+  if (!fun->hasBaseScript()) {
+    return false;
+  }
+  BaseScript* script = fun->baseScript();
+  return uint32_t(reinterpret_cast<uintptr_t>(script)) == scriptAddr &&
+         script->externalTierWord() != 0;
+}
+
 // `Exception` op: get and clear the pending exception, boxed into *out.
 // May fail (e.g. an interrupt), in which case the error propagates. No
 // PENDING exception at a catch entry means the error is uncatchable

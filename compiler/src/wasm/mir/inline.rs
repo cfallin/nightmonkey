@@ -114,6 +114,7 @@ impl Maps {
             Type::Fact(FactKind::Fuse(f)) => Type::Fact(FactKind::Fuse(self.fuses[&f])),
             Type::Fact(FactKind::NativeIntact(n)) => Type::Fact(FactKind::NativeIntact(self.natives[&n])),
             Type::Fact(FactKind::Binding(b)) => Type::Fact(FactKind::Binding(self.bindings[&b])),
+            Type::Fact(FactKind::BindingFn(b)) => Type::Fact(FactKind::BindingFn(self.bindings[&b])),
             t => t,
         })
     }

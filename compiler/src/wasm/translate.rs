@@ -1312,13 +1312,6 @@ pub enum Outcome {
         /// classified funcidx against it) and the `Call` to the callee body;
         /// an uncompiled callee leaves the const at `u32::MAX` (arm dead).
         likely_patches: Vec<(Value, Value, u32)>,
-        /// Fuse-guarded direct-call placeholders: `(enabled I32Const,
-        /// Call value, binding_id, callee_source_id)`. Post-placement the
-        /// caller patches the `Call` to the callee body and the const to 1,
-        /// and records binding_id -> callee table index for the reactor's
-        /// arm-time validation; an uncompiled callee (or a binding predicted
-        /// with conflicting callees) leaves the const at 0 (arm dead).
-        fuse_call_patches: Vec<FuseCallPatch>,
         /// Callee value-cell address placeholders: `(addr I32Const, row)`.
         /// Post-translation (once the prop-IC region size fixes the cell
         /// region's base) mod.rs patches each const to
@@ -1825,6 +1818,9 @@ pub struct TranslateCtx<'a> {
     pub source: &'a Source,
     pub opts: &'a Options,
     pub syn_gnames: &'a HashMap<NameId, u32>,
+    /// Per binding row, its predicted function's script and address
+    /// (`EnvLayout::binding_preds`).
+    pub binding_preds: &'a HashMap<u32, (ScriptId, u32)>,
     /// The analysis output. Tables the translator reads unchanged are read
     /// straight off this; the `*_in` fields below are the ones the env
     /// layout DERIVES (address-bearing descriptors, merged views).
@@ -1902,22 +1898,6 @@ pub struct ArrayElemIn {
 pub struct FusedGname {
     pub fuse_addr: u32,
     pub boxed: u64,
-}
-
-/// One fuse-guarded direct-call arm a body claimed. `wasm/mod.rs` patches
-/// `enabled` to 1 and `call` to the callee once the binding's expected callee
-/// is confirmed unique and compiled; an arm whose callee never compiles stays
-/// dead behind its `enabled` 0.
-#[derive(Clone, Copy)]
-pub struct FuseCallPatch {
-    /// The `enabled` constant the emitted guard tests.
-    pub enabled: Value,
-    /// The stub call the direct call replaces.
-    pub call: Value,
-    /// The global binding the callee was read from.
-    pub binding: u32,
-    /// The callee this arm predicts.
-    pub callee: ScriptId,
 }
 
 /// The value-boxing forms of the synthetic helper bodies here, which the
@@ -2605,6 +2585,7 @@ mod tests {
             source,
             opts,
             syn_gnames: empty_syn_gnames(),
+            binding_preds: empty_binding_preds(),
             facts: empty_facts(),
             this_layouts_in: empty_this_layouts(),
             stamp_ctors_in: empty_stamp_ctors(),
@@ -2669,6 +2650,7 @@ mod tests {
     empty_table!(empty_array_stamp, HashMap<Site, u32>);
     empty_table!(empty_array_elem, HashMap<Site, ArrayElemIn>);
     empty_table!(empty_syn_gnames, HashMap<NameId, u32>);
+    empty_table!(empty_binding_preds, HashMap<u32, (ScriptId, u32)>);
     fn op_byte(o: JSOp) -> u8 {
         o as u16 as u8
     }

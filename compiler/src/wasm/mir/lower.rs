@@ -45,10 +45,11 @@ use crate::ids::{Pc, ScriptId};
 use crate::mir;
 use crate::mir::func::{Edge, EdgeArg, RootKind};
 use crate::mir::ops::{
-    frame_parts, ArithOp, BitOp, Cc, ConstVal, F64Op, JsBinop, JsCc, JsUnop, MathFn, NumRepr,
-    Opcode, UnboxKind,
+    frame_parts, ArithOp, BindingCheck, BitOp, Cc, ConstVal, F64Op, JsBinop, JsCc, JsUnop, MathFn,
+    NumRepr, Opcode, UnboxKind,
 };
-use crate::mir::types::{Machine, ObjKind, TagSet, Type as MType};
+use crate::mir::types::{FactKind, Machine, ObjKind, TagSet, Type as MType};
+use crate::region_shape::BINDING_FUSE_PREDICTED;
 use crate::opsem::{
     PRIM_BIGINT, PRIM_BOOLEAN, PRIM_DOUBLE, PRIM_INT32, PRIM_NULL, PRIM_STRING, PRIM_SYMBOL,
     PRIM_UNDEFINED,
@@ -96,7 +97,19 @@ const DIRECT_CONSTRUCT: bool = true;
 /// Whether global binding writes get their inline arm.
 const INLINE_GNAME_SETS: bool = true;
 
+/// A call whose callee's type proves its script calls that script's body
+/// with no native arms and no classify (`js_call_proven`).
+const PROVEN_CALLS: bool = true;
+
 const UNDEF: u64 = TAG_UNDEFINED << 32;
+
+/// The tags of values that are no GC thing (no barrier owes them anything).
+const GC_FREE_TAGS: TagSet = TagSet::prims(crate::opsem::Prims::from_bits(
+    crate::opsem::NUM.bits()
+        | crate::opsem::PRIM_BOOLEAN.bits()
+        | crate::opsem::PRIM_NULL.bits()
+        | crate::opsem::PRIM_UNDEFINED.bits(),
+));
 
 /// `JS::GenericNaN()`'s bits.
 const CANONICAL_NAN_BITS: u64 = 0x7FF8_0000_0000_0000;
@@ -2909,6 +2922,12 @@ impl<'a> Lower<'a> {
             // The activation's environment is fixed (§5.1): the frame's env
             // slot, which the fresh entry (or baseline, before an onramp)
             // set, and which is rooted with the frame.
+            Opcode::GlobalObject => {
+                let realm = self.load_i32(self.cx, JSCONTEXT_REALM_OFFSET);
+                let global = self.load_i32(realm, REALM_GLOBAL_OFFSET);
+                let g = self.box_tagged(TAG_OBJECT, global);
+                self.def(inst, g);
+            }
             Opcode::EnvCurrent => {
                 let env = self.frame_env();
                 let p = self.un(Operator::I32WrapI64, env, Type::I32);
@@ -4176,8 +4195,29 @@ impl<'a> Lower<'a> {
                 let ok = self.bin(Operator::I32Eq, w, one, Type::I32);
                 self.guard(inst, ok, &[])?;
             }
-            Opcode::CheckBinding(b, write) => {
+            Opcode::CheckBinding(b, BindingCheck::Fn) => {
+                // The value fuse in its predicted state: the binding holds
+                // a compiled function of its predicted script. A cell a
+                // major GC zeroed re-arms at the resolve, so a miss resolves
+                // once before it exits.
                 let slot = self.mm.bindings[b].slot;
+                let vals = self.i32c(self.h.global_vals_base + 16 * slot);
+                let fw = self.load_i32(vals, 8);
+                let want = self.i32c(BINDING_FUSE_PREDICTED);
+                let ok = self.bin(Operator::I32Eq, fw, want, Type::I32);
+                let miss = self.body.add_block();
+                let t = self.edge(inst, 0, &[])?;
+                self.cond_br(ok, t, Self::to(miss));
+                self.cur = miss;
+                let bv = self.i32c(slot);
+                self.call(self.h.resolve_global_slot_guarded, &[self.cx, bv], &[Type::I32]);
+                let fw = self.load_i32(vals, 8);
+                let ok = self.bin(Operator::I32Eq, fw, want, Type::I32);
+                self.guard(inst, ok, &[])?;
+            }
+            Opcode::CheckBinding(b, k) => {
+                let slot = self.mm.bindings[b].slot;
+                let write = k == BindingCheck::Write;
                 if !write {
                     // A read of a binding whose value fuse is armed
                     // (`gGlobalVals`) needs no slot: `load_gname` takes the
@@ -4185,8 +4225,7 @@ impl<'a> Lower<'a> {
                     // loads its fact reaches (they dominate them).
                     let vals = self.i32c(self.h.global_vals_base + 16 * slot);
                     let fw = self.load_i32(vals, 8);
-                    let one = self.i32c(1);
-                    let armed = self.bin(Operator::I32Eq, fw, one, Type::I32);
+                    let armed = self.fuse_armed(fw);
                     if let Some(&EdgeArg::Out(0)) = d.succs[0].args.first() {
                         let fact = self.f.blocks[d.succs[0].block].params[0];
                         self.binding_armed.insert(fact, armed);
@@ -4194,6 +4233,25 @@ impl<'a> Lower<'a> {
                     let chk = self.body.add_block();
                     let t = self.edge(inst, 0, &[])?;
                     self.cond_br(armed, t, Self::to(chk));
+                    self.cur = chk;
+                } else {
+                    // An armed value fuse says the binding is still the
+                    // global's own data property (a redefinition, delete or
+                    // lexical shadow blows it), and a resolved row whether
+                    // it is writable (bit 2; a major GC zeroes the row,
+                    // which the full test below resolves again).
+                    let vals = self.i32c(self.h.global_vals_base + 16 * slot);
+                    let fw = self.load_i32(vals, 8);
+                    let base = self.i32c(self.h.global_slots_base);
+                    let entry = self.load_i32(base, 8 * slot);
+                    let two = self.i32c(2);
+                    let armed4 = self.bin(Operator::I32Shl, fw, two, Type::I32);
+                    let both = self.bin(Operator::I32And, armed4, entry, Type::I32);
+                    let four = self.i32c(4);
+                    let fast = self.bin(Operator::I32And, both, four, Type::I32);
+                    let chk = self.body.add_block();
+                    let t = self.edge(inst, 0, &[])?;
+                    self.cond_br(fast, t, Self::to(chk));
                     self.cur = chk;
                 }
                 let ok = self.binding_ok(slot, write);
@@ -4206,6 +4264,14 @@ impl<'a> Lower<'a> {
                 // a write, which kills the fact).
                 let slot = self.mm.bindings[b].slot;
                 let vals = self.i32c(self.h.global_vals_base + 16 * slot);
+                if self.ty(d.args[0]) == MType::Fact(FactKind::BindingFn(b)) {
+                    // In the predicted state, which a write leaves only
+                    // for another function of the script (and kills the
+                    // fact meanwhile): the copy is the value.
+                    let v = self.load_i64(vals, 0);
+                    self.def(inst, v);
+                    return Ok(());
+                }
                 // (A write to a global disarms its fuse but keeps the
                 // fact: only a load in the check's `ok` block, before any
                 // write there.)
@@ -4220,8 +4286,7 @@ impl<'a> Lower<'a> {
                     Some(&a) => a,
                     None => {
                         let fw = self.load_i32(vals, 8);
-                        let one = self.i32c(1);
-                        self.bin(Operator::I32Eq, fw, one, Type::I32)
+                        self.fuse_armed(fw)
                     }
                 };
                 let (hit, miss, join) = (self.body.add_block(), self.body.add_block(), self.body.add_block());
@@ -4245,7 +4310,8 @@ impl<'a> Lower<'a> {
                 let def = &self.mm.bindings[b];
                 let (slot, name) = (def.slot, def.name);
                 let fused = self.gname_fused.get(&name).copied();
-                self.binding_store(slot, a[1], fused);
+                let gc_free = value_tags(&self.ty(d.args[1])).subset_of(GC_FREE_TAGS);
+                self.binding_store(slot, a[1], gc_free, fused);
             }
             Opcode::LoadField(name) => self.field_op(inst, name, a[0], None)?,
             Opcode::LoadSlot(name) => {
@@ -4618,16 +4684,14 @@ impl<'a> Lower<'a> {
         let base = self.i32c(self.h.global_slots_base);
         let entry0 = self.load_i32(base, 8 * slot);
         let shape0 = self.load_i32(base, 8 * slot + 4);
+        // Resolved (bit 0), and for a write writable (bit 2).
         let usable = |l: &mut Self, e: Value| {
-            let one = l.i32c(1);
-            let r = l.bin(Operator::I32And, e, one, Type::I32);
+            let m = l.i32c(if write { 5 } else { 1 });
+            let r = l.bin(Operator::I32And, e, m, Type::I32);
             if !write {
                 return r;
             }
-            let two = l.i32c(2);
-            let sh = l.bin(Operator::I32ShrU, e, two, Type::I32);
-            let w = l.bin(Operator::I32And, sh, one, Type::I32);
-            l.bin(Operator::I32And, r, w, Type::I32)
+            l.bin(Operator::I32Eq, r, m, Type::I32)
         };
         let u0 = usable(self, entry0);
         let realm = self.load_i32(self.cx, JSCONTEXT_REALM_OFFSET);
@@ -4654,8 +4718,29 @@ impl<'a> Lower<'a> {
     /// (bit 1 of the entry selects the dynamic slots; `entry & !7` is the
     /// byte offset from that base, past the fixed-slot header when fixed).
     fn binding_addr(&mut self, slot: u32) -> Value {
+        self.binding_slot(slot).0
+    }
+
+    /// Binding row `slot`'s global slot, the binding checked: its address,
+    /// the global object, the row's entry and whether the slot is dynamic
+    /// (`binding_addr`). A major GC since the check zeroes the row (its
+    /// shape word may dangle): resolved again first, to the same slot (the
+    /// check's binding is a data property that cannot move).
+    fn binding_slot(&mut self, slot: u32) -> (Value, Value, Value, Value) {
         let base = self.i32c(self.h.global_slots_base);
-        let entry = self.load_i32(base, 8 * slot);
+        let entry0 = self.load_i32(base, 8 * slot);
+        let one = self.i32c(1);
+        let resolved = self.bin(Operator::I32And, entry0, one, Type::I32);
+        let (resolve_b, join) = (self.body.add_block(), self.body.add_block());
+        let entry = self.body.add_blockparam(join, Type::I32);
+        self.cond_br(resolved, BlockTarget { block: join, args: vec![entry0] }, Self::to(resolve_b));
+        self.cur = resolve_b;
+        let bv = self.i32c(slot);
+        let entry1 = self.call1(self.h.resolve_global_slot_guarded, &[self.cx, bv], Type::I32);
+        self.terminate(Terminator::Br {
+            target: BlockTarget { block: join, args: vec![entry1] },
+        });
+        self.cur = join;
         let realm = self.load_i32(self.cx, JSCONTEXT_REALM_OFFSET);
         let global = self.load_i32(realm, REALM_GLOBAL_OFFSET);
         let one = self.i32c(1);
@@ -4669,42 +4754,59 @@ impl<'a> Lower<'a> {
         let off = self.bin(Operator::I32Add, idx8, add, Type::I32);
         let slots = self.load_i32(global, NATIVE_SLOTS_OFFSET);
         let slot_base = self.select(Type::I32, slots, global, dynamic);
-        self.bin(Operator::I32Add, slot_base, off, Type::I32)
+        let addr = self.bin(Operator::I32Add, slot_base, off, Type::I32);
+        (addr, global, entry, dynamic)
     }
 
     /// `store_gname` (§3): the resolved, writable slot of binding row
-    /// `slot` takes `val`, with the barriers, the binding's value fuse and
-    /// the bind epoch as the syntactic global store keeps them, and a
-    /// fused literal's fuse (`gname_set_arms`' tail).
-    fn binding_store(&mut self, slot: u32, val: Value, fused: Option<crate::wasm::translate::FusedGname>) {
-        let addr = self.binding_addr(slot);
+    /// `slot` takes `val`, with the barriers and the binding's value fuse
+    /// as the syntactic global store keeps them, and a
+    /// fused literal's fuse (`gname_set_arms`' tail). `gc_free`: the value
+    /// is no GC thing, by its type.
+    fn binding_store(&mut self, slot: u32, val: Value, gc_free: bool, fused: Option<crate::wasm::translate::FusedGname>) {
+        let (addr, global, entry, dynamic) = self.binding_slot(slot);
         self.pre_barrier(addr, 0);
         self.store_i64(addr, 0, val);
-        let base = self.i32c(self.h.global_slots_base);
-        let entry = self.load_i32(base, 8 * slot);
-        let realm = self.load_i32(self.cx, JSCONTEXT_REALM_OFFSET);
-        let global = self.load_i32(realm, REALM_GLOBAL_OFFSET);
-        let live = self.load_i32(global, SHAPE_OFFSET);
-        let one = self.i32c(1);
-        let sh = self.bin(Operator::I32ShrU, entry, one, Type::I32);
-        let dynamic = self.bin(Operator::I32And, sh, one, Type::I32);
-        let three = self.i32c(3);
-        let idx = self.bin(Operator::I32ShrU, entry, three, Type::I32);
-        let flags = self.load_i32(live, SHAPE_IMMUTABLE_FLAGS_OFFSET);
-        let fs = self.i32c(SHAPE_FIXED_SLOTS_SHIFT);
-        let nf = self.bin(Operator::I32ShrU, flags, fs, Type::I32);
-        let fm = self.i32c(SHAPE_FIXED_SLOTS_MASK_BITS);
-        let nfixed = self.bin(Operator::I32And, nf, fm, Type::I32);
-        let idx_plus = self.bin(Operator::I32Add, idx, nfixed, Type::I32);
-        let abs = self.select(Type::I32, idx_plus, idx, dynamic);
-        self.post_barrier(self.h.post_write_barrier, global, abs, val);
-        self.binding_fuses(slot, val, fused);
+        if !gc_free {
+            // The generational post-barrier: the global object is tenured,
+            // so a nursery GC thing is recorded, by the slot's index (its
+            // shape's fixed slots first), which only that path computes.
+            let cont = self.body.add_block();
+            let tag = self.tag_of(val);
+            let min = self.i32c(VAL_GCTHING_TAG_MIN);
+            let is_gc = self.bin(Operator::I32GeU, tag, min, Type::I32);
+            let gc = self.body.add_block();
+            self.cond_br(is_gc, Self::to(gc), Self::to(cont));
+            self.cur = gc;
+            let mask = self.i32c(NOT_CHUNK_MASK);
+            let cell = self.un(Operator::I32WrapI64, val, Type::I32);
+            let chunk = self.bin(Operator::I32And, cell, mask, Type::I32);
+            let sb = self.load_i32(chunk, CHUNK_STORE_BUFFER_OFFSET);
+            let record = self.body.add_block();
+            self.cond_br(sb, Self::to(record), Self::to(cont));
+            self.cur = record;
+            let three = self.i32c(3);
+            let idx = self.bin(Operator::I32ShrU, entry, three, Type::I32);
+            let live = self.load_i32(global, SHAPE_OFFSET);
+            let flags = self.load_i32(live, SHAPE_IMMUTABLE_FLAGS_OFFSET);
+            let fs = self.i32c(SHAPE_FIXED_SLOTS_SHIFT);
+            let nf = self.bin(Operator::I32ShrU, flags, fs, Type::I32);
+            let fm = self.i32c(SHAPE_FIXED_SLOTS_MASK_BITS);
+            let nfixed = self.bin(Operator::I32And, nf, fm, Type::I32);
+            let idx_plus = self.bin(Operator::I32Add, idx, nfixed, Type::I32);
+            let abs = self.select(Type::I32, idx_plus, idx, dynamic);
+            let owner = self.box_tagged(TAG_OBJECT, global);
+            self.call(self.h.post_write_barrier, &[owner, abs, val], &[]);
+            self.terminate(Terminator::Br { target: Self::to(cont) });
+            self.cur = cont;
+        }
+        self.binding_fuses(slot, val, gc_free, fused);
     }
 
     /// A syntactic global store's bookkeeping, after the slot store: the
-    /// binding's value fuse (`gGlobalVals[bid]`), the bind epoch, and a
-    /// fused literal's fuse.
-    fn binding_fuses(&mut self, bid: u32, val: Value, fused: Option<crate::wasm::translate::FusedGname>) {
+    /// binding's value fuse (`gGlobalVals[bid]`) and a fused literal's
+    /// fuse.
+    fn binding_fuses(&mut self, bid: u32, val: Value, gc_free: bool, fused: Option<crate::wasm::translate::FusedGname>) {
         let one = self.i32c(1);
         let two = self.i32c(2);
         // The binding's value fuse (`gGlobalVals[bid]`): an armed cell whose
@@ -4712,20 +4814,26 @@ impl<'a> Lower<'a> {
         // unarmed with the re-arm left to the runtime.
         let vals = self.i32c(self.h.global_vals_base + 16 * bid);
         let fw = self.load_i32(vals, 8);
-        let armed = self.bin(Operator::I32Eq, fw, one, Type::I32);
+        let armed = self.fuse_armed(fw);
         let old = self.load_i64(vals, 0);
         let changed = self.bin(Operator::I64Ne, old, val, Type::I32);
         let blow = self.bin(Operator::I32And, armed, changed, Type::I32);
         let (blow_b, cont) = (self.body.add_block(), self.body.add_block());
         self.cond_br(blow, Self::to(blow_b), Self::to(cont));
         self.cur = blow_b;
-        let tag = self.tag_of(val);
-        let st = self.i32c(TAG_STRING as u32);
-        let is_gc = self.bin(Operator::I32GeU, tag, st, Type::I32);
         let (gc_b, plain_b) = (self.body.add_block(), self.body.add_block());
-        self.cond_br(is_gc, Self::to(gc_b), Self::to(plain_b));
+        if gc_free {
+            self.terminate(Terminator::Br { target: Self::to(plain_b) });
+        } else {
+            let tag = self.tag_of(val);
+            let st = self.i32c(TAG_STRING as u32);
+            let is_gc = self.bin(Operator::I32GeU, tag, st, Type::I32);
+            self.cond_br(is_gc, Self::to(gc_b), Self::to(plain_b));
+        }
         self.cur = plain_b;
+        // Armed with the new value; no function, so not predicted.
         self.store_i64(vals, 0, val);
+        self.store_i32(vals, 8, one);
         self.terminate(Terminator::Br { target: Self::to(cont) });
         self.cur = gc_b;
         let z = self.i32c(0);
@@ -4734,12 +4842,6 @@ impl<'a> Lower<'a> {
         self.call(self.h.binding_written, &[b], &[]);
         self.terminate(Terminator::Br { target: Self::to(cont) });
         self.cur = cont;
-        // The bind epoch.
-        let slot = self.i32c(self.h.strlit_slot + crate::region_shape::STRLIT_BIND_EPOCH_ADDR_OFF);
-        let ep = self.load_i32(slot, 0);
-        let e = self.load_i32(ep, 0);
-        let e1 = self.bin(Operator::I32Add, e, one, Type::I32);
-        self.store_i32(ep, 0, e1);
         // A fused literal's fuse: the literal arms it, anything else blows
         // it.
         if let Some(fg) = fused {
@@ -4755,11 +4857,18 @@ impl<'a> Lower<'a> {
         }
     }
 
+    /// Whether a binding's value-fuse word `fw` is armed: 1, or 3 (armed
+    /// with its predicted function).
+    fn fuse_armed(&mut self, fw: Value) -> Value {
+        let one = self.i32c(1);
+        self.bin(Operator::I32And, fw, one, Type::I32)
+    }
+
     fn gname_fast_arms(&mut self, inst: mir::Inst, bid: u32) -> R<()> {
         let vals = self.i32c(self.h.global_vals_base + 16 * bid);
         let fw = self.load_i32(vals, 8);
         let one = self.i32c(1);
-        let armed = self.bin(Operator::I32Eq, fw, one, Type::I32);
+        let armed = self.fuse_armed(fw);
         let (hit_b, slots_b) = (self.body.add_block(), self.body.add_block());
         self.cond_br(armed, Self::to(hit_b), Self::to(slots_b));
         self.cur = hit_b;
@@ -4910,7 +5019,7 @@ impl<'a> Lower<'a> {
         let idx_plus = self.bin(Operator::I32Add, idx, nfixed, Type::I32);
         let abs = self.select(Type::I32, idx_plus, idx, dynamic);
         self.post_barrier(self.h.post_write_barrier, global, abs, val);
-        self.binding_fuses(bid, val, fused);
+        self.binding_fuses(bid, val, false, fused);
         let t = self.edge(inst, 0, &[])?;
         self.terminate(Terminator::Br { target: t });
         self.cur = slow;
@@ -7204,6 +7313,19 @@ impl<'a> Lower<'a> {
         /// Headroom a compiled body may use past its actuals (the runtime
         /// entries' `kNightStackHeadroomSlots`).
         const HEADROOM: u32 = 64 * 1024;
+        // A callee whose type proves its script (a predicted global's
+        // read, a guarded closure): a compiled body (what proved it tested
+        // that), no native, its table index in its script.
+        let proven = match self.ty(self.f.insts[inst].args[0]) {
+            MType::Val(v) if v.tags.is_nonempty_subset_of(TagSet::OBJECT) => match v.obj.kind {
+                ObjKind::Function(Some(k)) => self.mm.script_addrs.get(&k).copied(),
+                _ => None,
+            },
+            _ => None,
+        };
+        if let Some(addr) = proven.filter(|_| PROVEN_CALLS) {
+            return self.js_call_proven(inst, ops, iter, addr, HEADROOM);
+        }
         if ops.len() == 3 && !iter {
             let call = self.body.add_block();
             self.char_arms(inst, ops, call)?;
@@ -7343,6 +7465,108 @@ impl<'a> Lower<'a> {
         }
         // An iterator method's call reports an uncallable callee as the
         // iterator protocol does.
+        let generic_f = if iter { self.h.call_iter } else { self.h.call };
+        let ok_generic = self.call1(generic_f, &[self.cx, top, base, argc_v], Type::I32);
+        self.terminate(Terminator::Br {
+            target: BlockTarget {
+                block: join,
+                args: vec![ok_generic],
+            },
+        });
+
+        self.cur = join;
+        self.after_gc(&live);
+        let result = self.load_i64(self.vp, top_off);
+        let post = self.epoch();
+        let same = self.bin(Operator::I32Eq, call_pre, post, Type::I32);
+        self.clean_or_dirty(inst, ok, same, &[result])
+    }
+
+    /// `js_call_op` for a callee of a known compiled script at `addr`: no
+    /// native arms and no classify; the script's table index, and the
+    /// site's static call of that body where it is the one the site
+    /// predicts. (Such a callee is never a class constructor, whose call
+    /// throws: no binding predicts one.)
+    fn js_call_proven(&mut self, inst: mir::Inst, ops: &[Value], iter: bool, addr: u32, headroom: u32) -> R<()> {
+        let live = self.live_across(inst);
+        self.root(&live)?;
+        let call_pre = self.epoch();
+        let frame = self.top_off(live.len());
+        for (k, &v) in ops.iter().enumerate() {
+            self.store_i64(self.vp, frame + 8 * u32::try_from(k).unwrap(), v);
+        }
+        let argc = u32::try_from(ops.len() - 2).unwrap();
+        let top_off = frame + 8 * (argc + 2);
+        let base = self.add_off(self.vp, frame);
+        let top = self.add_off(self.vp, top_off);
+        let limit_addr = self.i32c(self.h.night_stack_limit_base);
+        let limit = self.load_i32(limit_addr, 0);
+        let hi = self.add_off(top, headroom);
+        let fits = self.bin(Operator::I32LeU, hi, limit, Type::I32);
+        let (direct_b, generic_b, join) = (self.body.add_block(), self.body.add_block(), self.body.add_block());
+        let ok = self.body.add_blockparam(join, Type::I32);
+        self.cond_br(fits, Self::to(direct_b), Self::to(generic_b));
+
+        self.cur = direct_b;
+        let script = self.i32c(addr);
+        let funcidx = self.load_i32(script, BASESCRIPT_NIGHTFUNCINDEX_OFFSET);
+        let argc_v = self.i32c(argc);
+        let undef = self.i64c(UNDEF);
+        let likely: Vec<u32> = self.f.insts[inst]
+            .attach
+            .map(|a| self.f.attachments[a].targets.iter().map(|k| k.get()).collect())
+            .unwrap_or_default();
+        if let Some(&sid) = likely.first().filter(|_| likely.len() == 1) {
+            let expected = self.i32c(u32::MAX);
+            let is_likely = self.bin(Operator::I32Eq, funcidx, expected, Type::I32);
+            let (likely_b, indirect_b) = (self.body.add_block(), self.body.add_block());
+            self.cond_br(is_likely, Self::to(likely_b), Self::to(indirect_b));
+            self.cur = likely_b;
+            let args = self.body.arg_pool.from_iter([self.cx, base, argc_v, top, script, undef].into_iter());
+            let tys = self.body.type_pool.from_iter([Type::I32, Type::I32].into_iter());
+            let call = self.push_val(ValueDef::Operator(
+                Operator::Call {
+                    function_index: self.h.direct_call_stub2,
+                },
+                args,
+                tys,
+            ));
+            self.likely_patches.push((expected, call, sid));
+            let err = self.push_val(ValueDef::PickOutput(call, 0, Type::I32));
+            let ok_likely = self.un(Operator::I32Eqz, err, Type::I32);
+            self.terminate(Terminator::Br {
+                target: BlockTarget {
+                    block: join,
+                    args: vec![ok_likely],
+                },
+            });
+            self.cur = indirect_b;
+        }
+        let off = self.i32c(u32::MAX);
+        self.body_off_patches.push(off);
+        let body_idx = self.bin(Operator::I32Sub, funcidx, off, Type::I32);
+        let args = self.body.arg_pool.from_iter([self.cx, base, argc_v, top, script, undef, body_idx].into_iter());
+        let tys = self.body.type_pool.from_iter([Type::I32, Type::I32].into_iter());
+        let call = self.push_val(ValueDef::Operator(
+            Operator::CallIndirect {
+                sig_index: self.h.night_abi_sig2,
+                table_index: self.h.indirect_table,
+            },
+            args,
+            tys,
+        ));
+        let err = self.push_val(ValueDef::PickOutput(call, 0, Type::I32));
+        let ok_direct = self.un(Operator::I32Eqz, err, Type::I32);
+        self.terminate(Terminator::Br {
+            target: BlockTarget {
+                block: join,
+                args: vec![ok_direct],
+            },
+        });
+
+        // Out of stack: the generic call, which reports the overflow.
+        self.cur = generic_b;
+        let argc_v = self.i32c(argc);
         let generic_f = if iter { self.h.call_iter } else { self.h.call };
         let ok_generic = self.call1(generic_f, &[self.cx, top, base, argc_v], Type::I32);
         self.terminate(Terminator::Br {
@@ -7884,24 +8108,21 @@ impl<'a> Lower<'a> {
             .filter(|(v, _)| *v == callee)
             .map(|&(_, f)| f);
         let cell = (memo.is_none() && !chains).then(|| {
+            // This guard's own row: it learns only a callee that passed
+            // the whole test below (a function of the script, which is
+            // compiled, as it stays), else holds 0 (empty, or a GC's
+            // zeroing) or the poison 1. So a hit is the whole test: the
+            // row's low word, a learned callee's pointer, is the callee.
             let cell = self.i32c(CALL_CELL_ADDR_PLACEHOLDER);
             let idx = self.atoms.next_call_cell();
             self.call_cell_patches.push((cell, idx + 1));
-            let boxed = self.box_tagged(TAG_OBJECT, a[0]);
-            let cached = self.load_i64(cell, 0);
-            let f = self.load_i32(cell, CALL_CELL_FUNCIDX);
-            let sc = self.load_i32(cell, CALL_CELL_SCRIPT);
-            let hit = self.bin(Operator::I64Eq, boxed, cached, Type::I32);
-            let want = self.i32c(addr);
-            let same = self.bin(Operator::I32Eq, sc, want, Type::I32);
-            let z = self.i32c(0);
-            let compiled = self.bin(Operator::I32Ne, f, z, Type::I32);
-            let ok = self.bin(Operator::I32And, hit, same, Type::I32);
-            let ok = self.bin(Operator::I32And, ok, compiled, Type::I32);
+            let cached = self.load_i32(cell, 0);
+            let ok = self.bin(Operator::I32Eq, a[0], cached, Type::I32);
             let slow = self.body.add_block();
             let t = self.edge(inst, 0, &[a[0]])?;
             self.cond_br(ok, t, Self::to(slow));
             self.cur = slow;
+            let boxed = self.box_tagged(TAG_OBJECT, a[0]);
             Ok::<_, String>((cell, boxed))
         });
         let cell = cell.transpose()?;
@@ -7959,8 +8180,6 @@ impl<'a> Lower<'a> {
                 self.cond_br(empty, Self::to(learn), Self::to(poison));
                 self.cur = learn;
                 self.store_i64(dst, 0, boxed);
-                self.store_i32(dst, CALL_CELL_FUNCIDX, idx);
-                self.store_i32(dst, CALL_CELL_SCRIPT, script);
                 let t = self.edge(inst, 0, &[a[0]])?;
                 self.terminate(Terminator::Br { target: t });
                 self.cur = poison;

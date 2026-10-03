@@ -94,7 +94,7 @@ impl UnboxKind {
         }
     }
 
-    /// The raw type unboxing `v` (already within `tags()`) yields.
+        /// The raw type unboxing `v` (already within `tags()`) yields.
     fn result(self, v: &VSet) -> Type {
         match self {
             UnboxKind::I32 => Type::I32(v.num.int_range(I32_MIN, I32_MAX)),
@@ -103,6 +103,28 @@ impl UnboxKind {
             UnboxKind::Obj => Type::Obj(v.obj),
             UnboxKind::Str => Type::Str(v.str),
         }
+    }
+}
+
+/// What a `check.binding` proves of its binding.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum BindingCheck {
+    /// Its slot is resolved against the global object's live shape (or
+    /// its value fuse is armed): `load_gname` may read it.
+    Read,
+    /// That, and the slot is a writable data property: `store_gname` may
+    /// write it.
+    Write,
+    /// Its value fuse is in the predicted state: the binding holds a
+    /// compiled function of its predicted script (`BindingDef::pred`),
+    /// which `load_gname` then yields, typed.
+    Fn,
+}
+
+impl BindingCheck {
+    /// Whether a check of this kind proves one of kind `o` too.
+    pub fn implies(self, o: BindingCheck) -> bool {
+        self == o || o == BindingCheck::Read
     }
 }
 
@@ -522,9 +544,8 @@ pub enum Opcode {
     /// An `int` known to be int32 (T: fails outside int32's range).
     IntToI32,
     CheckFuse(FuseId),
-    /// The binding's slot is resolved against the global object's live
-    /// shape (and, with `write`, is a writable data property).
-    CheckBinding(BindingId, bool),
+    /// The binding is usable as `BindingCheck` says.
+    CheckBinding(BindingId, BindingCheck),
     CheckNative(NativeId),
     /// The receiver (boxed) has, for property `name`, the accessor the
     /// runtime's accessor-call cache recorded for its shape (a getter, or
@@ -762,6 +783,8 @@ pub enum Opcode {
     // Globals and environments.
     LoadGName(BindingId),
     StoreGName(BindingId),
+    /// The global object (the realm's, fixed for the program) -> object.
+    GlobalObject,
     EnvCurrent,
     /// The callee of the function environment `hops` links up the frame's
     /// chain (`EnvCallee`, `super` in an arrow or eval) -> object.
@@ -1432,12 +1455,18 @@ pub fn signature(op: &Opcode, args: &[Type], m: &Module) -> SigResult {
             })?;
             Sig::output(Type::Fact(FactKind::Fuse(*f)))
         }
-        CheckBinding(b, _) => {
+        CheckBinding(b, k) => {
             arity(args, 0)?;
-            want(m.bindings.contains(*b), || {
-                format!("check.binding: {b} is not in the module")
-            })?;
-            Sig::output(Type::Fact(FactKind::Binding(*b)))
+            let def = m
+                .bindings
+                .get(*b)
+                .ok_or_else(|| format!("check.binding: {b} is not in the module"))?;
+            if *k == BindingCheck::Fn {
+                want(def.pred.is_some(), || format!("check.binding.fn: {b} has no predicted function"))?;
+                Sig::output(Type::Fact(FactKind::BindingFn(*b)))
+            } else {
+                Sig::output(Type::Fact(FactKind::Binding(*b)))
+            }
         }
         AccessorProbe(..) => {
             arity(args, 1)?;
@@ -2157,13 +2186,23 @@ pub fn signature(op: &Opcode, args: &[Type], m: &Module) -> SigResult {
                 .bindings
                 .get(*b)
                 .ok_or_else(|| format!("gname op: {b} is not in the module"))?;
+            let typed = matches!(op, LoadGName(_)) && args.first() == Some(&Type::Fact(FactKind::BindingFn(*b)));
             want(
-                !args.is_empty() && args[0] == Type::Fact(FactKind::Binding(*b)),
+                typed || args.first() == Some(&Type::Fact(FactKind::Binding(*b))),
                 || format!("gname op: first operand must be the fact.binding({b}) ghost"),
             )?;
             if let LoadGName(_) = op {
                 arity(args, 1)?;
-                Sig::result(def.claim)
+                match def.pred.filter(|_| typed) {
+                    // The predicted function (`check.binding.fn`).
+                    Some(k) => Sig::result(Type::Val(VSet::new(
+                        TagSet::OBJECT,
+                        NumInfo::TOP,
+                        ObjInfo::kind(ObjKind::Function(Some(k))),
+                        StrInfo::TOP,
+                    ))),
+                    None => Sig::result(def.claim),
+                }
             } else {
                 arity(args, 2)?;
                 want(is_subtype(&args[1], &def.claim), || {
@@ -2171,6 +2210,10 @@ pub fn signature(op: &Opcode, args: &[Type], m: &Module) -> SigResult {
                 })?;
                 Sig::none()
             }
+        }
+        GlobalObject => {
+            arity(args, 0)?;
+            Sig::result(Type::val(TagSet::OBJECT))
         }
         EnvCurrent => {
             arity(args, 0)?;
@@ -2577,7 +2620,7 @@ pub fn effects(op: &Opcode, args: &[Type], m: &Module) -> Effects {
         LoadGName(b) => fx.reads = vec![Region::Global(*b)],
         StoreGName(b) => {
             fx.writes = vec![Region::Global(*b)];
-            fx.kill = KillPattern::of(KillSet::FUSE);
+            fx.kill = KillPattern::of(store_gname_kills(*b, m));
             fx.flags = FlagsEffect::Bits(FlagBits::BIND);
         }
         // The frame's current environment, which a scope's entry and exit
@@ -2596,6 +2639,16 @@ pub fn effects(op: &Opcode, args: &[Type], m: &Module) -> Effects {
         _ => {}
     }
     fx
+}
+
+/// What `store_gname` to binding `b` kills: every fuse (a fused literal's
+/// may blow), and, for a binding with a predicted function, the binding
+/// facts (the value may no longer be that function).
+pub fn store_gname_kills(b: BindingId, m: &Module) -> KillSet {
+    match m.bindings.get(b).and_then(|d| d.pred) {
+        Some(_) => KillSet::FUSE.union(KillSet::BINDING),
+        None => KillSet::FUSE,
+    }
 }
 
 #[cfg(test)]

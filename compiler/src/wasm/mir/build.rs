@@ -32,8 +32,8 @@ use crate::ids::{ArgIndex, Pc, ScriptId};
 use crate::mir;
 use crate::mir::func::{Edge, EdgeArg, FrameShape, LoopDecl, Root, RootKind};
 use crate::mir::ops::{
-    ArithOp, BitOp, Cc, ConstVal, F64Op, JsBinop, JsCc, JsUnop, MathFn, NumRepr, Opcode, RtOp,
-    UnboxKind,
+    ArithOp, BindingCheck, BitOp, Cc, ConstVal, F64Op, JsBinop, JsCc, JsUnop, MathFn, NumRepr, Opcode,
+    RtOp, UnboxKind,
 };
 use crate::mir::types::{
     IRange, KeyRange, LayoutClaim, LayoutState, ObjInfo, ObjKind, TagSet, Type as MType, I32_MAX, I32_MIN,
@@ -501,6 +501,11 @@ const DATA_GETS: bool = true;
 /// A type test a branch consumes narrows the tested value on the branch
 /// it proves (`fuse_test`).
 const NARROW_TESTS: bool = true;
+
+/// A global the analysis predicts holds one function (`gname_fns`) is
+/// read as that function behind its value fuse's predicted state
+/// (`check.binding.fn`).
+const PREDICTED_GNAMES: bool = true;
 
 /// A call of a known single callee not inlined gets a direct arm
 /// (`attach_targets`).
@@ -1394,10 +1399,17 @@ impl<'s, 'a> Run<'s, 'a> {
         if let Some((b, _)) = self.mm.bindings.iter().find(|(_, d)| d.slot == slot) {
             return b;
         }
+        // A predicted function (`gname_fns`): its script's address is what
+        // the runtime's arm compares, and what a guard on it would.
+        let pred = self.s.ctx.binding_preds.get(&slot).filter(|_| PREDICTED_GNAMES).map(|&(k, addr)| {
+            self.mm.script_addrs.insert(k, addr);
+            k
+        });
         self.mm.bindings.push(mir::module::BindingDef {
             name,
             claim: MType::VAL_TOP,
             slot,
+            pred,
         })
     }
 
@@ -5596,7 +5608,24 @@ impl<'s, 'a> Run<'s, 'a> {
                 self.push(v, Ty::Val(TagSet::STRING));
             }
             BindUnqualifiedGName => {
-                let a = self.atom(p.next_uint32().unwrap())?;
+                let index = p.next_uint32().unwrap();
+                let a = self.atom(index)?;
+                if let Some(&slot) = self.s.syn_bids.get(&index).filter(|_| TYPED_GNAMES) {
+                    // The target of an assignment to a syntactic global:
+                    // while the binding is the global's writable data
+                    // property (the check the store makes, which then
+                    // folds into this one), the global object; else exit
+                    // here.
+                    let b = self.binding(a, slot);
+                    self.guard(
+                        Opcode::CheckBinding(b, BindingCheck::Write),
+                        vec![],
+                        MType::Fact(mir::types::FactKind::Binding(b)),
+                    );
+                    let r = self.inst(Opcode::GlobalObject, vec![], Some(MType::val(TagSet::OBJECT)));
+                    self.push(r, Ty::Val(TagSet::OBJECT));
+                    return Ok(());
+                }
                 let r = self.js(Opcode::JsBindGName(a), vec![], MType::val(TagSet::OBJECT));
                 self.push(r, Ty::Val(TagSet::OBJECT));
             }
@@ -5612,13 +5641,13 @@ impl<'s, 'a> Run<'s, 'a> {
                         // the slot; a miss exits here.
                         let b = self.binding(a, slot);
                         let fact = self.guard(
-                            Opcode::CheckBinding(b, true),
+                            Opcode::CheckBinding(b, BindingCheck::Write),
                             vec![],
                             MType::Fact(mir::types::FactKind::Binding(b)),
                         );
                         let (t, _) = self.f.add_inst(self.cur, Opcode::StoreGName(b), vec![fact, y], &[], vec![]);
                         self.f.witnesses[t] = Some(mir::func::Witness {
-                            may_kill: mir::types::KillPattern::of(mir::types::KillSet::FUSE),
+                            may_kill: mir::types::KillPattern::of(mir::ops::store_gname_kills(b, &self.mm)),
                         });
                     }
                     _ => self.js_void_keep(Opcode::JsSetName(a, op == StrictSetGName), vec![e, y], v),
@@ -5825,13 +5854,35 @@ impl<'s, 'a> Run<'s, 'a> {
                 }
                 let r = match self.s.syn_bids.get(&index) {
                     Some(&slot) if TYPED_GNAMES => {
+                        let b = self.binding(a, slot);
+                        if let Some(k) = self.mm.bindings[b].pred {
+                            // A predicted function: while the binding's
+                            // value fuse says it holds a compiled function
+                            // of script `k`, the read is that function,
+                            // typed (a call through it needs no callee
+                            // guard); else exit here.
+                            let fact = self.guard(
+                                Opcode::CheckBinding(b, BindingCheck::Fn),
+                                vec![],
+                                MType::Fact(mir::types::FactKind::BindingFn(b)),
+                            );
+                            let t = MType::Val(mir::types::VSet::new(
+                                TagSet::OBJECT,
+                                mir::types::NumInfo::TOP,
+                                ObjInfo::kind(ObjKind::Function(Some(k))),
+                                mir::types::StrInfo::TOP,
+                            ));
+                            let r = self.inst(Opcode::LoadGName(b), vec![fact], Some(t));
+                            self.gname_vals.insert(r, a);
+                            self.push(r, Ty::Fn(k));
+                            return Ok(());
+                        }
                         // §3: `check.binding`, then a leaf load of the
                         // slot. A syntactic global is a non-configurable
                         // data property, so the check holds once resolved;
                         // a miss exits here.
-                        let b = self.binding(a, slot);
                         let fact = self.guard(
-                            Opcode::CheckBinding(b, false),
+                            Opcode::CheckBinding(b, BindingCheck::Read),
                             vec![],
                             MType::Fact(mir::types::FactKind::Binding(b)),
                         );

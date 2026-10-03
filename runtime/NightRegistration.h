@@ -30,7 +30,7 @@ namespace night {
 
 // Bump on any change to the registration block, the layout descriptor, or
 // the NIGHT_ENV_REGIONS wire.
-static constexpr uint32_t NightAotAbiVersion = 8;
+static constexpr uint32_t NightAotAbiVersion = 9;
 
 // Every field-offset / size / flag-bit constant the external reader
 // dereferences. Order is the wire order of `NightLayoutDescriptor::fields`;

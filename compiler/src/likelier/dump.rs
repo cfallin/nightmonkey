@@ -77,6 +77,9 @@ pub fn dump_facts(facts: &LikelyFacts, path: &str) {
             claim.bits()
         ));
     }
+    for (&name, &k) in &facts.gname_fns {
+        lines.push(format!("gname_fns {} = {k}", esc(facts.names.get(name))));
+    }
     for (&site, &claim) in &facts.call_types {
         lines.push(format!("call_types {site} = {:#x}", claim.bits()));
     }

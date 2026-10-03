@@ -617,6 +617,9 @@ pub enum RawKind {
 pub enum FactKind {
     Fuse(FuseId),
     Binding(BindingId),
+    /// The binding holds a compiled function of its predicted script
+    /// (`BindingDef::pred`): a `Binding` fact whose read is typed.
+    BindingFn(BindingId),
     NativeIntact(NativeId),
 }
 
@@ -787,6 +790,7 @@ pub fn is_subtype(a: &Type, b: &Type) -> bool {
         (Type::F64(x), Type::F64(y)) => x.le(y),
         (Type::Obj(x), Type::Obj(y)) => x.le(y),
         (Type::Str(x), Type::Str(y)) => x.le(y),
+        (Type::Fact(FactKind::BindingFn(x)), Type::Fact(FactKind::Binding(y))) => x == y,
         (a, b) => a == b,
     }
 }
@@ -801,6 +805,11 @@ pub fn join(a: &Type, b: &Type) -> Option<Type> {
         (Type::Obj(x), Type::Obj(y)) => Type::Obj(x.join(y)),
         (Type::Str(x), Type::Str(y)) => Type::Str(x.join(y)),
         (a, b) if a == b => *a,
+        // A typed read's fact and a plain one: the plain one.
+        (
+            Type::Fact(FactKind::BindingFn(x) | FactKind::Binding(x)),
+            Type::Fact(FactKind::BindingFn(y) | FactKind::Binding(y)),
+        ) if x == y => Type::Fact(FactKind::Binding(*x)),
         _ => return None,
     })
 }
@@ -913,7 +922,7 @@ impl KillPattern {
     pub fn hits(&self, t: &Type) -> KillSet {
         match t {
             Type::Fact(FactKind::Fuse(_)) if self.set.contains(KillSet::FUSE) => KillSet::FUSE,
-            Type::Fact(FactKind::Binding(_)) if self.set.contains(KillSet::BINDING) => {
+            Type::Fact(FactKind::Binding(_) | FactKind::BindingFn(_)) if self.set.contains(KillSet::BINDING) => {
                 KillSet::BINDING
             }
             Type::Fact(FactKind::NativeIntact(_)) if self.set.contains(KillSet::NATIVE) => {

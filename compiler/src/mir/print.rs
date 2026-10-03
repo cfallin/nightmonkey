@@ -212,6 +212,7 @@ pub fn type_str_in(m: Option<&Module>, t: &Type) -> String {
         Type::W64 => s.push_str("w64"),
         Type::Fact(FactKind::Fuse(f)) => write!(s, "fact.fuse({f})").unwrap(),
         Type::Fact(FactKind::Binding(b)) => write!(s, "fact.binding({b})").unwrap(),
+        Type::Fact(FactKind::BindingFn(b)) => write!(s, "fact.binding_fn({b})").unwrap(),
         Type::Fact(FactKind::NativeIntact(n)) => write!(s, "fact.native({n})").unwrap(),
     }
     s
@@ -317,8 +318,9 @@ pub fn mnemonic(op: &Opcode) -> String {
         F64ToIntExact => "f64.to_int_exact".into(),
         IntToI32 => "int.to_i32".into(),
         CheckFuse(_) => "check.fuse".into(),
-        CheckBinding(_, false) => "check.binding".into(),
-        CheckBinding(_, true) => "check.binding.write".into(),
+        CheckBinding(_, BindingCheck::Read) => "check.binding".into(),
+        CheckBinding(_, BindingCheck::Write) => "check.binding.write".into(),
+        CheckBinding(_, BindingCheck::Fn) => "check.binding.fn".into(),
         CheckNative(_) => "check.native".into(),
         AccessorProbe(..) => "accessor.probe".into(),
         Jump => "jump".into(),
@@ -494,6 +496,7 @@ pub fn mnemonic(op: &Opcode) -> String {
         StrCharCodeAt => "str.char_code_at".into(),
         LoadGName(_) => "load_gname".into(),
         StoreGName(_) => "store_gname".into(),
+        GlobalObject => "global.object".into(),
         EnvCurrent => "env.current".into(),
         EnvSet => "env.set".into(),
         EnvCallee(_) => "env.callee".into(),
@@ -714,7 +717,7 @@ pub fn print_module(m: &Module) -> String {
             writeln!(out).unwrap();
         }
         for (b, d) in m.bindings.iter() {
-            writeln!(
+            write!(
                 out,
                 "  binding {b} = {} : {} slot={}",
                 atom(Some(m), d.name),
@@ -722,6 +725,10 @@ pub fn print_module(m: &Module) -> String {
                 d.slot
             )
             .unwrap();
+            if let Some(k) = d.pred {
+                write!(out, " pred={k}").unwrap();
+            }
+            writeln!(out).unwrap();
         }
         for (n, d) in m.natives.iter() {
             writeln!(

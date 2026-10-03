@@ -254,15 +254,15 @@ pub fn serialize_atom_table(atoms: &translate::AtomTable) -> Vec<u8> {
 /// order. The reactor pre-interns each to a `PropertyKey` at startup (mirroring
 /// `gAtomIds`) so the lazy `night_runtime_resolve_global_slot` `lookupPure` never
 /// re-atomizes. Little-endian throughout.
-// Per binding: the UTF-16 name, then a u32 expected-callee word (the
-// funcref-table index + 1 of the predicted callee for fuse-guarded direct
-// calls at this binding's gname-callee sites; 0 = no call prediction). The
-// reactor's arm-time validation compares the armed value's AOT target
-// against it.
+// Per binding: the UTF-16 name, then a u32 predicted-script word (the
+// address of the script whose function the analysis predicts the binding
+// holds, `EnvLayout::binding_preds`; 0 = no prediction). The runtime arms
+// the binding's value fuse to its predicted state (3) only while the
+// binding holds a compiled function of that script.
 pub fn serialize_global_binding_table(
     tbl: &Names,
     names: &[NameId],
-    expected_index: &HashMap<u32, u32>,
+    preds: &HashMap<u32, (ScriptId, u32)>,
 ) -> Vec<u8> {
     let mut out = Vec::new();
     out.extend_from_slice(&(names.len() as u32).to_le_bytes());
@@ -272,11 +272,8 @@ pub fn serialize_global_binding_table(
         for &u in name.chars() {
             out.extend_from_slice(&u.to_le_bytes());
         }
-        let exp = expected_index
-            .get(&u32::try_from(i).unwrap())
-            .map(|&idx| idx + 1)
-            .unwrap_or(0);
-        out.extend_from_slice(&exp.to_le_bytes());
+        let pred = preds.get(&u32::try_from(i).unwrap()).map_or(0, |&(_, addr)| addr);
+        out.extend_from_slice(&pred.to_le_bytes());
     }
     out
 }
@@ -920,6 +917,11 @@ pub fn resolve_helpers(
 pub struct EnvLayout {
     pub syn_gname_names: Vec<NameId>,
     pub syn_gnames: HashMap<NameId, u32>,
+    /// Per binding row, the script of the function the analysis predicts
+    /// it holds (`gname_fns`) and that script's address: the runtime arms
+    /// the binding's value fuse to its predicted state (3) only while the
+    /// binding holds a function of that script.
+    pub binding_preds: HashMap<u32, (ScriptId, u32)>,
     /// The analysis output, carried whole: every table the translator reads
     /// unchanged lives here rather than as a renamed copy below.
     pub facts: LikelyFacts,
@@ -1610,9 +1612,27 @@ pub fn layout_env(
         append_cache_base + translate::APPEND_CACHE_SIZE * translate::APPEND_CACHE_ENTRY_BYTES;
     let prop_ic_base = accessor_cache_base
         + translate::ACCESSOR_CACHE_SIZE * translate::ACCESSOR_CACHE_ENTRY_BYTES;
+    // Bindings with a predicted function (`gname_fns`), by row, with the
+    // script's address for the runtime's arm-time test. Not a class
+    // constructor: a read typed with its script is called directly
+    // (`js_call_proven`), and a class constructor's call must throw.
+    let binding_preds: HashMap<u32, (ScriptId, u32)> = syn_gnames
+        .iter()
+        .filter_map(|(n, &bid)| {
+            let &k = facts.gname_fns.get(n)?;
+            match source.object(SourceObjectId::new(k.get())) {
+                SourceObject::Script(s) if s.addr != 0 && !s.is_class_ctor => Some((bid, (k, s.addr))),
+                _ => None,
+            }
+        })
+        .collect();
+    if opts.diagnostics.stats {
+        crate::diag_line!("night: {} predicted-function global binding(s)", binding_preds.len());
+    }
     Ok(EnvLayout {
         syn_gname_names,
         syn_gnames,
+        binding_preds,
         facts,
         likely_class_layouts,
         fused_list,
@@ -1674,7 +1694,6 @@ pub struct TranslateOut {
     /// (widened-ABI bodies).
     pub source_id_to_table_func: HashMap<u32, Func>,
     pub sid_to_index: HashMap<u32, u32>,
-    pub fuse_binding_index: HashMap<u32, u32>,
     pub strlit_patches: Vec<(Func, waffle::Value, u32)>,
     pub regex_entries: Vec<(JsString, u32, u32, u32, u32, u32)>,
     pub prop_ic_base: usize,
@@ -1790,7 +1809,6 @@ pub fn translate_all(
     )> = Vec::new();
     let mut ctor_nslots_patch_sites: Vec<(Func, waffle::Value, u32)> = Vec::new();
     let mut likely_patches: Vec<(Func, waffle::Value, waffle::Value, u32)> = Vec::new();
-    let mut fuse_call_patches: Vec<(Func, translate::FuseCallPatch)> = Vec::new();
     let mut call_cell_patches: Vec<(Func, waffle::Value, u32)> = Vec::new();
     let mut intrinsic_cell_patches: Vec<(Func, waffle::Value, u32)> = Vec::new();
     let mut alloc_cell_patches: Vec<(Func, waffle::Value, u32)> = Vec::new();
@@ -1809,6 +1827,7 @@ pub fn translate_all(
         source,
         opts,
         syn_gnames: &env.syn_gnames,
+        binding_preds: &env.binding_preds,
         facts: &env.facts,
         this_layouts_in: &env.this_layouts_tx,
         stamp_ctors_in: &env.stamp_ctors_tx,
@@ -1891,7 +1910,6 @@ pub fn translate_all(
                     sig,
                     body,
                     likely_patches: lp,
-                    fuse_call_patches: fcp,
                     call_cell_patches: ccp,
                     alloc_cell_patches: acp,
                     iof_cell_patches: icp,
@@ -1954,9 +1972,6 @@ pub fn translate_all(
                     }
                     for (expected, call, callee_sid) in lp {
                         likely_patches.push((f, expected, call, callee_sid));
-                    }
-                    for p in fcp {
-                        fuse_call_patches.push((f, p));
                     }
                     for (addr, idx) in ccp {
                         call_cell_patches.push((f, addr, idx));
@@ -2162,65 +2177,6 @@ pub fn translate_all(
         crate::diag_line!("night: {n_likely} likely-callee sites armed");
     }
 
-    // Fuse-guarded direct calls: a binding gets one expected callee
-    // (the reactor validates the armed value's AOT target against it before
-    // arming). Bindings predicted with conflicting callees across sites, or
-    // whose callee did not compile, stay out of the table and their sites'
-    // arms stay dead (enabled const 0).
-    let mut fuse_binding_expected: HashMap<u32, u32> = HashMap::default();
-    let mut fuse_binding_conflict: HashSet<u32> = HashSet::default();
-    for (_, p) in &fuse_call_patches {
-        match fuse_binding_expected.entry(p.binding) {
-            std::collections::hash_map::Entry::Occupied(e) => {
-                if *e.get() != p.callee.get() {
-                    fuse_binding_conflict.insert(p.binding);
-                }
-            }
-            std::collections::hash_map::Entry::Vacant(v) => {
-                v.insert(p.callee.get());
-            }
-        }
-    }
-    for bid in &fuse_binding_conflict {
-        fuse_binding_expected.remove(bid);
-    }
-    let mut n_fuse_calls = 0usize;
-    for (f, p) in fuse_call_patches {
-        let (enabled, call, bid) = (p.enabled, p.call, p.binding);
-        if fuse_binding_conflict.contains(&bid) {
-            continue;
-        }
-        let Some(&callee) = source_id_to_func.get(&p.callee.get()) else {
-            fuse_binding_expected.remove(&bid);
-            continue;
-        };
-        if let FuncDecl::Body(_, _, body) = &mut m.funcs[f] {
-            if let waffle::ValueDef::Operator(waffle::Operator::I32Const { value: g }, _, _) =
-                &mut body.values[enabled]
-            {
-                *g = 1;
-            }
-            if let waffle::ValueDef::Operator(waffle::Operator::Call { function_index }, _, _) =
-                &mut body.values[call]
-            {
-                *function_index = callee;
-                n_fuse_calls += 1;
-            }
-        }
-    }
-    // bindingId -> callee funcref-table index (what the reactor's arm-time
-    // validation compares NightCalleeNightTarget's low word against).
-    let fuse_binding_index: HashMap<u32, u32> = fuse_binding_expected
-        .iter()
-        .filter_map(|(&bid, sid)| sid_to_index.get(sid).map(|&idx| (bid, idx)))
-        .collect();
-    if opts.diagnostics.stats {
-        crate::diag_line!(
-            "night: {n_fuse_calls} fuse-guarded call sites armed ({} bindings)",
-            fuse_binding_index.len()
-        );
-    }
-
     let prop_ic_size = atoms.prop_cache_count() as usize * translate::INLINE_IC_STRIDE as usize;
     if opts.diagnostics.stats {
         crate::diag_line!(
@@ -2360,7 +2316,6 @@ pub fn translate_all(
         source_id_to_func,
         source_id_to_table_func,
         sid_to_index,
-        fuse_binding_index,
         strlit_patches,
         regex_entries,
         prop_ic_base,
