@@ -7027,9 +7027,12 @@ impl<'a> Lower<'a> {
     /// falls through to the helper, which also fills the cell.
     fn instanceof_arms(&mut self, inst: mir::Inst, lhs: Value, rhs: Value, cell: Value) -> R<()> {
         let slow = self.body.add_block();
-        let rt = self.tag_of(rhs);
-        let r_obj = self.tag_is(rt, TAG_OBJECT as u32);
-        self.check(r_obj, slow);
+        // (An object by its type: a predicted global's function, say.)
+        if !value_tags(&self.ty(self.f.insts[inst].args[1])).is_nonempty_subset_of(TagSet::OBJECT) {
+            let rt = self.tag_of(rhs);
+            let r_obj = self.tag_is(rt, TAG_OBJECT as u32);
+            self.check(r_obj, slow);
+        }
         let rptr = self.un(Operator::I32WrapI64, rhs, Type::I32);
         let rshape = self.load_i32(rptr, SHAPE_OFFSET);
         let cshape = self.load_i32(cell, 0);
