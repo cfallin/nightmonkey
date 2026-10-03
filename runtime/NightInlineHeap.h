@@ -113,6 +113,17 @@ struct NightEnvCell {
 // the caller then leaves the linmem slots zero and no cell ever fills.
 bool NightNurseryAddresses(JSContext* cx, uint32_t* posAddr, uint32_t* endAddr);
 
+// The nursery cell header word of a string allocated at the zone's catch-all
+// string site, and the address of that site's allocation count. False (both
+// left alone) when the zone does not allocate strings in the nursery.
+bool NightNurseryStringAlloc(JSContext* cx, uint32_t* header,
+                             uint32_t* countAddr);
+
+// Whether a JSRope's children sit where the compiled concat writes them
+// (+8 and +12), checked on a real rope: the accessors that would let a
+// static_assert say so are private.
+bool NightCheckRopeLayout(JSContext* cx);
+
 // Fill a site's row from the first object the generic helper allocated
 // there. Both return whether they filled it: only an object the inline path
 // can reproduce exactly qualifies (see the definitions for the conditions).

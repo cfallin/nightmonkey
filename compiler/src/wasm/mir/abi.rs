@@ -143,6 +143,27 @@ pub(crate) const STRING_ATOM_BIT: u32 = 1 << 3;
 pub(crate) const STRING_LINEAR_BIT: u32 = 1 << 4;
 pub(crate) const STRING_INLINE_CHARS_BIT: u32 = 1 << 6;
 pub(crate) const STRING_LATIN1_CHARS_BIT: u32 = 1 << 10;
+/// `JSString::MAX_LENGTH`.
+pub(crate) const STRING_MAX_LENGTH: u32 = (1 << 30) - 2;
+/// `JSFatInlineString::MAX_LENGTH_{LATIN1,TWO_BYTE}`: a concat no longer
+/// than this is flattened into an inline string, not made a rope.
+pub(crate) const FAT_INLINE_MAX_LATIN1: u32 = 24;
+pub(crate) const FAT_INLINE_MAX_TWO_BYTE: u32 = 12;
+/// A JSRope: the string header, then its children at +8 and +12.
+pub(crate) const ROPE_BYTES: u32 = 16;
+pub(crate) const ROPE_LEFT_OFFSET: u32 = 8;
+pub(crate) const ROPE_RIGHT_OFFSET: u32 = 12;
+
+// --- JSClass --------------------------------------------------------------
+//
+//   JSClass     +4 flags   +8 cOps
+//   JSClassOps  +28 call
+
+pub(crate) const JSCLASS_FLAGS_OFFSET: u32 = 4;
+pub(crate) const JSCLASS_COPS_OFFSET: u32 = 8;
+pub(crate) const JSCLASSOPS_CALL_OFFSET: u32 = 28;
+pub(crate) const JSCLASS_EMULATES_UNDEFINED: u32 = 1 << 6;
+pub(crate) const JSCLASS_IS_PROXY: u32 = 1 << 19;
 
 // --- JSFunction / BaseScript ----------------------------------------------
 //

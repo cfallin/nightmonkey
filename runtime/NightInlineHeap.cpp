@@ -128,6 +128,34 @@ static_assert(ObjectElements::FROZEN == 0x40, "ELEMENTS_FROZEN_FLAG");
 // storeBuffer pointer (ChunkBase's first field) is non-null. The compiled
 // store tests both inline and calls the barrier helpers below only on a hit.
 static_assert(Nursery::nurseryCellHeaderSize() == 8, "NURSERY_HEADER_BYTES");
+
+// --- JSClass: the inline typeof --------------------------------------------
+static_assert(offsetof(JSClass, flags) == 4, "JSCLASS_FLAGS_OFFSET");
+static_assert(offsetof(JSClass, cOps) == 8, "JSCLASS_COPS_OFFSET");
+static_assert(offsetof(JSClassOps, call) == 28, "JSCLASSOPS_CALL_OFFSET");
+static_assert(JSCLASS_EMULATES_UNDEFINED == 1u << 6, "JSCLASS_EMULATES_UNDEFINED");
+static_assert(JSCLASS_IS_PROXY == 1u << 19, "JSCLASS_IS_PROXY");
+static_assert(JSTYPE_UNDEFINED == 0 && JSTYPE_OBJECT == 1 &&
+                  JSTYPE_FUNCTION == 2 && JSTYPE_STRING == 3 &&
+                  JSTYPE_NUMBER == 4 && JSTYPE_BOOLEAN == 5 &&
+                  JSTYPE_SYMBOL == 6 && JSTYPE_BIGINT == 7,
+              "the JSType numbering typeof_eq decodes");
+
+// --- JSString and the inline rope -----------------------------------------
+//
+// A compiled concat allocates a JSRope in the nursery as the JIT's concat
+// stub does: flags (Latin1 iff both halves are), length, then the children.
+static_assert(JSString::offsetOfFlags() == 0, "STRING_FLAGS_OFFSET");
+static_assert(JSString::offsetOfLength() == 4, "STRING_LENGTH_OFFSET");
+static_assert(sizeof(JSString) == 16, "ROPE_BYTES");
+// (The children's offsets, ROPE_LEFT_OFFSET 8 and ROPE_RIGHT_OFFSET 12, are
+// private to JSRope: NightCheckRopeLayout checks them on a real rope.)
+static_assert(JSString::INIT_ROPE_FLAGS == 0, "a rope's flags are its Latin1 bit");
+static_assert(JSString::LATIN1_CHARS_BIT == 1u << 10, "STRING_LATIN1_CHARS_BIT");
+static_assert(JSString::MAX_LENGTH == (1u << 30) - 2, "STRING_MAX_LENGTH");
+static_assert(JSFatInlineString::MAX_LENGTH_LATIN1 == 24 &&
+                  JSFatInlineString::MAX_LENGTH_TWO_BYTE == 12,
+              "FAT_INLINE_MAX_LATIN1 / FAT_INLINE_MAX_TWO_BYTE");
 static_assert(uint32_t(JS::detail::ValueLowerInclGCThingTag) == 0xFFFFFF86u,
               "VAL_GCTHING_TAG_MIN");
 static_assert(js::gc::ChunkStoreBufferOffset == 0, "CHUNK_STORE_BUFFER_OFFSET");
@@ -237,6 +265,31 @@ bool NightNurseryAddresses(JSContext* cx, uint32_t* posAddr,
   uintptr_t pos = reinterpret_cast<uintptr_t>(nursery.addressOfPosition());
   *posAddr = uint32_t(pos);
   *endAddr = uint32_t(pos + Nursery::offsetOfCurrentEndFromPosition());
+  return true;
+}
+
+bool NightCheckRopeLayout(JSContext* cx) {
+  static const char kHalf[] = "night-rope-layout-check-half";
+  JS::RootedString l(cx, JS_NewStringCopyZ(cx, kHalf));
+  JS::RootedString r(cx, l ? JS_NewStringCopyZ(cx, kHalf) : nullptr);
+  JSString* rope = r ? JS_ConcatStrings(cx, l, r) : nullptr;
+  if (!rope || !rope->isRope()) {
+    return false;
+  }
+  const uint32_t* w = reinterpret_cast<const uint32_t*>(rope);
+  return w[2] == uint32_t(reinterpret_cast<uintptr_t>(rope->asRope().leftChild())) &&
+         w[3] == uint32_t(reinterpret_cast<uintptr_t>(rope->asRope().rightChild()));
+}
+
+bool NightNurseryStringAlloc(JSContext* cx, uint32_t* header,
+                             uint32_t* countAddr) {
+  Zone* zone = cx->zone();
+  if (!cx->nursery().isEnabled() || !zone->allocNurseryStrings()) {
+    return false;
+  }
+  gc::AllocSite* site = zone->unknownAllocSite(JS::TraceKind::String);
+  *header = uint32_t(gc::NurseryCellHeader::MakeValue(site, JS::TraceKind::String));
+  *countAddr = uint32_t(reinterpret_cast<uintptr_t>(site->nurseryAllocCountAddress()));
   return true;
 }
 

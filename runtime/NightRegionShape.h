@@ -98,14 +98,16 @@ namespace night {
   _(argsClassUnmappedOff, 4)                                                   \
   _(argsClassDataArgsOff, 8)                                                   \
   _(argsDynCodeFuseOff, 12)                                                    \
-  /* Inline string-literal block, right after the args metadata:           */  \
-  /* [emptyString @0, thin replay triple @4, fat triple @16, stamp-epoch   */  \
-  /* address @28, unused (0) @32, &PlainObject::class_                   */  \
-  /* @36]. The major-GC purge zeroes exactly the triples ([@4, @28)): the  */  \
-  /* words after them are host constants and must survive it.              */  \
+  /* Inline string block, right after the args metadata: [emptyString @0, */  \
+  /* string nursery header @4, its alloc site's count address @8, unused  */  \
+  /* @12..@28, stamp-epoch address @28, unused (0) @32,                   */  \
+  /* &PlainObject::class_ @36]. The header word is 0 while the zone does  */  \
+  /* not allocate strings in the nursery; the runtime refreshes it after  */  \
+  /* every GC, the only place the zone's flag moves.                      */  \
   _(strlitBlockBytes, 40)                                                      \
   _(strlitEmptyStringOff, 0)                                                   \
-  _(strlitTriplesEnd, 28)                                                      \
+  _(strlitStrHeaderOff, 4)                                                     \
+  _(strlitStrCountAddrOff, 8)                                                  \
   _(strlitStampEpochAddrOff, 28)                                               \
   _(strlitBindEpochAddrOff, 32)                                                \
   _(strlitPlainClassOff, 36)                                                   \
@@ -161,8 +163,8 @@ static_assert((Night_bindingFuseArmed & 1) && (Night_bindingFusePredicted & 1) &
               "a binding fuse is armed exactly when bit 0 is set");
 static_assert(Night_strlitPlainClassOff + 4 <= Night_strlitBlockBytes,
               "the plain-object class must fit the strlit block");
-static_assert(Night_strlitTriplesEnd <= Night_strlitStampEpochAddrOff,
-              "the purge must not zero the published epoch addresses");
+static_assert(Night_strlitStrCountAddrOff + 4 <= Night_strlitStampEpochAddrOff,
+              "the string-alloc words must not overlap the epoch address");
 
 // The three block bases C++ recomputes off propicGenPtr, in one place so the
 // arithmetic exists once. `genBase` is `gEnv.propicGenPtr`.

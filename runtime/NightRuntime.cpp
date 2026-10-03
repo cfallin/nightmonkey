@@ -283,8 +283,9 @@ struct NightState {
   // Per-binding value-fuse cells (u32 per binding, right after the
   // `gEnv.gslotsPtr` rows).
   uint32_t globalValsBase = 0;
-  // Inline string-literal block (mirrors mod.rs strlit_slot): emptyString @0,
-  // thin replay triple [hdr, flags, total] @4, fat triple @16.
+  // Inline string block (mirrors mod.rs strlit_slot): emptyString @0, the
+  // string nursery header @4 and its alloc site's count address @8
+  // (RefreshStringAlloc).
   uint32_t strLitBase = 0;
   // Inline string-method call guard cells (gEnv.propicGenPtr + 32/40/48) and
   // the builtin identity cells (+64): the boxed bits of the originals,
@@ -1169,6 +1170,37 @@ static void NightNurseryEndCallback(JSContext* cx,
                                     JS::GCNurseryProgress progress,
                                     JS::GCReason reason, void* data);
 
+// Inline string allocation (the strlit block's header and count words): the
+// nursery cell header of a string allocated at the zone's catch-all string
+// site, and the address of that site's allocation count, which the compiled
+// allocation bumps as the engine's own does (the count is what the
+// pretenuring heuristics weigh). Both 0 -- the compiled arms take their
+// helper -- unless the zone allocates strings in the nursery. That flag moves
+// only inside a GC, so a refresh at startup, after every minor GC and at the
+// end of every cycle tracks it the way discarding JIT code does for Ion.
+static void RefreshStringAlloc(JSContext* cx) {
+  if (!gState.strLitBase) {
+    return;
+  }
+  uint32_t header = 0;
+  uint32_t countAddr = 0;
+  if (gState.nurseryInlineOK) {
+    js::night::NightNurseryStringAlloc(cx, &header, &countAddr);
+  }
+  *LinMem<uint32_t>(gState.strLitBase +
+                    js::night::Night_strlitStrCountAddrOff) = countAddr;
+  *LinMem<uint32_t>(gState.strLitBase + js::night::Night_strlitStrHeaderOff) =
+      header;
+}
+
+static void NightStringAllocNurseryCallback(JSContext* cx,
+                                            JS::GCNurseryProgress progress,
+                                            JS::GCReason reason, void* data) {
+  if (progress == JS::GCNurseryProgress::GC_NURSERY_COLLECTION_END) {
+    RefreshStringAlloc(cx);
+  }
+}
+
 // Per-binding value-fuse cells ([bits u64][fuseWord u32][pad], 16 bytes
 // per binding, right after the gGlobalSlots rows). fuseWord 1 (armed) means
 // bits IS the binding's current value -- the compiled read/call arms serve
@@ -1672,6 +1704,7 @@ bool night_runtime_install_env(JSContext* cx,
       MOZ_RELEASE_ASSERT(JSFatInlineString::MAX_LENGTH_LATIN1 == 24);
       MOZ_RELEASE_ASSERT(sizeof(JSString) == 16);
       MOZ_RELEASE_ASSERT(sizeof(JSFatInlineString) == 32);
+      MOZ_RELEASE_ASSERT(js::night::NightCheckRopeLayout(cx));
     }
     // Per-binding value fuses: enable the cells (right after the
     // gGlobalSlots rows) unless the kill switch is set; the nursery-end
@@ -1889,6 +1922,9 @@ bool night_runtime_install_env(JSContext* cx,
         posAddr;
     *LinMem<uint32_t>(env.propicGenPtr + js::night::Night_hostNurseryEndOff) =
         endAddr;
+    RefreshStringAlloc(cx);
+    JS::AddGCNurseryCollectionCallback(cx, NightStringAllocNurseryCallback,
+                                       nullptr);
   }
 
   // Capture the pristine defineProperty family for the binding-fuse
@@ -3476,18 +3512,7 @@ static void NightPurgeMovableCaches() {
   if (gEnv.intrinsicCellsPtr && gEnv.intrinsicCellsLen) {
     ZeroRegion(gEnv.intrinsicCellsPtr, gEnv.intrinsicCellsLen);
   }
-  // The strlit thin/fat replay triples embed zone/alloc-site pointers in the
-  // nursery header word; zero them (the slow helper refills). The
-  // emptyString slot at +0 is a permanent atom and stays, and so do the
-  // epoch addresses in the tail: zeroing through the block end would take
-  // the stamp-epoch address with it, making the compiled epoch compare
-  // read address 0 on both sides and admit every keep arm.
   js::night::NightPurgeAddMemo();
-  if (gState.strLitBase) {
-    ZeroRegion(gState.strLitBase + js::night::Night_strlitEmptyStringOff + 4,
-               js::night::Night_strlitTriplesEnd -
-                   js::night::Night_strlitEmptyStringOff - 4);
-  }
   // The string-method and builtin guard cells hold raw function bits;
   // compaction moves functions, so re-write them from the rooted
   // (auto-updated) values.
@@ -3512,6 +3537,9 @@ static void NightGcSliceCallback(JSContext* cx, JS::GCProgress progress,
       (progress == JS::GC_SLICE_END &&
        desc.options_ == JS::GCOptions::Shrink)) {
     NightPurgeMovableCaches();
+  }
+  if (progress == JS::GC_CYCLE_END) {
+    RefreshStringAlloc(cx);
   }
   if (gState.prevSliceCallback) {
     gState.prevSliceCallback(cx, progress, desc);
@@ -4370,27 +4398,6 @@ bool night_runtime_string(JSContext* cx, uint32_t top, uint32_t atomId) {
   }
   if (!str) {
     return false;
-  }
-  // Fill the inline-strlit replay triple for this kind from the fresh
-  // allocation (header word LAST: it is the armed guard). Only a nursery
-  // inline Latin1 string qualifies -- the inline path replays exactly this
-  // layout. The nursery cell header size (8) is static_asserted in
-  // NightInlineHeap.cpp.
-  if (gState.strLitBase && gNames.latin1Ok[atomId] &&
-      js::gc::IsInsideNursery(str) && str->isLinear() && str->isInline() &&
-      str->asLinear().hasLatin1Chars()) {
-    size_t n = gNames.latin1[atomId].size();
-    if (n >= 2 && n <= JSFatInlineString::MAX_LENGTH_LATIN1) {
-      bool thin = n <= JSThinInlineString::MAX_LENGTH_LATIN1;
-      uint32_t* blk = LinMem<uint32_t>(gState.strLitBase + (thin ? 4 : 16));
-      if (!blk[0]) {
-        uintptr_t s = reinterpret_cast<uintptr_t>(str);
-        blk[1] = *reinterpret_cast<uint32_t*>(s);
-        blk[2] =
-            uint32_t((thin ? sizeof(JSString) : sizeof(JSFatInlineString)) + 8);
-        blk[0] = *reinterpret_cast<uint32_t*>(s - 8);
-      }
-    }
   }
   WriteNightOut(top, JS::StringValue(str).asRawBits());
   return true;

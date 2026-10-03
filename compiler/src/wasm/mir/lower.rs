@@ -51,7 +51,7 @@ use crate::mir::ops::{
 use crate::mir::types::{FactKind, Machine, ObjKind, TagSet, Type as MType};
 use crate::region_shape::BINDING_FUSE_PREDICTED;
 use crate::opsem::{
-    PRIM_BIGINT, PRIM_BOOLEAN, PRIM_DOUBLE, PRIM_INT32, PRIM_NULL, PRIM_STRING, PRIM_SYMBOL,
+    Prims, PRIM_BIGINT, PRIM_BOOLEAN, PRIM_DOUBLE, PRIM_INT32, PRIM_NULL, PRIM_STRING, PRIM_SYMBOL,
     PRIM_UNDEFINED,
 };
 use crate::wasm::baseline::layout::{
@@ -67,7 +67,9 @@ use crate::wasm::mir::abi::{
     SHAPE_PERMUTED_SLOTS_BIT, SHAPE_SMALL_SLOTSPAN_SHIFT, TA_DATA_PAYLOAD_OFFSET, TA_LENGTH_PAYLOAD_OFFSET, ELEMENTS_LENGTH_BACK,
     ELEMENTS_CAPACITY_BACK, ELEMENTS_PUSH_BAIL_MASK, ELEMENTS_HEADER_BYTES, ALLOC_CELL_ADDR_PLACEHOLDER,
     STRING_LENGTH_OFFSET, STRING_FLAGS_OFFSET, STRING_CHARS_OFFSET, STRING_LINEAR_BIT,
-    STRING_INLINE_CHARS_BIT, STRING_LATIN1_CHARS_BIT, CALL_CELL_ADDR_PLACEHOLDER, CALL_CELL_FUNCIDX,
+    STRING_INLINE_CHARS_BIT, STRING_LATIN1_CHARS_BIT, STRING_MAX_LENGTH, FAT_INLINE_MAX_LATIN1,
+    FAT_INLINE_MAX_TWO_BYTE, JSCLASS_COPS_OFFSET, JSCLASS_EMULATES_UNDEFINED, JSCLASS_FLAGS_OFFSET,
+    JSCLASS_IS_PROXY, JSCLASSOPS_CALL_OFFSET, ROPE_BYTES, ROPE_LEFT_OFFSET, ROPE_RIGHT_OFFSET, CALL_CELL_ADDR_PLACEHOLDER, CALL_CELL_FUNCIDX,
     CALL_CELL_SCRIPT, EARLY_KEY_MAX, EARLY_KEY_SHIFT, IC_SET_ABSSLOT,
     IC_SET_RECVSHAPE, IC_SET_SLOTENC, IC_TRANS_ABSSLOT, IC_TRANS_NEWSHAPE,
     IC_TRANS_OLDSHAPE, IC_TRANS_PROTO0, IC_TRANS_PROTO_HOPS, IC_TRANS_PROTO_ROW_BYTES,
@@ -2908,10 +2910,7 @@ impl<'a> Lower<'a> {
                 }
             }
             Opcode::JsTypeofEq(k) => {
-                // A leaf: no GC, no JS.
-                let kv = self.i32c(u32::from(k));
-                let f = self.h.typeof_eq;
-                let v = self.call1(f, &[self.cx, a[0], kv], Type::I32);
+                let v = self.typeof_eq(a[0], k);
                 self.def(inst, v);
             }
             Opcode::JsConstantStrictEq(k) => {
@@ -4611,9 +4610,9 @@ impl<'a> Lower<'a> {
         id
     }
 
-    /// `a + b` of two strings: the quiet concat helper (it runs
-    /// no user code and touches no stamp, so it takes `ok_clean`), where
-    /// both operands' types admit a string.
+    /// `a + b` of two strings, where both operands' types admit a string:
+    /// `rope_concat`'s inline arms, then the quiet concat helper (it runs
+    /// no user code and touches no stamp, so it takes `ok_clean`).
     fn concat_arm(&mut self, inst: mir::Inst, d: &mir::func::InstData, a: &[Value]) -> R<()> {
         let s = TagSet::prims(PRIM_STRING);
         if value_tags(&self.ty(d.args[0])).intersect(s).is_empty() || value_tags(&self.ty(d.args[1])).intersect(s).is_empty() {
@@ -4628,6 +4627,9 @@ impl<'a> Lower<'a> {
         let (cat, other) = (self.body.add_block(), self.body.add_block());
         self.cond_br(both, Self::to(cat), Self::to(other));
         self.cur = cat;
+        let helper = self.body.add_block();
+        self.rope_concat(inst, x, y, helper)?;
+        self.cur = helper;
         // The helper's reload rebinds the live values on its path only.
         let saved = (self.vmap.clone(), self.slotted.clone(), self.dirty.clone(), self.framed.clone(), self.cold);
         let live = self.live_across(inst);
@@ -4638,6 +4640,143 @@ impl<'a> Lower<'a> {
         (self.vmap, self.slotted, self.dirty, self.framed, self.cold) = saved;
         self.epoch_same = None;
         self.cur = other;
+        Ok(())
+    }
+
+    /// `typeof x == T` (`!=` with bit 7 of `k`) inline. The tag decides
+    /// every type but an object's, and a primitive type is decided by it
+    /// alone. An object's class decides the rest: the function classes are
+    /// "function"; a class without a call hook that is neither a proxy nor
+    /// emulates undefined is "object". Any other object asks the helper (a
+    /// leaf: no GC, no JS).
+    fn typeof_eq(&mut self, x: Value, k: u8) -> Value {
+        const JSTYPE_UNDEFINED: u8 = 0;
+        const JSTYPE_OBJECT: u8 = 1;
+        const JSTYPE_FUNCTION: u8 = 2;
+        let (ty, neg) = (k & 0x7f, k & 0x80 != 0);
+        let prims = match ty {
+            JSTYPE_UNDEFINED => PRIM_UNDEFINED,
+            JSTYPE_OBJECT => PRIM_NULL,
+            JSTYPE_FUNCTION => Prims::EMPTY,
+            3 => PRIM_STRING,
+            4 => PRIM_INT32 | PRIM_DOUBLE,
+            5 => PRIM_BOOLEAN,
+            6 => PRIM_SYMBOL,
+            _ => PRIM_BIGINT,
+        };
+        let negate = |l: &mut Self, v: Value| if neg { l.un(Operator::I32Eqz, v, Type::I32) } else { v };
+        let prim = self.has_tags(x, TagSet::prims(prims));
+        if !matches!(ty, JSTYPE_UNDEFINED | JSTYPE_OBJECT | JSTYPE_FUNCTION) {
+            return negate(self, prim);
+        }
+        let join = self.body.add_block();
+        let r = self.body.add_blockparam(join, Type::I32);
+        let (obj_b, prim_b) = (self.body.add_block(), self.body.add_block());
+        let tag = self.tag_of(x);
+        let is_obj = self.tag_is(tag, TAG_OBJECT as u32);
+        self.cond_br(is_obj, Self::to(obj_b), Self::to(prim_b));
+        self.cur = prim_b;
+        let pv = negate(self, prim);
+        self.terminate(Terminator::Br { target: BlockTarget { block: join, args: vec![pv] } });
+        self.cur = obj_b;
+        let obj = self.un(Operator::I32WrapI64, x, Type::I32);
+        let shape = self.load_i32(obj, SHAPE_OFFSET);
+        let base = self.load_i32(shape, SHAPE_BASESHAPE_OFFSET);
+        let clasp = self.load_i32(base, BASESHAPE_CLASP_OFFSET);
+        let slot = self.i32c(self.h.fn_class_slot);
+        let fn_class = self.load_i32(slot, 0);
+        let ext_class = self.load_i32(slot, 4);
+        let is_fn = self.bin(Operator::I32Eq, clasp, fn_class, Type::I32);
+        let is_ext = self.bin(Operator::I32Eq, clasp, ext_class, Type::I32);
+        let is_fn = self.bin(Operator::I32Or, is_fn, is_ext, Type::I32);
+        let (fun_b, other_b, helper_b) = (self.body.add_block(), self.body.add_block(), self.body.add_block());
+        self.cond_br(is_fn, Self::to(fun_b), Self::to(other_b));
+        self.cur = fun_b;
+        let fv = self.i32c(u32::from((ty == JSTYPE_FUNCTION) != neg));
+        self.terminate(Terminator::Br { target: BlockTarget { block: join, args: vec![fv] } });
+        self.cur = other_b;
+        let flags = self.load_i32(clasp, JSCLASS_FLAGS_OFFSET);
+        let odd = self.i32c(JSCLASS_IS_PROXY | JSCLASS_EMULATES_UNDEFINED);
+        let odd = self.bin(Operator::I32And, flags, odd, Type::I32);
+        let plain = self.un(Operator::I32Eqz, odd, Type::I32);
+        self.check(plain, helper_b);
+        let cops = self.load_i32(clasp, JSCLASS_COPS_OFFSET);
+        let (ops_b, obj_t) = (self.body.add_block(), self.body.add_block());
+        self.cond_br(cops, Self::to(ops_b), Self::to(obj_t));
+        self.cur = ops_b;
+        let call = self.load_i32(cops, JSCLASSOPS_CALL_OFFSET);
+        let uncallable = self.un(Operator::I32Eqz, call, Type::I32);
+        self.cond_br(uncallable, Self::to(obj_t), Self::to(helper_b));
+        self.cur = obj_t;
+        let ov = self.i32c(u32::from((ty == JSTYPE_OBJECT) != neg));
+        self.terminate(Terminator::Br { target: BlockTarget { block: join, args: vec![ov] } });
+        self.cur = helper_b;
+        let kv = self.i32c(u32::from(k));
+        let hv = self.call1(self.h.typeof_eq, &[self.cx, x, kv], Type::I32);
+        self.terminate(Terminator::Br { target: BlockTarget { block: join, args: vec![hv] } });
+        self.cur = join;
+        r
+    }
+
+    /// The concat of strings `x` and `y` inline, as the JIT's concat stub
+    /// does, taking edge 0: either half when the other is empty, else a
+    /// nursery rope over the two. A result short enough to be an inline
+    /// string (which the engine flattens rather than ropes), one past the
+    /// maximum length, a zone that does not allocate strings in the nursery
+    /// (the runtime's header word is 0) and a full nursery take `helper`.
+    /// No GC, no user code: nothing live needs rooting.
+    fn rope_concat(&mut self, inst: mir::Inst, x: Value, y: Value, helper: Block) -> R<()> {
+        let (xp, yp) = (self.un(Operator::I32WrapI64, x, Type::I32), self.un(Operator::I32WrapI64, y, Type::I32));
+        let z = self.i32c(0);
+        let lx = self.load_i32(xp, STRING_LENGTH_OFFSET);
+        let ly = self.load_i32(yp, STRING_LENGTH_OFFSET);
+        for (len, other) in [(lx, y), (ly, x)] {
+            let empty = self.bin(Operator::I32Eq, len, z, Type::I32);
+            let (take, next) = (self.body.add_block(), self.body.add_block());
+            self.cond_br(empty, Self::to(take), Self::to(next));
+            self.cur = take;
+            let t = self.edge(inst, 0, &[other])?;
+            self.terminate(Terminator::Br { target: t });
+            self.cur = next;
+        }
+        let total = self.bin(Operator::I32Add, lx, ly, Type::I32);
+        let fx = self.load_i32(xp, STRING_FLAGS_OFFSET);
+        let fy = self.load_i32(yp, STRING_FLAGS_OFFSET);
+        let both = self.bin(Operator::I32And, fx, fy, Type::I32);
+        let l1 = self.i32c(STRING_LATIN1_CHARS_BIT);
+        let flags = self.bin(Operator::I32And, both, l1, Type::I32);
+        let (fl, ft) = (self.i32c(FAT_INLINE_MAX_LATIN1), self.i32c(FAT_INLINE_MAX_TWO_BYTE));
+        let inline_max = self.select(Type::I32, fl, ft, flags);
+        let roped = self.bin(Operator::I32GtU, total, inline_max, Type::I32);
+        self.check(roped, helper);
+        let max = self.i32c(STRING_MAX_LENGTH);
+        let fits = self.bin(Operator::I32LeU, total, max, Type::I32);
+        self.check(fits, helper);
+        let hslot = self.i32c(self.h.strlit_slot + crate::region_shape::STRLIT_STR_HEADER_OFF);
+        let hdr = self.load_i32(hslot, 0);
+        let armed = self.bin(Operator::I32Ne, hdr, z, Type::I32);
+        self.check(armed, helper);
+        let size = self.i32c(NURSERY_HEADER_BYTES + ROPE_BYTES);
+        let pos = self.nursery_bump(size, helper);
+        self.store_i32(pos, 0, hdr);
+        // The catch-all site's count, as the engine's allocation bumps it.
+        let cslot = self.i32c(self.h.strlit_slot + crate::region_shape::STRLIT_STR_COUNT_ADDR_OFF);
+        let caddr = self.load_i32(cslot, 0);
+        let n = self.load_i32(caddr, 0);
+        let one = self.i32c(1);
+        let n1 = self.bin(Operator::I32Add, n, one, Type::I32);
+        self.store_i32(caddr, 0, n1);
+        let hb = self.i32c(NURSERY_HEADER_BYTES);
+        let s = self.bin(Operator::I32Add, pos, hb, Type::I32);
+        self.store_i32(s, STRING_FLAGS_OFFSET, flags);
+        self.store_i32(s, STRING_LENGTH_OFFSET, total);
+        self.store_i32(s, ROPE_LEFT_OFFSET, xp);
+        self.store_i32(s, ROPE_RIGHT_OFFSET, yp);
+        let payload = self.un(Operator::I64ExtendI32U, s, Type::I64);
+        let tag = self.i64c(TAG_STRING << 32);
+        let r = self.bin(Operator::I64Or, payload, tag, Type::I64);
+        let t = self.edge(inst, 0, &[r])?;
+        self.terminate(Terminator::Br { target: t });
         Ok(())
     }
 
@@ -5682,8 +5821,14 @@ impl<'a> Lower<'a> {
         let Some(census) = self.exit_census else { return };
         static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let name = match self.f.insts[inst].op {
+            Opcode::GetPropData(n) | Opcode::SetPropData(n) => {
+                format!(" {}", String::from_utf16_lossy(self.mm.atoms[n].chars()))
+            }
+            _ => String::new(),
+        };
         crate::diag_line!(
-            "night: mir slowcall {id} sid#{} {}",
+            "night: mir slowcall {id} sid#{} {}{name}",
             self.f.script,
             mir::print::mnemonic(&self.f.insts[inst].op)
         );
