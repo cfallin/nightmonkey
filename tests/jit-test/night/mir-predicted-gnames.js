@@ -38,7 +38,9 @@ function expectCall(r, x) {
 }
 
 for (var r = 0; r < 400; r++) {
-  if (r == 100) g[key] = other;
+  // A GC resets the blown fuse; the next read re-arms it, armed, not in
+  // the predicted state.
+  if (r == 100) { g[key] = other; gc(); }
   if (r == 200) g[key] = 5;
   if (r == 300) g[key] = savedTarget;
   if (r == 150) g[ctorKey] = Other;
