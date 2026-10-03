@@ -50,7 +50,8 @@ pub(crate) const NATIVE_SLOTS_OFFSET: u32 = 8;
 //   bit   16      TYPES/SHALLOW  every masked field holds a value of its mask
 //   bit   17      SLOTS          the static slot predictions hold
 //   bits  18..29  the predicted alloc site's early class key, while the
-//                 CONSTRUCTING sentinel is set
+//                 CONSTRUCTING sentinel is set; once stamped, bit 18 is
+//                 advance-ineligible and bit 19 CLOSED
 //   bit   30      RANGES         the predicted field value ranges hold
 //   bit   31      CONSTRUCTING sentinel
 //
@@ -60,6 +61,12 @@ pub(crate) const NATIVE_SLOTS_OFFSET: u32 = 8;
 
 pub(crate) const CLASS_WORD_SHALLOW: u32 = 0x0001_0000;
 pub(crate) const CLASS_WORD_SLOTS: u32 = 0x0002_0000;
+/// CLOSED, in a published (non-sentinel) word only, where bits 18..29 are
+/// free of the early key: the object has no own property outside its
+/// layout's row. Every stamp gate sets it where the object's span is the
+/// row's length; an add of a name outside the row clears it (the engine's
+/// add hook, by name; a compiled add arm, always), bumping the epoch.
+pub(crate) const CLASS_WORD_CLOSED: u32 = 0x0008_0000;
 /// The predicted VALUE RANGES of the layout's masked fields hold. Unlike
 /// TYPES -- whose engine-wide claim is only numberness, with the finer mask
 /// re-checked at every load -- this one is consumed checklessly, so it gets a

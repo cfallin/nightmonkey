@@ -422,6 +422,10 @@ pub struct LayoutClaim {
     /// Independent of `types` (a type claim holds by name); an access
     /// with a slot prediction needs it, one without reads through an IC.
     pub slots: bool,
+    /// CLOSED: the object has no own property outside its layout's row,
+    /// so a name the row lacks is not its own (a published stamp's bit,
+    /// killable as `types` is).
+    pub closed: bool,
     pub state: LayoutState,
 }
 
@@ -430,6 +434,7 @@ impl LayoutClaim {
         o.keys.contains(&self.keys)
             && (!o.types || self.types)
             && (!o.slots || self.slots)
+            && (!o.closed || self.closed)
             && self.state.le(o.state)
     }
 
@@ -438,6 +443,7 @@ impl LayoutClaim {
             keys: self.keys.hull(&o.keys),
             types: self.types && o.types,
             slots: self.slots && o.slots,
+            closed: self.closed && o.closed,
             state: self.state.join(o.state),
         }
     }
@@ -830,15 +836,18 @@ impl KillSet {
     pub const FUSE: KillSet = KillSet(1 << 3);
     pub const BINDING: KillSet = KillSet(1 << 4);
     pub const NATIVE: KillSet = KillSet(1 << 5);
-    pub const ALL: KillSet = KillSet(0x3f);
+    /// Only a claim's `CLOSED` bit (an own property added outside the row).
+    pub const CLOSED: KillSet = KillSet(1 << 6);
+    pub const ALL: KillSet = KillSet(0x7f);
 
-    pub const NAMES: [(&'static str, KillSet); 6] = [
+    pub const NAMES: [(&'static str, KillSet); 7] = [
         ("layout", KillSet::LAYOUT),
         ("types", KillSet::TYPES),
         ("constructing", KillSet::CONSTRUCTING),
         ("fuse", KillSet::FUSE),
         ("binding", KillSet::BINDING),
         ("native", KillSet::NATIVE),
+        ("closed", KillSet::CLOSED),
     ];
 
     pub const fn union(self, o: KillSet) -> KillSet {
@@ -910,6 +919,9 @@ impl KillPattern {
         if self.set.contains(KillSet::TYPES) && c.types {
             hit = hit.union(KillSet::TYPES);
         }
+        if self.set.contains(KillSet::CLOSED) && c.closed {
+            hit = hit.union(KillSet::CLOSED);
+        }
         if self.set.contains(KillSet::CONSTRUCTING)
             && matches!(c.state, LayoutState::Constructing(_))
         {
@@ -978,6 +990,9 @@ impl Type {
                 if hit.contains(KillSet::TYPES) {
                     c.types = false;
                 }
+                if hit.contains(KillSet::CLOSED) {
+                    c.closed = false;
+                }
                 if hit.contains(KillSet::CONSTRUCTING) {
                     c.state = LayoutState::Prefix(c.state.slots().unwrap_or(0));
                 }
@@ -1004,6 +1019,7 @@ mod tests {
             },
             types,
             slots: false,
+            closed: false,
             state,
         }
     }

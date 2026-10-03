@@ -702,6 +702,10 @@ pub struct Helpers {
     /// that is not plain`: MIR's `new_this.init` slow path (the object to
     /// the out-slot). May GC; runs no JS.
     pub new_this_init: Func,
+    /// `night_runtime_method_arm(recv i64, cell i32, atom i32, script i32)
+    /// -> i32` (leaf): arm a predicted-method cell for the receiver's
+    /// prototype (`method.load`'s miss).
+    pub method_arm: Func,
     /// `night_runtime_set_fun_name(cx, top, fun i64, name i64, prefixKind i32) -> ok`:
     /// `JSOp::SetFunName` -- set the inferred name on an anonymous function.
     /// Leaves `fun` on the stack (no out-slot).
@@ -1254,6 +1258,18 @@ pub struct ThisLayoutIn {
     pub init_home: bool,
 }
 
+/// A property-read site's predicted method (`method_sites`): the
+/// receivers' layout ids, the site's method cell, and the predicted script
+/// (and its address, which the runtime's arm compares).
+#[derive(Clone, Copy)]
+pub struct MethodSiteIn {
+    pub layout_id: u32,
+    pub hi_layout_id: u32,
+    pub cell_addr: u32,
+    pub script: ScriptId,
+    pub script_addr: u32,
+}
+
 #[derive(Clone, Copy)]
 pub struct PropSiteIn {
     pub cell_addr: u32,
@@ -1302,6 +1318,9 @@ pub struct StampCtorIn {
     /// An unpredicted add at an assigned offset below this bound could sit
     /// inside a clump member's guarded prefix and must clear SLOTS.
     pub ext_bound: u32,
+    /// Whether the layout is one a stamp may make CLOSED
+    /// (`closed_layouts`).
+    pub closable: bool,
 }
 
 /// Outcome of trying to translate one script.
@@ -1860,6 +1879,9 @@ pub struct TranslateCtx<'a> {
     /// every predicted field is a fixed slot, as the add check wants.
     pub lit_nslots_in: &'a HashMap<Site, u32>,
     pub prop_sites_in: &'a HashMap<Site, PropSiteIn>,
+    pub method_sites_in: &'a HashMap<Site, MethodSiteIn>,
+    /// The layout ids a stamp may make CLOSED (`closed_layouts`).
+    pub closed_layouts_in: &'a HashSet<u32>,
     /// Same keying, each field's full predicted type (`ClassFieldFacts::
     /// types`): what MIR's TYPES bit asserts, for any type.
     pub layout_field_types_in: &'a HashMap<StampKey, HashMap<NameId, Claim>>,
@@ -2603,6 +2625,8 @@ mod tests {
             lit_stamps_in: empty_lit_stamps(),
             lit_nslots_in: empty_lit_stamps(),
             prop_sites_in: empty_prop_sites(),
+            method_sites_in: empty_method_sites(),
+            closed_layouts_in: empty_closed_layouts(),
             layout_field_types_in: empty_layout_field_types(),
             array_stamp_in: empty_array_stamp(),
             array_elem_in: empty_array_elem(),
@@ -2645,6 +2669,8 @@ mod tests {
     empty_table!(empty_lit_stamps, HashMap<Site, u32>);
     empty_table!(empty_fused_gnames, HashMap<NameId, FusedGname>);
     empty_table!(empty_prop_sites, HashMap<Site, PropSiteIn>);
+    empty_table!(empty_method_sites, HashMap<Site, MethodSiteIn>);
+    empty_table!(empty_closed_layouts, HashSet<u32>);
     empty_table!(empty_this_layouts, HashMap<ScriptId, ThisLayoutIn>);
     empty_table!(empty_stamp_ctors, HashMap<ScriptId, StampCtorIn>);
     empty_table!(empty_arg_restamps, HashMap<ScriptId, (u32, StampCtorIn)>);
@@ -3546,6 +3572,11 @@ mod tests {
             returns: vec![Type::I32],
         });
         let new_this_init = stub(&mut m, nti_sig, true, "night_runtime_new_this_init");
+        let ma_sig = m.signatures.push(SignatureData {
+            params: vec![Type::I64, Type::I32, Type::I32, Type::I32],
+            returns: vec![Type::I32],
+        });
+        let method_arm = stub(&mut m, ma_sig, true, "night_runtime_method_arm");
         // math_unary: (kind i32, x f64) -> f64; math_pow: (x f64, y f64) -> f64.
         let mu_sig = m.signatures.push(SignatureData {
             params: vec![Type::I32, Type::F64],
@@ -3859,6 +3890,7 @@ mod tests {
                 set_elem_pure,
                 new_this,
                 new_this_init,
+                method_arm,
             },
         )
     }

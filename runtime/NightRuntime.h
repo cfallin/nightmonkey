@@ -436,6 +436,13 @@ uint32_t night_runtime_new_this_init(JSContext* cx, uint32_t top,
                                      uint32_t stampWord, uint32_t valsAddr,
                                      uint32_t n, uint32_t cache0,
                                      uint32_t wantBits);
+// `method.load`'s miss: arm the predicted-method cell at `cellAddr` for
+// receiver `recvBits` (its name `atomId`, its predicted script at
+// `scriptAddr`). 1 = armed for this receiver's prototype; 0 = not (the cell
+// stays unarmable until a GC). A leaf.
+NIGHT_RUNTIME_EXPORT(night_runtime_method_arm)
+int32_t night_runtime_method_arm(uint64_t recvBits, uint32_t cellAddr,
+                                 uint32_t atomId, uint32_t scriptAddr);
 NIGHT_RUNTIME_EXPORT(night_runtime_set_prop_pure)
 uint32_t night_runtime_set_prop_pure(JSContext* cx, uint32_t top,
                                      uint64_t recv, uint32_t atomId,

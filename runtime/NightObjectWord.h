@@ -59,11 +59,19 @@ static constexpr uint32_t SlotsAddMismatch3 = 12;
 static constexpr uint32_t SlotsAddMismatch4 = 13;
 // JSObject::setFlag (object-flag shape change, e.g. a Watchtower watch).
 static constexpr uint32_t ObjectFlagChange = 14;
+// NightClearClosedBit (an add to a CLOSED object).
+static constexpr uint32_t ClosedAdd = 15;
 }  // namespace NightBumpSite
 
 static constexpr uint32_t kWordTypes = 0x00010000u;
 static constexpr uint32_t kWordSlots = 0x00020000u;
 static constexpr uint32_t kWordAdvIneligible = 0x00040000u;
+// CLOSED (bit 19, a stamped word's only: under the sentinel it is an early
+// key bit): the object has no own property outside its layout's row. The
+// stamp gates set it where the object holds exactly its row (SLOTS, and a
+// span of the row's length); since it then has every row field, any add
+// is outside the row and clears it.
+static constexpr uint32_t kWordClosed = 0x00080000u;
 static constexpr uint32_t kWordRanges = 0x40000000u;
 static constexpr uint32_t kWordConstructing = 0x80000000u;
 
@@ -91,11 +99,23 @@ inline void NightNoteDemotion(uint32_t oldWord, uint32_t site) {
 }
 
 // SLOTS-only clear: an add deviated from the clump's slot predictions.
+// CLOSED goes with it (it is set only with SLOTS, and compiled add arms
+// test it only where SLOTS holds).
 inline void NightClearSlotsBit(JSObject* obj, uint32_t site = 0) {
   uint32_t w = obj->externalWord();
   if (w & kWordSlots) {
     NightNoteDemotion(w, site);
-    obj->setExternalWord(w & ~kWordSlots);
+    uint32_t clear = kWordSlots | (w & kWordConstructing ? 0 : kWordClosed);
+    obj->setExternalWord(w & ~clear);
+  }
+}
+
+// CLOSED-only clear: a property was added to a CLOSED object.
+inline void NightClearClosedBit(JSObject* obj) {
+  uint32_t w = obj->externalWord();
+  if ((w & (kWordConstructing | kWordClosed)) == kWordClosed) {
+    NightNoteDemotion(w, NightBumpSite::ClosedAdd);
+    obj->setExternalWord(w & ~kWordClosed);
   }
 }
 

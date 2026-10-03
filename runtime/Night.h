@@ -34,6 +34,7 @@ bool NightSnapshotCaptureExtras(JSContext* cx, JS::Handle<JSScript*> root);
 bool NightSnapshotCaptureHeap(JSContext* cx);
 
 class NativeObject;
+class ObjectFuse;
 class SharedShape;
 
 namespace night {
@@ -51,6 +52,12 @@ bool NightShapeForAdd(JSContext* cx, JS::Handle<NativeObject*> obj,
                       JS::HandleId id, uint8_t flags, SharedShape** result);
 void NightPurgeAddMemo();
 bool NightSlotsCovered(NativeObject* obj, uint32_t n);
+
+// The engine invalidated constant-property assumptions about `fuse`'s
+// object (JS::ExternalCompilerHooks::objectFuseInvalidated): unarm the
+// predicted-method cells resting on the property in `slot` (UINT32_MAX:
+// on any of them).
+void NightObjectFuseInvalidated(ObjectFuse* fuse, uint32_t slot);
 
 // Global-object write hooks, called from the engine's own property paths so
 // that an INTERPRETED global write (a declined script, a generator, eval)

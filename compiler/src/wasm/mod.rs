@@ -909,6 +909,7 @@ pub fn resolve_helpers(
         set_elem_pure: resolve(m, "night_runtime_set_elem_pure")?,
         new_this: resolve(m, "night_runtime_new_this")?,
         new_this_init: resolve(m, "night_runtime_new_this_init")?,
+        method_arm: resolve(m, "night_runtime_method_arm")?,
     })
 }
 
@@ -923,6 +924,12 @@ pub struct EnvLayout {
     /// the binding's value fuse to its predicted state (3) only while the
     /// binding holds a function of that script.
     pub binding_preds: HashMap<u32, (ScriptId, u32)>,
+    /// Per property-read site with a predicted method (`method_sites`),
+    /// its cell; the cells' region.
+    pub method_sites_tx: HashMap<Site, translate::MethodSiteIn>,
+    pub method_cells_base: u32,
+    pub method_cells_len: u32,
+    pub closed_layouts_tx: HashSet<u32>,
     /// The analysis output, carried whole: every table the translator reads
     /// unchanged lives here rather than as a renamed copy below.
     pub facts: LikelyFacts,
@@ -1308,6 +1315,7 @@ pub fn layout_env(
                     ranges: ranges_of(LayoutKey::new(key.get())),
                     prefix_keys,
                     ext_bound: ext_bound_of(LayoutKey::new(key.get())),
+                    closable: facts.closed_layouts.contains(&key),
                 },
             )
         })
@@ -1611,8 +1619,50 @@ pub fn layout_env(
     // published through its own region-table slot, ABI v5).
     let accessor_cache_base =
         append_cache_base + translate::APPEND_CACHE_SIZE * translate::APPEND_CACHE_ENTRY_BYTES;
-    let prop_ic_base = accessor_cache_base
+    // Predicted-method cells, one per (receiver layouts, name, script) of
+    // the analysis's method sites (zero-init; GC-zeroed). A class
+    // constructor's call must throw, so none is predicted.
+    let method_cells_base = accessor_cache_base
         + translate::ACCESSOR_CACHE_SIZE * translate::ACCESSOR_CACHE_ENTRY_BYTES;
+    let mut method_cell_of: HashMap<(LayoutKey, LayoutKey, NameId, ScriptId), u32> = HashMap::default();
+    let mut method_sites: Vec<_> = facts.method_sites.iter().map(|(&s, &v)| (s, v)).collect();
+    method_sites.sort_unstable_by_key(|&(s, _)| (s.script, s.pc));
+    let method_sites_tx: HashMap<Site, translate::MethodSiteIn> = method_sites
+        .into_iter()
+        .filter_map(|(site, (lo, hi, name, k))| {
+            let script_addr = match source.object(SourceObjectId::new(k.get())) {
+                SourceObject::Script(s) if s.addr != 0 && !s.is_class_ctor => s.addr,
+                _ => return None,
+            };
+            let n = u32::try_from(method_cell_of.len()).unwrap();
+            let i = *method_cell_of.entry((lo, hi, name, k)).or_insert(n);
+            Some((
+                site,
+                translate::MethodSiteIn {
+                    layout_id: *ctor_layout_id.get(&lo)?,
+                    hi_layout_id: *ctor_layout_id.get(&hi)?,
+                    cell_addr: method_cells_base + shape::METHOD_CELL_BYTES * i,
+                    script: k,
+                    script_addr,
+                },
+            ))
+        })
+        .collect();
+    // The layout ids a stamp may make CLOSED (`closed_layouts`).
+    let closed_layouts_tx: HashSet<u32> = facts
+        .closed_layouts
+        .iter()
+        .filter_map(|k| ctor_layout_id.get(k).copied())
+        .collect();
+    let method_cells_len = shape::METHOD_CELL_BYTES * u32::try_from(method_cell_of.len()).unwrap();
+    if opts.diagnostics.stats {
+        crate::diag_line!(
+            "night: {} predicted-method site(s), {} cell(s)",
+            method_sites_tx.len(),
+            method_cell_of.len()
+        );
+    }
+    let prop_ic_base = method_cells_base + method_cells_len;
     // Bindings with a predicted function (`gname_fns`), by row, with the
     // script's address for the runtime's arm-time test. Not a class
     // constructor: a read typed with its script is called directly
@@ -1634,6 +1684,10 @@ pub fn layout_env(
         syn_gname_names,
         syn_gnames,
         binding_preds,
+        method_sites_tx,
+        method_cells_base,
+        method_cells_len,
+        closed_layouts_tx,
         facts,
         likely_class_layouts,
         fused_list,
@@ -1841,6 +1895,8 @@ pub fn translate_all(
         lit_stamps_in: &env.lit_stamps_tx,
         lit_nslots_in: &env.lit_nslots_tx,
         prop_sites_in: &env.prop_sites_tx,
+        method_sites_in: &env.method_sites_tx,
+        closed_layouts_in: &env.closed_layouts_tx,
         layout_field_types_in: &env.layout_field_types_tx,
         array_stamp_in: &env.array_stamp_tx,
         array_elem_in: &env.array_elem_tx,

@@ -57,7 +57,9 @@ namespace night {
   _(megaSetPtr, Addr)        \
   _(mathNativesPtr, Addr)    \
   _(appendCachePtr, Addr)    \
-  _(accessorCachePtr, Addr)
+  _(accessorCachePtr, Addr)  \
+  _(methodCellsPtr, Addr)    \
+  _(methodCellsLen, Len)
 
 enum class NightEnvRegion : uint32_t {
 #define NIGHT_ENV_REGION_ENUM(name, kind) name,

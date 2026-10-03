@@ -72,6 +72,11 @@ static void GlobalLexicalShadowAdded(JSContext* cx, uint64_t idBits) {
   night_runtime_global_lexical_shadow_added(uintptr_t(idBits));
 }
 
+static void ObjectFuseInvalidated(JSContext* cx, js::ObjectFuse* fuse,
+                                  uint32_t propSlot) {
+  NightObjectFuseInvalidated(fuse, propSlot);
+}
+
 static JS::ExternalEnterStatus Convert(EnterNightStatus status) {
   switch (status) {
     case EnterNightStatus::Error:
@@ -128,6 +133,7 @@ JS::ExternalCompilerHooks js::night::gNightHooks = {
     /* globalKeyChanged */ GlobalKeyChanged,
     /* globalDataStored */ GlobalDataStored,
     /* globalLexicalShadowAdded */ GlobalLexicalShadowAdded,
+    /* objectFuseInvalidated */ ObjectFuseInvalidated,
     /* enterScript */ EnterScript,
     /* enterCall */ EnterCall,
     /* isForeignGenerator */ IsForeignGenerator,

@@ -63,7 +63,7 @@ use crate::wasm::mir::abi::{
     LAMBDA_CELL_GEN, LAMBDA_CELL_TEMPLATE,
     BINOP_BITAND, BINOP_BITNOT, BINOP_BITOR, BINOP_BITXOR, BINOP_DEC, BINOP_DIV, BINOP_INC,
     BINOP_LSH, BINOP_MOD, BINOP_MUL, BINOP_RSH, BINOP_SUB, BINOP_URSH, CLASS_WORD_SHALLOW,
-    CLASS_WORD_RANGES, CLASS_WORD_SENTINEL, CLASS_WORD_SLOTS, SHAPE_SMALL_SLOTSPAN_MASK_BITS,
+    CLASS_WORD_CLOSED, CLASS_WORD_RANGES, CLASS_WORD_SENTINEL, CLASS_WORD_SLOTS, SHAPE_SMALL_SLOTSPAN_MASK_BITS,
     SHAPE_PERMUTED_SLOTS_BIT, SHAPE_SMALL_SLOTSPAN_SHIFT, TA_DATA_PAYLOAD_OFFSET, TA_LENGTH_PAYLOAD_OFFSET, ELEMENTS_LENGTH_BACK,
     ELEMENTS_CAPACITY_BACK, ELEMENTS_PUSH_BAIL_MASK, ELEMENTS_HEADER_BYTES, ALLOC_CELL_ADDR_PLACEHOLDER,
     STRING_LENGTH_OFFSET, STRING_FLAGS_OFFSET, STRING_CHARS_OFFSET, STRING_LINEAR_BIT,
@@ -4166,7 +4166,7 @@ impl<'a> Lower<'a> {
                 let same = self.bin(Operator::I32Eq, construct_pre, post, Type::I32);
                 self.clean_or_dirty(inst, ok_p, same, &[res_p])?;
             }
-            Opcode::GuardLayout { keys, types, slots } => {
+            Opcode::GuardLayout { keys, types, slots, closed } => {
                 // The stamp word (`JSObject*+4`): identity is layout key + 1
                 // in the low 16 bits; TYPES is the SHALLOW bit (§4.3). The
                 // SLOTS bit too: a claim then holds
@@ -4176,7 +4176,9 @@ impl<'a> Lower<'a> {
                 let w = self.load_i32(a[0], OBJ_CLASS_IDX_OFFSET);
                 let m = self.i32c(0xFFFF);
                 let id = self.bin(Operator::I32And, w, m, Type::I32);
-                let want = if types { CLASS_WORD_SHALLOW } else { 0 } | if slots { CLASS_WORD_SLOTS } else { 0 };
+                let want = if types { CLASS_WORD_SHALLOW } else { 0 }
+                    | if slots { CLASS_WORD_SLOTS } else { 0 }
+                    | if closed { CLASS_WORD_CLOSED } else { 0 };
                 // One masked compare: identity and
                 // the bits at once. Over a range, the masked word less the
                 // lowest wanted word is at most the span only with every
@@ -4231,7 +4233,13 @@ impl<'a> Lower<'a> {
                 let keep = CLASS_WORD_SLOTS | if c.types { CLASS_WORD_SHALLOW } else { 0 };
                 let kb = self.i32c(keep);
                 let bits = self.bin(Operator::I32And, w, kb, Type::I32);
-                let idx = self.i32c(c.keys.lo.get() + 1);
+                // Exactly the row's fields: CLOSED, where the layout may be.
+                let closed = if self.mm.layouts.get(&c.keys.lo).is_some_and(|l| l.closed) {
+                    CLASS_WORD_CLOSED
+                } else {
+                    0
+                };
+                let idx = self.i32c((c.keys.lo.get() + 1) | closed);
                 let nw = self.bin(Operator::I32Or, idx, bits, Type::I32);
                 self.store_i32(a[0], OBJ_CLASS_IDX_OFFSET, nw);
                 self.def(inst, a[0]);
@@ -4246,6 +4254,55 @@ impl<'a> Lower<'a> {
                 let one = self.i32c(1);
                 let ok = self.bin(Operator::I32Eq, w, one, Type::I32);
                 self.guard(inst, ok, &[])?;
+            }
+            Opcode::MethodLoad { cell, atom, script } => {
+                // The receiver's prototype is the one the cell is armed
+                // for (an unarmed cell holds 0, an unarmable one 1): the
+                // function there. Else, if unarmed, the runtime arms it
+                // for this prototype (a leaf) and it is tested again.
+                let sa = self
+                    .mm
+                    .script_addrs
+                    .get(&script)
+                    .copied()
+                    .ok_or("lowering: method.load of a script with no address")?;
+                let c = self.i32c(cell);
+                let shape = self.load_i32(a[0], SHAPE_OFFSET);
+                let base = self.load_i32(shape, SHAPE_BASESHAPE_OFFSET);
+                let proto = self.load_i32(base, BASESHAPE_PROTO_OFFSET);
+                let p = self.load_i32(c, 0);
+                let hit = self.bin(Operator::I32Eq, proto, p, Type::I32);
+                let f = self.load_i32(c, crate::region_shape::METHOD_CELL_FN_OFF);
+                let miss = self.body.add_block();
+                let t = self.edge(inst, 0, &[f])?;
+                self.cond_br(hit, t, Self::to(miss));
+                self.cur = miss;
+                let (arm, done) = (self.body.add_block(), self.body.add_block());
+                let ok = self.body.add_blockparam(done, Type::I32);
+                let z = self.i32c(0);
+                let unarmed = self.bin(Operator::I32Eq, p, z, Type::I32);
+                self.cond_br(
+                    unarmed,
+                    Self::to(arm),
+                    BlockTarget {
+                        block: done,
+                        args: vec![z],
+                    },
+                );
+                self.cur = arm;
+                let rb = self.box_tagged(TAG_OBJECT, a[0]);
+                let av = self.atom(atom);
+                let sv = self.i32c(sa);
+                let r = self.call1(self.h.method_arm, &[rb, c, av, sv], Type::I32);
+                self.terminate(Terminator::Br {
+                    target: BlockTarget {
+                        block: done,
+                        args: vec![r],
+                    },
+                });
+                self.cur = done;
+                let f = self.load_i32(c, crate::region_shape::METHOD_CELL_FN_OFF);
+                self.guard(inst, ok, &[f])?;
             }
             Opcode::CheckBinding(b, BindingCheck::Fn) => {
                 // The value fuse in its predicted state: the binding holds
@@ -6049,7 +6106,9 @@ impl<'a> Lower<'a> {
         let k_sent = self.bin(Operator::I32And, kraw, km, Type::I32);
         let m16 = self.i32c(0xFFFF);
         let k_idx = self.bin(Operator::I32And, w, m16, Type::I32);
-        let k = self.bin(Operator::I32Or, k_sent, k_idx, Type::I32);
+        let sb = self.i32c(CLASS_WORD_SENTINEL);
+        let sent = self.bin(Operator::I32And, w, sb, Type::I32);
+        let k = self.select(Type::I32, k_sent, k_idx, sent);
         // An add past the layout's extent (its bound in the this-cells
         // table; 0 = unknown) leaves every predicted slot where it was:
         // SLOTS holds.
@@ -6074,6 +6133,13 @@ impl<'a> Lower<'a> {
             let both = self.bin(Operator::I32And, ke, oe, Type::I32);
             hit = self.bin(Operator::I32Or, hit, both, Type::I32);
         }
+        // An add to a CLOSED object (which holds SLOTS, so is keyed) is
+        // outside its row: the helper, whose engine add clears the bit.
+        let cm = self.i32c(CLASS_WORD_SENTINEL | CLASS_WORD_CLOSED);
+        let cbits = self.bin(Operator::I32And, w, cm, Type::I32);
+        let cv = self.i32c(CLASS_WORD_CLOSED);
+        let open = self.bin(Operator::I32Ne, cbits, cv, Type::I32);
+        let hit = self.bin(Operator::I32And, hit, open, Type::I32);
         self.cond_br(hit, Self::to(go), Self::to(slow));
         self.cur = go;
         let addr = self.bin(Operator::I32Add, obj, slot_off, Type::I32);
@@ -6312,13 +6378,40 @@ impl<'a> Lower<'a> {
             self.terminate(Terminator::Br { target: Self::to(go) });
             self.cur = go;
         }
-        let kb = self.i32c(keep);
+        // CLOSED in `keep` says the layout may be (the bit itself is an
+        // early-key bit in `w0`).
+        let kb = self.i32c(keep & !CLASS_WORD_CLOSED);
         let bits = self.bin(Operator::I32And, w0, kb, Type::I32);
         let idx = self.i32c(layout + 1);
         let w = self.bin(Operator::I32Or, idx, bits, Type::I32);
+        // Every field there and a span of the row's length: nothing else
+        // (CLOSED).
+        let w = if keep & CLASS_WORD_CLOSED != 0 {
+            self.or_closed_if_span(w, span, nfields)
+        } else {
+            w
+        };
         self.store_i32(obj, OBJ_CLASS_IDX_OFFSET, w);
         self.terminate(Terminator::Br { target: Self::to(done) });
         self.cur = done;
+    }
+
+    /// Stamp word `w` with CLOSED where its object holds its row's `n`
+    /// fields and nothing else: `span`, its slot span with every slot
+    /// below `n` holding a property, is `n`, and `w` keeps SLOTS (every
+    /// add landed where the row puts its name, so those properties are the
+    /// row's).
+    fn or_closed_if_span(&mut self, w: Value, span: Value, n: u32) -> Value {
+        let nv = self.i32c(n);
+        let eq = self.bin(Operator::I32Eq, span, nv, Type::I32);
+        let ssh = self.i32c(CLASS_WORD_SLOTS.trailing_zeros());
+        let sl = self.bin(Operator::I32ShrU, w, ssh, Type::I32);
+        let ok = self.bin(Operator::I32And, eq, sl, Type::I32);
+        let one = self.i32c(1);
+        let ok = self.bin(Operator::I32And, ok, one, Type::I32);
+        let sh = self.i32c(CLASS_WORD_CLOSED.trailing_zeros());
+        let c = self.bin(Operator::I32Shl, ok, sh, Type::I32);
+        self.bin(Operator::I32Or, w, c, Type::I32)
     }
 
     /// `x === k` for a `StrictConstantEq` operand `k` (the high byte its
@@ -8184,9 +8277,14 @@ impl<'a> Lower<'a> {
         let stamp = self.body.add_block();
         self.cond_br(ok, Self::to(stamp), Self::to(slow));
         self.cur = stamp;
-        let kb = self.i32c(keep);
+        let kb = self.i32c(keep & !CLASS_WORD_CLOSED);
         let bits = self.bin(Operator::I32And, w0, kb, Type::I32);
         let nw = self.bin(Operator::I32Or, want, bits, Type::I32);
+        let nw = if keep & CLASS_WORD_CLOSED != 0 {
+            self.or_closed_if_span(nw, span, nfields)
+        } else {
+            nw
+        };
         self.store_i32(obj, OBJ_CLASS_IDX_OFFSET, nw);
         self.terminate(Terminator::Br { target: Self::to(done) });
         self.cur = slow;

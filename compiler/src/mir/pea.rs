@@ -471,11 +471,12 @@ fn pea_one(m: &Module, f: &mut Func, cfg: &Cfg, t: Inst, tried: &mut BTreeSet<In
         keys: KeyRange::one(key),
         types: word & crate::wasm::mir::abi::CLASS_WORD_SHALLOW != 0,
         slots: true,
+        closed: false,
         state: LayoutState::Published,
     };
     let g_unbox = Opcode::GuardUnbox(UnboxKind::Obj);
     let g_kind = Opcode::GuardKind(ObjKind::Plain);
-    let g_layout = Opcode::GuardLayout { keys: claim.keys, types: claim.types, slots: true };
+    let g_layout = Opcode::GuardLayout { keys: claim.keys, types: claim.types, slots: true, closed: false };
     let Ok(o_ty) = signature(&g_unbox, &[val_ty], m).map(|s| s.outputs[0]) else { return false };
     let Ok(p_ty) = signature(&g_kind, &[o_ty], m).map(|s| s.outputs[0]) else { return false };
     let Ok(typed_ty) = signature(&g_layout, &[p_ty], m).map(|s| s.outputs[0]) else { return false };

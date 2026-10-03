@@ -56,6 +56,7 @@ pub(super) fn is_guard(op: &Opcode) -> bool {
             | Opcode::GuardLayout { .. }
             | Opcode::GuardSingleton(_)
             | Opcode::GuardScript(_)
+            | Opcode::MethodLoad { .. }
             | Opcode::CheckFuse(_)
             | Opcode::CheckBinding(..)
             | Opcode::IntToI32
@@ -1160,6 +1161,11 @@ pub fn fold_guards(m: &Module, f: &mut Func) -> usize {
             // or not.
             if fx.may_run_js {
                 cur.retain(|(op, _), _| !matches!(op, Opcode::CheckFuse(_) | Opcode::CheckBinding(..)));
+            }
+            // A method's holder property may change by any write, script or
+            // not (a data store to the holder runs none).
+            if fx.may_run_js || !fx.writes.is_empty() || !fx.kill.is_empty() {
+                cur.retain(|(op, _), _| !matches!(op, Opcode::MethodLoad { .. }));
             }
             if idx + 1 != insts.len() {
                 continue;

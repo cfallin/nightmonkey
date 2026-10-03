@@ -724,6 +724,8 @@ fn main() -> Result<()> {
         mathNativesPtr: env.math_natives_base,
         appendCachePtr: env.append_cache_base,
         accessorCachePtr: env.accessor_cache_base,
+        methodCellsPtr: env.method_cells_base,
+        methodCellsLen: env.method_cells_len,
     }
     .to_words();
     for (i, w) in region_table.iter().enumerate() {

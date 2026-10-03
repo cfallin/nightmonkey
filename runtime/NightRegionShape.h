@@ -127,7 +127,15 @@ namespace night {
   _(bindingCellFuseOff, 8)                                                     \
   _(bindingFuseArmed, 1)                                                       \
   _(bindingFuseBlown, 2)                                                       \
-  _(bindingFusePredicted, 3)
+  _(bindingFusePredicted, 3)                                                   \
+  /* Predicted-method cells (gEnv.methodCellsPtr): [proto u32 @0][pad]     */  \
+  /* [fn bits u64 @8]. Armed: proto is the receivers' prototype through    */  \
+  /* which the name resolves to fn, a compiled function of the predicted   */  \
+  /* script held by a constant (ObjectFuse) property. 0 unarmed, 1 not     */  \
+  /* armable until a GC.                                                   */  \
+  _(methodCellBytes, 16)                                                       \
+  _(methodCellFnOff, 8)                                                        \
+  _(methodCellPoison, 1)
 
 #define NIGHT_REGION_SHAPE_CONST(name, value) \
   static constexpr uint32_t Night_##name = (value);

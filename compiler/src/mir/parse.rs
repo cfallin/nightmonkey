@@ -518,6 +518,7 @@ impl Parser {
                 let keys = self.keys()?;
                 let types = self.eat_word("types");
                 let mut slots = self.eat_word("slots");
+                let closed = self.eat_word("closed");
                 let state = if self.eat_word("prefix") {
                     LayoutState::Prefix(self.paren_u32()?)
                 } else if self.eat_word("constructing") {
@@ -526,7 +527,7 @@ impl Parser {
                 } else {
                     LayoutState::Published
                 };
-                o.layout = Some(LayoutClaim { keys, types, slots, state });
+                o.layout = Some(LayoutClaim { keys, types, slots, closed, state });
             } else {
                 o.kind = self.kind()?;
             }
@@ -785,10 +786,11 @@ impl Parser {
                     } else {
                         None
                     };
+                    let closed = self.eat_word("closed");
                     if self
                         .m
                         .layouts
-                        .insert(k, Layout { fields, named, elements })
+                        .insert(k, Layout { fields, named, elements, closed })
                         .is_some()
                     {
                         return self.err(format!("layout L{k} declared twice"));
@@ -1290,7 +1292,8 @@ impl Parser {
                 let keys = self.keys()?;
                 let types = self.eat_word("types");
                 let slots = self.eat_word("slots");
-                GuardLayout { keys, types, slots }
+                let closed = self.eat_word("closed");
+                GuardLayout { keys, types, slots, closed }
             }
             GuardCtor { .. } => {
                 let key = self.layout_key()?;
@@ -1300,6 +1303,14 @@ impl Parser {
                 GuardCtor { key, n, types }
             }
             GuardScript(_) => GuardScript(self.script()?),
+            MethodLoad { .. } => {
+                let cell = self.int()?;
+                self.expect_punct(",")?;
+                let atom = self.atom()?;
+                self.expect_punct(",")?;
+                let script = self.script()?;
+                MethodLoad { cell, atom, script }
+            }
             CheckFuse(_) => CheckFuse(FuseId::from_u32(self.prefixed("F", "a fuse")?)),
             CheckBinding(_, w) => CheckBinding(BindingId::from_u32(self.prefixed("G", "a binding")?), w),
             LoadGName(_) => LoadGName(BindingId::from_u32(self.prefixed("G", "a binding")?)),
@@ -1558,6 +1569,7 @@ fn template(mn: &str) -> Option<Opcode> {
             keys: KeyRange::one(LayoutKey::new(0)),
             types: false,
             slots: false,
+            closed: false,
         },
         GuardCtor {
             key: LayoutKey::new(0),
@@ -1566,6 +1578,11 @@ fn template(mn: &str) -> Option<Opcode> {
         },
         GuardSingleton(SnapObj::from_u32(0)),
         GuardScript(ScriptId::new(0)),
+        MethodLoad {
+            cell: 0,
+            atom: AtomId::from_u32(0),
+            script: ScriptId::new(0),
+        },
         F64ToIntExact,
         IntToI32,
         CheckFuse(FuseId::from_u32(0)),

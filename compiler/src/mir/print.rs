@@ -73,7 +73,7 @@ pub fn atom_str(s: &JsString) -> String {
 
 /// Words the parser gives meaning in an atom's position.
 fn is_reserved_word(s: &str) -> bool {
-    matches!(s, "types" | "slots" | "hole" | "named")
+    matches!(s, "types" | "slots" | "closed" | "hole" | "named")
 }
 
 pub fn tags_str(t: TagSet) -> String {
@@ -132,6 +132,9 @@ fn claim_str(c: &LayoutClaim) -> String {
     // A constructing state implies its slots.
     if c.slots && c.state == LayoutState::Published {
         s.push_str(" slots");
+    }
+    if c.closed {
+        s.push_str(" closed");
     }
     match c.state {
         LayoutState::Published => {}
@@ -315,6 +318,7 @@ pub fn mnemonic(op: &Opcode) -> String {
         GuardCtor { .. } => "guard.ctor".into(),
         GuardSingleton(_) => "guard.singleton".into(),
         GuardScript(_) => "guard.script".into(),
+        MethodLoad { .. } => "method.load".into(),
         F64ToIntExact => "f64.to_int_exact".into(),
         IntToI32 => "int.to_i32".into(),
         CheckFuse(_) => "check.fuse".into(),
@@ -561,13 +565,16 @@ fn immediates(m: &Module, op: &Opcode) -> Option<String> {
         | InitField(a) => atom(Some(m), *a),
         GuardTags(t) => tags_str(*t),
         GuardKind(k) => kind_str(*k),
-        GuardLayout { keys, types, slots } => {
+        GuardLayout { keys, types, slots, closed } => {
             let mut s = keys_str(keys);
             if *types {
                 s.push_str(" types");
             }
             if *slots {
                 s.push_str(" slots");
+            }
+            if *closed {
+                s.push_str(" closed");
             }
             s
         }
@@ -579,6 +586,7 @@ fn immediates(m: &Module, op: &Opcode) -> Option<String> {
             s
         }
         GuardScript(s) => format!("s{s}"),
+        MethodLoad { cell, atom: a, script } => format!("{cell}, {}, s{script}", atom(Some(m), *a)),
         CheckFuse(f) => f.to_string(),
         CheckBinding(b, _) | LoadGName(b) | StoreGName(b) => b.to_string(),
         CheckNative(n) | CallNative(n) => n.to_string(),
@@ -702,6 +710,9 @@ pub fn print_module(m: &Module) -> String {
             }
             if let Some(r) = l.elements {
                 write!(out, " elements r{r}").unwrap();
+            }
+            if l.closed {
+                out.push_str(" closed");
             }
             out.push('\n');
         }

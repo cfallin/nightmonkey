@@ -29,6 +29,9 @@ pub struct Layout {
     /// For array layouts: the class region the stamp proves, which names
     /// the `Elements`/`ArrayLength` alias regions of its accesses.
     pub elements: Option<RegionRoot>,
+    /// Whether its stamp may be CLOSED (`closed_layouts`): publishing an
+    /// object of exactly its row then makes it so.
+    pub closed: bool,
 }
 
 impl Layout {

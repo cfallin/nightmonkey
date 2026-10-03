@@ -527,6 +527,8 @@ pub enum Opcode {
         keys: KeyRange,
         types: bool,
         slots: bool,
+        /// And the CLOSED bit: no own property outside the row.
+        closed: bool,
     },
     /// An object under construction for layout `key` (MIR.md §2.3): its
     /// word carries the CONSTRUCTING sentinel with `key`'s early key, and
@@ -539,6 +541,14 @@ pub enum Opcode {
     },
     GuardSingleton(SnapObj),
     GuardScript(ScriptId),
+    /// A predicted method (`method_sites`): the receiver, of layouts whose
+    /// rows lack `atom` and CLOSED, reads `atom` through its prototype
+    /// chain as the function in the method cell at `cell` -- the cell
+    /// armed for the receiver's prototype, so the chain resolves the name
+    /// to a compiled function of `script`, held by a constant property.
+    /// ok: that function; fail: the cell is not armed for this prototype
+    /// and the runtime could not arm it.
+    MethodLoad { cell: u32, atom: AtomId, script: ScriptId },
     /// An f64 that is exactly an int32 (not -0) becomes an `I32`.
     F64ToIntExact,
     /// An `int` known to be int32 (T: fails outside int32's range).
@@ -927,6 +937,7 @@ impl Opcode {
             | GuardCtor { .. }
             | GuardSingleton(_)
             | GuardScript(_)
+            | MethodLoad { .. }
             | F64ToIntExact
             | IntToI32
             | CheckFuse(_)
@@ -1393,13 +1404,14 @@ pub fn signature(op: &Opcode, args: &[Type], m: &Module) -> SigResult {
             let kind = if o.kind.le(*k) { o.kind } else { *k };
             Sig::output(Type::Obj(ObjInfo { kind, ..o }))
         }
-        GuardLayout { keys, types, slots } => {
+        GuardLayout { keys, types, slots, closed } => {
             arity(args, 1)?;
             let o = obj(&args[0], "guard.layout")?;
             let new = LayoutClaim {
                 keys: *keys,
                 types: *types,
                 slots: *slots,
+                closed: *closed,
                 state: LayoutState::Published,
             };
             let layout = match o.layout {
@@ -1419,6 +1431,7 @@ pub fn signature(op: &Opcode, args: &[Type], m: &Module) -> SigResult {
                     keys: KeyRange::one(*key),
                     types: *types,
                     slots: true,
+                    closed: false,
                     state: LayoutState::Constructing(*n),
                 }),
                 ..o
@@ -1448,6 +1461,24 @@ pub fn signature(op: &Opcode, args: &[Type], m: &Module) -> SigResult {
                 kind: ObjKind::Function(Some(*s)),
                 ..o
             }))
+        }
+        MethodLoad { atom, script, .. } => {
+            arity(args, 1)?;
+            let o = obj(&args[0], "method.load")?;
+            let c = o.layout.ok_or("method.load: receiver has no layout claim")?;
+            want(c.closed && c.state == LayoutState::Published, || {
+                "method.load: receiver is not a closed published layout".into()
+            })?;
+            // Every layout the receiver may be lacks the name: CLOSED then
+            // says it is not the receiver's own.
+            for k in c.keys.lo.get()..=c.keys.hi.get() {
+                let has = m
+                    .layouts
+                    .get(&crate::ids::LayoutKey::new(k))
+                    .is_some_and(|l| l.fields.iter().flatten().any(|f| f.name == *atom));
+                want(!has, || format!("method.load: layout L{k} has the name"))?;
+            }
+            Sig::output(Type::Obj(ObjInfo::kind(ObjKind::Function(Some(*script)))))
         }
         IntToI32 => {
             arity(args, 1)?;
@@ -1951,6 +1982,7 @@ pub fn signature(op: &Opcode, args: &[Type], m: &Module) -> SigResult {
                     keys: KeyRange::one(*key),
                     types: *types,
                     slots: true,
+                    closed: false,
                     state: LayoutState::Constructing(*n),
                 }),
                 ..ObjInfo::TOP
@@ -2107,9 +2139,13 @@ pub fn signature(op: &Opcode, args: &[Type], m: &Module) -> SigResult {
                 c.keys.lo == c.keys.hi && n as usize == layout.fields.len(),
                 || "publish_layout: not every field is initialized".into(),
             )?;
+            // Exactly the row (a constructing state is exact: anything
+            // that might add to the object kills it), so CLOSED where the
+            // layout may be.
             Sig::result(Type::Obj(ObjInfo {
                 layout: Some(LayoutClaim {
                     state: LayoutState::Published,
+                    closed: layout.closed,
                     ..c
                 }),
                 ..o
@@ -2137,6 +2173,7 @@ pub fn signature(op: &Opcode, args: &[Type], m: &Module) -> SigResult {
                     keys: KeyRange::one(*k),
                     types: true,
                     slots: true,
+                    closed: false,
                     state: LayoutState::Constructing(0),
                 }),
             }))
@@ -2664,6 +2701,8 @@ pub fn effects(op: &Opcode, args: &[Type], m: &Module) -> Effects {
         // Reading a rope's chars flattens it, which allocates.
         StrCharCodeAt => fx.may_gc = true,
         LoadGName(b) => fx.reads = vec![Region::Global(*b)],
+        // Its cell, which the runtime arms and unarms.
+        MethodLoad { .. } => fx.reads = vec![Region::Unknown],
         StoreGName(b) => {
             fx.writes = vec![Region::Global(*b)];
             fx.kill = KillPattern::of(store_gname_kills(*b, m));

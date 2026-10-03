@@ -148,6 +148,11 @@ impl Maps {
             StoreGName(b) => StoreGName(self.bindings[&b]),
             CheckNative(n) => CheckNative(self.natives[&n]),
             AccessorProbe(a, set) => AccessorProbe(self.atom(a), set),
+            MethodLoad { cell, atom, script } => MethodLoad {
+                cell,
+                atom: self.atom(atom),
+                script,
+            },
             JsRt(r) => JsRt(r.map_atoms(|a| self.atom(a))),
             Restamp(i) => Restamp(self.restamp_base + i),
             ConstObj(_) | GuardSingleton(_) | CallNative(_) => {
@@ -212,6 +217,7 @@ fn merge_module(mm: &mut Module, k: &Module) -> Result<Maps, String> {
         if mine.elements.is_none() {
             mine.elements = lay.elements;
         }
+        mine.closed |= lay.closed;
         if mine.fields.len() < lay.fields.len() {
             mine.fields.resize(lay.fields.len(), None);
         }

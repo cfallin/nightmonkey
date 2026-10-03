@@ -137,9 +137,13 @@ pub(crate) fn typed_restamp_args(ctx: &TranslateCtx<'_>, si: &StampCtorIn) -> Op
 
 /// The validity bits a ctor-exit stamp of `si` carries forward: SLOTS,
 /// plus SHALLOW/RANGES only when the layout has masked fields / range
-/// claims (see `emit_class_idx_stamp_impl`).
+/// claims (see `emit_class_idx_stamp_impl`). And CLOSED where the layout
+/// may be, not as a bit to keep (under the sentinel it is a key bit) but
+/// to say the stamp sets it where the object holds exactly its row.
 pub(crate) fn ctor_stamp_keep_bits(si: &StampCtorIn) -> u32 {
-    CLASS_WORD_SLOTS
+    let closed = if si.closable { CLASS_WORD_CLOSED } else { 0 };
+    closed
+        | CLASS_WORD_SLOTS
         | if si.masks.iter().any(|m| !m.is_none()) { CLASS_WORD_SHALLOW } else { 0 }
         | if si.ranges.iter().any(Option::is_some) { CLASS_WORD_RANGES } else { 0 }
 }

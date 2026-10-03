@@ -1805,6 +1805,7 @@ impl Solver<'_> {
         self.emit_getter_names(&mut facts);
         let plan = LayoutPlan::build(self, &mut facts, &deleg);
         caps.add(&plan.caps);
+        facts.closed_layouts = self.closed_layouts(&plan);
         let totals = self.emit_site_facts(&mut facts, &plan);
         self.emit_arg_cls(&mut facts, &plan);
         self.emit_class_rows(&mut facts, &plan, &totals.typed_read_positions);
@@ -2478,6 +2479,13 @@ impl Solver<'_> {
                     let (glo, ghi) = plan.range_of(group)?;
                     plan.subrange_in(glo, ghi, name)
                 });
+            if found.is_none() && is_read {
+                if let Some(k) = self.method_pred(plan, &facts.closed_layouts, site, name, lo, hi) {
+                    facts
+                        .method_sites
+                        .insert(site, (LayoutKey::new(lo), LayoutKey::new(hi), name, k));
+                }
+            }
             if found.is_none() {
                 self.dump_prop_gap(site, name, is_read, "no-slot-fact", recv);
                 if self.opts.diagnostics.propgap {
@@ -2632,6 +2640,50 @@ impl Solver<'_> {
     /// one of them. The kill censuses say a fact died and `--dump-clsfact`
     /// says whether a consumer wanted one; this says why the analysis never
     /// made one, which is the only question the other two leave open.
+    /// The layouts whose class holds no property outside their row
+    /// (`closed_layouts`): every name the class's view has a value for
+    /// (elements aside, which are no named property) is in the row.
+    fn closed_layouts(&self, plan: &LayoutPlan) -> HashSet<LayoutKey> {
+        let mut held: HashMap<ClassId, HashSet<NameId>> = HashMap::default();
+        for (c, n, cell) in self.engine.field_cells() {
+            if n != self.names_of.elems && !self.engine.ts(cell).is_empty() {
+                held.entry(c).or_default().insert(n);
+            }
+        }
+        plan.rows
+            .iter()
+            .filter(|&(k, row)| {
+                plan.key_class
+                    .get(k)
+                    .is_some_and(|c| held.get(c).is_none_or(|ns| ns.iter().all(|n| row.names.contains(n))))
+            })
+            .map(|(&k, _)| LayoutKey::new(k))
+            .collect()
+    }
+
+    /// A read of `name` at `site` on receivers of layouts `lo..=hi`, none
+    /// of whose rows has the name: its predicted method, where the read's
+    /// value is exactly one scripted function (of any number of closures)
+    /// and nothing else -- what the receivers' prototype chain holds.
+    fn method_pred(
+        &self,
+        plan: &LayoutPlan,
+        closed: &HashSet<LayoutKey>,
+        site: Site,
+        name: NameId,
+        lo: u32,
+        hi: u32,
+    ) -> Option<ScriptId> {
+        if (lo..=hi).any(|k| plan.names(k).contains(&name) || !closed.contains(&LayoutKey::new(k))) {
+            return None;
+        }
+        let ts = self.site_read_ts.get(&site)?;
+        match (ts.fns.ids(), ts.prims.is_empty(), ts.unknown, ts.obj) {
+            ([f], true, false, ObjType::Empty) => f.as_script(),
+            _ => None,
+        }
+    }
+
     fn dump_prop_gap(
         &self,
         site: Site,

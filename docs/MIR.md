@@ -287,6 +287,7 @@ Fences kill them like any other type (§4).
 |---|---|---|---|
 | identity (`keys`) | object has layout K | yes, killable | exit to baseline at the op's PC |
 | `TYPES` (+`RANGES`) | K's protected fields hold their predicted types (and ranges) | **yes, killable** | exit to baseline at the op's PC |
+| `CLOSED` | the object has no own property outside K's row (M5s) | **yes, killable** | the predicted-method read's IC arm |
 | `SLOTS` | K's fields sit in their predicted fixed slots | **no**: local to each op | the IC, staying in OPT |
 
 - **Identity and `TYPES` are part of what OPT means.**
@@ -2128,6 +2129,87 @@ What was measured:
   row, the engine's and the inline arms'), and the holder's slot (a
   per-site cell, or a prototype property fuse for Ion's constant method).
 These are design decisions for the owner.
+
+**M5s. CLOSED stamps and predicted methods (2026-10-03; the owner's
+answer to M5r's method loads).** A prototype method load read through the
+IC's holder way (~25 values) and then guarded the callee's script for an
+inlined call.
+- **CLOSED** (class word bit 19, a stamped word's only: under the
+  sentinel it is an early-key bit): the object has no own property outside
+  its layout's row. A type component (`LayoutClaim::closed`, guarded with
+  the identity in `guard.layout`'s masked compare), killed as `types` is
+  (`KillSet::CLOSED`, in `ALL`).
+  - Set where an object holds exactly its row: `publish_layout` (a
+    constructing state is exact), and the stamp gates (MIR's inline stamp
+    and restamp, the runtime's `ctor_stamp`/`ctor_restamp`) where the
+    word keeps SLOTS and the span is the row's length.
+  - Only for layouts in `closed_layouts`: those whose class the analysis
+    never sees hold a property outside the row (no value in a view cell
+    for another name). A stamp's keep mask carries CLOSED as that flag,
+    never as a bit to keep. Without it, objects that grow by design (a
+    prefix layout's, splay's nodes given `left`/`right` later) each
+    cleared the bit once, bumping the epoch, which made every call
+    around them dirty: an exit storm (raytrace 212 -> 233k exits, splay
+    36 -> 196k).
+  - Cleared, with an epoch bump, by any add to a CLOSED object (all its
+    row is there, so the add is outside it): the engine's add hook
+    (`NightAddPropCheck`), and SLOTS's clear, which takes it along, so
+    CLOSED implies SLOTS. The compiled add arm (`set_ic_trans`) sends a
+    CLOSED receiver to the helper, a test folded into its SLOTS-keyed
+    path. `DemotedForMir` counts it.
+  - Fixed on the way: `set_ic_trans` read a stamped word's bits 18..29 as
+    part of the layout key (an advance-ineligible word's key was off by
+    one); it now selects by the sentinel.
+- **Predicted methods** (`method_sites`): a read the analysis gives no
+  slot fact, of layouts all closable and none of whose rows has the
+  name, whose value is exactly one scripted function. `method.load cell,
+  name, script` on the receiver guarded `L.. closed`: its prototype (shape,
+  base shape, proto: three loads) is the one the method cell
+  (`methodCellsPtr`, 16 bytes: prototype, function) is armed for, giving
+  the function, typed `Function(script)`; a miss on an unarmed cell calls
+  `night_runtime_method_arm` (a leaf) and tests again. The read's other
+  arm (a receiver of another layout or not CLOSED, another prototype, a
+  cell that cannot arm) reads through the IC and guards the script,
+  exiting after the read on a miss; both arms join typed, so the call
+  through the value needs no callee guard (`js_call_proven`, inlined
+  directly).
+  - Arming walks the prototype chain from the receiver's prototype
+    (native, tenured, resolve-free) to the holder of a data property
+    holding a tenured compiled function of the script, sets the holder's
+    ObjectFuse flag (GC suppressed) and marks the property constant
+    (`tryOptimizeConstantProperty`). A cell that cannot arm holds 1 until
+    the next GC (a minor GC can tenure what it needed).
+  - Unarming: the engine's new hook `objectFuseInvalidated(cx, fuse,
+    slot)`, called wherever ObjectFuse invalidates Ion's constant-property
+    dependencies: the holder's property written, deleted or made an
+    accessor (a value change), the name added to a prototype below the
+    holder (shape teleporting's shadowing), a prototype changed on the
+    chain, a swap. A major GC zeroes every cell. The engine's own paths
+    are the only writers of the holder (the IC fills refuse Watchtower-
+    watched objects, and setting the flag resets the holder's word, so no
+    typed store reaches it).
+  - `method.load` folds like a guard, dropped from availability at any op
+    that may run script, writes or kills (a data store to the holder runs
+    none). It is not hoisted: its type is not killable.
+  - A class made by a factory shares its scripts with the factory's other
+    classes, and so a cell (one per layouts, name and script), armed for
+    one prototype: the others read through the IC.
+- Fixed-work value census (against the item 3 build): richards -7.9%,
+  deltablue -5.7%, earley-boyer -1.5% (the instanceof change), raytrace
+  +0.5% (the add arm's CLOSED test and key fix, 7 values per compiled
+  add), the rest unchanged. Exits: unchanged.
+- Open: an inlined method re-guards its `this` (`guard.layout ... types
+  slots`) on a value the call site's receiver guard does not fold with
+  (a box/unbox apart); richards' remaining `guard.layout`/
+  `guard.unbox.obj` are mostly these.
+- Night test: mir-method-fuse.js (each case its own classes: the holder's
+  property rewritten, made an accessor, deleted; the name given to
+  receivers by the engine and by a compiled add the analysis does not
+  see; to a prototype below the holder; a chain prototype and receivers
+  given other prototypes; receivers made with a reassigned `prototype`).
+  It fails against mutants that skip the prototype compare, leave cells
+  armed at the hook, never clear CLOSED, and let the compiled add arm
+  replay onto a CLOSED object.
 
 **M6. The rest of §10**: box/unbox cleanup, memory optimizations, and
 numeric optimizations, each with its guard-count and instruction-count

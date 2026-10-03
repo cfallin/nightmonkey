@@ -80,6 +80,9 @@ pub fn dump_facts(facts: &LikelyFacts, path: &str) {
     for (&name, &k) in &facts.gname_fns {
         lines.push(format!("gname_fns {} = {k}", esc(facts.names.get(name))));
     }
+    for (site, &(lo, hi, name, k)) in &facts.method_sites {
+        lines.push(format!("method_sites {site} = L{lo}..L{hi} {} {k}", esc(facts.names.get(name))));
+    }
     for (&site, &claim) in &facts.call_types {
         lines.push(format!("call_types {site} = {:#x}", claim.bits()));
     }

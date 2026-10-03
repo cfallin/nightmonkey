@@ -503,6 +503,8 @@ pub fn build_inprocess_batch(
         mathNativesPtr: env.math_natives_base,
         appendCachePtr: env.append_cache_base,
         accessorCachePtr: env.accessor_cache_base,
+        methodCellsPtr: env.method_cells_base,
+        methodCellsLen: env.method_cells_len,
     };
 
     let mut header = [0u32; ENV_DESC_WORDS];
@@ -694,6 +696,7 @@ mod tests {
         "night_runtime_set_elem_pure",
         "night_runtime_new_this",
         "night_runtime_new_this_init",
+        "night_runtime_method_arm",
         "night_runtime_bigint",
         "night_runtime_non_syntactic_global_this",
         "night_runtime_set_intrinsic",

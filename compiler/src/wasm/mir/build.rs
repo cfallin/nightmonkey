@@ -108,6 +108,7 @@ impl Ty {
                     keys,
                     types,
                     slots,
+                    closed: false,
                     state: LayoutState::Published,
                 }),
                 ..ObjInfo::TOP
@@ -118,6 +119,7 @@ impl Ty {
                     keys: KeyRange::one(crate::ids::LayoutKey::new(key)),
                     types,
                     slots: true,
+                    closed: false,
                     state: LayoutState::Constructing(n),
                 }),
                 ..ObjInfo::TOP
@@ -543,6 +545,8 @@ const NARROW_TESTS: bool = true;
 /// read as that function behind its value fuse's predicted state
 /// (`check.binding.fn`).
 const PREDICTED_GNAMES: bool = true;
+/// Reads of predicted methods through their cells (`method.load`).
+const METHOD_LOADS: bool = true;
 
 /// An inlined `new` of a constructor whose body starts by storing its
 /// formals into its first fields makes the object with them
@@ -2274,7 +2278,9 @@ impl<'s, 'a> Run<'s, 'a> {
                 (a, claim)
             })
             .collect();
+        let closed = self.s.ctx.closed_layouts_in.contains(&key);
         let l = self.mm.layouts.entry(crate::ids::LayoutKey::new(key)).or_default();
+        l.closed |= closed;
         if l.fields.len() > out.len() {
             return None;
         }
@@ -2625,7 +2631,7 @@ impl<'s, 'a> Run<'s, 'a> {
         let types = (lo.get()..=hi.get()).all(|k| self.s.types_bit(k) != 0);
         // SLOTS too: `this`'s accesses have slot predictions.
         let ty = Ty::Obj(keys, types, true);
-        let g = self.guard(Opcode::GuardLayout { keys, types, slots: true }, vec![o], ty.mir());
+        let g = self.guard(Opcode::GuardLayout { keys, types, slots: true, closed: false }, vec![o], ty.mir());
         self.st.pop();
         self.push(g, ty);
     }
@@ -2778,7 +2784,7 @@ impl<'s, 'a> Run<'s, 'a> {
                 let t = types.unwrap_or(false);
                 let s = site.slotted;
                 let ty = Ty::Obj(keys, t, s);
-                let g = self.guard(Opcode::GuardLayout { keys, types: t, slots: s }, vec![recv.v], ty.mir());
+                let g = self.guard(Opcode::GuardLayout { keys, types: t, slots: s, closed: false }, vec![recv.v], ty.mir());
                 for x in self.st.iter_mut() {
                     if x.v == recv.v {
                         *x = Slot { v: g, ty };
@@ -3295,6 +3301,168 @@ impl<'s, 'a> Run<'s, 'a> {
     /// Guard boxed receiver `x` to an object of the site's layouts (§4.3):
     /// an object tag test, then the stamp compare, branching to `fallback`
     /// (no params) when either fails.
+    /// `recv.a` at a predicted-method site (`method_sites`), the read before
+    /// `next`: on a receiver of the site's layouts, CLOSED (no own property
+    /// outside the row, which lacks the name), the function its method
+    /// cell holds for the receiver's prototype (`method.load`); else
+    /// through the IC, whose value must be a function of the predicted
+    /// script or the read exits after it. The result is typed that
+    /// function either way, so a call through it needs no callee guard.
+    fn method_get(&mut self, next: Pc, a: mir::entity::AtomId, recv: Slot) -> bool {
+        let Some(&ms) = self.s.ctx.method_sites_in.get(&self.site(self.pc)).filter(|_| METHOD_LOADS) else {
+            return false;
+        };
+        // The IC arm exits after the read, with its value pushed.
+        let depth = self.st.len() + 1 - self.frame_len();
+        if self.s.depths.at(next) != Some(u32::try_from(depth).unwrap()) {
+            return false;
+        }
+        let k = ms.script;
+        self.mm.script_addrs.insert(k, ms.script_addr);
+        let fobj = MType::Obj(ObjInfo::kind(ObjKind::Function(Some(k))));
+        let ft = mir::ops::box_type(&fobj).expect("an object boxes");
+        let data = self.data_get_ok(a);
+        if !data {
+            self.demote_for_generic_arm(1);
+        }
+        let x = self.boxed(recv);
+        let join = self.new_block();
+        let jr = self.f.add_param(join, ft);
+        let generic = self.new_block();
+        // The cell's arm.
+        let ob = self.new_block();
+        let o = self.f.add_param(ob, MType::OBJ_TOP);
+        self.term(
+            Opcode::GuardUnbox(UnboxKind::Obj),
+            vec![x],
+            vec![
+                Edge {
+                    block: ob,
+                    args: vec![EdgeArg::Out(0)],
+                },
+                Self::goto(generic),
+            ],
+        );
+        self.at(ob);
+        let keys = KeyRange {
+            lo: crate::ids::LayoutKey::new(ms.layout_id),
+            hi: crate::ids::LayoutKey::new(ms.hi_layout_id),
+        };
+        let lt = MType::Obj(ObjInfo {
+            layout: Some(LayoutClaim {
+                keys,
+                types: false,
+                slots: false,
+                closed: true,
+                state: LayoutState::Published,
+            }),
+            ..ObjInfo::TOP
+        });
+        let lb = self.new_block();
+        let lo = self.f.add_param(lb, lt);
+        self.term(
+            Opcode::GuardLayout {
+                keys,
+                types: false,
+                slots: false,
+                closed: true,
+            },
+            vec![o],
+            vec![
+                Edge {
+                    block: lb,
+                    args: vec![EdgeArg::Out(0)],
+                },
+                Self::goto(generic),
+            ],
+        );
+        self.at(lb);
+        let mb = self.new_block();
+        let mv = self.f.add_param(mb, fobj);
+        self.term(
+            Opcode::MethodLoad {
+                cell: ms.cell_addr,
+                atom: a,
+                script: k,
+            },
+            vec![lo],
+            vec![
+                Edge {
+                    block: mb,
+                    args: vec![EdgeArg::Out(0)],
+                },
+                Self::goto(generic),
+            ],
+        );
+        self.at(mb);
+        let bv = self.inst(Opcode::Box, vec![mv], Some(ft));
+        self.jump_with(join, bv);
+        // The IC's arm, its value the predicted function or an exit.
+        self.at(generic);
+        let r = if data {
+            self.data_get(a, x)
+        } else {
+            self.js(Opcode::JsGetProp(a), vec![x], MType::VAL_TOP)
+        };
+        let mut st = self.st.clone();
+        st.push(Slot {
+            v: r,
+            ty: Ty::Val(TagSet::ALL),
+        });
+        let saved = (self.cur, self.live);
+        let fail = self.new_block();
+        self.at(fail);
+        let ops = self.exit_operands(next, &st);
+        let eop = self.exit_op(next, false);
+        self.term(eop, ops, vec![]);
+        (self.cur, self.live) = saved;
+        let gb = self.new_block();
+        let go = self.f.add_param(gb, MType::OBJ_TOP);
+        self.term(
+            Opcode::GuardUnbox(UnboxKind::Obj),
+            vec![r],
+            vec![
+                Edge {
+                    block: gb,
+                    args: vec![EdgeArg::Out(0)],
+                },
+                Self::goto(fail),
+            ],
+        );
+        self.at(gb);
+        let sb = self.new_block();
+        let so = self.f.add_param(sb, fobj);
+        self.term(
+            Opcode::GuardScript(k),
+            vec![go],
+            vec![
+                Edge {
+                    block: sb,
+                    args: vec![EdgeArg::Out(0)],
+                },
+                Self::goto(fail),
+            ],
+        );
+        self.at(sb);
+        let bv = self.inst(Opcode::Box, vec![so], Some(ft));
+        self.jump_with(join, bv);
+        self.at(join);
+        self.push(jr, Ty::Fn(k));
+        true
+    }
+
+    /// End the current block with a jump to `b`, passing `v`.
+    fn jump_with(&mut self, b: mir::Block, v: mir::Value) {
+        self.term(
+            Opcode::Jump,
+            vec![],
+            vec![Edge {
+                block: b,
+                args: vec![EdgeArg::Value(v)],
+            }],
+        );
+    }
+
     fn guard_layout_or(&mut self, x: mir::Value, site: &TypedSite, fallback: mir::Block) -> mir::Value {
         let ob = self.new_block();
         let o = self.f.add_param(ob, MType::OBJ_TOP);
@@ -3319,6 +3487,7 @@ impl<'s, 'a> Run<'s, 'a> {
                 keys,
                 types: site.types,
                 slots: site.slotted,
+                closed: false,
                 state: LayoutState::Published,
             }),
             ..ObjInfo::TOP
@@ -3330,6 +3499,7 @@ impl<'s, 'a> Run<'s, 'a> {
                 keys,
                 types: site.types,
                 slots: site.slotted,
+                closed: false,
             },
             vec![o],
             vec![
@@ -4909,7 +5079,7 @@ impl<'s, 'a> Run<'s, 'a> {
                     let ok = self.new_block();
                     let out = self.f.add_param(ok, t.mir());
                     self.term(
-                        Opcode::GuardLayout { keys, types, slots },
+                        Opcode::GuardLayout { keys, types, slots, closed: false },
                         vec![o],
                         vec![
                             Edge {
@@ -6121,6 +6291,9 @@ impl<'s, 'a> Run<'s, 'a> {
                     return Ok(());
                 }
                 if self.accessor_get(pc, a, recv) {
+                    return Ok(());
+                }
+                if self.method_get(pc + op.len(), a, recv) {
                     return Ok(());
                 }
                 let site = self

@@ -377,6 +377,20 @@ pub struct LikelyFacts {
     /// "predicted" state only while the binding holds a function of that
     /// script, and a read compiled against it tests that state.
     pub gname_fns: HashMap<NameId, ScriptId>,
+    /// Per property-read site, a predicted method: the receiver's layouts
+    /// (the key range `lo..=hi`) all lack the name, and the read's value is
+    /// exactly one scripted function, which the receivers' prototype chain
+    /// holds. A prediction: a `method.load` reads it from a cell the
+    /// runtime arms only while the chain resolves the name to a compiled
+    /// function of that script, held by a constant (ObjectFuse) property.
+    pub method_sites: HashMap<Site, (LayoutKey, LayoutKey, NameId, ScriptId)>,
+    /// The layouts whose class the analysis never sees hold a property
+    /// outside the layout's row: a stamp of one may say CLOSED (no own
+    /// property outside the row), and adding one to it is a surprise, not a
+    /// stage of its construction (a prefix layout's object, or one given
+    /// fields later, would clear the bit, and bump the stamp epoch, once
+    /// per object).
+    pub closed_layouts: HashSet<LayoutKey>,
     /// Per-element-site likely typed-array kind: at a GetElem/SetElem,
     /// the receiver class's element kind when it settled on a single one. Consumed as a guarded-monomorphic inline
     /// read/store arm (clasp guard + kind-specific access); a wrong prediction

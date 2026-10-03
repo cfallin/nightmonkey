@@ -83,6 +83,8 @@
 #include "vm/JSContext.h"    // JSContext::nightStack
 #include "vm/JSFunction.h"  // JSFunction, js::SetFunctionName, CloneFunctionReuseScript
 #include "vm/JSScript.h"          // JSScript, BaseScript::gcthings
+#include "gc/GC.h"                // js::gc::AutoSuppressGC
+#include "vm/ObjectFuse.h"        // js::ObjectFuse (predicted-method cells)
 #include "vm/ObjectOperations.h"  // js::DefineAccessorProperty
 #include "vm/RegExpObject.h"      // js::CloneRegExpObject
 #include "vm/Shape.h"             // js::BaseShape::offsetOfProto
@@ -2682,12 +2684,13 @@ static bool SetPropCached(JSContext* cx, uint32_t top, uint64_t recv,
                           bool vouched);
 
 // Whether a store that changed `obj`'s word from `before` to `after`
-// demoted a claim of its published class MIR reads: TYPES or SLOTS, or the
-// class itself. RANGES, which no MIR claim reads, may drop as on every
+// demoted a claim of its published class MIR reads: TYPES, SLOTS or CLOSED,
+// or the class itself. RANGES, which no MIR claim reads, may drop as on every
 // engine store; a word under construction backs no fact past a generic op
 // (the builder demotes its `Ctor` slots).
 static bool DemotedForMir(uint32_t before, uint32_t after) {
-  constexpr uint32_t claims = js::night::kWordTypes | js::night::kWordSlots;
+  constexpr uint32_t claims = js::night::kWordTypes | js::night::kWordSlots |
+                               js::night::kWordClosed;
   return !(before & js::night::kWordConstructing) &&
          (((before & claims) & ~after) != 0 ||
           ((before & 0xFFFF) != 0 && (after & 0xFFFF) == 0));
@@ -3259,6 +3262,141 @@ static void RefreshBindingCells() {
   }
 }
 
+// --- Predicted-method cells ------------------------------------------------
+//
+// A method load whose name the analysis resolves through the receiver's
+// prototype chain to one script (`method.load`) reads its function from a
+// cell (gEnv.methodCellsPtr, Night_methodCell*): armed, the cell holds the
+// receivers' prototype P and the function, which a property of a holder H
+// (P or above it) holds. The receiver is CLOSED (no own property outside
+// its row), so the name is not its own, and P is its prototype, so the
+// lookup starts there. What keeps the rest true is the holder's ObjectFuse:
+// H's property is marked constant, and whatever the engine invalidates
+// constant-property assumptions for -- a write, a delete or a redefinition
+// of it, the name added to a prototype below it (shape teleporting's
+// shadowing), a prototype change on the chain, a swap -- reaches
+// `NightObjectFuseInvalidated`, which unarms the cells that
+// depend on it. A major GC zeroes every cell (P or the function may die).
+struct MethodDep {
+  js::ObjectFuse* fuse;
+  uint32_t slot;
+  uint32_t cell;
+};
+static std::vector<MethodDep> gMethodDeps;
+
+static void ZeroMethodCells() {
+  if (gEnv.methodCellsPtr && gEnv.methodCellsLen) {
+    ZeroRegion(gEnv.methodCellsPtr, gEnv.methodCellsLen);
+  }
+  gMethodDeps.clear();
+}
+
+// A cell found not armable stays so (poisoned) until the next GC: one
+// that tenures a function or prototype may make it armable.
+static void UnpoisonMethodCells() {
+  if (!gEnv.methodCellsPtr) {
+    return;
+  }
+  for (uint32_t off = 0; off < gEnv.methodCellsLen;
+       off += js::night::Night_methodCellBytes) {
+    uint32_t* c = LinMem<uint32_t>(gEnv.methodCellsPtr + off);
+    if (c[0] == js::night::Night_methodCellPoison) {
+      c[0] = 0;
+    }
+  }
+}
+
+// Arm the method cell at `cellAddr` for receiver `recvBits` (an object of a
+// CLOSED layout, which compiled code has guarded): name `atomId` resolves
+// from its prototype, through native, tenured, resolve-free objects, to a
+// data property holding a compiled function of `scriptAddr`'s script,
+// tenured, which the holder's ObjectFuse can track as constant. 1 when
+// armed (the cell then matches this receiver's prototype); else 0, the
+// cell poisoned. A leaf: the holder's fuse flag is set with GC suppressed.
+int32_t night_runtime_method_arm(uint64_t recvBits, uint32_t cellAddr,
+                                 uint32_t atomId, uint32_t scriptAddr) {
+  JSContext* cx = gState.cx;
+  uint32_t* c = LinMem<uint32_t>(cellAddr);
+  if (!cx || !gNames.ids || atomId >= gNames.ids->size() || c[0] != 0) {
+    return 0;
+  }
+  c[0] = js::night::Night_methodCellPoison;
+  JS::Value rv = JS::Value::fromRawBits(recvBits);
+  if (!rv.isObject()) {
+    return 0;
+  }
+  JS::PropertyKey id = (*gNames.ids)[atomId].get();
+  JSObject* proto = rv.toObject().staticPrototype();
+  js::NativeObject* holder = nullptr;
+  mozilla::Maybe<js::PropertyInfo> prop;
+  for (JSObject* o = proto; o; o = o->staticPrototype()) {
+    if (!o->is<js::NativeObject>() || js::gc::IsInsideNursery(o) ||
+        o->hasDynamicPrototype()) {
+      return 0;
+    }
+    js::NativeObject* n = &o->as<js::NativeObject>();
+    if (js::ClassMayResolveId(cx->names(), n->getClass(), id, n)) {
+      return 0;
+    }
+    prop = n->lookupPure(id);
+    if (prop) {
+      holder = n;
+      break;
+    }
+  }
+  if (!holder || !prop->isDataProperty()) {
+    return 0;
+  }
+  JS::Value fv = holder->getSlot(prop->slot());
+  if (!js::night::NightIsCompiledFunctionOf(fv.asRawBits(), scriptAddr) ||
+      js::gc::IsInsideNursery(&fv.toObject())) {
+    return 0;
+  }
+  js::ObjectFuse* fuse = nullptr;
+  {
+    js::gc::AutoSuppressGC nogc(cx);
+    JS::Rooted<js::NativeObject*> h(cx, holder);
+    if (!h->hasObjectFuse() && !js::NativeObject::setHasObjectFuse(cx, h)) {
+      cx->recoverFromOutOfMemory();
+      return 0;
+    }
+    fuse = cx->zone()->objectFuses.getOrCreate(cx, h);
+    if (!fuse) {
+      cx->recoverFromOutOfMemory();
+      return 0;
+    }
+    // The flag reshaped the holder; its properties are the same.
+    prop = h->lookupPure(id);
+    if (!prop || !fuse->tryOptimizeConstantProperty(*prop)) {
+      return 0;
+    }
+  }
+  gMethodDeps.push_back({fuse, prop->slot(), cellAddr});
+  *reinterpret_cast<uint64_t*>(c + js::night::Night_methodCellFnOff / 4) =
+      fv.asRawBits();
+  c[0] = uint32_t(reinterpret_cast<uintptr_t>(proto));
+  return 1;
+}
+
+// The engine invalidated constant-property assumptions about `fuse`'s
+// object: the property in `slot`, or every one (UINT32_MAX). Unarm the
+// cells resting on them; they re-arm at their next miss if they still can.
+extern "C++" {
+void js::night::NightObjectFuseInvalidated(js::ObjectFuse* fuse,
+                                           uint32_t slot) {
+  for (size_t i = 0; i < gMethodDeps.size();) {
+    const MethodDep& d = gMethodDeps[i];
+    if (d.fuse == fuse && (slot == UINT32_MAX || d.slot == slot)) {
+      ZeroRegion(d.cell, js::night::Night_methodCellBytes);
+      gMethodDeps[i] = gMethodDeps.back();
+      gMethodDeps.pop_back();
+    } else {
+      i++;
+    }
+  }
+}
+}  // extern "C++"
+
 static void NightPurgeMovableCaches() {
   if (gEnv.propicGenPtr) {
     *LinMem<uint32_t>(gEnv.propicGenPtr + js::night::Night_hostGenOff) += 1;
@@ -3338,6 +3476,7 @@ static void NightPurgeMovableCaches() {
   // (auto-updated) values.
   RearmStringMethodCells();
   RearmBuiltinCells();
+  ZeroMethodCells();
 }
 
 // The purge points, all on the slice callback: `GC_CYCLE_BEGIN`/`GC_CYCLE_END`
@@ -3381,6 +3520,7 @@ static void NightNurseryEndCallback(JSContext* cx,
   // rooted values.
   RearmStringMethodCells();
   RearmBuiltinCells();
+  UnpoisonMethodCells();
   // Binding cells armed with a nursery value: the value moved, the slot is
   // the truth. Unarm and re-arm from it (a program that re-creates its
   // heap-view globals on every run never lets that view tenure, so it
@@ -4947,6 +5087,21 @@ int32_t night_runtime_mir_stress(uint32_t period) {
   return period != 0 && ++count % period == 0 ? 1 : 0;
 }
 
+// The stamp of `obj`, whose slots below `n` all hold properties, with
+// layout `layoutId`, keeping `keepBits` of its word `w0`; and CLOSED where
+// `keepBits` says the layout may be (as a bit of `w0` it is an early-key
+// bit, never kept) and those are its row's fields (SLOTS) and its only ones
+// (a span of `n`), as MIR's `or_closed_if_span`.
+static uint32_t NightClosedIfExact(js::NativeObject* obj, uint32_t layoutId,
+                                   uint32_t w0, uint32_t keepBits, uint32_t n) {
+  uint32_t w = (layoutId + 1) | (w0 & keepBits & ~js::night::kWordClosed);
+  if ((keepBits & js::night::kWordClosed) && (w & js::night::kWordSlots) &&
+      obj->is<js::PlainObject>() && obj->slotSpan() == n) {
+    w |= js::night::kWordClosed;
+  }
+  return w;
+}
+
 // The ctor-exit stamp's first-stamp form (MIR's `ctor_stamp_inline`),
 // as a helper: the same ownership and span gates, the same new word, no
 // epoch bump (a sentinel word carries no facts).
@@ -4969,7 +5124,7 @@ void night_runtime_ctor_stamp(uint64_t thisBits, uint32_t layoutId,
     return;
   }
   NightCensusTraceStamp("ctor", layoutId, w0, keepBits);
-  obj->setExternalWord((layoutId + 1) | (w0 & keepBits));
+  obj->setExternalWord(NightClosedIfExact(obj, layoutId, w0, keepBits, nFields));
 }
 
 // The restamp form (MIR's inline `restamp`), as a helper. No epoch
@@ -5009,7 +5164,7 @@ void night_runtime_ctor_restamp(uint64_t thisBits, uint32_t layoutId,
     return;
   }
   NightCensusTraceStamp("restamp", layoutId, w0, keepBits);
-  obj->setExternalWord((layoutId + 1) | (w0 & keepBits));
+  obj->setExternalWord(NightClosedIfExact(obj, layoutId, w0, keepBits, nFields));
 }
 
 // `FinalYieldRval`: close the completed generator.
@@ -6924,6 +7079,7 @@ bool js::night::NightSlotsCovered(js::NativeObject* obj, uint32_t n) {
 // SLOTS bit.
 void js::night::NightAddPropCheck(JSObject* obj, JS::PropertyKey id,
                                   uint32_t slot, uint32_t nfixed) {
+  js::night::NightClearClosedBit(obj);
   uint32_t w = obj->externalWord();
   if (MOZ_LIKELY((w & 0x00020000u) == 0)) {
     return;
