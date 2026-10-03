@@ -2077,7 +2077,8 @@ test, the class word's RANGES bit).
   materializing with `new_this.init`.
 - Octane A/B (xap, seeds x4): earley-boyer +12.9%, the rest within
   noise (crypto +2.4%, raytrace -1.9%).
-- Night test: mir-new-this-init.js (setters and read-only properties of
+- Night test: mir-new-this-init.js (`this` leaked mid-construction to a
+  callee that adds a field of its own, setters and read-only properties of
   field names arriving on the chain, a reassigned `prototype`, a longer
   chain, missing arguments, values outside a field's claim, GCs); it
   fails against a mutant that skips the chain's shape checks.

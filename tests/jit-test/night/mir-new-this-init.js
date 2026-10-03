@@ -134,3 +134,45 @@ for (var r = 0; r < 300; r++) {
   else if (r < 250) assertEq(o.v, "str" + r);
   else assertEq(o.v.r, r);
 }
+
+// `this` leaked mid-construction: after the prefilled fields (a callee
+// sees them, and from some point adds a field of its own before the
+// constructor's next), and from a setter for a field's name that arrives
+// on the chain (it sees the fields before it, and not those after).
+var leaked = null;
+var addZ = false;
+function peek(o) {
+  leaked = o;
+  if (addZ) o.z = 1;
+  return o.c === undefined ? o.a + o.b : -1;
+}
+function L(a, b) { this.a = a; this.b = b; this.seen = peek(this); this.c = a + b; }
+function mkL(i) { return new L(i, i * 3); }
+for (var r = 0; r < 300; r++) {
+  addZ = r >= 200;
+  var o = mkL(r);
+  assertEq(leaked, o);
+  assertEq(o.seen, r * 4);
+  assertEq(keysOf(o), addZ ? "a,b,z,seen,c" : "a,b,seen,c");
+  assertEq(o.c, r * 4);
+}
+function S(p, q, s) { this.p = p; this.q = q; this.s = s; }
+function mkS(i) { return new S(i, i + 1, i + 2); }
+var midKeys = [];
+for (var r = 0; r < 300; r++) {
+  if (r == 150) {
+    Object.defineProperty(S.prototype, "q", {
+      set(v) { leaked = this; midKeys.push(keysOf(this) + ":" + v); }, configurable: true,
+    });
+  }
+  if (r == 250) delete S.prototype.q;
+  var o = mkS(r);
+  if (r >= 150 && r < 250) {
+    assertEq(leaked, o);
+    assertEq(keysOf(o), "p,s");
+    assertEq(midKeys[midKeys.length - 1], "p:" + (r + 1));
+  } else {
+    assertEq(keysOf(o), "p,q,s");
+  }
+}
+assertEq(midKeys.length, 100);
