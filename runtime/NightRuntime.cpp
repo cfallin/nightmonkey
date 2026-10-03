@@ -2595,7 +2595,8 @@ uint32_t night_runtime_get_prop_ic_miss(JSContext* cx, uint32_t top,
 
 static uint32_t SetPropIcMiss(JSContext* cx, uint32_t top, uint64_t recv,
                               uint32_t atomId, uint64_t val, uint32_t cacheIdx,
-                              bool strict, bool vouched);
+                              bool strict, bool vouched,
+                              bool skipRows = false);
 static void NightCensusTraceSet(uint32_t atomId, uint32_t word,
                                 uint32_t flags);
 
@@ -2681,7 +2682,7 @@ static bool TryPureElementRead(JSContext* cx, uint32_t top, uint64_t recv,
                                uint64_t key);
 static bool SetPropCached(JSContext* cx, uint32_t top, uint64_t recv,
                           uint32_t atomId, uint64_t val, uint32_t cacheIdx,
-                          bool vouched);
+                          bool vouched, bool skipRows = false);
 
 // Whether a store that changed `obj`'s word from `before` to `after`
 // demoted a claim of its published class MIR reads: TYPES, SLOTS or CLOSED,
@@ -2938,7 +2939,7 @@ static void NoteSetShape(uint32_t cacheIdx, uint32_t recvShape,
 // one served the store.
 static bool SetPropCached(JSContext* cx, uint32_t top, uint64_t recv,
                           uint32_t atomId, uint64_t val, uint32_t cacheIdx,
-                          bool vouched) {
+                          bool vouched, bool skipRows) {
   SetNightTop(cx, top);
   // Add-transition row (linear-memory, after the site's ways; the
   // compiled body replays fixed-slot adds inline and only falls here for
@@ -2978,7 +2979,7 @@ static bool SetPropCached(JSContext* cx, uint32_t top, uint64_t recv,
       // so nearly every execution of the inline add arm finds an empty row
       // and lands here instead. The site row replays two proto hops; deeper
       // chains stay on the table alone.
-      if (trow.numProtos <= 4 && !trow.skip) {
+      if (trow.numProtos <= 4 && (!trow.skip || skipRows)) {
         uint32_t* srow = InlineTransRow(cacheIdx);
         uint32_t nfixed = JS::Value::fromRawBits(recv)
                               .toObject()
@@ -3006,9 +3007,11 @@ static bool SetPropCached(JSContext* cx, uint32_t top, uint64_t recv,
   return false;
 }
 
+// `skipRows`: the site's row may hold a transition that skips slots (an
+// `init_field` site, whose compiled replay initializes them; MIR.md §2.3).
 static uint32_t SetPropIcMiss(JSContext* cx, uint32_t top, uint64_t recv,
                               uint32_t atomId, uint64_t val, uint32_t cacheIdx,
-                              bool strict, bool vouched) {
+                              bool strict, bool vouched, bool skipRows) {
   SetNightTop(cx, top);
   JS::HandleId id = AtomIdChecked(atomId);
   // Fused globals: a fused global's write must never be served by the
@@ -3029,7 +3032,7 @@ static uint32_t SetPropIcMiss(JSContext* cx, uint32_t top, uint64_t recv,
       return kMissOk;
     }
   }
-  if (SetPropCached(cx, top, recv, atomId, val, cacheIdx, vouched)) {
+  if (SetPropCached(cx, top, recv, atomId, val, cacheIdx, vouched, skipRows)) {
     return kMissClean;
   }
   const MissQuiet quiet(cx);
@@ -3076,7 +3079,7 @@ static uint32_t SetPropIcMiss(JSContext* cx, uint32_t top, uint64_t recv,
       // served by the global table alone (its rows carry four hops), and so
       // is a transition that skips slots (the compiled replays do not
       // initialize them).
-      if (numProtos <= 4 && !skip) {
+      if (numProtos <= 4 && (!skip || skipRows)) {
         uint32_t* row = InlineTransRow(cacheIdx);
         uint32_t nfixed = obj->as<js::NativeObject>().numFixedSlots();
         FillTransRow(row, shapeBefore, newShape, slot, nfixed, protoPtrs,
@@ -3136,7 +3139,7 @@ static uint32_t SetPropIcMiss(JSContext* cx, uint32_t top, uint64_t recv,
 // site's add-transition row so the inline replay hits next time. The
 // object (a GC may have moved it) goes to the out-slot. Returns 1 iff the
 // object is still under construction with the caller's early key, with
-// `wantBits` (SLOTS, TYPES) set and exactly `expectSpan` slots: the
+// `wantBits` (SLOTS, TYPES) set and exactly the fields `expectSet`: the
 // constructing type the caller continues with. 0 leaves the rest of the
 // constructor to baseline (an add not done is done there; one done
 // becomes an overwrite). May GC.
@@ -3173,9 +3176,21 @@ uint32_t night_runtime_elem_grow(JSContext* cx, uint32_t top, uint64_t recv,
   return 1;
 }
 
+// Whether `obj`, under construction with word `w`, has exactly the fields
+// `set` of its layout (bit i: field i, at slot i): the word's set and the
+// span of the fields (any other property would raise it), as MIR's
+// `guard.ctor`.
+static bool NightHasExactlyFields(js::NativeObject* obj, uint32_t w,
+                                  uint32_t set) {
+  uint32_t span = set ? 32 - mozilla::CountLeadingZeroes32(set) : 0;
+  return (w & ((1u << js::night::kCtorSetBits) - 1)) ==
+             (set & ((1u << js::night::kCtorSetBits) - 1)) &&
+         obj->slotSpan() == span;
+}
+
 uint32_t night_runtime_init_field(JSContext* cx, uint32_t top, uint64_t recv,
                                   uint32_t atomId, uint64_t val,
-                                  uint32_t cacheIdx, uint32_t expectSpan,
+                                  uint32_t cacheIdx, uint32_t expectSet,
                                   uint32_t wantBits) {
   SetNightTop(cx, top);
   WriteNightOut(top, recv);
@@ -3189,7 +3204,8 @@ uint32_t night_runtime_init_field(JSContext* cx, uint32_t top, uint64_t recv,
   if (!PlainStore(obj, id) || obj->as<js::NativeObject>().lookupPure(id).isSome()) {
     return 0;
   }
-  uint32_t r = SetPropIcMiss(cx, top, recv, atomId, val, cacheIdx, false, true);
+  uint32_t r =
+      SetPropIcMiss(cx, top, recv, atomId, val, cacheIdx, false, true, true);
   WriteNightOut(top, JS::ObjectValue(*obj).asRawBits());
   if (r == kMissErr) {
     cx->clearPendingException();
@@ -3198,7 +3214,8 @@ uint32_t night_runtime_init_field(JSContext* cx, uint32_t top, uint64_t recv,
   uint32_t w = obj->externalWord();
   return (w & (js::night::kWordConstructing | 0x3FFC0000u)) == key &&
                  (w & wantBits) == wantBits &&
-                 obj->as<js::NativeObject>().slotSpan() == expectSpan
+                 NightHasExactlyFields(&obj->as<js::NativeObject>(), w,
+                                       expectSet)
              ? 1
              : 0;
 }
@@ -5140,7 +5157,8 @@ void night_runtime_ctor_restamp(uint64_t thisBits, uint32_t layoutId,
   }
   js::NativeObject* obj = &v.toObject().as<js::NativeObject>();
   uint32_t w0 = obj->externalWord();
-  uint32_t idx = w0 & 0xFFFF;
+  // Under the sentinel the low half is a set of fields, not an identity.
+  uint32_t idx = w0 & js::night::kWordConstructing ? 0 : w0 & 0xFFFF;
   if (idx == layoutId + 1) {
     return;
   }
@@ -6713,7 +6731,7 @@ uint32_t night_runtime_new_this_init(JSContext* cx, uint32_t top,
     uint64_t val = *LinMem<uint64_t>(valsAddr + 8 * i);
     uint32_t r = night_runtime_init_field(
         cx, top, JS::ObjectValue(*obj).asRawBits(), row[i], val, cache0 + i,
-        i + 1, wantBits);
+        (2u << i) - 1, wantBits);
     if (!r) {
       return cx->isExceptionPending() ? 0 : 2;
     }
@@ -7160,6 +7178,11 @@ void js::night::NightAddPropCheck(JSObject* obj, JS::PropertyKey id,
     }
   } else {
     clear = slot >= nfixed || slot != pos;
+    // A field of the layout under construction, at its slot: into the
+    // word's set of the fields added (MIR.md §2.3).
+    if (!clear && (half & 0x8000) && pos < js::night::kCtorSetBits) {
+      obj->setExternalWord(obj->externalWord() | (1u << pos));
+    }
   }
   if (clear) {
     js::night::NightClearSlotsBit(obj, js::night::NightBumpSite::SlotsAddMismatch4);

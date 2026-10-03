@@ -448,13 +448,14 @@ uint32_t night_runtime_set_prop_pure(JSContext* cx, uint32_t top,
                                      uint64_t recv, uint32_t atomId,
                                      uint64_t val, uint32_t cacheIdx,
                                      uint32_t flags);
-// MIR's `init_field` slow path: the plain add of the next predicted field
-// to an object under construction; 1 iff it stays `constructing(n+1)`
-// (`expectSpan` slots, `wantBits` kept). The object to the out-slot. May GC.
+// MIR's `init_field` slow path: the plain add of a predicted field to an
+// object under construction; 1 iff it is then `constructing(expectSet)`
+// (exactly those fields of its layout, bit i field i; `wantBits` kept).
+// The object to the out-slot. May GC.
 NIGHT_RUNTIME_EXPORT(night_runtime_init_field)
 uint32_t night_runtime_init_field(JSContext* cx, uint32_t top, uint64_t recv,
                                   uint32_t atomId, uint64_t val,
-                                  uint32_t cacheIdx, uint32_t expectSpan,
+                                  uint32_t cacheIdx, uint32_t expectSet,
                                   uint32_t wantBits);
 NIGHT_RUNTIME_EXPORT(night_runtime_ctor_stamp)
 void night_runtime_ctor_stamp(uint64_t thisBits, uint32_t layoutId,

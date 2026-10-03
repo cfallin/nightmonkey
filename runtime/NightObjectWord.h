@@ -74,6 +74,10 @@ static constexpr uint32_t kWordAdvIneligible = 0x00040000u;
 static constexpr uint32_t kWordClosed = 0x00080000u;
 static constexpr uint32_t kWordRanges = 0x40000000u;
 static constexpr uint32_t kWordConstructing = 0x80000000u;
+// Under the sentinel, the low half (a stamped word's identity) is the set
+// of the layout's fields added so far (bit i: field i), for the first
+// kCtorSetBits of them (MIR.md §2.3; FieldSet::WORD_BITS).
+static constexpr uint32_t kCtorSetBits = 16;
 
 // The engine-path store policy (JS::ExternalCompilerHooks store masks).
 // TYPES asserts that every field holds a value of its predicted type (any

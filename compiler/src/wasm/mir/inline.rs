@@ -39,7 +39,7 @@ pub(crate) struct Callee {
     /// normal return leaves it in, where they agree (fields added, or
     /// `None`: published, or disagreeing). The caller's next use of the
     /// object guards it back to that state (`guard.ctor`).
-    pub this_out: Option<(u32, u32, bool)>,
+    pub this_out: Option<(u32, crate::mir::types::FieldSet, bool)>,
     /// The sites it spliced itself, its callees' included (the caller's
     /// inlining budget counts them).
     pub sites: u32,

@@ -4183,7 +4183,9 @@ impl<'a> Lower<'a> {
                 // the bits at once. Over a range, the masked word less the
                 // lowest wanted word is at most the span only with every
                 // bit there (a missing bit, at 1 << 16 or above, wraps it).
-                let mask = self.i32c(0xFFFF | want);
+                // The sentinel too, which the expected word lacks: under
+                // it the low half is a set of fields, not an identity.
+                let mask = self.i32c(CLASS_WORD_SENTINEL | 0xFFFF | want);
                 let wm = self.bin(Operator::I32And, w, mask, Type::I32);
                 let exp = self.i32c((keys.lo.get() + 1) | want);
                 let ok = if keys.lo == keys.hi {
@@ -4201,20 +4203,24 @@ impl<'a> Lower<'a> {
             }
             Opcode::GuardCtor { key, n, types } => {
                 // Under construction for `key` (§2.3): the sentinel with
-                // its early key, SLOTS (and TYPES), and exactly `n` slots,
-                // in insertion order (a permuted shape's span may cover
-                // holes), so the first `n` fields.
+                // its early key, SLOTS (and TYPES), the word's field set
+                // `n`, and the span of `n` (every field is at its row's
+                // slot, so a property past them would raise it): exactly
+                // the fields `n`.
                 let w = self.load_i32(a[0], OBJ_CLASS_IDX_OFFSET);
                 let bits = CLASS_WORD_SLOTS | if types { CLASS_WORD_SHALLOW } else { 0 };
-                let m = self.i32c(CLASS_WORD_SENTINEL | (EARLY_KEY_MAX << EARLY_KEY_SHIFT) | bits);
-                let want = self.i32c(CLASS_WORD_SENTINEL | ((key.get() + 1) << EARLY_KEY_SHIFT) | bits);
+                let fm = (1 << mir::types::FieldSet::WORD_BITS) - 1;
+                let m = self.i32c(CLASS_WORD_SENTINEL | (EARLY_KEY_MAX << EARLY_KEY_SHIFT) | bits | fm);
+                let want = self.i32c(
+                    CLASS_WORD_SENTINEL | ((key.get() + 1) << EARLY_KEY_SHIFT) | bits | n.word_bits(),
+                );
                 let wm = self.bin(Operator::I32And, w, m, Type::I32);
                 let ok = self.bin(Operator::I32Eq, wm, want, Type::I32);
                 let shape = self.load_i32(a[0], SHAPE_OFFSET);
                 let imm = self.load_i32(shape, SHAPE_IMMUTABLE_FLAGS_OFFSET);
-                let sm = self.i32c((SHAPE_SMALL_SLOTSPAN_MASK_BITS << SHAPE_SMALL_SLOTSPAN_SHIFT) | SHAPE_PERMUTED_SLOTS_BIT);
+                let sm = self.i32c(SHAPE_SMALL_SLOTSPAN_MASK_BITS << SHAPE_SMALL_SLOTSPAN_SHIFT);
                 let span = self.bin(Operator::I32And, imm, sm, Type::I32);
-                let nv = self.i32c(n << SHAPE_SMALL_SLOTSPAN_SHIFT);
+                let nv = self.i32c(n.span() << SHAPE_SMALL_SLOTSPAN_SHIFT);
                 let s_ok = self.bin(Operator::I32Eq, span, nv, Type::I32);
                 let ok = self.bin(Operator::I32And, ok, s_ok, Type::I32);
                 self.guard(inst, ok, &[a[0]])?;
@@ -6684,6 +6690,13 @@ impl<'a> Lower<'a> {
         let mir::types::LayoutState::Constructing(n) = c.state else {
             return Err("lowering: init_field on a published object".into());
         };
+        let i = self
+            .mm
+            .layouts
+            .get(&c.keys.lo)
+            .and_then(|l| l.field(name))
+            .map(|(i, _)| u32::try_from(i).unwrap())
+            .ok_or("lowering: init_field of a field its layout lacks")?;
         let num = matches!(self.ty(d.args[1]), MType::Val(s) if s.tags.subset_of(TagSet::NUMBER));
         let at = self.atom(name);
         let cache = self.atoms.next_prop_cache();
@@ -6695,7 +6708,7 @@ impl<'a> Lower<'a> {
         let old = self.load_i32(row, IC_TRANS_OLDSHAPE);
         let m_old = self.bin(Operator::I32Eq, old, shape, Type::I32);
         self.check(m_old, slow);
-        let off = FIXED_SLOTS_BASE + 8 * n;
+        let off = FIXED_SLOTS_BASE + 8 * i;
         let slot_off = self.load_i32(row, IC_TRANS_SLOTOFF);
         let want = self.i32c(off);
         let at_slot = self.bin(Operator::I32Eq, slot_off, want, Type::I32);
@@ -6709,6 +6722,13 @@ impl<'a> Lower<'a> {
             let ok = self.bin(Operator::I32Or, empty, same, Type::I32);
             self.check(ok, slow);
         }
+        // An add past the span (a field ahead of others in the row): the
+        // slots it skips, which the new shape covers, hold undefined until
+        // their fields come.
+        for j in n.span()..i {
+            let u = self.i64c(UNDEF);
+            self.store_i64(obj, FIXED_SLOTS_BASE + 8 * j, u);
+        }
         self.store_i64(obj, off, val);
         let new_s = self.load_i32(row, IC_TRANS_NEWSHAPE);
         self.store_i32(obj, SHAPE_OFFSET, new_s);
@@ -6716,15 +6736,25 @@ impl<'a> Lower<'a> {
             let abs = self.load_i32(row, IC_TRANS_ABSSLOT);
             self.post_barrier(self.h.post_write_barrier, obj, abs, val);
         }
+        // The word: the field in its set; RANGES dropped (no MIR claim
+        // reads it). The word is the sentinel's, which no fact covers.
         let w = self.load_i32(obj, OBJ_CLASS_IDX_OFFSET);
-        self.clear_bits(obj, w, CLASS_WORD_RANGES);
+        let keep = self.i32c(!CLASS_WORD_RANGES);
+        let w = self.bin(Operator::I32And, w, keep, Type::I32);
+        let w = if i < mir::types::FieldSet::WORD_BITS {
+            let b = self.i32c(1 << i);
+            self.bin(Operator::I32Or, w, b, Type::I32)
+        } else {
+            w
+        };
+        self.store_i32(obj, OBJ_CLASS_IDX_OFFSET, w);
         let t = self.edge(inst, 0, &[obj])?;
         self.terminate(Terminator::Br { target: t });
         self.cur = slow;
         let live = self.live_across(inst);
         let recv = self.box_tagged(TAG_OBJECT, obj);
         let bits = CLASS_WORD_SLOTS | if c.types { CLASS_WORD_SHALLOW } else { 0 };
-        let (cv, sv, bv) = (self.i32c(cache), self.i32c(n + 1), self.i32c(bits));
+        let (cv, sv, bv) = (self.i32c(cache), self.i32c(n.with(i).0), self.i32c(bits));
         let (ok, out) = self.gc_call(self.h.init_field, &[recv, at, val, cv, sv, bv], &live)?;
         self.epoch_same = None;
         let o2 = self.un(Operator::I32WrapI64, out, Type::I32);
@@ -6746,10 +6776,15 @@ impl<'a> Lower<'a> {
             self.clear_bits(obj, w, CLASS_WORD_RANGES);
             return;
         };
-        let m16 = self.i32c(0xFFFF);
+        // A stamped word's identity (under the sentinel the low half is a
+        // set of fields).
+        let m16 = self.i32c(CLASS_WORD_SENTINEL | 0xFFFF);
         let idx = self.bin(Operator::I32And, w, m16, Type::I32);
         let lo = self.i32c(min);
-        let arr = self.bin(Operator::I32GeU, idx, lo, Type::I32);
+        let hi = self.i32c(0xFFFF);
+        let arr_lo = self.bin(Operator::I32GeU, idx, lo, Type::I32);
+        let arr_hi = self.bin(Operator::I32LeU, idx, hi, Type::I32);
+        let arr = self.bin(Operator::I32And, arr_lo, arr_hi, Type::I32);
         let (a, o, join) = (self.body.add_block(), self.body.add_block(), self.body.add_block());
         self.cond_br(arr, Self::to(a), Self::to(o));
         self.cur = a;
@@ -7101,7 +7136,9 @@ impl<'a> Lower<'a> {
         let hb = self.i32c(NURSERY_HEADER_BYTES);
         let obj = self.bin(Operator::I32Add, pos, hb, Type::I32);
         self.store_i32(obj, SHAPE_OFFSET, fshape);
-        let wv = self.i32c(word & !CLASS_WORD_RANGES);
+        // The fields' set with them.
+        let set = mir::types::FieldSet::prefix(u32::try_from(xs.len()).unwrap());
+        let wv = self.i32c((word & !CLASS_WORD_RANGES) | set.word_bits());
         self.store_i32(obj, OBJ_CLASS_IDX_OFFSET, wv);
         let slotsw = self.load_i32(cell, 8);
         self.store_i32(obj, NATIVE_SLOTS_OFFSET, slotsw);
@@ -8234,7 +8271,9 @@ impl<'a> Lower<'a> {
         self.cur = obj_b;
         let obj = self.un(Operator::I32WrapI64, this, Type::I32);
         let w0 = self.load_i32(obj, OBJ_CLASS_IDX_OFFSET);
-        let m16 = self.i32c(0xFFFF);
+        // A stamped word's identity (under the sentinel the low half is a
+        // set of fields).
+        let m16 = self.i32c(CLASS_WORD_SENTINEL | 0xFFFF);
         let idx = self.bin(Operator::I32And, w0, m16, Type::I32);
         let want = self.i32c(layout + 1);
         let already = self.bin(Operator::I32Eq, idx, want, Type::I32);

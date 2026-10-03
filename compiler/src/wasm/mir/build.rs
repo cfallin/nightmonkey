@@ -36,7 +36,7 @@ use crate::mir::ops::{
     RtOp, UnboxKind,
 };
 use crate::mir::types::{
-    IRange, KeyRange, LayoutClaim, LayoutState, ObjInfo, ObjKind, TagSet, Type as MType, I32_MAX, I32_MIN,
+    FieldSet, IRange, KeyRange, LayoutClaim, LayoutState, ObjInfo, ObjKind, TagSet, Type as MType, I32_MAX, I32_MIN,
 };
 use crate::opsem::{PRIM_BIGINT, PRIM_INT32, PRIM_NULL, PRIM_UNDEFINED};
 use crate::wasm::baseline::layout::{self, FrameLayout, StackDepths};
@@ -70,7 +70,7 @@ enum Ty {
     /// once every field is there. Its field accesses below `n` are typed;
     /// a fence (anything that may reach the object) demotes it to a boxed
     /// object, which the rest of the constructor treats generically.
-    Ctor(u32, u32, bool),
+    Ctor(u32, FieldSet, bool),
     /// A native object (`obj{Native}`, raw): its elements are addressable
     /// (`load_elem`, `store_elem`). Immutable, so no fence kills it.
     Native,
@@ -330,7 +330,7 @@ impl<'a> Shape<'a> {
         &self,
         k: ScriptId,
         fns: &[Option<ScriptId>],
-        this_ctor: Option<(u32, u32, bool)>,
+        this_ctor: Option<(u32, FieldSet, bool)>,
         ictx: InlineCtx,
     ) -> Option<std::rc::Rc<super::inline::Callee>> {
         let mut fns = fns.to_vec();
@@ -350,7 +350,7 @@ impl<'a> Shape<'a> {
         &self,
         k: ScriptId,
         fns: &[Option<ScriptId>],
-        this_ctor: Option<(u32, u32, bool)>,
+        this_ctor: Option<(u32, FieldSet, bool)>,
         ictx: InlineCtx,
     ) -> Option<super::inline::Callee> {
         if k == self.sid {
@@ -662,8 +662,8 @@ fn build_at<'a>(
     is_global: bool,
     ictx: InlineCtx,
     formal_fns: &[Option<ScriptId>],
-    this_ctor: Option<(u32, u32, bool)>,
-) -> Result<(mir::Module, mir::Func, Option<(u32, u32, bool)>, u32), String> {
+    this_ctor: Option<(u32, FieldSet, bool)>,
+) -> Result<(mir::Module, mir::Func, Option<(u32, FieldSet, bool)>, u32), String> {
     if is_global {
         return Err("global script".into());
     }
@@ -719,11 +719,12 @@ fn build_at<'a>(
     // them from the leading stores (`inline_construct`); no other builder
     // enters a constructor's body with its own object under construction
     // past its start.
-    if let Some((key, n, _)) = this_ctor.filter(|&(_, n, _)| n > 0) {
-        if ctx.stamp_ctors_in.get(&sid).is_some_and(|si| si.layout_id == key) {
+    if let Some((key, n, _)) = this_ctor.filter(|&(_, n, _)| n != FieldSet::EMPTY) {
+        let n = n.as_prefix().map_or(0, |n| n as usize);
+        if n > 0 && ctx.stamp_ctors_in.get(&sid).is_some_and(|si| si.layout_id == key) {
             let pre = ctor_formal_prefix(script);
-            if pre.len() >= n as usize {
-                shape.prefill_pcs = pre[..n as usize].iter().map(|&(_, _, pc)| pc).collect();
+            if pre.len() >= n {
+                shape.prefill_pcs = pre[..n].iter().map(|&(_, _, pc)| pc).collect();
             }
         }
     }
@@ -957,7 +958,7 @@ fn int32_demand(script: &Script, ops: &[Op]) -> std::collections::BTreeSet<Pc> {
 /// What the runs share: the script's decoded shape.
 /// A callee build's context (`callee_in`): the script, the known closures
 /// its formals receive, and the constructing `this` it receives, if any.
-type CalleeKey = (ScriptId, Vec<Option<ScriptId>>, Option<(u32, u32, bool)>, InlineCtx);
+type CalleeKey = (ScriptId, Vec<Option<ScriptId>>, Option<(u32, FieldSet, bool)>, InlineCtx);
 
 /// Where a callee is built for inlining: its
 /// depth, the sites it may splice itself, whether the root call site is
@@ -1033,7 +1034,7 @@ struct Shape<'a> {
     /// The object under construction the inlining call passes as `this`
     /// (`Ty::Ctor`: layout key, fields added, TYPES): the body is built
     /// for it, with no entry guard, as a context-sensitive callee build.
-    this_ctor: Option<(u32, u32, bool)>,
+    this_ctor: Option<(u32, FieldSet, bool)>,
     /// A constructor built for its own `this` already holding its first
     /// fields (`new_this.init` made them from its leading stores): the pcs
     /// of those stores, which this build skips (`ctor_formal_prefix`).
@@ -1228,14 +1229,14 @@ struct Run<'s, 'a> {
     /// (§2.3), or as an inlined callee left them: a field add or a method
     /// call through one guards the construction state again
     /// (`guard.ctor`), and continues typed.
-    ctor_hint: BTreeMap<mir::Value, (u32, u32, bool)>,
+    ctor_hint: BTreeMap<mir::Value, (u32, FieldSet, bool)>,
     /// Each constructed layout's fields and claims, registered in the
     /// module (`ctor_layout`); `None` where the table cannot hold them.
     ctor_layouts: BTreeMap<u32, Option<std::rc::Rc<Vec<(mir::entity::AtomId, MType)>>>>,
     /// The state `this` (a `Ctor`) is in at every return seen so far
     /// (`Callee::this_out`): `None` before the first, `Some(None)` once
     /// two disagree or one is anything else.
-    this_out: Option<Option<(u32, u32, bool)>>,
+    this_out: Option<Option<(u32, FieldSet, bool)>>,
     slot_cls: BTreeMap<usize, u32>,
     /// Values that are the frame's `this` (`FunctionThis`'s results),
     /// and the frame slots a write carries that to (`.this`).
@@ -2325,7 +2326,7 @@ impl<'s, 'a> Run<'s, 'a> {
         let Some(i) = fields.iter().position(|&(f, _)| f == a) else {
             return false;
         };
-        if i >= n as usize {
+        if !n.contains(u32::try_from(i).unwrap()) {
             return false;
         }
         let claim = if t { fields[i].1 } else { MType::VAL_TOP };
@@ -2351,10 +2352,10 @@ impl<'s, 'a> Run<'s, 'a> {
     /// the state the add expects (`guard.ctor`) first. `false` (nothing
     /// built) for any other store.
     fn ctor_set(&mut self, next: Pc, a: mir::entity::AtomId, recv: Slot, v: Slot) -> bool {
-        let (key, t, hinted) = match recv.ty {
-            Ty::Ctor(key, _, t) => (key, t, false),
+        let (key, t, hint) = match recv.ty {
+            Ty::Ctor(key, _, t) => (key, t, None),
             Ty::Val(_) => match self.ctor_hint.get(&recv.v) {
-                Some(&(key, _, t)) => (key, t, true),
+                Some(&(key, n, t)) => (key, t, Some(n)),
                 None => return false,
             },
             _ => return false,
@@ -2363,15 +2364,23 @@ impl<'s, 'a> Run<'s, 'a> {
         let Some(i) = fields.iter().position(|&(f, _)| f == a) else {
             return false;
         };
-        let recv = if hinted {
-            // The add of field `i` expects exactly `i` fields.
+        let iu = u32::try_from(i).unwrap();
+        let n = match recv.ty {
+            Ty::Ctor(_, n, _) => n,
+            _ => hint.unwrap(),
+        };
+        if !n.contains(iu) && !n.may_add(iu) {
+            return false;
+        }
+        let recv = if let Some(n) = hint {
+            // The state the object was left in.
             let o = self.guard(Opcode::GuardUnbox(UnboxKind::Obj), vec![recv.v], MType::OBJ_TOP);
             let g = Opcode::GuardCtor {
                 key: crate::ids::LayoutKey::new(key),
-                n: u32::try_from(i).unwrap(),
+                n,
                 types: t,
             };
-            let ty = Ty::Ctor(key, u32::try_from(i).unwrap(), t);
+            let ty = Ty::Ctor(key, n, t);
             let c = self.guard(g, vec![o], ty.mir());
             let s = Slot { v: c, ty };
             self.replace_slot(recv.v, s);
@@ -2379,15 +2388,12 @@ impl<'s, 'a> Run<'s, 'a> {
         } else {
             recv
         };
-        let Ty::Ctor(_, n, _) = recv.ty else { unreachable!() };
-        let n = n as usize;
-        if i > n {
-            return false;
-        }
+        let all = FieldSet::prefix(u32::try_from(fields.len()).unwrap());
         // A leading store `new_this.init` already made (the value is the
         // formal's, which nothing before it can have changed).
-        if self.s.prefill_pcs.get(i) == Some(&self.pc) && n == self.s.prefill_pcs.len() {
-            if i + 1 == n && n == fields.len() {
+        let pre = self.s.prefill_pcs.len();
+        if self.s.prefill_pcs.get(i) == Some(&self.pc) && n == FieldSet::prefix(u32::try_from(pre).unwrap()) {
+            if i + 1 == pre && n == all {
                 self.publish_ctor(key, t, recv.v);
             }
             return true;
@@ -2404,17 +2410,17 @@ impl<'s, 'a> Run<'s, 'a> {
         } else {
             self.guard(Opcode::GuardTags(ctags), vec![x], claim)
         };
-        if i < n {
+        if n.contains(iu) {
             let x = if t { x } else { self.weaken(x, MType::VAL_TOP) };
             self.store_mask = Some((vec![(key + 1, ctags)], false));
             self.js_dirty_exits(Opcode::StoreField(a), vec![recv.v, x], None, next, Some(v));
             return true;
         }
-        let ty = Ty::Ctor(key, u32::try_from(n + 1).unwrap(), t);
+        let ty = Ty::Ctor(key, n.with(iu), t);
         let o = self.guard(Opcode::InitField(a), vec![recv.v, x], ty.mir());
         let s = Slot { v: o, ty };
         self.replace_slot(recv.v, s);
-        if n + 1 == fields.len() {
+        if n.with(iu) == all {
             self.publish_ctor(key, t, o);
         }
         true
@@ -2476,7 +2482,7 @@ impl<'s, 'a> Run<'s, 'a> {
     /// inlined `targets` as `this`, after them: every callee's `this_out`,
     /// where they agree, is its next use's guard (`ctor_hint`).
     fn ctor_after(&mut self, targets: &[(ScriptId, std::rc::Rc<super::inline::Callee>)], boxed: mir::Value) {
-        let outs: Vec<Option<(u32, u32, bool)>> = targets.iter().map(|(_, c)| c.this_out).collect();
+        let outs: Vec<Option<(u32, FieldSet, bool)>> = targets.iter().map(|(_, c)| c.this_out).collect();
         match outs.first() {
             Some(&Some(o)) if outs.iter().all(|&x| x == Some(o)) => {
                 self.ctor_hint.insert(boxed, o);
@@ -2601,7 +2607,7 @@ impl<'s, 'a> Run<'s, 'a> {
                 if self.ctor_layout(key).is_some() {
                     let t = self.s.types_bit(key) != 0;
                     let v = self.top().v;
-                    self.ctor_hint.insert(v, (key, 0, t));
+                    self.ctor_hint.insert(v, (key, FieldSet::EMPTY, t));
                 }
             }
         }
@@ -3926,7 +3932,7 @@ impl<'s, 'a> Run<'s, 'a> {
             let proto = self.data_get(proto_atom, vals[0]);
             let n = u32::try_from(xs.len()).unwrap();
             let ok = self.new_block();
-            let this_n = self.f.add_param(ok, Ty::Ctor(key, n, t).mir());
+            let this_n = self.f.add_param(ok, Ty::Ctor(key, FieldSet::prefix(n), t).mir());
             let (fail, err) = (self.exit_block(false), self.exit_block(true));
             let op = Opcode::NewThisInit {
                 nslots,
@@ -3966,15 +3972,15 @@ impl<'s, 'a> Run<'s, 'a> {
         // `init_field`s and whose methods see its construction state.
         let mut this_op = this;
         if let Some((key, t)) = self.ctor_of_word(k, word) {
-            if let Some(c) = self.s.callee_ctx(k, &[], Some((key, 0, t)), self.admitted) {
+            if let Some(c) = self.s.callee_ctx(k, &[], Some((key, FieldSet::EMPTY, t)), self.admitted) {
                 self.inline_sites = (self.inline_sites + c.sites).saturating_sub(callee.sites);
                 let o = self.assert_guard(Opcode::GuardUnbox(UnboxKind::Obj), vec![this], MType::OBJ_TOP);
                 let g = Opcode::GuardCtor {
                     key: crate::ids::LayoutKey::new(key),
-                    n: 0,
+                    n: FieldSet::EMPTY,
                     types: t,
                 };
-                this_op = self.assert_guard(g, vec![o], Ty::Ctor(key, 0, t).mir());
+                this_op = self.assert_guard(g, vec![o], Ty::Ctor(key, FieldSet::EMPTY, t).mir());
                 callee = c;
             }
         }
@@ -4019,7 +4025,7 @@ impl<'s, 'a> Run<'s, 'a> {
             return None;
         }
         let n = u32::try_from(formals.len()).unwrap();
-        let c = self.s.callee_ctx(k, &[], Some((key, n, t)), self.admitted)?;
+        let c = self.s.callee_ctx(k, &[], Some((key, FieldSet::prefix(n), t)), self.admitted)?;
         let xs = formals
             .iter()
             .enumerate()
@@ -4130,7 +4136,7 @@ impl<'s, 'a> Run<'s, 'a> {
     /// With the `.apply` the pristine builtin, the site's known targets
     /// are inlined, their formals read from this frame's actuals; any other
     /// target, or another `.apply`, forwards through the runtime.
-    fn apply_forward(&mut self, vals: &[mir::Value], this_ctor: Option<((u32, u32, bool), Slot)>) -> mir::Value {
+    fn apply_forward(&mut self, vals: &[mir::Value], this_ctor: Option<((u32, FieldSet, bool), Slot)>) -> mir::Value {
         let site = self.site(self.pc);
         let facts = &self.s.ctx.facts;
         // Resolved for the site that entered this copy where the analysis
@@ -4257,7 +4263,7 @@ impl<'s, 'a> Run<'s, 'a> {
         &mut self,
         vals: &[mir::Value],
         fns: &[Option<ScriptId>],
-        this_ctor: Option<((u32, u32, bool), Slot, mir::Value)>,
+        this_ctor: Option<((u32, FieldSet, bool), Slot, mir::Value)>,
     ) -> Option<mir::Value> {
         if !CALL_FWD {
             return None;

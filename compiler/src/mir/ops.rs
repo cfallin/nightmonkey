@@ -15,7 +15,7 @@ use crate::ids::{EnvSlot, LayoutKey, Pc, ScriptId};
 use crate::mir::entity::{AtomId, BindingId, FuseId, NativeId, SnapObj};
 use crate::mir::module::{Module, Region};
 use crate::mir::types::{
-    is_subtype, join, FactKind, IRange, KeyRange, KillPattern, KillSet, LayoutClaim, LayoutState,
+    is_subtype, join, FactKind, FieldSet, IRange, KeyRange, KillPattern, KillSet, LayoutClaim, LayoutState,
     NumInfo, ObjInfo, ObjKind, RawKind, StrInfo, TagSet, Type, VSet, I32_MAX, I32_MIN, INT_LIM,
 };
 use crate::opsem::{TaKind, PRIM_BIGINT, PRIM_DOUBLE, PRIM_INT32, PRIM_NULL, PRIM_UNDEFINED};
@@ -532,11 +532,11 @@ pub enum Opcode {
     },
     /// An object under construction for layout `key` (MIR.md §2.3): its
     /// word carries the CONSTRUCTING sentinel with `key`'s early key, and
-    /// SLOTS (and TYPES if `types`), and it has exactly `n` slots, so
-    /// `key`'s first `n` fields (`constructing(n)`).
+    /// SLOTS (and TYPES if `types`), and the fields `n` (the word's set
+    /// and a span of theirs), exactly (`constructing(n)`).
     GuardCtor {
         key: LayoutKey,
-        n: u32,
+        n: FieldSet,
         types: bool,
     },
     GuardSingleton(SnapObj),
@@ -1260,11 +1260,11 @@ fn field_claims(
         // prediction (an access finds it through an IC).
         match layout.field(name) {
             Some((slot, f)) => {
-                if let Some(n) = c.state.slots() {
-                    want(slot < n as usize, || {
+                if let Some(n) = c.state.fields() {
+                    want(n.contains(u32::try_from(slot).unwrap()), || {
                         format!(
-                            "{what}: field {} is slot {slot}, beyond the {n}-slot prefix",
-                            m.atoms[name]
+                            "{what}: field {} (slot {slot}) is not yet added ({:#x})",
+                            m.atoms[name], n.0
                         )
                     })?;
                 }
@@ -1292,7 +1292,7 @@ pub fn slot_of(o: &ObjInfo, name: AtomId, m: &Module) -> Option<u32> {
     let mut slot = None;
     for k in c.keys.keys() {
         let (s, _) = m.layouts.get(&k)?.field(name)?;
-        if slot.is_some_and(|x| x != s) || c.state.slots().is_some_and(|n| s >= n as usize) {
+        if slot.is_some_and(|x| x != s) || c.state.fields().is_some_and(|n| !n.contains(u32::try_from(s).unwrap())) {
             return None;
         }
         slot = Some(s);
@@ -1983,7 +1983,7 @@ pub fn signature(op: &Opcode, args: &[Type], m: &Module) -> SigResult {
                     types: *types,
                     slots: true,
                     closed: false,
-                    state: LayoutState::Constructing(*n),
+                    state: LayoutState::Constructing(FieldSet::prefix(*n)),
                 }),
                 ..ObjInfo::TOP
             }))
@@ -2099,24 +2099,19 @@ pub fn signature(op: &Opcode, args: &[Type], m: &Module) -> SigResult {
                 .layouts
                 .get(&c.keys.lo)
                 .ok_or_else(|| format!("init_field: layout L{} is not in the module", c.keys.lo))?;
-            let f = layout
-                .fields
-                .get(n as usize)
-                .ok_or("init_field: every field is already initialized")?
-                .as_ref()
-                .ok_or("init_field: the next field is not described")?;
-            want(f.name == *name, || {
-                format!(
-                    "init_field: next field is {}, not {}",
-                    m.atoms[f.name], m.atoms[*name]
-                )
+            let (i, f) = layout
+                .field(*name)
+                .ok_or_else(|| format!("init_field: the layout has no field {}", m.atoms[*name]))?;
+            let i = u32::try_from(i).unwrap();
+            want(n.may_add(i), || {
+                format!("init_field: field {} may not be added to {:#x}", m.atoms[*name], n.0)
             })?;
             want(is_subtype(&args[1], &f.claim), || {
                 "init_field: value does not conform to the field's claim".into()
             })?;
             Sig::output(Type::Obj(ObjInfo {
                 layout: Some(LayoutClaim {
-                    state: LayoutState::Constructing(n + 1),
+                    state: LayoutState::Constructing(n.with(i)),
                     ..c
                 }),
                 ..o
@@ -2136,7 +2131,7 @@ pub fn signature(op: &Opcode, args: &[Type], m: &Module) -> SigResult {
                 format!("publish_layout: layout L{} is not in the module", c.keys.lo)
             })?;
             want(
-                c.keys.lo == c.keys.hi && n as usize == layout.fields.len(),
+                c.keys.lo == c.keys.hi && n == FieldSet::prefix(u32::try_from(layout.fields.len()).unwrap()),
                 || "publish_layout: not every field is initialized".into(),
             )?;
             // Exactly the row (a constructing state is exact: anything
@@ -2174,7 +2169,7 @@ pub fn signature(op: &Opcode, args: &[Type], m: &Module) -> SigResult {
                     types: true,
                     slots: true,
                     closed: false,
-                    state: LayoutState::Constructing(0),
+                    state: LayoutState::Constructing(FieldSet::EMPTY),
                 }),
             }))
         }
@@ -2765,6 +2760,7 @@ mod tests {
                                     keys: KeyRange::one(LayoutKey::new(4)),
                                     types: true,
                                     slots: true,
+                                    closed: false,
                                     state: LayoutState::Published,
                                 }),
                             },
@@ -2774,6 +2770,7 @@ mod tests {
                 ],
                 named: vec![],
                 elements: None,
+                closed: false,
             },
         );
         m
@@ -2787,6 +2784,7 @@ mod tests {
                 keys: KeyRange::one(LayoutKey::new(3)),
                 types,
                 slots: true,
+                closed: false,
                 state: LayoutState::Published,
             }),
         })

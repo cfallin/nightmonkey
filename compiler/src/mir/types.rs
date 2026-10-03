@@ -365,23 +365,93 @@ impl ObjKind {
     }
 }
 
+/// A set of a layout's row positions (bit `i`: field `i`, which an object
+/// of the layout holds at slot `i`): the fields an object under
+/// construction has had added, in any order (MIR.md §2.3). Its class word
+/// carries the set's first `WORD_BITS` positions; a field past them is
+/// added only after every field before it, so a set reaching them is a
+/// prefix there.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Default)]
+pub struct FieldSet(pub u32);
+
+impl FieldSet {
+    pub const EMPTY: FieldSet = FieldSet(0);
+    /// The positions the class word of an object under construction holds.
+    pub const WORD_BITS: u32 = 16;
+
+    /// The first `n` positions.
+    pub fn prefix(n: u32) -> FieldSet {
+        FieldSet(if n >= 32 { u32::MAX } else { (1u32 << n) - 1 })
+    }
+
+    pub fn contains(self, i: u32) -> bool {
+        i < 32 && self.0 & (1 << i) != 0
+    }
+
+    pub fn with(self, i: u32) -> FieldSet {
+        FieldSet(self.0 | (1 << i))
+    }
+
+    pub fn subset_of(self, o: FieldSet) -> bool {
+        self.0 & !o.0 == 0
+    }
+
+    pub fn intersect(self, o: FieldSet) -> FieldSet {
+        FieldSet(self.0 & o.0)
+    }
+
+    /// The slot span of an object holding exactly these fields: the
+    /// highest position, plus one.
+    pub fn span(self) -> u32 {
+        32 - self.0.leading_zeros()
+    }
+
+    /// `Some(n)` where these are the first `n` positions.
+    pub fn as_prefix(self) -> Option<u32> {
+        (self.0 & self.0.wrapping_add(1) == 0).then(|| self.span())
+    }
+
+    /// Whether field `i` may be added to an object holding these: one the
+    /// class word can record, or the next in order.
+    pub fn may_add(self, i: u32) -> bool {
+        !self.contains(i) && (i < Self::WORD_BITS || self.as_prefix() == Some(i))
+    }
+
+    /// The low half of the class word of an object holding these.
+    pub fn word_bits(self) -> u32 {
+        self.0 & ((1 << Self::WORD_BITS) - 1)
+    }
+}
+
+/// A prefix set as its length, any other as its positions: `{0, 2}`.
+impl std::fmt::Display for FieldSet {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if let Some(n) = self.as_prefix() {
+            return write!(f, "{n}");
+        }
+        let ps: Vec<String> = (0..32).filter(|&i| self.contains(i)).map(|i| i.to_string()).collect();
+        write!(f, "{{{}}}", ps.join(", "))
+    }
+}
+
 /// How much of layout `keys` an object is known to have (MIR.md §2.3).
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
 pub enum LayoutState {
     /// A published instance: a stamp guard for `keys` passes on it.
     #[default]
     Published,
-    /// Supports exactly the layout's first `n` slots. The common
-    /// supertype of a published object and one still under construction.
-    Prefix(u32),
-    /// Carries the CONSTRUCTING sentinel and has had the first `n`
-    /// predicted fields added. A published-K stamp guard would fail on it.
-    Constructing(u32),
+    /// Holds at least the layout's fields in the set (at their slots). The
+    /// common supertype of a published object and one still under
+    /// construction.
+    Prefix(FieldSet),
+    /// Carries the CONSTRUCTING sentinel and has had exactly the fields in
+    /// the set added. A published-K stamp guard would fail on it.
+    Constructing(FieldSet),
 }
 
 impl LayoutState {
-    /// How many leading slots this state supports; `None` is all of them.
-    pub fn slots(self) -> Option<u32> {
+    /// The fields this state supports; `None` is all of them.
+    pub fn fields(self) -> Option<FieldSet> {
         match self {
             LayoutState::Published => None,
             LayoutState::Prefix(n) | LayoutState::Constructing(n) => Some(n),
@@ -391,8 +461,9 @@ impl LayoutState {
     pub fn le(self, o: LayoutState) -> bool {
         match (self, o) {
             (a, b) if a == b => true,
-            // Anything that supports at least `m` slots is a prefix-`m`.
-            (a, LayoutState::Prefix(m)) => a.slots().is_none_or(|n| n >= m),
+            // Anything that supports at least the fields `m` is a
+            // prefix-`m`.
+            (a, LayoutState::Prefix(m)) => a.fields().is_none_or(|n| m.subset_of(n)),
             _ => false,
         }
     }
@@ -401,8 +472,8 @@ impl LayoutState {
         if self == o {
             return self;
         }
-        let n = match (self.slots(), o.slots()) {
-            (Some(a), Some(b)) => a.min(b),
+        let n = match (self.fields(), o.fields()) {
+            (Some(a), Some(b)) => a.intersect(b),
             (Some(a), None) | (None, Some(a)) => a,
             (None, None) => unreachable!("two distinct states that are both Published"),
         };
@@ -994,7 +1065,7 @@ impl Type {
                     c.closed = false;
                 }
                 if hit.contains(KillSet::CONSTRUCTING) {
-                    c.state = LayoutState::Prefix(c.state.slots().unwrap_or(0));
+                    c.state = LayoutState::Prefix(c.state.fields().unwrap_or(FieldSet::EMPTY));
                 }
                 Some(c)
             });
@@ -1142,13 +1213,13 @@ mod tests {
         let cons = |n| {
             obj(
                 ObjKind::Plain,
-                Some(claim(3, 3, true, LayoutState::Constructing(n))),
+                Some(claim(3, 3, true, LayoutState::Constructing(FieldSet::prefix(n)))),
             )
         };
         let prefix = |n| {
             obj(
                 ObjKind::Plain,
-                Some(claim(3, 3, true, LayoutState::Prefix(n))),
+                Some(claim(3, 3, true, LayoutState::Prefix(FieldSet::prefix(n)))),
             )
         };
         let published = obj(
@@ -1163,6 +1234,23 @@ mod tests {
         assert!(!is_subtype(&cons(2), &published));
         // Nor a different stage of construction.
         assert!(!is_subtype(&cons(1), &cons(2)));
+        // Fields added out of order: a set, not a count.
+        let set = |b| {
+            obj(
+                ObjKind::Plain,
+                Some(claim(3, 3, true, LayoutState::Constructing(FieldSet(b)))),
+            )
+        };
+        let at_least = |b| {
+            obj(
+                ObjKind::Plain,
+                Some(claim(3, 3, true, LayoutState::Prefix(FieldSet(b)))),
+            )
+        };
+        assert!(is_subtype(&set(0b101), &at_least(0b100)));
+        assert!(!is_subtype(&set(0b101), &at_least(0b010)));
+        assert!(!is_subtype(&set(0b101), &prefix(2)));
+        assert_eq!(join(&set(0b101), &set(0b110)), Some(at_least(0b100)));
         assert!(!is_subtype(&cons(2), &cons(1)));
         // A published K supports every prefix.
         assert!(is_subtype(&published, &prefix(2)));
@@ -1229,14 +1317,14 @@ mod tests {
         // Constructing weakens to the prefix.
         let c = obj(
             ObjKind::Plain,
-            Some(claim(3, 3, true, LayoutState::Constructing(2))),
+            Some(claim(3, 3, true, LayoutState::Constructing(FieldSet::prefix(2)))),
         );
         let cw = c.weakened(&KillPattern::of(KillSet::CONSTRUCTING));
         assert_eq!(
             cw,
             obj(
                 ObjKind::Plain,
-                Some(claim(3, 3, true, LayoutState::Prefix(2)))
+                Some(claim(3, 3, true, LayoutState::Prefix(FieldSet::prefix(2))))
             )
         );
     }

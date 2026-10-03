@@ -160,11 +160,11 @@ LayoutClaim := { keys: [lo,hi], types: bool, constructing: Option<…> }   (§2.
   type `Obj{K constructing(0)}` (`Ty::Ctor` in the builder). A
   constructing `this` is part of a callee build's context, like the
   closures it receives (`callee_ctx`), so the body has no entry guard.
-- **In the body.** The add of K's next field is `init_field` (the value
-  guarded to the field's claim, exiting on a miss); a field already
-  added is a typed `load_field`/`store_field`; once every field is
-  there, `publish_layout` stamps K and `this` is a published `Obj{K}`
-  (its prediction witness: `constructing`). A builder run's only
+- **In the body.** The add of a field of K's not yet added, in any order
+  (M5t), is `init_field` (the value guarded to the field's claim, exiting
+  on a miss); a field already added is a typed `load_field`/
+  `store_field`; once every field is there, `publish_layout` stamps K and
+  `this` is a published `Obj{K}` (its prediction witness: `constructing`). A builder run's only
   constructing object is its own `this`, so an add replaces every slot
   of K's constructing type (a join may have made a second value of it).
 - **Methods.** A method called on the constructing `this` is spliced
@@ -172,8 +172,9 @@ LayoutClaim := { keys: [lo,hi], types: bool, constructing: Option<…> }   (§2.
   reading the fields added so far typed. The caller continues with a
   boxed copy, hinted (`ctor_hint`) with the state the callee's returns
   leave `this` in (`Callee::this_out`) where they agree; its next add or
-  method call guards that state back (`guard.ctor K, n`: sentinel, early
-  key, SLOTS/TYPES, exactly `n` slots), exiting on a miss.
+  method call guards that state back (`guard.ctor K, S`: sentinel, early
+  key, SLOTS/TYPES, the word's field set `S` and the span of `S`), exiting
+  on a miss.
 - **Fences.** A fence demotes a `Ctor` to a boxed, hinted object (a
   published-layout `ObjHint` would be wrong); the next use re-guards.
 - **`init_field`'s slow path** is `night_runtime_init_field`: the plain
@@ -2210,6 +2211,55 @@ inlined call.
   It fails against mutants that skip the prototype compare, leave cells
   armed at the hook, never clear CLOSED, and let the compiled add arm
   replay onto a CLOSED object.
+
+**M5t. Construction states as sets of fields (2026-10-03; the owner's
+answer to M5r's slot alignment).** `constructing(n)` (the layout's first
+`n` fields) became `constructing(S)`, the set of the layout's fields added
+so far, in whatever order, and `prefix(n)` became `prefix(S)` (at least
+those): `Constructing(S) <= Prefix(T)` where `T` is a subset of `S`, and
+two different construction states join to the prefix of their
+intersection (`FieldSet`; the text format writes a prefix as its length,
+any other set as `{0, 2}`). This frees a layout's row order from the
+order its constructors add fields in, which slot alignment (2c) needs.
+- **The word.** Under the CONSTRUCTING sentinel the low half (a stamped
+  word's identity) is the set, bit `i` field `i` (at slot `i`), for a
+  row's first 16 fields; a field past them is added only in order, after
+  all of them (`FieldSet::may_add`). The shape is still the engine's, in
+  insertion order, for everything else (a generic path, enumeration).
+  - Set by the typed adds (`init_field`'s inline replay, unconditionally:
+    the word is a sentinel's, which no fact covers), `new_this.init` (its
+    prefix), and the engine's add hook for a row field added at its slot
+    (`NightAddPropCheck`): the slow paths and the C++ replays go through
+    it.
+  - Not by the generic add arm (`set_ic_trans`), whose every add would pay
+    for it. A set that under-reports is safe: `guard.ctor` and the slow
+    path's test (`NightHasExactlyFields`) fail on it, and exit; a hole
+    filled generically still fails `init_field`'s old-shape test and the
+    slow path's own lookup.
+- **`guard.ctor K, S`**: the word's set is `S` and the span is `S`'s
+  (highest field plus one; every field is at its row's slot, so any other
+  property raises it), the permuted-shape bit no longer asked. Exact: what
+  `publish_layout`'s CLOSED rests on.
+- **Published guards** mask the sentinel too (`guard.layout`; the restamp
+  gates' "already stamped" test; the element-store duty's array test): a
+  constructing object's set may equal a layout's identity.
+- **Adds past the span.** `init_field` of a field ahead of others (a slot
+  skipped) stores undefined in the skipped slots, statically, before the
+  new shape covers them (the GC traces the span); its site's row may now
+  hold such a transition (`SetPropIcMiss`'s `skipRows`, `init_field`'s slow
+  path only: the generic arms, which do not initialize skipped slots,
+  never see one).
+- Fixed-work value census against M5s: unchanged (no benchmark constructor
+  adds out of row order yet), raytrace +0.6% (`init_field`'s word store,
+  two values per typed add).
+- Night test: mir-ctor-fieldsets.js (two orders at one site; the last
+  field first, with GCs, object values throughout; different sets on two
+  paths; `this` leaked half-made; a half-made object whose set reads as
+  another layout's identity, read by code typed for that layout; a setter
+  arriving for a field's name). It fails against a mutant whose published
+  guard does not mask the sentinel. One that leaves skipped slots
+  uninitialized passes it: the garbage left there in these runs is benign
+  to the GC (number bits, or still-live objects).
 
 **M6. The rest of §10**: box/unbox cleanup, memory optimizations, and
 numeric optimizations, each with its guard-count and instruction-count

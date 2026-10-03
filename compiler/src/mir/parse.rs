@@ -495,6 +495,33 @@ impl Parser {
         })
     }
 
+    /// A field set: its length for a prefix, else `{i, j, ...}`.
+    fn field_set(&mut self) -> PResult<FieldSet> {
+        if !self.eat_punct("{") {
+            return Ok(FieldSet::prefix(self.int()?));
+        }
+        let mut f = FieldSet::EMPTY;
+        while !self.eat_punct("}") {
+            let i: u32 = self.int()?;
+            if i >= 32 {
+                return self.err(format!("field position {i} out of range"));
+            }
+            f = f.with(i);
+            if !self.eat_punct(",") {
+                self.expect_punct("}")?;
+                break;
+            }
+        }
+        Ok(f)
+    }
+
+    fn paren_field_set(&mut self) -> PResult<FieldSet> {
+        self.expect_punct("(")?;
+        let n = self.field_set()?;
+        self.expect_punct(")")?;
+        Ok(n)
+    }
+
     fn paren_u32(&mut self) -> PResult<u32> {
         self.expect_punct("(")?;
         let n = self.int()?;
@@ -520,10 +547,10 @@ impl Parser {
                 let mut slots = self.eat_word("slots");
                 let closed = self.eat_word("closed");
                 let state = if self.eat_word("prefix") {
-                    LayoutState::Prefix(self.paren_u32()?)
+                    LayoutState::Prefix(self.paren_field_set()?)
                 } else if self.eat_word("constructing") {
                     slots = true;
-                    LayoutState::Constructing(self.paren_u32()?)
+                    LayoutState::Constructing(self.paren_field_set()?)
                 } else {
                     LayoutState::Published
                 };
@@ -1298,7 +1325,7 @@ impl Parser {
             GuardCtor { .. } => {
                 let key = self.layout_key()?;
                 self.expect_punct(",")?;
-                let n = self.int()?;
+                let n = self.field_set()?;
                 let types = self.eat_word("types");
                 GuardCtor { key, n, types }
             }
@@ -1573,7 +1600,7 @@ fn template(mn: &str) -> Option<Opcode> {
         },
         GuardCtor {
             key: LayoutKey::new(0),
-            n: 0,
+            n: FieldSet::EMPTY,
             types: false,
         },
         GuardSingleton(SnapObj::from_u32(0)),
