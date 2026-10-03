@@ -4278,8 +4278,16 @@ impl<'a> Lower<'a> {
                 let proto = self.load_i32(base, BASESHAPE_PROTO_OFFSET);
                 let p = self.load_i32(c, 0);
                 let hit = self.bin(Operator::I32Eq, proto, p, Type::I32);
+                // CLOSED (the receiver is of a published layout: its word
+                // is a stamp's).
+                let w = self.load_i32(a[0], OBJ_CLASS_IDX_OFFSET);
+                let cb = self.i32c(CLASS_WORD_CLOSED);
+                let closed = self.bin(Operator::I32And, w, cb, Type::I32);
                 let f = self.load_i32(c, crate::region_shape::METHOD_CELL_FN_OFF);
-                let miss = self.body.add_block();
+                let (miss, open) = (self.body.add_block(), self.body.add_block());
+                let fail = self.edge(inst, 1, &[])?;
+                self.cond_br(closed, Self::to(open), fail);
+                self.cur = open;
                 let t = self.edge(inst, 0, &[f])?;
                 self.cond_br(hit, t, Self::to(miss));
                 self.cur = miss;

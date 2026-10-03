@@ -542,12 +542,12 @@ pub enum Opcode {
     GuardSingleton(SnapObj),
     GuardScript(ScriptId),
     /// A predicted method (`method_sites`): the receiver, of layouts whose
-    /// rows lack `atom` and CLOSED, reads `atom` through its prototype
+    /// rows lack `atom`, if CLOSED, reads `atom` through its prototype
     /// chain as the function in the method cell at `cell` -- the cell
     /// armed for the receiver's prototype, so the chain resolves the name
     /// to a compiled function of `script`, held by a constant property.
-    /// ok: that function; fail: the cell is not armed for this prototype
-    /// and the runtime could not arm it.
+    /// ok: that function; fail: the receiver is not CLOSED, or the cell is
+    /// not armed for its prototype and the runtime could not arm it.
     MethodLoad { cell: u32, atom: AtomId, script: ScriptId },
     /// An f64 that is exactly an int32 (not -0) becomes an `I32`.
     F64ToIntExact,
@@ -1466,11 +1466,11 @@ pub fn signature(op: &Opcode, args: &[Type], m: &Module) -> SigResult {
             arity(args, 1)?;
             let o = obj(&args[0], "method.load")?;
             let c = o.layout.ok_or("method.load: receiver has no layout claim")?;
-            want(c.closed && c.state == LayoutState::Published, || {
-                "method.load: receiver is not a closed published layout".into()
+            want(c.state == LayoutState::Published, || {
+                "method.load: receiver is not of a published layout".into()
             })?;
-            // Every layout the receiver may be lacks the name: CLOSED then
-            // says it is not the receiver's own.
+            // Every layout the receiver may be lacks the name: CLOSED (which
+            // the op tests) then says it is not the receiver's own.
             for k in c.keys.lo.get()..=c.keys.hi.get() {
                 let has = m
                     .layouts

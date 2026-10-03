@@ -157,3 +157,22 @@ check(300, function (i) {
   if (i % 2) ownJAlias(p, ownM);
   assertEq(callJ(p), (i % 2 ? "own:" : "proto:") + i);
 });
+
+// A receiver of no layout the read's site was predicted for, whose
+// prototype holds the method (a JSON object given the class's prototype,
+// reaching the read through a computed global; the analysis follows
+// neither): the method, inlined built for the site's layout, must not read
+// it as that layout (it holds the field at another slot, and another
+// property, of the field's type, where the layout has the field).
+function sharedM() { return this.x; }
+function KA(x) { this.pad = -1; this.x = x; }
+KA.prototype.m = sharedM;
+function callK(o) { return o.m(); }
+check(300, function (i) { assertEq(callK(new KA({ v: i })).v, i); });
+var callKAlias = this[key("callK")];
+var setProto = Object[key("setPrototypeOf")];
+check(300, function (i) {
+  var o = JSON.parse("{\"x\":{\"v\":" + i + "},\"y\":{\"v\":-1}}");
+  setProto(o, KA.prototype);
+  assertEq(callKAlias(o).v, i);
+});

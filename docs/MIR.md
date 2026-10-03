@@ -2261,6 +2261,36 @@ order its constructors add fields in, which slot alignment (2c) needs.
   uninitialized passes it: the garbage left there in these runs is benign
   to the GC (number bits, or still-live objects).
 
+**M5u. A method's `this` proven at its call (2026-10-03; M5s's open
+item).** An inlined method re-guarded its `this` (`guard.tags`, `unbox`,
+`guard.layout L.. types slots`, ~12 values) right after the call site had
+guarded the same receiver for its `method.load`.
+- **Callees built for a typed `this`.** A call whose receiver is of a
+  proven published layout (`Ty::Obj`) builds its inlined callees for it
+  (`ThisObj` in the callee context, as `Ty::Ctor` for an object under
+  construction): the callee's `this` is that raw object, its `FunctionThis`
+  keeps it, and its entry guard (`this_layouts`) is subsumed where the type
+  covers its layouts and TYPES. The inline frame takes the receiver's boxed
+  copy (`splice`'s `frame_this`), and `boxed` reuses a refined receiver's
+  boxed value (`boxed_as`) rather than boxing again.
+- **The method read proves the receiver.** Where the predicted method's
+  own `this` claim covers the site's layouts, `method_get` guards the
+  receiver to it before the read, exiting there on a receiver of another
+  layout (one the method's guard would refuse; nothing has happened yet),
+  and retypes its copies on the operand stack (the call's `this`; a local's
+  copy stays boxed, so write-through stores need not box). `method.load`
+  tests CLOSED itself (a load and a test), so a receiver that is not CLOSED
+  still reads through the IC rather than exiting.
+- Snapshot objects of a closable layout (their properties exactly its
+  row) are stamped CLOSED too.
+- Fixed-work value census against M5t: richards -4.5%, deltablue -3.0%,
+  raytrace -0.3%, the rest unchanged; exits unchanged.
+- Night test: mir-method-fuse.js's last case (a JSON object given the
+  class's prototype, reaching the read through a computed global): it
+  exits at the receiver's guard before the read in each call. A mutant
+  that drops that guard's layout test passes the test: the foreign
+  receiver still exits later, in the inlined method.
+
 **M6. The rest of §10**: box/unbox cleanup, memory optimizations, and
 numeric optimizations, each with its guard-count and instruction-count
 tests.

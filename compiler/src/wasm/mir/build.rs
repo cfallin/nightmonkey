@@ -318,7 +318,7 @@ impl<'a> Shape<'a> {
     /// inline-eligible script that is not this one, not a constructor
     /// that stamps its `this`, and small enough once built.
     fn callee(&self, k: ScriptId, ictx: InlineCtx) -> Option<std::rc::Rc<super::inline::Callee>> {
-        self.callee_ctx(k, &[], None, ictx)
+        self.callee_ctx(k, &[], None, None, ictx)
     }
 
     /// `callee`, built knowing which of its formals the call passes a
@@ -331,17 +331,18 @@ impl<'a> Shape<'a> {
         k: ScriptId,
         fns: &[Option<ScriptId>],
         this_ctor: Option<(u32, FieldSet, bool)>,
+        this_obj: Option<ThisObj>,
         ictx: InlineCtx,
     ) -> Option<std::rc::Rc<super::inline::Callee>> {
         let mut fns = fns.to_vec();
         while fns.last() == Some(&None) {
             fns.pop();
         }
-        let key = (k, fns, this_ctor, ictx);
+        let key = (k, fns, this_ctor, this_obj, ictx);
         if let Some(c) = self.callees.borrow().get(&key) {
             return c.clone();
         }
-        let c = self.build_callee(k, &key.1, this_ctor, ictx).map(std::rc::Rc::new);
+        let c = self.build_callee(k, &key.1, this_ctor, this_obj, ictx).map(std::rc::Rc::new);
         self.callees.borrow_mut().insert(key, c.clone());
         c
     }
@@ -351,6 +352,7 @@ impl<'a> Shape<'a> {
         k: ScriptId,
         fns: &[Option<ScriptId>],
         this_ctor: Option<(u32, FieldSet, bool)>,
+        this_obj: Option<ThisObj>,
         ictx: InlineCtx,
     ) -> Option<super::inline::Callee> {
         if k == self.sid {
@@ -367,7 +369,7 @@ impl<'a> Shape<'a> {
         }
         let nargs = usize::from(ks.nargs);
         let fns: Vec<Option<ScriptId>> = fns.iter().copied().take(nargs).collect();
-        let (mut mm, f, this_out, sites) = match build_at(self.ctx, names, k, ks, false, ictx, &fns, this_ctor) {
+        let (mut mm, f, this_out, sites) = match build_at(self.ctx, names, k, ks, false, ictx, &fns, this_ctor, this_obj) {
             Ok(r) => r,
             Err(_) => return None,
         };
@@ -491,7 +493,7 @@ pub fn build<'a>(
     script: &'a Script,
     is_global: bool,
 ) -> Result<(mir::Module, mir::Func), String> {
-    build_at(ctx, names, sid, script, is_global, InlineCtx::ROOT, &[], None).map(|(m, f, _, _)| (m, f))
+    build_at(ctx, names, sid, script, is_global, InlineCtx::ROOT, &[], None, None).map(|(m, f, _, _)| (m, f))
 }
 
 /// Element accesses the analysis predicts on arrays, with int32 keys, are
@@ -547,6 +549,8 @@ const NARROW_TESTS: bool = true;
 const PREDICTED_GNAMES: bool = true;
 /// Reads of predicted methods through their cells (`method.load`).
 const METHOD_LOADS: bool = true;
+/// Callees inlined at a receiver of a proven type are built for it.
+const TYPED_THIS: bool = true;
 
 /// An inlined `new` of a constructor whose body starts by storing its
 /// formals into its first fields makes the object with them
@@ -663,6 +667,7 @@ fn build_at<'a>(
     ictx: InlineCtx,
     formal_fns: &[Option<ScriptId>],
     this_ctor: Option<(u32, FieldSet, bool)>,
+    this_obj: Option<ThisObj>,
 ) -> Result<(mir::Module, mir::Func, Option<(u32, FieldSet, bool)>, u32), String> {
     if is_global {
         return Err("global script".into());
@@ -715,6 +720,7 @@ fn build_at<'a>(
     shape.ictx = ictx;
     shape.formal_fns = formal_fns.to_vec();
     shape.this_ctor = this_ctor;
+    shape.this_obj = this_obj;
     // Its own layout's `this` with fields already: only a `new` that made
     // them from the leading stores (`inline_construct`); no other builder
     // enters a constructor's body with its own object under construction
@@ -958,7 +964,13 @@ fn int32_demand(script: &Script, ops: &[Op]) -> std::collections::BTreeSet<Pc> {
 /// What the runs share: the script's decoded shape.
 /// A callee build's context (`callee_in`): the script, the known closures
 /// its formals receive, and the constructing `this` it receives, if any.
-type CalleeKey = (ScriptId, Vec<Option<ScriptId>>, Option<(u32, FieldSet, bool)>, InlineCtx);
+type CalleeKey = (ScriptId, Vec<Option<ScriptId>>, Option<(u32, FieldSet, bool)>, Option<ThisObj>, InlineCtx);
+
+/// A published object the inlining call passes as `this`, of a type its
+/// guards proved: layouts `lo..=hi` (ids), TYPES, SLOTS. The callee is
+/// built for it, its own `this` guard (the method's `this_layouts`)
+/// subsumed where the type proves it.
+type ThisObj = (u32, u32, bool, bool);
 
 /// Where a callee is built for inlining: its
 /// depth, the sites it may splice itself, whether the root call site is
@@ -1035,6 +1047,9 @@ struct Shape<'a> {
     /// (`Ty::Ctor`: layout key, fields added, TYPES): the body is built
     /// for it, with no entry guard, as a context-sensitive callee build.
     this_ctor: Option<(u32, FieldSet, bool)>,
+    /// The published object of a known type the inlining call passes as
+    /// `this` (`ThisObj`).
+    this_obj: Option<ThisObj>,
     /// A constructor built for its own `this` already holding its first
     /// fields (`new_this.init` made them from its leading stores): the pcs
     /// of those stores, which this build skips (`ctor_formal_prefix`).
@@ -1097,6 +1112,7 @@ impl<'a> Shape<'a> {
             callees: Default::default(),
             formal_fns: vec![],
             this_ctor: None,
+            this_obj: None,
             prefill_pcs: vec![],
             name_classes: Default::default(),
             layout_fields: Default::default(),
@@ -1230,6 +1246,9 @@ struct Run<'s, 'a> {
     /// call through one guards the construction state again
     /// (`guard.ctor`), and continues typed.
     ctor_hint: BTreeMap<mir::Value, (u32, FieldSet, bool)>,
+    /// Raw objects already held boxed (a receiver a guard refined): their
+    /// boxed value, for `boxed` to reuse rather than box again.
+    boxed_as: BTreeMap<mir::Value, mir::Value>,
     /// Each constructed layout's fields and claims, registered in the
     /// module (`ctor_layout`); `None` where the table cannot hold them.
     ctor_layouts: BTreeMap<u32, Option<std::rc::Rc<Vec<(mir::entity::AtomId, MType)>>>>,
@@ -1293,6 +1312,7 @@ impl<'s, 'a> Run<'s, 'a> {
             val_cls: BTreeMap::new(),
             lit_rows: BTreeMap::new(),
             ctor_hint: BTreeMap::new(),
+            boxed_as: BTreeMap::new(),
             ctor_layouts: BTreeMap::new(),
             this_out: None,
             slot_cls: BTreeMap::new(),
@@ -1975,6 +1995,9 @@ impl<'s, 'a> Run<'s, 'a> {
 
     /// `x` as a boxed value, of type `Val(x.ty.tags())`.
     fn boxed(&mut self, x: Slot) -> mir::Value {
+        if let Some(&b) = self.boxed_as.get(&x.v) {
+            return b;
+        }
         let v = match x.ty {
             Ty::Val(_) | Ty::Fn(_) => return x.v,
             _ => {
@@ -2628,13 +2651,19 @@ impl<'s, 'a> Run<'s, 'a> {
             return;
         }
         let x = self.top();
-        let v = self.boxed(x);
-        let o = self.guard(Opcode::GuardUnbox(UnboxKind::Obj), vec![v], MType::OBJ_TOP);
         let keys = KeyRange { lo, hi };
         // Identity and TYPES are what OPT means (§4.3): where the layouts
         // type their fields, the guard proves TYPES too, and `this`'s
         // field reads are of their predicted types unchecked.
         let types = (lo.get()..=hi.get()).all(|k| self.s.types_bit(k) != 0);
+        // A `this` the inlining call passes proven so already.
+        if let Ty::Obj(k2, t2, true) = x.ty {
+            if keys.contains(&k2) && (t2 || !types) {
+                return;
+            }
+        }
+        let v = self.boxed(x);
+        let o = self.guard(Opcode::GuardUnbox(UnboxKind::Obj), vec![v], MType::OBJ_TOP);
         // SLOTS too: `this`'s accesses have slot predictions.
         let ty = Ty::Obj(keys, types, true);
         let g = self.guard(Opcode::GuardLayout { keys, types, slots: true, closed: false }, vec![o], ty.mir());
@@ -3304,9 +3333,6 @@ impl<'s, 'a> Run<'s, 'a> {
         Some(site)
     }
 
-    /// Guard boxed receiver `x` to an object of the site's layouts (§4.3):
-    /// an object tag test, then the stamp compare, branching to `fallback`
-    /// (no params) when either fails.
     /// `recv.a` at a predicted-method site (`method_sites`), the read before
     /// `next`: on a receiver of the site's layouts, CLOSED (no own property
     /// outside the row, which lacks the name), the function its method
@@ -3314,6 +3340,12 @@ impl<'s, 'a> Run<'s, 'a> {
     /// through the IC, whose value must be a function of the predicted
     /// script or the read exits after it. The result is typed that
     /// function either way, so a call through it needs no callee guard.
+    ///
+    /// Where the method's own `this` claim (its entry guard) covers the
+    /// site's layouts, the receiver is guarded to it first, exiting before
+    /// the read on a receiver of another layout (one the method's guard
+    /// would refuse): its copies (the call's `this`) are then of that type,
+    /// and the method, inlined, is built for it, with no guard of its own.
     fn method_get(&mut self, next: Pc, a: mir::entity::AtomId, recv: Slot) -> bool {
         let Some(&ms) = self.s.ctx.method_sites_in.get(&self.site(self.pc)).filter(|_| METHOD_LOADS) else {
             return false;
@@ -3327,6 +3359,19 @@ impl<'s, 'a> Run<'s, 'a> {
         self.mm.script_addrs.insert(k, ms.script_addr);
         let fobj = MType::Obj(ObjInfo::kind(ObjKind::Function(Some(k))));
         let ft = mir::ops::box_type(&fobj).expect("an object boxes");
+        let keys = KeyRange {
+            lo: crate::ids::LayoutKey::new(ms.layout_id),
+            hi: crate::ids::LayoutKey::new(ms.hi_layout_id),
+        };
+        let types = (ms.layout_id..=ms.hi_layout_id).all(|kk| self.s.types_bit(kk) != 0);
+        let typed_recv = TYPED_THIS
+            && self
+                .s
+                .ctx
+                .facts
+                .this_layouts
+                .get(&k)
+                .is_some_and(|&(lo, hi)| KeyRange { lo, hi }.contains(&keys));
         let data = self.data_get_ok(a);
         if !data {
             self.demote_for_generic_arm(1);
@@ -3335,7 +3380,13 @@ impl<'s, 'a> Run<'s, 'a> {
         let join = self.new_block();
         let jr = self.f.add_param(join, ft);
         let generic = self.new_block();
-        // The cell's arm.
+        // The receiver, of the site's layouts: of the method's claim, or
+        // exiting here; else any other reads through the IC.
+        let (gt, gs, miss) = if typed_recv {
+            (types, true, self.exit_block(false))
+        } else {
+            (false, false, generic)
+        };
         let ob = self.new_block();
         let o = self.f.add_param(ob, MType::OBJ_TOP);
         self.term(
@@ -3346,32 +3397,19 @@ impl<'s, 'a> Run<'s, 'a> {
                     block: ob,
                     args: vec![EdgeArg::Out(0)],
                 },
-                Self::goto(generic),
+                Self::goto(miss),
             ],
         );
         self.at(ob);
-        let keys = KeyRange {
-            lo: crate::ids::LayoutKey::new(ms.layout_id),
-            hi: crate::ids::LayoutKey::new(ms.hi_layout_id),
-        };
-        let lt = MType::Obj(ObjInfo {
-            layout: Some(LayoutClaim {
-                keys,
-                types: false,
-                slots: false,
-                closed: true,
-                state: LayoutState::Published,
-            }),
-            ..ObjInfo::TOP
-        });
+        let rty = Ty::Obj(keys, gt, gs);
         let lb = self.new_block();
-        let lo = self.f.add_param(lb, lt);
+        let lo = self.f.add_param(lb, rty.mir());
         self.term(
             Opcode::GuardLayout {
                 keys,
-                types: false,
-                slots: false,
-                closed: true,
+                types: gt,
+                slots: gs,
+                closed: false,
             },
             vec![o],
             vec![
@@ -3379,10 +3417,23 @@ impl<'s, 'a> Run<'s, 'a> {
                     block: lb,
                     args: vec![EdgeArg::Out(0)],
                 },
-                Self::goto(generic),
+                Self::goto(miss),
             ],
         );
         self.at(lb);
+        if typed_recv {
+            // The receiver's copies on the operand stack (the call's
+            // `this`) are this object, of this type, known as boxed as `x`;
+            // the frame's (a local's) stay as they are, boxed.
+            let base = self.frame_len();
+            for s in self.st[base..].iter_mut() {
+                if s.v == recv.v {
+                    *s = Slot { v: lo, ty: rty };
+                }
+            }
+            self.boxed_as.insert(lo, x);
+        }
+        // The cell's arm (`method.load` tests CLOSED itself).
         let mb = self.new_block();
         let mv = self.f.add_param(mb, fobj);
         self.term(
@@ -3402,7 +3453,14 @@ impl<'s, 'a> Run<'s, 'a> {
         );
         self.at(mb);
         let bv = self.inst(Opcode::Box, vec![mv], Some(ft));
-        self.jump_with(join, bv);
+        self.term(
+            Opcode::Jump,
+            vec![],
+            vec![Edge {
+                block: join,
+                args: vec![EdgeArg::Value(bv)],
+            }],
+        );
         // The IC's arm, its value the predicted function or an exit.
         self.at(generic);
         let r = if data {
@@ -3451,24 +3509,22 @@ impl<'s, 'a> Run<'s, 'a> {
         );
         self.at(sb);
         let bv = self.inst(Opcode::Box, vec![so], Some(ft));
-        self.jump_with(join, bv);
+        self.term(
+            Opcode::Jump,
+            vec![],
+            vec![Edge {
+                block: join,
+                args: vec![EdgeArg::Value(bv)],
+            }],
+        );
         self.at(join);
         self.push(jr, Ty::Fn(k));
         true
     }
 
-    /// End the current block with a jump to `b`, passing `v`.
-    fn jump_with(&mut self, b: mir::Block, v: mir::Value) {
-        self.term(
-            Opcode::Jump,
-            vec![],
-            vec![Edge {
-                block: b,
-                args: vec![EdgeArg::Value(v)],
-            }],
-        );
-    }
-
+    /// Guard boxed receiver `x` to an object of the site's layouts (§4.3):
+    /// an object tag test, then the stamp compare, branching to `fallback`
+    /// (no params) when either fails.
     fn guard_layout_or(&mut self, x: mir::Value, site: &TypedSite, fallback: mir::Block) -> mir::Value {
         let ob = self.new_block();
         let o = self.f.add_param(ob, MType::OBJ_TOP);
@@ -3741,14 +3797,16 @@ impl<'s, 'a> Run<'s, 'a> {
     /// guarded to each target's script in turn, each target's MIR spliced
     /// in on its hit; the ordinary call when none matches. Returns the
     /// result, at the continuation. With `this_raw` (an object under
-    /// construction, `ctor_pass`), the callees receive it as their `this`,
-    /// built for it.
+    /// construction, `ctor_pass`, where `this_ctor`; else a published one
+    /// of a proven type), the callees receive it as their `this`, built for
+    /// it.
     fn inline_call_this(
         &mut self,
         targets: &[(ScriptId, std::rc::Rc<super::inline::Callee>)],
         vals: &[mir::Value],
         fallback: Option<(Opcode, Vec<mir::Value>)>,
         this_raw: Option<mir::Value>,
+        this_ctor: bool,
     ) -> mir::Value {
         // Facts are fixed: with every kill in the callees exiting (none
         // fenced), a kill leaves for baseline at the call's next pc, and
@@ -3810,7 +3868,8 @@ impl<'s, 'a> Run<'s, 'a> {
             let saved_mm = self.mm.clone();
             let saved_frames = self.f.inline_frames.len();
             self.retain_all();
-            match super::inline::splice(&mut self.mm, &mut self.f, callee, 0, hit, &operands, None, argc, join, dirty.clone(), err) {
+            let frame_this = this_raw.map(|_| vals[1]);
+            match super::inline::splice(&mut self.mm, &mut self.f, callee, 0, hit, &operands, None, frame_this, argc, join, dirty.clone(), err) {
                 Ok(()) => {
                     self.mm.script_addrs.insert(*k, callee.mm.script_addrs[k]);
                 }
@@ -3835,7 +3894,7 @@ impl<'s, 'a> Run<'s, 'a> {
         // to the target the analysis resolved for this copy: another target
         // (`initialize` replaced) is baseline's to call, which keeps the
         // object from every generic op (MIR-MEMORY.md §6).
-        if this_raw.is_some() && CTOR_FWD_EXITS {
+        if this_ctor && CTOR_FWD_EXITS {
             let ex = self.exit_block(false);
             self.term(Opcode::Jump, vec![], vec![Self::goto(ex)]);
             self.at(join);
@@ -3972,7 +4031,7 @@ impl<'s, 'a> Run<'s, 'a> {
         // `init_field`s and whose methods see its construction state.
         let mut this_op = this;
         if let Some((key, t)) = self.ctor_of_word(k, word) {
-            if let Some(c) = self.s.callee_ctx(k, &[], Some((key, FieldSet::EMPTY, t)), self.admitted) {
+            if let Some(c) = self.s.callee_ctx(k, &[], Some((key, FieldSet::EMPTY, t)), None, self.admitted) {
                 self.inline_sites = (self.inline_sites + c.sites).saturating_sub(callee.sites);
                 let o = self.assert_guard(Opcode::GuardUnbox(UnboxKind::Obj), vec![this], MType::OBJ_TOP);
                 let g = Opcode::GuardCtor {
@@ -4025,7 +4084,7 @@ impl<'s, 'a> Run<'s, 'a> {
             return None;
         }
         let n = u32::try_from(formals.len()).unwrap();
-        let c = self.s.callee_ctx(k, &[], Some((key, FieldSet::prefix(n), t)), self.admitted)?;
+        let c = self.s.callee_ctx(k, &[], Some((key, FieldSet::prefix(n), t)), None, self.admitted)?;
         let xs = formals
             .iter()
             .enumerate()
@@ -4086,7 +4145,7 @@ impl<'s, 'a> Run<'s, 'a> {
         let saved_frames = self.f.inline_frames.len();
         let here = self.cur;
         self.retain_all();
-        match super::inline::splice(&mut self.mm, &mut self.f, callee, 0, here, &operands, Some(nt), argc, ret, None, err) {
+        match super::inline::splice(&mut self.mm, &mut self.f, callee, 0, here, &operands, Some(nt), None, argc, ret, None, err) {
             Ok(()) => {
                 self.mm.script_addrs.insert(k, callee.mm.script_addrs[&k]);
                 self.live = false;
@@ -4151,7 +4210,7 @@ impl<'s, 'a> Run<'s, 'a> {
         // `this` under construction (a wrapper constructor's forward to its
         // `initialize`): targets built for it, as `call_forward`'s.
         let tc = this_ctor.map(|(c, _)| c);
-        let build = |s: &Shape<'a>, k, ictx| s.callee_ctx(k, &[], tc, ictx).filter(|c| !c.reads_actuals);
+        let build = |s: &Shape<'a>, k, ictx| s.callee_ctx(k, &[], tc, None, ictx).filter(|c| !c.reads_actuals);
         let Some(targets) = self.admit(&sids, false, &build) else {
             return self.js(helper.0, helper.1, MType::VAL_TOP);
         };
@@ -4176,7 +4235,7 @@ impl<'s, 'a> Run<'s, 'a> {
         for k in 0..n {
             call.push(self.inst(Opcode::ActualArgOr(k), vec![], Some(MType::VAL_TOP)));
         }
-        let r = self.inline_call_this(&targets, &call, Some(helper.clone()), raw);
+        let r = self.inline_call_this(&targets, &call, Some(helper.clone()), raw, raw.is_some());
         if raw.is_some() {
             self.ctor_after(&targets, vals[2]);
         }
@@ -4278,7 +4337,7 @@ impl<'s, 'a> Run<'s, 'a> {
             None => facts.apply_target_sets.get(&site).cloned().unwrap_or_default(),
         };
         let tc = this_ctor.map(|(c, ..)| c);
-        let targets = self.admit(&sids, false, &|s, k, ictx| s.callee_ctx(k, fns, tc, ictx))?;
+        let targets = self.admit(&sids, false, &|s, k, ictx| s.callee_ctx(k, fns, tc, None, ictx))?;
         let raw = this_ctor.map(|(_, x, boxed)| self.ctor_pass(x, boxed));
         let generic = (Opcode::Call, vals.to_vec());
         // Arms with fences meet at `join`: `Obj` slots go in as `ObjHint`.
@@ -4295,7 +4354,7 @@ impl<'s, 'a> Run<'s, 'a> {
         );
         self.term(Opcode::Br, vec![is_call], vec![Self::goto(fast), Self::goto(slow)]);
         self.at(fast);
-        let r = self.inline_call_this(&targets, &vals[1..], Some(generic.clone()), raw);
+        let r = self.inline_call_this(&targets, &vals[1..], Some(generic.clone()), raw, raw.is_some());
         if raw.is_some() {
             self.ctor_after(&targets, vals[2]);
         }
@@ -5270,9 +5329,18 @@ impl<'s, 'a> Run<'s, 'a> {
         self.f.add_param(b0, callee);
         let all = Ty::Val(TagSet::ALL);
         // An object under construction the inlining `new` or call passes.
-        let this_ty = match self.s.this_ctor {
-            Some((k, n, t)) => Ty::Ctor(k, n, t),
-            None => all,
+        let this_ty = match (self.s.this_ctor, self.s.this_obj) {
+            (Some((k, n, t)), _) => Ty::Ctor(k, n, t),
+            // A published object of a proven type the inlining call passes.
+            (None, Some((lo, hi, t, sl))) => Ty::Obj(
+                KeyRange {
+                    lo: crate::ids::LayoutKey::new(lo),
+                    hi: crate::ids::LayoutKey::new(hi),
+                },
+                t,
+                sl,
+            ),
+            (None, None) => all,
         };
         let this = self.f.add_param(b0, this_ty.mir());
         self.st.push(Slot { v: this, ty: this_ty });
@@ -7531,6 +7599,14 @@ impl<'s, 'a> Run<'s, 'a> {
                 };
                 let recv_ctor = this_ctor(operands.get(1)).map(|c| (c, operands[1]));
                 let fwd_ctor = this_ctor(operands.get(2)).map(|c| (c, operands[2]));
+                // A published receiver of a proven type: callees built for
+                // it, its own guard subsumed.
+                let recv_obj = match operands.get(1).map(|x| x.ty) {
+                    Some(Ty::Obj(keys, t, sl)) if TYPED_THIS && recv_ctor.is_none() => {
+                        Some(((keys.lo.get(), keys.hi.get(), t, sl), operands[1].v))
+                    }
+                    _ => None,
+                };
                 let vals: Vec<mir::Value> = operands.into_iter().map(|x| self.boxed(x)).collect();
                 let facts_sids = self.s.ctx.facts.scripted_targets(self.site(pc));
                 let known_sids: Vec<ScriptId> = known.into_iter().collect();
@@ -7549,11 +7625,16 @@ impl<'s, 'a> Run<'s, 'a> {
                     self.apply_forward(&vals, fwd_ctor)
                 } else if let Some(targets) = {
                     let rc = recv_ctor.map(|(c, _)| c);
+                    let ro = recv_obj.map(|(o, _)| o);
                     let fns = &fns;
-                    self.admit(&sids, false, &|s, k, ictx| s.callee_ctx(k, fns, rc, ictx))
+                    self.admit(&sids, false, &|s, k, ictx| s.callee_ctx(k, fns, rc, ro, ictx))
                 } {
                     let raw = recv_ctor.map(|(_, x)| self.ctor_pass(x, vals[1]));
-                    let r = self.inline_call_this(&targets, &vals, None, raw);
+                    let r = if let Some((_, o)) = recv_obj {
+                        self.inline_call_this(&targets, &vals, None, Some(o), false)
+                    } else {
+                        self.inline_call_this(&targets, &vals, None, raw, raw.is_some())
+                    };
                     if raw.is_some() {
                         self.ctor_after(&targets, vals[1]);
                     }

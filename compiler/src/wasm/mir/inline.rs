@@ -257,7 +257,9 @@ fn merge_module(mm: &mut Module, k: &Module) -> Result<Maps, String> {
 /// `operands`: callee (an object of `k`'s script), `this`, and one value
 /// per formal, or, for a callee that reads its actuals (`argc` given, the
 /// call's count), every actual, padded to the formals. Its returns go to `join` (one `Val` param), its exceptions
-/// to `err` (no params).
+/// to `err` (no params). `frame_this`: the boxed `this` for the callee's
+/// frame, where `operands`' is a raw object (a `this` the callee is built
+/// for), which the frame would otherwise box again.
 pub(crate) fn splice(
     mm: &mut Module,
     f: &mut Func,
@@ -266,6 +268,7 @@ pub(crate) fn splice(
     enter: Block,
     operands: &[Value],
     new_target: Option<Value>,
+    frame_this: Option<Value>,
     argc: Option<u32>,
     join: Block,
     dirty: Option<Edge>,
@@ -475,6 +478,9 @@ pub(crate) fn splice(
     // A construct's frame also gets its new.target (`inline.enter`'s last
     // operand); the entry's params are callee, this and the formals.
     let mut enter_ops = operands.to_vec();
+    if let Some(t) = frame_this {
+        enter_ops[1] = t;
+    }
     enter_ops.extend(new_target);
     let (enter_inst, _) = f.add_inst(enter, Opcode::InlineEnter, enter_ops, &[], vec![]);
     f.inst_frame[enter_inst] = base;

@@ -32,6 +32,8 @@ pub mod stamp {
     pub const SLOTS: u32 = 0x0002_0000;
     /// The TYPES (SHALLOW) validity bit.
     pub const TYPES: u32 = super::mir::abi::CLASS_WORD_SHALLOW;
+    /// The CLOSED bit (no own property outside the row).
+    pub const CLOSED: u32 = super::mir::abi::CLASS_WORD_CLOSED;
     pub const SHAPE_OFFSET: u32 = super::mir::abi::SHAPE_OFFSET;
     pub const SHAPE_IMMUTABLE_FLAGS_OFFSET: u32 = super::mir::abi::SHAPE_IMMUTABLE_FLAGS_OFFSET;
     pub const SHAPE_FIXED_SLOTS_SHIFT: u32 = super::mir::abi::SHAPE_FIXED_SLOTS_SHIFT;

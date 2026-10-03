@@ -538,7 +538,14 @@ fn main() -> Result<()> {
                         })
                 });
             let types = if types { night_compiler::wasm::stamp::TYPES } else { 0 };
-            out.push((addr, (lid + 1) | night_compiler::wasm::stamp::SLOTS | types));
+            // CLOSED: its properties are exactly the row's, of a layout that
+            // may be.
+            let closed = if env.closed_layouts_tx.contains(&lid) {
+                night_compiler::wasm::stamp::CLOSED
+            } else {
+                0
+            };
+            out.push((addr, (lid + 1) | night_compiler::wasm::stamp::SLOTS | types | closed));
         }
         out
     };
