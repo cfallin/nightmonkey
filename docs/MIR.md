@@ -2075,6 +2075,8 @@ test, the class word's RANGES bit).
   `initialize` that stores computed values, `this.x = x ? x : 0`); that is
   partial escape analysis of the `new_this` object (MIR-MEMORY.md §6),
   materializing with `new_this.init`.
+- Octane A/B (xap, seeds x4): earley-boyer +12.9%, the rest within
+  noise (crypto +2.4%, raytrace -1.9%).
 - Night test: mir-new-this-init.js (setters and read-only properties of
   field names arriving on the chain, a reassigned `prototype`, a longer
   chain, missing arguments, values outside a field's claim, GCs); it
