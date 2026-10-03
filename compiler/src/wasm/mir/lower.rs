@@ -103,6 +103,9 @@ const INLINE_GNAME_SETS: bool = true;
 /// A call whose callee's type proves its script calls that script's body
 /// with no native arms and no classify (`js_call_proven`).
 const PROVEN_CALLS: bool = true;
+/// The most arguments past the first an inline `push` stores (each costs a
+/// store and a post-barrier test).
+const PUSH_ARM_MAX_EXTRA: usize = 7;
 
 const UNDEF: u64 = TAG_UNDEFINED << 32;
 
@@ -7794,12 +7797,13 @@ impl<'a> Lower<'a> {
             let call = self.body.add_block();
             self.char_arms(inst, ops, call)?;
             self.cur = call;
-            if self.names_atom("push") {
-                let call = self.body.add_block();
-                self.push_arm(inst, ops, call)?;
-                self.cur = call;
-            }
         }
+        if (3..=3 + PUSH_ARM_MAX_EXTRA).contains(&ops.len()) && !iter && self.names_atom("push") {
+            let call = self.body.add_block();
+            self.push_arm(inst, ops, call)?;
+            self.cur = call;
+        }
+
         if ops.len() == 2 && !iter && self.names_atom("pop") {
             let call = self.body.add_block();
             self.pop_arm(inst, ops, call)?;
@@ -8318,14 +8322,15 @@ impl<'a> Lower<'a> {
         self.bin(Operator::I64Eq, callee, bits, Type::I32)
     }
 
-    /// `Array.prototype.push(v)` on a dense array, call-free: with
-    /// the elements packed, room left, and the receiver's shape
-    /// in the append cache with its protos' shapes unchanged (no indexed
-    /// property can appear on them), store at the end and bump the
-    /// initialized length and `length`, taking `ok_clean` with the new
-    /// length; else `other`.
+    /// `Array.prototype.push(v, ...)` on a dense array, call-free: with
+    /// the elements packed, room left for every argument, and the
+    /// receiver's shape in the append cache with its protos' shapes
+    /// unchanged (no indexed property can appear on them), store them at
+    /// the end and bump the initialized length and `length`, taking
+    /// `ok_clean` with the new length; else `other`.
     fn push_arm(&mut self, inst: mir::Inst, ops: &[Value], other: Block) -> R<()> {
-        let (callee, this, arg) = (ops[0], ops[1], ops[2]);
+        let (callee, this, args) = (ops[0], ops[1], &ops[2..]);
+        let n = u32::try_from(args.len()).unwrap();
         let is_push = self.builtin_is(callee, BC_ARR_PUSH);
         let ttag = self.tag_of(this);
         let this_obj = self.tag_is(ttag, TAG_OBJECT as u32);
@@ -8341,9 +8346,12 @@ impl<'a> Lower<'a> {
         let bail = self.bin(Operator::I32And, flags, bm, Type::I32);
         let flags_ok = self.un(Operator::I32Eqz, bail, Type::I32);
         let len_eq = self.bin(Operator::I32Eq, len, initlen, Type::I32);
-        let has_cap = self.bin(Operator::I32LtU, initlen, cap, Type::I32);
-        let imax = self.i32c(0x7FFF_FFFF);
-        let fits = self.bin(Operator::I32LtU, len, imax, Type::I32);
+        // `cap - initlen >= n` (initlen <= cap always).
+        let room = self.bin(Operator::I32Sub, cap, initlen, Type::I32);
+        let nv = self.i32c(n);
+        let has_cap = self.bin(Operator::I32GeU, room, nv, Type::I32);
+        let imax = self.i32c(0x7FFF_FFFF - n);
+        let fits = self.bin(Operator::I32LeU, len, imax, Type::I32);
         let a = self.bin(Operator::I32And, flags_ok, len_eq, Type::I32);
         let b = self.bin(Operator::I32And, has_cap, fits, Type::I32);
         let ok = self.bin(Operator::I32And, a, b, Type::I32);
@@ -8369,13 +8377,18 @@ impl<'a> Lower<'a> {
         // A stamped array's element claims (RANGES, TYPES) hold for a value
         // no site proves here: dropped (the array stamp's store duty).
         self.elem_duty(obj);
-        self.store_i64(addr, 0, arg);
-        let one = self.i32c(1);
-        let newlen = self.bin(Operator::I32Add, initlen, one, Type::I32);
+        for (k, &arg) in args.iter().enumerate() {
+            self.store_i64(addr, 8 * u32::try_from(k).unwrap(), arg);
+        }
+        let newlen = self.bin(Operator::I32Add, initlen, nv, Type::I32);
         self.set_elem_header(elements, ELEMENTS_INITLEN_BACK, newlen);
         self.set_elem_header(elements, ELEMENTS_LENGTH_BACK, newlen);
         let f = self.h.post_write_barrier_elem;
-        self.post_barrier(f, obj, initlen, arg);
+        for (k, &arg) in args.iter().enumerate() {
+            let kv = self.i32c(u32::try_from(k).unwrap());
+            let idx = self.bin(Operator::I32Add, initlen, kv, Type::I32);
+            self.post_barrier(f, obj, idx, arg);
+        }
         let r = self.box_tagged(TAG_INT32, newlen);
         let t = self.edge(inst, 0, &[r])?;
         self.terminate(Terminator::Br { target: t });
