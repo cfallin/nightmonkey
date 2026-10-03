@@ -61,6 +61,28 @@ keep/drop call:
   in parallel. Each timed run loads a fresh copy of the `.cwasm`: its page
   layout is worth a stable 2–3%, and copying re-randomizes it.
 
+## Where the executed instructions go
+
+`--value-census` counts executed Wasm values (instructions) by the MIR op
+that emitted them. Octane runs each benchmark for a fixed time, so a faster
+build does more iterations and its totals grow; compare builds on fixed
+work:
+
+```
+.claude/skills/nm-bench/vcensus.sh <tag> "deltablue richards" [nightmonkey js]
+```
+
+runs Octane's deterministic mode (warmup off, `deterministicIterations`
+divided by `DIV`, default 20) and leaves `$W/vcensus/<tag>-<bench>.{out,map}`.
+On those (or any `--value-census` run's stdout and compile log):
+
+- `valcen.py out map [--sites] [--grep RE] [--top N]`: values by op, or by
+  op@site;
+- `propw.py out map [--sites]`: generic property access (`getprop.data`,
+  `setprop.data`, `js.getprop`, `js.setprop`) weighted by the analysis's
+  reason the site has no `prop_sites` row; compile with `--dump-propgap`
+  too.
+
 ## The cross-engine table
 
 ```
