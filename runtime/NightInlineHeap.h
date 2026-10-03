@@ -70,6 +70,15 @@ struct NightConstructCell {
   uint32_t gen;
   uint32_t protoPtr;
   uint32_t protoSlotEnc;
+  // MIR's `new_this.init` (the constructor's leading field adds made with
+  // the allocation): the object's shape after them (written last: it arms
+  // the row), and the prototype chain's shapes then (the prototype's, and
+  // its prototype and that one's, or 0): a setter or read-only property of
+  // one of those names added since reshapes one of them.
+  uint32_t finalShape;
+  uint32_t protoShape;
+  uint32_t proto2Ptr;
+  uint32_t proto2Shape;
 };
 
 // A `Lambda` site's row, in the construct-cell region: the alloc words of the

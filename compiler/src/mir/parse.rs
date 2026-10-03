@@ -1335,6 +1335,17 @@ impl Parser {
                 self.expect_punct(",")?;
                 NewThis(n, self.int()?)
             }
+            NewThisInit { .. } => {
+                let nslots = self.int()?;
+                self.expect_punct(",")?;
+                let word = self.int()?;
+                self.expect_punct(",")?;
+                let key = LayoutKey::new(self.prefixed("L", "a layout")?);
+                let types = self.eat_word("types");
+                self.expect_punct(",")?;
+                let n = self.int()?;
+                NewThisInit { nslots, word, key, types, n }
+            }
             CtorStamp(..) | CtorPublish(..) => {
                 let l = self.int()?;
                 self.expect_punct(",")?;
@@ -1734,6 +1745,13 @@ fn template(mn: &str) -> Option<Opcode> {
         Construct(0, 0),
         CreateThis(0, 0),
         NewThis(0, 0),
+        NewThisInit {
+            nslots: 0,
+            word: 0,
+            key: LayoutKey::new(0),
+            types: false,
+            n: 0,
+        },
         FnIsCtor,
         ObjEmulatesUndef,
         Restamp(0),

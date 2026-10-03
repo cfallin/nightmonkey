@@ -117,7 +117,7 @@ namespace night {
   /* are written only by compiled code and read back only by it, so their   */ \
   /* sizes are not shared and stay in translate.rs.)                        */ \
   _(allocCellBytes, 32)                                                        \
-  _(constructCellBytes, 40)                                                    \
+  _(constructCellBytes, 56)                                                    \
   /* Per-binding value-fuse cells (gGlobalVals, after the slot rows):      */  \
   /* [bits u64 @0][fuse word u32 @8][pad]. Fuse states: 0 unarmed, 1       */  \
   /* armed (bits are the value), 2 blown, 3 armed with the binding's       */  \

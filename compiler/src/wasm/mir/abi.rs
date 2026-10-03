@@ -219,6 +219,10 @@ pub(crate) const CONSTRUCT_CELL_CTORSHAPE: u32 = 20;
 pub(crate) const CONSTRUCT_CELL_GEN: u32 = 24;
 pub(crate) const CONSTRUCT_CELL_PROTOPTR: u32 = 28;
 pub(crate) const CONSTRUCT_CELL_PROTOSLOTENC: u32 = 32;
+pub(crate) const CONSTRUCT_CELL_FINALSHAPE: u32 = 36;
+pub(crate) const CONSTRUCT_CELL_PROTOSHAPE: u32 = 40;
+pub(crate) const CONSTRUCT_CELL_PROTO2PTR: u32 = 44;
+pub(crate) const CONSTRUCT_CELL_PROTO2SHAPE: u32 = 48;
 pub(crate) const CONSTRUCT_CELL_ADDR_PLACEHOLDER: u32 = 0xDEAD_C000;
 // A `Lambda` site's row (`NightLambdaCell`) and a prologue's CallObject row
 // (`NightEnvCell`), in the construct-cell region: an alloc row, then the

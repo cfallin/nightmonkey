@@ -174,6 +174,7 @@
   NIGHT_RUNTIME_HELPER(night_runtime_get_elem_pure)               \
   NIGHT_RUNTIME_HELPER(night_runtime_set_elem_pure)               \
   NIGHT_RUNTIME_HELPER(night_runtime_new_this)                    \
+  NIGHT_RUNTIME_HELPER(night_runtime_new_this_init)               \
   NIGHT_RUNTIME_HELPER(night_runtime_regex_ci_compare)
 
 namespace js {

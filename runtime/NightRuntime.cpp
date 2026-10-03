@@ -6486,6 +6486,100 @@ bool night_runtime_new_this(JSContext* cx, uint32_t top, uint64_t calleeBits,
 #endif
 }
 
+// The final part of construct cell `cellAddr` (MIR's `new_this.init`), from
+// `obj` just given its layout's first `n` row fields: its shape, armed only
+// where those fields are its only properties, each in its row's fixed slot
+// (what the inline path's stores write), the alloc part is current (this
+// generation's), and the prototype chain is at most two tenured objects,
+// whose shapes the inline path re-checks.
+static void FillConstructCellFinal(uint32_t cellAddr, JSObject* obj,
+                                   const std::vector<uint32_t>& row,
+                                   uint32_t n) {
+  if (!cellAddr || !gNames.ids || !obj->is<js::NativeObject>()) {
+    return;
+  }
+  auto* cell = LinMem<js::night::NightConstructCell>(cellAddr);
+  if (!cell->ctorShape || cell->gen != (gEnv.propicGenPtr ? InlineGen() : 0)) {
+    return;
+  }
+  auto& nobj = obj->as<js::NativeObject>();
+  if (nobj.slotSpan() != n || n > nobj.numFixedSlots()) {
+    return;
+  }
+  for (uint32_t i = 0; i < n; i++) {
+    mozilla::Maybe<js::PropertyInfo> prop =
+        nobj.lookupPure((*gNames.ids)[row[i]].get());
+    if (prop.isNothing() || !prop->isDataProperty() || prop->slot() != i) {
+      return;
+    }
+  }
+  JSObject* p = obj->staticPrototype();
+  if (!p || uint32_t(reinterpret_cast<uintptr_t>(p)) != cell->protoPtr ||
+      js::gc::IsInsideNursery(p)) {
+    return;
+  }
+  JSObject* p2 = p->staticPrototype();
+  if (p2 && (p2->staticPrototype() || js::gc::IsInsideNursery(p2))) {
+    return;
+  }
+  cell->protoShape = js::night::NightObjectShape(p);
+  cell->proto2Ptr = uint32_t(reinterpret_cast<uintptr_t>(p2));
+  cell->proto2Shape = p2 ? js::night::NightObjectShape(p2) : 0;
+  // Written last: it arms the row.
+  cell->finalShape = js::night::NightObjectShape(obj);
+}
+
+uint32_t night_runtime_new_this_init(JSContext* cx, uint32_t top,
+                                     uint64_t calleeBits, uint64_t protoBits,
+                                     uint32_t nSlots, uint32_t cellAddr,
+                                     uint32_t stampWord, uint32_t valsAddr,
+                                     uint32_t n, uint32_t cache0,
+                                     uint32_t wantBits) {
+  SetNightTop(cx, top);
+#ifdef ENABLE_JS_NIGHTMONKEY
+  // The layout under construction: the stamp word's early key.
+  uint32_t half = stampWord >> 16;
+  uint32_t k = (half & 0x8000) ? (half >> 2) & 0xfff : 0;
+  if (k == 0 || k - 1 >= gLayouts.rows.size() ||
+      gLayouts.rows[k - 1].size() < n) {
+    return 2;
+  }
+  const std::vector<uint32_t>& row = gLayouts.rows[k - 1];
+  uint64_t out = 0;
+  if (!js::night::NightNewThis(cx, calleeBits, protoBits, nSlots, &out,
+                               stampWord)) {
+    return 0;
+  }
+  FillConstructCell(cx, cellAddr, out, calleeBits);
+  JS::RootedObject obj(cx, &JS::Value::fromRawBits(out).toObject());
+  for (uint32_t i = 0; i < n; i++) {
+    // Reread each time: the values are rooted where they are (below
+    // `top`), and a GC may have moved them.
+    uint64_t val = *LinMem<uint64_t>(valsAddr + 8 * i);
+    uint32_t r = night_runtime_init_field(
+        cx, top, JS::ObjectValue(*obj).asRawBits(), row[i], val, cache0 + i,
+        i + 1, wantBits);
+    if (!r) {
+      return cx->isExceptionPending() ? 0 : 2;
+    }
+  }
+  FillConstructCellFinal(cellAddr, obj, row, n);
+  WriteNightOut(top, JS::ObjectValue(*obj).asRawBits());
+  return 1;
+#else
+  (void)calleeBits;
+  (void)protoBits;
+  (void)nSlots;
+  (void)cellAddr;
+  (void)stampWord;
+  (void)valsAddr;
+  (void)n;
+  (void)cache0;
+  (void)wantBits;
+  return 0;
+#endif
+}
+
 // --- closure support: thin POD wrappers over the js::night:: helpers. The
 // may-GC ones take `top`, install it, and pass the out-slot (= top) through.
 // ---

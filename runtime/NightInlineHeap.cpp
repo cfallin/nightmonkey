@@ -215,6 +215,14 @@ static_assert(offsetof(NightConstructCell, protoPtr) == 28,
               "construct cell protoPtr@28");
 static_assert(offsetof(NightConstructCell, protoSlotEnc) == 32,
               "construct cell protoSlotEnc@32");
+static_assert(offsetof(NightConstructCell, finalShape) == 36,
+              "construct cell finalShape@36");
+static_assert(offsetof(NightConstructCell, protoShape) == 40,
+              "construct cell protoShape@40");
+static_assert(offsetof(NightConstructCell, proto2Ptr) == 44,
+              "construct cell proto2Ptr@44");
+static_assert(offsetof(NightConstructCell, proto2Shape) == 48,
+              "construct cell proto2Shape@48");
 
 // ==========================================================================
 // Inline nursery allocation

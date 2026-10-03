@@ -74,6 +74,7 @@ use crate::wasm::mir::abi::{
     IC_TRANS_ROW_OFF, IC_TRANS_SLOTOFF, BASESHAPE_PROTO_OFFSET, IOF_CELL_ADDR_PLACEHOLDER,
     IOF_CELL_GEN, IOF_CELL_SLOTENC, CONSTRUCT_CELL_ADDR_PLACEHOLDER, CONSTRUCT_CELL_CTORSHAPE,
     CONSTRUCT_CELL_GEN, CONSTRUCT_CELL_PROTOPTR, CONSTRUCT_CELL_PROTOSLOTENC, NURSERY_HEADER_BYTES,
+    CONSTRUCT_CELL_FINALSHAPE, CONSTRUCT_CELL_PROTOSHAPE, CONSTRUCT_CELL_PROTO2PTR, CONSTRUCT_CELL_PROTO2SHAPE,
     IC_WAY_HOLDERPTR, IC_WAY_MONO_OFF, IC_WAY_RECVSHAPE,
     IC_WAY_ADDR_PLACEHOLDER, NATIVE_SLOTS_OFFSET, SHAPE_BASESHAPE_OFFSET, BASESHAPE_CLASP_OFFSET,
     BASESCRIPT_NIGHTFUNCINDEX_OFFSET, FUNC_FLAGS_SLOT_OFFSET, FUNCTION_FLAGS_CONSTRUCTOR, FUNC_ENV_SLOT_OFFSET, FUNC_SCRIPT_SLOT_OFFSET,
@@ -3540,6 +3541,57 @@ impl<'a> Lower<'a> {
                 let e = self.edge(inst, 1, &[])?;
                 self.cond_br(ok, t, e);
             }
+            Opcode::NewThisInit { nslots, word, types, n, .. } => {
+                // As `new_this`, with the first `n` fields made with the
+                // object: the row's final shape and one check of the
+                // prototype chain, else the runtime's adds (which fill the
+                // row), failing before anything observable where an add
+                // would not be plain.
+                let live = self.live_across(inst);
+                let callee = self.box_tagged(TAG_OBJECT, a[0]);
+                let xs: Vec<Value> = a[2..].to_vec();
+                let (obj, slow, cell) = self.construct_this_final(a[1], word, &xs);
+                let t = self.edge(inst, 0, &[obj])?;
+                self.terminate(Terminator::Br { target: t });
+                self.cur = slow;
+                self.root(&live)?;
+                let base = self.top_off(live.len());
+                for (i, &x) in xs.iter().enumerate() {
+                    self.store_i64(self.vp, base + 8 * u32::try_from(i).unwrap(), x);
+                }
+                let top_off = base + 8 * n;
+                let top = self.add_off(self.vp, top_off);
+                let vals = self.add_off(self.vp, base);
+                let cache0 = self.atoms.next_prop_cache();
+                for _ in 1..n {
+                    self.atoms.next_prop_cache();
+                }
+                let bits = CLASS_WORD_SLOTS | if types { CLASS_WORD_SHALLOW } else { 0 };
+                let args: Vec<Value> = [nslots, 0, word, 0, n, cache0, bits]
+                    .iter()
+                    .map(|&c| self.i32c(c))
+                    .collect();
+                let r = self.call1(
+                    self.h.new_this_init,
+                    &[self.cx, top, callee, a[1], args[0], cell, args[2], vals, args[4], args[5], args[6]],
+                    Type::I32,
+                );
+                self.after_gc(&live);
+                self.cold = true;
+                let out = self.load_i64(self.vp, top_off);
+                let o = self.un(Operator::I32WrapI64, out, Type::I32);
+                let one = self.i32c(1);
+                let made = self.bin(Operator::I32Eq, r, one, Type::I32);
+                let (yes, no) = (self.body.add_block(), self.body.add_block());
+                self.cond_br(made, Self::to(yes), Self::to(no));
+                self.cur = yes;
+                let t = self.edge(inst, 0, &[o])?;
+                self.terminate(Terminator::Br { target: t });
+                self.cur = no;
+                let f = self.edge(inst, 1, &[])?;
+                let e = self.edge(inst, 2, &[])?;
+                self.cond_br(r, f, e);
+            }
             Opcode::CreateThis(nslots, word) => {
                 // May GC: root what is live across it.
                 let live = self.live_across(inst);
@@ -6904,6 +6956,68 @@ impl<'a> Lower<'a> {
         let tag = self.i64c(TAG_OBJECT << 32);
         let this_v = self.bin(Operator::I64Or, payload, tag, Type::I64);
         (this_v, slow, cell)
+    }
+
+    /// `new_this.init`'s inline arm: with the site's construct cell's final
+    /// part armed under the live IC generation, `proto` its prototype, and
+    /// the prototype chain's shapes as recorded (no setter or read-only
+    /// property of the fields' names added since), a nursery bump with the
+    /// final shape, the class word (RANGES cleared, as the adds leave it),
+    /// and the fields `xs` in their fixed slots (no barriers: the object is
+    /// in the nursery, and new). Returns the object, the miss block and the
+    /// cell.
+    fn construct_this_final(&mut self, proto: Value, word: u32, xs: &[Value]) -> (Value, Block, Value) {
+        let cell = self.i32c(CONSTRUCT_CELL_ADDR_PLACEHOLDER);
+        let idx = self.atoms.next_construct_cell();
+        self.construct_cell_patches.push((cell, idx + 1));
+        let slow = self.body.add_block();
+        let fshape = self.load_i32(cell, CONSTRUCT_CELL_FINALSHAPE);
+        let cgen = self.load_i32(cell, CONSTRUCT_CELL_GEN);
+        let gen_addr = self.i32c(self.h.prop_ic_gen_base);
+        let live_gen = self.load_i32(gen_addr, 0);
+        let z = self.i32c(0);
+        let filled = self.bin(Operator::I32Ne, fshape, z, Type::I32);
+        let g_ok = self.bin(Operator::I32Eq, cgen, live_gen, Type::I32);
+        let hit = self.bin(Operator::I32And, filled, g_ok, Type::I32);
+        self.check(hit, slow);
+        let pt = self.tag_of(proto);
+        let p_obj = self.tag_is(pt, TAG_OBJECT as u32);
+        let pptr = self.un(Operator::I32WrapI64, proto, Type::I32);
+        let cproto = self.load_i32(cell, CONSTRUCT_CELL_PROTOPTR);
+        let p_eq = self.bin(Operator::I32Eq, pptr, cproto, Type::I32);
+        let p_ok = self.bin(Operator::I32And, p_obj, p_eq, Type::I32);
+        self.check(p_ok, slow);
+        let ps = self.load_i32(pptr, SHAPE_OFFSET);
+        let cps = self.load_i32(cell, CONSTRUCT_CELL_PROTOSHAPE);
+        let ps_ok = self.bin(Operator::I32Eq, ps, cps, Type::I32);
+        self.check(ps_ok, slow);
+        let p2 = self.load_i32(cell, CONSTRUCT_CELL_PROTO2PTR);
+        let (has2, done2) = (self.body.add_block(), self.body.add_block());
+        self.cond_br(p2, Self::to(has2), Self::to(done2));
+        self.cur = has2;
+        let p2s = self.load_i32(p2, SHAPE_OFFSET);
+        let cp2s = self.load_i32(cell, CONSTRUCT_CELL_PROTO2SHAPE);
+        let p2_ok = self.bin(Operator::I32Eq, p2s, cp2s, Type::I32);
+        self.check(p2_ok, slow);
+        self.terminate(Terminator::Br { target: Self::to(done2) });
+        self.cur = done2;
+        let total = self.load_i32(cell, 4);
+        let pos = self.nursery_bump(total, slow);
+        let hdr = self.load_i32(cell, 16);
+        self.store_i32(pos, 0, hdr);
+        let hb = self.i32c(NURSERY_HEADER_BYTES);
+        let obj = self.bin(Operator::I32Add, pos, hb, Type::I32);
+        self.store_i32(obj, SHAPE_OFFSET, fshape);
+        let wv = self.i32c(word & !CLASS_WORD_RANGES);
+        self.store_i32(obj, OBJ_CLASS_IDX_OFFSET, wv);
+        let slotsw = self.load_i32(cell, 8);
+        self.store_i32(obj, NATIVE_SLOTS_OFFSET, slotsw);
+        let elemsw = self.load_i32(cell, 12);
+        self.store_i32(obj, OBJ_ELEMENTS_OFFSET, elemsw);
+        for (i, &x) in xs.iter().enumerate() {
+            self.store_i64(obj, FIXED_SLOTS_BASE + 8 * u32::try_from(i).unwrap(), x);
+        }
+        (obj, slow, cell)
     }
 
     /// `lhs instanceof rhs` inline, taking

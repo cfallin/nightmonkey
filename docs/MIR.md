@@ -2038,6 +2038,94 @@ invalidation, so the fuse is tested at run time, once per read:
   to another function, a non-function and back; a class in a global);
   it fails against a mutant that skips the fuse test.
 
+**M5q. Constructors made with their leading fields (2026-10-02;
+KICKOFF-9 item 3).** An inlined `new` paid `new_this` (~49 Wasm values)
+and an `init_field` per field (~40: the add-transition row's shape and
+slot checks, two prototype hops, the store, the new shape, a post-barrier
+test, the class word's RANGES bit).
+- **What is made with the object.** A constructor whose bytecode starts
+  with `this.f = <formal>` stores (`ctor_formal_prefix`: after
+  `FunctionThis; SetLocal L; Pop`, a run of `GetLocal L; GetArg j;
+  SetProp f; Pop`) whose names are its layout row's first fields, in
+  order: those values are the construct's arguments, known before the
+  `new`, and nothing between the stores can observe `this`.
+  `inline_construct` guards each to its field's claim (exiting before the
+  `new`) and emits `new_this.init(callee, proto, x0..xn-1)` (ok, fail,
+  err), typed as `n` `init_field`s would leave the object; the body is
+  built for that object (`callee_ctx` with `constructing(n)`) and skips
+  those stores (`prefill_pcs`), publishing where they were all of its
+  fields.
+- **Inline.** The construct cell gains a final part: the object's shape
+  after the adds, and the prototype chain's shapes then (prototype, and
+  its prototype, at most two). The arm checks the cell once (armed, this
+  generation, this prototype, the chain's shapes: a setter or read-only
+  property of a field's name since reshapes a holder), bumps the nursery
+  with the final shape and the class word (RANGES cleared, as the adds
+  leave it), and stores the fields into their fixed slots, with no
+  barriers (the object is new, in the nursery).
+- **Slow path.** `night_runtime_new_this_init` makes `this` and adds the
+  fields as `init_field`'s slow path does (plain, vouched), then fills the
+  cell's final part where the fields are the object's only properties,
+  each in its row's fixed slot; an add that is not plain fails the op
+  (exit before the `new`: nothing observable has happened).
+- Fixed-work value census: earley-boyer -13.2% (`init_field` 12.3% ->
+  0.7% of the work, `new_this` 6.5% -> `new_this.init` 6.9%), splay
+  -0.8%; the others have no such constructor in their hot code. Not
+  covered: raytrace's (`Class.create` wrappers forwarding to an
+  `initialize` that stores computed values, `this.x = x ? x : 0`); that is
+  partial escape analysis of the `new_this` object (MIR-MEMORY.md §6),
+  materializing with `new_this.init`.
+- Night test: mir-new-this-init.js (setters and read-only properties of
+  field names arriving on the chain, a reassigned `prototype`, a longer
+  chain, missing arguments, values outside a field's claim, GCs); it
+  fails against a mutant that skips the chain's shape checks.
+
+**M5r. Property facts: what the generic accesses are (2026-10-02;
+KICKOFF-9 item 2, findings only).** Generic property ops' executed values
+(fixed-work census), by the analysis's reason (`nm-bench/propw.py`):
+- **richards** (18% of its work): 79% `no-slot-fact` on one class: the
+  task control block's *prototype methods* (`isHeldOrSuspended`, `run`,
+  `markAsSuspended`, ...), loaded through the IC's holder way (~25 values)
+  and then guarded by script for the inlined call. 18% `AnyOf` (`run`
+  over the task region).
+- **deltablue** (30%): 25% `AnyOf` (`this.direction`, `v1`, `v2` in
+  `BinaryConstraint` methods, run on `ScaleConstraint` and
+  `EqualityConstraint`, whose rows disagree on the slots: Scale writes
+  `direction` before calling its super-constructor); 25% prototype methods
+  (`size`, `at`, `constraintAt`); 13% `js.getprop` method loads with no
+  record (`x.size()`, `this.input()`); 12% an array's `.length` (`elms =
+  new Array()`: no element claim, so no array stamp, so `length_op` has
+  no evidence); 10% `Direction.FORWARD` (a snapshot singleton's field).
+- **earley-boyer** (13.5%): 75% `AnyObject` `.car`/`.cdr`; 6% the
+  `.prototype` read before `new_this`.
+- **raytrace** (21%): `this` mid-construction 22%, `One` 21%, `AnyOf`
+  17.5%, `region-no-fact` 16%. **box2d** (13.5%): `AnyObject` 24%,
+  `ClassAny` without a slot 18%, `Empty` 16.5%.
+
+What was measured:
+- **A typed read costs what an IC hit does** where its guard does not
+  fold: `guard.unbox.obj` (6 values) + `guard.layout` (7) + `load_slot`
+  (1) against the IC's first way (~11). Tried: range facts by name for
+  `AnyObject` receivers (the classes whose rows hold the field, one
+  contiguous run agreeing on the slot): earley-boyer's generic property
+  values -45%, its total unchanged (+0.1%). Not landed. Typed access pays
+  where one guard serves several accesses (a method's `this`, guarded
+  once at entry; a loop-invariant receiver) or where the typed value
+  feeds typed code, which is deltablue's and raytrace's `this`-heavy
+  methods, not earley-boyer's list walks.
+- **Slot alignment (2c) conflicts with construction order.** Putting
+  `ScaleConstraint`'s shared fields first makes it add out of row order,
+  which `init_field`'s `constructing(n)` (the first `n` row fields)
+  cannot express: its adds fall to the runtime's skip replay. The
+  alternative is a per-key slot table for members that disagree (a range
+  guard, then `slot = table[key - lo]`), with no row change.
+- **Prototype method loads** need two facts a layout stamp does not give:
+  that the receiver has no own property of that name (an append past the
+  row keeps the stamp: a CLOSED bit, cleared by every add outside the
+  row, the engine's and the inline arms'), and the holder's slot (a
+  per-site cell, or a prototype property fuse for Ion's constant method).
+These are design decisions for the owner.
+
 **M6. The rest of §10**: box/unbox cleanup, memory optimizations, and
 numeric optimizations, each with its guard-count and instruction-count
 tests.

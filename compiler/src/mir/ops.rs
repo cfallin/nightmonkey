@@ -825,6 +825,20 @@ pub enum Opcode {
     /// `proto` (or Object.prototype if `proto` is no object). Runs no code;
     /// an allocation (MIR-MEMORY.md §6).
     NewThis(u32, u32),
+    /// `new_this` with the first `n` fields of layout `key` added, their
+    /// values the operands after `callee, proto` (a constructor whose body
+    /// starts by storing them: MIR.md M5q): the object under construction
+    /// with `n` fields, as that many `init_field`s would leave it. Runs no
+    /// code; `fail` where an add would not be plain (a setter or read-only
+    /// property of the name on the prototype chain), before anything
+    /// observable.
+    NewThisInit {
+        nslots: u32,
+        word: u32,
+        key: LayoutKey,
+        types: bool,
+        n: u32,
+    },
     /// Whether function `f` is a constructor (its flags): an arrow
     /// function or a method is not.
     FnIsCtor,
@@ -937,6 +951,7 @@ impl Opcode {
             JsLambda(_) | LitNew(_) | LitInit(..) => OK_ERR.to_vec(),
             // The global `this`, or a primitive's wrapper: no user code.
             JsBoxThis | NewThis(..) => OK_ERR.to_vec(),
+            NewThisInit { .. } => OK_FAIL_ERR.to_vec(),
             JsRt(_) | ApplyFwd => CLEAN_DIRTY_ERR.to_vec(),
             ArgsObject | RestArray(_) => OK_ERR.to_vec(),
             JsThrow => vec![SuccRole::Err],
@@ -1910,6 +1925,37 @@ pub fn signature(op: &Opcode, args: &[Type], m: &Module) -> SigResult {
             val(&args[1], "new_this proto")?;
             Sig::output(Type::val(TagSet::OBJECT))
         }
+        NewThisInit { key, types, n, .. } => {
+            arity(args, 2 + *n as usize)?;
+            let o = obj(&args[0], "new_this.init callee")?;
+            want(matches!(o.kind, ObjKind::Function(Some(_))), || {
+                "new_this.init: callee's script is not known".into()
+            })?;
+            val(&args[1], "new_this.init proto")?;
+            let layout = m
+                .layouts
+                .get(key)
+                .ok_or_else(|| format!("new_this.init: layout {key} is not in the module"))?;
+            for (i, t) in args[2..].iter().enumerate() {
+                let f = layout
+                    .fields
+                    .get(i)
+                    .and_then(Option::as_ref)
+                    .ok_or_else(|| format!("new_this.init: field {i} of {key} is not described"))?;
+                want(is_subtype(t, &f.claim), || {
+                    format!("new_this.init: value {i} does not conform to the field's claim")
+                })?;
+            }
+            Sig::output(Type::Obj(ObjInfo {
+                layout: Some(LayoutClaim {
+                    keys: KeyRange::one(*key),
+                    types: *types,
+                    slots: true,
+                    state: LayoutState::Constructing(*n),
+                }),
+                ..ObjInfo::TOP
+            }))
+        }
         FnIsCtor => {
             arity(args, 1)?;
             obj(&args[0], "fn.is_ctor")?;
@@ -2490,7 +2536,7 @@ pub fn effects(op: &Opcode, args: &[Type], m: &Module) -> Effects {
         ApplyFwd => return Effects::generic(FlagsEffect::Callee),
         // Allocations: they run no JS and change no class word (a GC moves
         // objects but keeps their words), so they kill nothing.
-        ArgsObject | RestArray(_) | JsLambda(_) | JsBoxThis | NewThis(..) => {
+        ArgsObject | RestArray(_) | JsLambda(_) | JsBoxThis | NewThis(..) | NewThisInit { .. } => {
             fx.may_gc = true;
             fx.may_throw = true;
         }

@@ -423,6 +423,19 @@ NIGHT_RUNTIME_EXPORT(night_runtime_new_this)
 bool night_runtime_new_this(JSContext* cx, uint32_t top, uint64_t calleeBits,
                             uint64_t protoBits, uint32_t nSlots,
                             uint32_t cellAddr, uint32_t stampWord);
+// MIR's `new_this.init` slow path: `night_runtime_new_this`, then the plain
+// adds (as `night_runtime_init_field`'s, its rows `cache0 + i`) of the
+// first `n` fields of the layout the stamp word's early key names, with the
+// boxed values at `valsAddr` (below `top`); then the construct cell's final
+// part. 1 = made (the object to the out-slot), 0 = error, 2 = an add that
+// is not plain (the caller exits before the `new`). Runs no code. May GC.
+NIGHT_RUNTIME_EXPORT(night_runtime_new_this_init)
+uint32_t night_runtime_new_this_init(JSContext* cx, uint32_t top,
+                                     uint64_t calleeBits, uint64_t protoBits,
+                                     uint32_t nSlots, uint32_t cellAddr,
+                                     uint32_t stampWord, uint32_t valsAddr,
+                                     uint32_t n, uint32_t cache0,
+                                     uint32_t wantBits);
 NIGHT_RUNTIME_EXPORT(night_runtime_set_prop_pure)
 uint32_t night_runtime_set_prop_pure(JSContext* cx, uint32_t top,
                                      uint64_t recv, uint32_t atomId,

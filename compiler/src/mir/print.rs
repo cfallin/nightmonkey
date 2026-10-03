@@ -512,6 +512,7 @@ pub fn mnemonic(op: &Opcode) -> String {
         Construct(..) => "construct".into(),
         CreateThis(..) => "create_this".into(),
         NewThis(..) => "new_this".into(),
+        NewThisInit { .. } => "new_this.init".into(),
         FnIsCtor => "fn.is_ctor".into(),
         ObjEmulatesUndef => "obj.emulates_undef".into(),
         Restamp(_) => "restamp".into(),
@@ -626,6 +627,9 @@ fn immediates(m: &Module, op: &Opcode) -> Option<String> {
         }
         JsRt(RtOp::InitProp(a, attrs)) => format!("{}, {attrs}", atom(Some(m), *a)),
         Construct(n, w) | CreateThis(n, w) | NewThis(n, w) => format!("{n}, {w}"),
+        NewThisInit { nslots, word, key, types, n } => {
+            format!("{nslots}, {word}, L{key}{}, {n}", if *types { " types" } else { "" })
+        }
         Restamp(i) => i.to_string(),
         StampFresh(w) => format!("{w:#x}"),
         CtorStamp(l, n, k) | CtorPublish(l, n, k) => format!("{l}, {n}, {k}"),

@@ -908,6 +908,7 @@ pub fn resolve_helpers(
         get_elem_pure: resolve(m, "night_runtime_get_elem_pure")?,
         set_elem_pure: resolve(m, "night_runtime_set_elem_pure")?,
         new_this: resolve(m, "night_runtime_new_this")?,
+        new_this_init: resolve(m, "night_runtime_new_this_init")?,
     })
 }
 

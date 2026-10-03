@@ -697,6 +697,11 @@ pub struct Helpers {
     /// word) -> ok`: MIR's `new_this` slow path (the object to the
     /// out-slot). May GC; runs no JS.
     pub new_this: Func,
+    /// `night_runtime_new_this_init(cx, top, callee i64, proto i64, nslots,
+    /// cell, word, vals, n, cache0, wantBits) -> 1 made | 0 error | 2 an add
+    /// that is not plain`: MIR's `new_this.init` slow path (the object to
+    /// the out-slot). May GC; runs no JS.
+    pub new_this_init: Func,
     /// `night_runtime_set_fun_name(cx, top, fun i64, name i64, prefixKind i32) -> ok`:
     /// `JSOp::SetFunName` -- set the inferred name on an anonymous function.
     /// Leaves `fun` on the stack (no out-slot).
@@ -3524,6 +3529,23 @@ mod tests {
             returns: vec![Type::I32],
         });
         let new_this = stub(&mut m, nt_sig, true, "night_runtime_new_this");
+        let nti_sig = m.signatures.push(SignatureData {
+            params: vec![
+                Type::I32,
+                Type::I32,
+                Type::I64,
+                Type::I64,
+                Type::I32,
+                Type::I32,
+                Type::I32,
+                Type::I32,
+                Type::I32,
+                Type::I32,
+                Type::I32,
+            ],
+            returns: vec![Type::I32],
+        });
+        let new_this_init = stub(&mut m, nti_sig, true, "night_runtime_new_this_init");
         // math_unary: (kind i32, x f64) -> f64; math_pow: (x f64, y f64) -> f64.
         let mu_sig = m.signatures.push(SignatureData {
             params: vec![Type::I32, Type::F64],
@@ -3836,6 +3858,7 @@ mod tests {
                 get_elem_pure,
                 set_elem_pure,
                 new_this,
+                new_this_init,
             },
         )
     }

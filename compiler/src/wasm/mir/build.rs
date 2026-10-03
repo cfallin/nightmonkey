@@ -384,6 +384,43 @@ impl<'a> Shape<'a> {
     }
 }
 
+/// A constructor's leading field stores of its formals, as its bytecode
+/// has them: after `FunctionThis; SetLocal L; Pop`, a run of `GetLocal L;
+/// GetArg j; SetProp name; Pop`. Each entry is (the name's gcthing index,
+/// the formal, the `SetProp`'s pc). A `new` inlining the constructor makes
+/// the object with these fields (`new_this.init`) and builds the body for
+/// it, skipping the stores; both sides read this one scan.
+pub(super) fn ctor_formal_prefix(script: &Script) -> Vec<(u32, u16, Pc)> {
+    let mut p = script.parser();
+    let pc_of = |p: &BytecodeParser| Pc::new(u32::try_from(script.bytecode.len() - p.remaining()).unwrap());
+    let mut out = vec![];
+    if p.next_op() != Some(JSOp::FunctionThis) || p.next_op() != Some(JSOp::SetLocal) {
+        return out;
+    }
+    let Some(local) = p.next_uint24() else { return out };
+    if p.next_op() != Some(JSOp::Pop) {
+        return out;
+    }
+    loop {
+        if p.next_op() != Some(JSOp::GetLocal) || p.next_uint24() != Some(local) {
+            return out;
+        }
+        if p.next_op() != Some(JSOp::GetArg) {
+            return out;
+        }
+        let Some(arg) = p.next_uint16() else { return out };
+        let pc = pc_of(&p);
+        if !matches!(p.next_op(), Some(JSOp::SetProp | JSOp::StrictSetProp)) {
+            return out;
+        }
+        let Some(name) = p.next_uint32() else { return out };
+        if p.next_op() != Some(JSOp::Pop) {
+            return out;
+        }
+        out.push((name, arg, pc));
+    }
+}
+
 /// A property access the analysis predicts: the receiver's layouts
 /// `[lo, hi]`, and whether the field's predicted type is backed by the
 /// stamp's TYPES bit: with it set on a valid stamp, every field holds a
@@ -506,6 +543,11 @@ const NARROW_TESTS: bool = true;
 /// read as that function behind its value fuse's predicted state
 /// (`check.binding.fn`).
 const PREDICTED_GNAMES: bool = true;
+
+/// An inlined `new` of a constructor whose body starts by storing its
+/// formals into its first fields makes the object with them
+/// (`new_this.init`), the body built to skip those stores.
+const PREFILL_INITS: bool = true;
 
 /// A call of a known single callee not inlined gets a direct arm
 /// (`attach_targets`).
@@ -669,6 +711,18 @@ fn build_at<'a>(
     shape.ictx = ictx;
     shape.formal_fns = formal_fns.to_vec();
     shape.this_ctor = this_ctor;
+    // Its own layout's `this` with fields already: only a `new` that made
+    // them from the leading stores (`inline_construct`); no other builder
+    // enters a constructor's body with its own object under construction
+    // past its start.
+    if let Some((key, n, _)) = this_ctor.filter(|&(_, n, _)| n > 0) {
+        if ctx.stamp_ctors_in.get(&sid).is_some_and(|si| si.layout_id == key) {
+            let pre = ctor_formal_prefix(script);
+            if pre.len() >= n as usize {
+                shape.prefill_pcs = pre[..n as usize].iter().map(|&(_, _, pc)| pc).collect();
+            }
+        }
+    }
     for (i, &gc) in script.gcthings.iter().enumerate() {
         if gc.is_other() {
             continue;
@@ -976,6 +1030,10 @@ struct Shape<'a> {
     /// (`Ty::Ctor`: layout key, fields added, TYPES): the body is built
     /// for it, with no entry guard, as a context-sensitive callee build.
     this_ctor: Option<(u32, u32, bool)>,
+    /// A constructor built for its own `this` already holding its first
+    /// fields (`new_this.init` made them from its leading stores): the pcs
+    /// of those stores, which this build skips (`ctor_formal_prefix`).
+    prefill_pcs: Vec<Pc>,
     /// `name_classes`, by name, made on first use.
     #[allow(clippy::type_complexity)]
     name_classes: std::cell::RefCell<BTreeMap<crate::ids::NameId, std::rc::Rc<Vec<(u32, TagSet)>>>>,
@@ -1034,6 +1092,7 @@ impl<'a> Shape<'a> {
             callees: Default::default(),
             formal_fns: vec![],
             this_ctor: None,
+            prefill_pcs: vec![],
             name_classes: Default::default(),
             layout_fields: Default::default(),
         })
@@ -2319,6 +2378,14 @@ impl<'s, 'a> Run<'s, 'a> {
         if i > n {
             return false;
         }
+        // A leading store `new_this.init` already made (the value is the
+        // formal's, which nothing before it can have changed).
+        if self.s.prefill_pcs.get(i) == Some(&self.pc) && n == self.s.prefill_pcs.len() {
+            if i + 1 == n && n == fields.len() {
+                self.publish_ctor(key, t, recv.v);
+            }
+            return true;
+        }
         // The value, of the field's claim: statically, or guarded here.
         let claim = fields[i].1;
         let ctags = match claim {
@@ -2342,26 +2409,29 @@ impl<'s, 'a> Run<'s, 'a> {
         let s = Slot { v: o, ty };
         self.replace_slot(recv.v, s);
         if n + 1 == fields.len() {
-            // Every field is there: the stamp. It ends construction, so it
-            // kills the claims on the object under construction, as its
-            // prediction witness says (§4.5); every copy of it is
-            // replaced by the published one.
-            let pty = Ty::Obj(KeyRange::one(crate::ids::LayoutKey::new(key)), t, true);
-            let (inst, rs) = self.f.add_inst(self.cur, Opcode::PublishLayout, vec![o], &[pty.mir()], vec![]);
-            self.f.witnesses[inst] = Some(mir::func::Witness {
-                may_kill: mir::types::KillPattern::of(mir::types::KillSet::CONSTRUCTING),
-            });
-            self.replace_slot(o, Slot { v: rs[0], ty: pty });
-            // A builder run's only constructing object is its own `this`,
-            // so the frame's `this` is now this published object (a
-            // standalone constructor's raw `this` slot never saw the
-            // guard that refined its boxed copy): `ctor_stamp` then has
-            // nothing left to do.
-            if self.s.ctx.stamp_ctors_in.get(&self.s.sid).is_some_and(|si| si.layout_id == key) {
-                self.st[0] = Slot { v: rs[0], ty: pty };
-            }
+            self.publish_ctor(key, t, o);
         }
         true
+    }
+
+    /// Every field of layout `key` is on object `o`: the stamp. It ends
+    /// construction, so it kills the claims on the object under
+    /// construction, as its prediction witness says (§4.5); every copy of
+    /// it is replaced by the published one.
+    fn publish_ctor(&mut self, key: u32, t: bool, o: mir::Value) {
+        let pty = Ty::Obj(KeyRange::one(crate::ids::LayoutKey::new(key)), t, true);
+        let (inst, rs) = self.f.add_inst(self.cur, Opcode::PublishLayout, vec![o], &[pty.mir()], vec![]);
+        self.f.witnesses[inst] = Some(mir::func::Witness {
+            may_kill: mir::types::KillPattern::of(mir::types::KillSet::CONSTRUCTING),
+        });
+        self.replace_slot(o, Slot { v: rs[0], ty: pty });
+        // A builder run's only constructing object is its own `this`, so
+        // the frame's `this` is now this published object (a standalone
+        // constructor's raw `this` slot never saw the guard that refined
+        // its boxed copy): `ctor_stamp` then has nothing left to do.
+        if self.s.ctx.stamp_ctors_in.get(&self.s.sid).is_some_and(|si| si.layout_id == key) {
+            self.st[0] = Slot { v: rs[0], ty: pty };
+        }
     }
 
     /// An object under construction `x` passed as a callee's `this`
@@ -3670,7 +3740,51 @@ impl<'s, 'a> Run<'s, 'a> {
         // next pc's value is the construct's, not `this`, so a kill here
         // has nowhere to exit to.
         let proto_atom = self.mm.intern_atom(&"prototype".encode_utf16().collect::<Vec<u16>>());
-        let this = if NEW_THIS && nt == vals[0] && self.ctor_of_word(k, word).is_some() && self.data_get_ok(proto_atom) {
+        let new_this = NEW_THIS && nt == vals[0] && self.ctor_of_word(k, word).is_some() && self.data_get_ok(proto_atom);
+        let mut callee = callee.clone();
+        // The constructor's leading stores of its formals, made with the
+        // allocation (`new_this.init`): the body is built for the object
+        // with those fields, and skips them.
+        let prefilled = if new_this && PREFILL_INITS {
+            self.ctor_prefill(k, word, &vals[2..vals.len() - 1])
+        } else {
+            None
+        };
+        if let Some((key, t, xs, c)) = prefilled {
+            self.inline_sites = (self.inline_sites + c.sites).saturating_sub(callee.sites);
+            callee = c;
+            let proto = self.data_get(proto_atom, vals[0]);
+            let n = u32::try_from(xs.len()).unwrap();
+            let ok = self.new_block();
+            let this_n = self.f.add_param(ok, Ty::Ctor(key, n, t).mir());
+            let (fail, err) = (self.exit_block(false), self.exit_block(true));
+            let op = Opcode::NewThisInit {
+                nslots,
+                word,
+                key: crate::ids::LayoutKey::new(key),
+                types: t,
+                n,
+            };
+            let mut operands = vec![kobj, proto];
+            operands.extend(xs);
+            self.term(
+                op,
+                operands,
+                vec![
+                    Edge {
+                        block: ok,
+                        args: vec![EdgeArg::Out(0)],
+                    },
+                    Self::goto(fail),
+                    Self::goto(err),
+                ],
+            );
+            self.at(ok);
+            let this = self.inst(Opcode::Box, vec![this_n], Some(mir::ops::box_type(&self.f.ty(this_n)).expect("objects box")));
+            let this = self.weaken(this, MType::val(TagSet::OBJECT));
+            return self.splice_construct(k, &callee, vals, nt, kobj, this, this_n, join, result, err, generic, nslots, word);
+        }
+        let this = if new_this {
             let proto = self.data_get(proto_atom, vals[0]);
             self.js_static(Opcode::NewThis(nslots, word), vec![kobj, proto], MType::val(TagSet::OBJECT))
         } else {
@@ -3680,7 +3794,6 @@ impl<'s, 'a> Run<'s, 'a> {
         // construction for the constructor's own layout, with no field
         // yet. The body is built for that `this`, whose adds are then
         // `init_field`s and whose methods see its construction state.
-        let mut callee = callee.clone();
         let mut this_op = this;
         if let Some((key, t)) = self.ctor_of_word(k, word) {
             if let Some(c) = self.s.callee_ctx(k, &[], Some((key, 0, t)), self.admitted) {
@@ -3695,6 +3808,92 @@ impl<'s, 'a> Run<'s, 'a> {
                 callee = c;
             }
         }
+        self.splice_construct(k, &callee, vals, nt, kobj, this, this_op, join, result, err, generic, nslots, word)
+    }
+
+    /// For an inlined `new` of constructor `k` (allocation word `word`)
+    /// with arguments `args`: its leading formal stores
+    /// (`ctor_formal_prefix`) that are its layout's first fields, in order,
+    /// as the layout key, TYPES, the values (of the fields' claims: guarded
+    /// here, exiting before the `new`) and the body built for the object
+    /// holding them. `None` where there are none.
+    #[allow(clippy::type_complexity)]
+    fn ctor_prefill(
+        &mut self,
+        k: ScriptId,
+        word: u32,
+        args: &[mir::Value],
+    ) -> Option<(u32, bool, Vec<mir::Value>, std::rc::Rc<super::inline::Callee>)> {
+        let (key, t) = self.ctor_of_word(k, word)?;
+        let ctx = self.s.ctx;
+        let crate::source::SourceObject::Script(ks) = ctx.source.object(crate::source::SourceObjectId::new(k.get())) else {
+            return None;
+        };
+        let fields = self.ctor_layout(key)?;
+        let mut formals: Vec<usize> = vec![];
+        for (gc, j, _) in ctor_formal_prefix(ks) {
+            let i = formals.len();
+            if i >= fields.len() || usize::from(j) >= args.len() {
+                break;
+            }
+            let named = ks.gcthings.get(gc as usize).is_some_and(|&g| {
+                !g.is_other()
+                    && matches!(ctx.source.object(g), crate::source::SourceObject::String(s) if s.chars() == self.mm.atoms[fields[i].0].chars())
+            });
+            if !named {
+                break;
+            }
+            formals.push(usize::from(j));
+        }
+        if formals.is_empty() {
+            return None;
+        }
+        let n = u32::try_from(formals.len()).unwrap();
+        let c = self.s.callee_ctx(k, &[], Some((key, n, t)), self.admitted)?;
+        let xs = formals
+            .iter()
+            .enumerate()
+            .map(|(i, &j)| {
+                let (x, claim) = (args[j], fields[i].1);
+                let ctags = match claim {
+                    MType::Val(s) => s.tags,
+                    _ => TagSet::ALL,
+                };
+                let xtags = match self.f.ty(x) {
+                    MType::Val(s) => s.tags,
+                    _ => TagSet::ALL,
+                };
+                if xtags.is_nonempty_subset_of(ctags) {
+                    self.weaken(x, claim)
+                } else {
+                    self.guard(Opcode::GuardTags(ctags), vec![x], claim)
+                }
+            })
+            .collect();
+        Some((key, t, xs, c))
+    }
+
+    /// `inline_construct`'s splice of the constructor `callee` (`k`) for
+    /// `this_op` (`this` boxed), and its result rule: the body's value if
+    /// an object, else `this`, at `join` (`result`); the generic construct
+    /// where the splice fails. Returns `result`.
+    #[allow(clippy::too_many_arguments)]
+    fn splice_construct(
+        &mut self,
+        k: ScriptId,
+        callee: &std::rc::Rc<super::inline::Callee>,
+        vals: &[mir::Value],
+        nt: mir::Value,
+        kobj: mir::Value,
+        this: mir::Value,
+        this_op: mir::Value,
+        join: mir::Block,
+        result: mir::Value,
+        err: mir::Block,
+        generic: mir::Block,
+        nslots: u32,
+        word: u32,
+    ) -> mir::Value {
         let nformals = callee.f.frame.formals as usize;
         let nargs = vals.len() - 3;
         let mut operands = vec![kobj, this_op];
@@ -3711,7 +3910,7 @@ impl<'s, 'a> Run<'s, 'a> {
         let saved_frames = self.f.inline_frames.len();
         let here = self.cur;
         self.retain_all();
-        match super::inline::splice(&mut self.mm, &mut self.f, &callee, 0, here, &operands, Some(nt), argc, ret, None, err) {
+        match super::inline::splice(&mut self.mm, &mut self.f, callee, 0, here, &operands, Some(nt), argc, ret, None, err) {
             Ok(()) => {
                 self.mm.script_addrs.insert(k, callee.mm.script_addrs[&k]);
                 self.live = false;
