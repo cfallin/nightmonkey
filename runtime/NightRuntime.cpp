@@ -1761,7 +1761,8 @@ bool night_runtime_install_env(JSContext* cx,
   // the String.prototype direct-dispatch methods indexOf, lastIndexOf,
   // slice, substring, toLowerCase, toUpperCase, trim, startsWith, endsWith,
   // includes, then the Array constructor, Function.prototype.apply,
-  // Function.prototype.call and Object.prototype.hasOwnProperty): capture
+  // Function.prototype.call, Object.prototype.hasOwnProperty, and
+  // RegExp.prototype.exec and .test, armed with their capture below): capture
   // the pristine builtins (user code has not run yet); the boxed bits of
   // each are re-written after every GC (functions move under compaction and
   // tenure out of the nursery; the PersistentRooted values track them).
@@ -1991,6 +1992,11 @@ bool night_runtime_install_env(JSContext* cx,
     if (JS_IsExceptionPending(cx)) {
       JS_ClearPendingException(cx);
     }
+    // The same two as builtin cells (BC_REGEXP_EXEC = 27, BC_REGEXP_TEST =
+    // 28): the compiled call's regexp arm matches its callee against them.
+    gFns.builtins[27] = gFns.regExpExec;
+    gFns.builtins[28] = gFns.regExpTest;
+    RearmBuiltinCells();
   }
 
   return true;
@@ -6261,6 +6267,17 @@ int32_t night_runtime_typeof_eq(JSContext* cx, uint64_t a, uint32_t operand) {
   bool eq = js::TypeOfValue(JS::Value::fromRawBits(a)) == type;
   bool neq = (operand & 0x80) != 0;
   return (eq != neq) ? 1 : 0;
+}
+
+uint64_t night_runtime_regexp_leaf(JSContext* cx, uint64_t re, uint64_t str,
+                                   uint32_t forTest) {
+  JS::Value out;
+  if (js::NightRegExpLeaf(cx, JS::Value::fromRawBits(re),
+                          JS::Value::fromRawBits(str), forTest != 0,
+                          &out) == 1) {
+    return out.asRawBits();
+  }
+  return JS::MagicValue(JS_GENERIC_MAGIC).asRawBits();
 }
 
 // Strict-equality of `a` against an immediate constant (`StrictConstantEq`).

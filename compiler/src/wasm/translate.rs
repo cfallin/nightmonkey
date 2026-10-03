@@ -358,6 +358,10 @@ pub struct Helpers {
     /// `night_runtime_typeof_eq(cx, a, operand) -> i32` (0/1): the fused
     /// `typeof a CMP "type"` (`TypeofEq`); infallible leaf.
     pub typeof_eq: Func,
+    /// `night_runtime_regexp_leaf(cx, re, str, forTest) -> i64`: the
+    /// pristine RegExp exec/test decided by a leaf, magic bits to take the
+    /// call.
+    pub regexp_leaf: Func,
     /// `night_runtime_constant_strict_eq(cx, a, operand) -> i32` (0/1): strict-equality of
     /// `a` against an immediate constant (`StrictConstantEq`/`Ne`); infallible
     /// leaf. The `Ne` form negates the result in the translator.
@@ -1182,6 +1186,10 @@ pub const BC_FUN_APPLY: u32 = 24;
 /// `hasOwnProperty.call(o, k)` arm guards both by value identity.
 pub const BC_FUN_CALL: u32 = 25;
 pub const BC_OBJ_HASOWN: u32 = 26;
+/// `RegExp.prototype.exec` and `.test` (self-hosted): the regexp arm's
+/// callee identities.
+pub const BC_REGEXP_EXEC: u32 = 27;
+pub const BC_REGEXP_TEST: u32 = 28;
 pub use crate::region_shape::BUILTIN_CELL_COUNT as BC_COUNT;
 const SHAPE_BASESHAPE_OFFSET: u32 = 0; // Shape::offsetOfBaseShape (header word)
 const BASESHAPE_CLASP_OFFSET: u32 = 0; // BaseShape::offsetOfClasp (header word)
@@ -3324,6 +3332,11 @@ mod tests {
             true,
             "night_runtime_constant_strict_eq",
         );
+        let regexp_leaf_sig = m.signatures.push(SignatureData {
+            params: vec![Type::I32, Type::I64, Type::I64, Type::I32],
+            returns: vec![Type::I64],
+        });
+        let regexp_leaf = stub_i64(&mut m, regexp_leaf_sig, "night_runtime_regexp_leaf");
         // bind_unqualified_gname: (cx i32, top i32, atomId i32) -> i32 (= getg_sig).
         let bind_unqualified_gname = stub(
             &mut m,
@@ -3904,6 +3917,7 @@ mod tests {
                 to_boolean,
                 typeof_,
                 typeof_eq,
+                regexp_leaf,
                 constant_strict_eq,
                 bind_unqualified_gname,
                 set_name,

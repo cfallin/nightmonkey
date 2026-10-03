@@ -637,6 +637,7 @@ mod tests {
         "night_runtime_typeof",
         "night_runtime_typeof_eq",
         "night_runtime_constant_strict_eq",
+        "night_runtime_regexp_leaf",
         "night_runtime_bind_unqualified_gname",
         "night_runtime_set_name",
         "night_runtime_new_object",

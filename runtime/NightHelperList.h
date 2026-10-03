@@ -103,6 +103,7 @@
   NIGHT_RUNTIME_HELPER(night_runtime_typeof)                      \
   NIGHT_RUNTIME_HELPER(night_runtime_typeof_eq)                   \
   NIGHT_RUNTIME_HELPER(night_runtime_constant_strict_eq)          \
+  NIGHT_RUNTIME_HELPER(night_runtime_regexp_leaf)                 \
   NIGHT_RUNTIME_HELPER(night_runtime_bind_unqualified_gname)      \
   NIGHT_RUNTIME_HELPER(night_runtime_set_name)                    \
   NIGHT_RUNTIME_HELPER(night_runtime_new_object)                  \

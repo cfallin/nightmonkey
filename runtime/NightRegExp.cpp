@@ -195,6 +195,62 @@ bool js::NightRegExpExecTestFast(JSContext* cx, Value* frame, bool forTest,
   return true;
 }
 
+/*
+ * The compiled call's RegExp.prototype.exec/.test arm: a leaf (no GC, no
+ * rooting) that decides the call without a frame when it can. `thisv` must be
+ * an optimizable RegExpObject that is neither global nor sticky (so lastIndex
+ * is read but never written: the call leaves the heap as it found it), with a
+ * compiled shared and an AOT matcher; `strv` a linear string. Returns 1 with
+ * *out the result for a failed match (null / false) and a successful test()
+ * (true), updating the statics as the engine does; 2 for a successful exec(),
+ * whose result object the caller's generic path builds (it runs the match
+ * again); 0 where any of that does not hold.
+ */
+int js::NightRegExpLeaf(JSContext* cx, const Value& thisv, const Value& strv,
+                        bool forTest, Value* out) {
+  JS::AutoCheckCannotGC nogc;
+  if (!thisv.isObject() || !strv.isString() ||
+      !IsOptimizableRegExpObject(&thisv.toObject(), cx)) {
+    return 0;
+  }
+  RegExpObject* reobj = &thisv.toObject().as<RegExpObject>();
+  if (reobj->isGlobalOrSticky() || !reobj->getLastIndex().isNumber() ||
+      !reobj->hasShared()) {
+    return 0;
+  }
+  RegExpShared* shared = reobj->getShared();
+  if (shared->kind() != RegExpShared::Kind::RegExp ||
+      !strv.toString()->isLinear()) {
+    return 0;
+  }
+  RegExpStatics* res = cx->global()->regExpRealm().regExpStatics.get();
+  if (!res) {
+    return 0;
+  }
+  JSLinearString* input = &strv.toString()->asLinear();
+  VectorMatchPairs matches;
+  if (!matches.externalAllocOrExpandArray(shared->pairCount())) {
+    return 0;
+  }
+  RegExpRunStatus status;
+  if (!irregexp::TryNightRegexMatch(
+          cx, JS::MutableHandle<RegExpShared*>::fromMarkedLocation(&shared),
+          JS::Handle<JSLinearString*>::fromMarkedLocation(&input), 0, &matches,
+          input->hasLatin1Chars(), &status)) {
+    return 0;
+  }
+  if (status == RegExpRunStatus::Success_NotFound) {
+    *out = forTest ? BooleanValue(false) : NullValue();
+    return 1;
+  }
+  if (!forTest) {
+    return 2;
+  }
+  res->updateLazily(cx, input, shared, 0);
+  *out = BooleanValue(true);
+  return 1;
+}
+
 namespace js {
 namespace irregexp {
 

@@ -805,6 +805,7 @@ pub fn resolve_helpers(
         to_boolean: resolve(m, "night_runtime_to_boolean")?,
         typeof_: resolve(m, "night_runtime_typeof")?,
         typeof_eq: resolve(m, "night_runtime_typeof_eq")?,
+        regexp_leaf: resolve(m, "night_runtime_regexp_leaf")?,
         constant_strict_eq: resolve(m, "night_runtime_constant_strict_eq")?,
         bind_unqualified_gname: resolve(m, "night_runtime_bind_unqualified_gname")?,
         set_name: resolve(m, "night_runtime_set_name")?,

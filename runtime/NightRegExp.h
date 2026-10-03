@@ -29,6 +29,12 @@ class VectorMatchPairs;
 [[nodiscard]] bool NightRegExpExecTestFast(JSContext* cx, JS::Value* frame,
                                            bool forTest, bool* handled);
 
+// The compiled exec/test arm's leaf (no GC): 1 with *out the result, 2 for a
+// matching exec() (the caller builds the result), 0 to take the call. See
+// the definition for what it decides.
+int NightRegExpLeaf(JSContext* cx, const JS::Value& thisv,
+                    const JS::Value& strv, bool forTest, JS::Value* out);
+
 namespace irregexp {
 
 // Try the AOT-compiled Wasm matcher for this RegExpShared (single match).

@@ -84,7 +84,7 @@ namespace night {
   _(hostBuiltinCellsOff, 64)                                                   \
   /* Builtin callee-identity cells, in translate::BC_* order. The count is */  \
   /* what positions everything after them.                                 */  \
-  _(builtinCellCount, 27)                                                      \
+  _(builtinCellCount, 29)                                                      \
   _(builtinCellBytes, 8)                                                       \
   /* TA-clasp table, right after the builtin cells: 9 fixed-length         */  \
   /* typed-array class pointers (element kind 1..=9 at index kind-1), 36   */  \

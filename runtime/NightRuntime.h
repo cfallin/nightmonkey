@@ -753,6 +753,11 @@ uint64_t night_runtime_typeof(JSContext* cx, uint64_t a);
 // byte (low bits = JSType, 0x80 = `!==`). Infallible leaf; returns 0/1.
 NIGHT_RUNTIME_EXPORT(night_runtime_typeof_eq)
 int32_t night_runtime_typeof_eq(JSContext* cx, uint64_t a, uint32_t operand);
+// The pristine RegExp.prototype.exec (forTest 0) / .test (1) called on `re`
+// with `str`, decided by a leaf: the result, or magic bits to take the call.
+NIGHT_RUNTIME_EXPORT(night_runtime_regexp_leaf)
+uint64_t night_runtime_regexp_leaf(JSContext* cx, uint64_t re, uint64_t str,
+                                   uint32_t forTest);
 // Strict-equality of `a` against an immediate constant (`StrictConstantEq`;
 // `operand` is the ConstantCompareOperand uint16). Infallible leaf; returns 0/1
 // (the `Ne` form is the translator negating this).

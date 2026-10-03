@@ -87,7 +87,8 @@ use crate::wasm::mir::abi::{
     SHAPE_OFFSET, VAL_GCTHING_TAG_MIN, ZONE_NEEDS_BARRIER_OFFSET,
 };
 use crate::wasm::translate::{
-    AtomTable, Helpers, APPEND_CACHE_ENTRY_BYTES, APPEND_CACHE_SIZE, BC_ARR_POP, BC_ARR_PUSH,
+    AtomTable, Helpers, APPEND_CACHE_ENTRY_BYTES, APPEND_CACHE_SIZE, BC_ARR_POP, BC_ARR_PUSH, BC_REGEXP_EXEC,
+    BC_REGEXP_TEST,
     ELEMENTS_POP_BAIL_MASK, INLINE_IC_STRIDE, MAGIC_GENERATOR_CLOSING, MAGIC_IS_CONSTRUCTING, MAGIC_UNINITIALIZED_LEXICAL, TAG_BIGINT_HI, TAG_BOOLEAN, TAG_CLEAR,
     TAG_INT32, TAG_MAGIC, TAG_NULL, TAG_OBJECT, TAG_STRING, TAG_SYMBOL, TAG_UNDEFINED,
 };
@@ -7803,7 +7804,11 @@ impl<'a> Lower<'a> {
             self.push_arm(inst, ops, call)?;
             self.cur = call;
         }
-
+        if ops.len() == 3 && !iter && (self.names_atom("exec") || self.names_atom("test")) {
+            let call = self.body.add_block();
+            self.regexp_arm(inst, ops, call)?;
+            self.cur = call;
+        }
         if ops.len() == 2 && !iter && self.names_atom("pop") {
             let call = self.body.add_block();
             self.pop_arm(inst, ops, call)?;
@@ -8392,6 +8397,24 @@ impl<'a> Lower<'a> {
         let r = self.box_tagged(TAG_INT32, newlen);
         let t = self.edge(inst, 0, &[r])?;
         self.terminate(Terminator::Br { target: t });
+        Ok(())
+    }
+
+    /// The pristine `RegExp.prototype.exec(s)` / `.test(s)` decided by the
+    /// runtime's leaf (a non-global, non-sticky regexp with an AOT matcher:
+    /// no frame, no GC, the heap untouched), taking `ok_clean` with the
+    /// result; else `other` (which also builds a successful exec's result).
+    fn regexp_arm(&mut self, inst: mir::Inst, ops: &[Value], other: Block) -> R<()> {
+        let (callee, this, s) = (ops[0], ops[1], ops[2]);
+        let is_exec = self.builtin_is(callee, BC_REGEXP_EXEC);
+        let is_test = self.builtin_is(callee, BC_REGEXP_TEST);
+        let either = self.bin(Operator::I32Or, is_exec, is_test, Type::I32);
+        self.check(either, other);
+        let r = self.call1(self.h.regexp_leaf, &[self.cx, this, s, is_test], Type::I64);
+        let tag = self.tag_of(r);
+        let miss = self.tag_is(tag, TAG_MAGIC as u32);
+        let t = self.edge(inst, 0, &[r])?;
+        self.cond_br(miss, Self::to(other), t);
         Ok(())
     }
 
