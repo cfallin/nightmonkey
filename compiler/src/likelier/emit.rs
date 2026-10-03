@@ -191,6 +191,16 @@ impl SlotFold {
     }
 }
 
+/// Lay a constructor's row out superclass first: the rows of its
+/// `.call`/`.apply` delegates (`Base.call(this, ...)`) before its own
+/// writes, wherever the calls sit. Subclasses of one base then share the
+/// base's fields as a prefix, at the same slots, so code reading them
+/// through any subclass (a base method's `this`) reads one slot
+/// (`subrange_in`, the group and region tables). The order fields are
+/// added in no longer matters to construction (`constructing(S)`; the
+/// runtime places each field at its row's slot).
+const SUPER_FIRST: bool = true;
+
 /// Expands a constructor's `this`-write events into the ordered layout row
 /// its instances end up with.
 ///
@@ -273,18 +283,36 @@ impl<'a> CtorRowExpander<'a> {
     }
 
     /// Walk `f`'s own events in program order, appending its writes and
-    /// splicing each delegation target's row where the call sits.
+    /// splicing each delegation target's row where the call sits; with
+    /// `SUPER_FIRST`, its `.call`/`.apply` delegates' rows (a superclass
+    /// constructor's) come first, wherever the call sits (MIR.md M5v).
     fn collect(&mut self, f: ScriptId, top: ScriptId, depth: u32) -> Vec<NameId> {
         let mut out = LayoutRow::default();
         let Some(events) = self.events.get(&f).cloned() else {
             return out.into_names();
         };
+        if SUPER_FIRST {
+            for ev in &events {
+                let TEvent::Deleg(pc) = ev else { continue };
+                let Some(t) = self.apply_targets.get(&Site::new(f, *pc)).copied() else {
+                    continue;
+                };
+                if t == f {
+                    continue;
+                }
+                self.note_participant(t, top);
+                for n in &self.expand_under(t, top, depth + 1) {
+                    out.push(*n);
+                }
+            }
+        }
         for ev in &events {
             let target = match ev {
                 TEvent::Write(n) => {
                     out.push(*n);
                     None
                 }
+                TEvent::Deleg(_) if SUPER_FIRST => None,
                 TEvent::Deleg(pc) => self.apply_targets.get(&Site::new(f, *pc)).copied(),
                 TEvent::DelegM(pc) => self
                     .follow_this_method_delegates

@@ -2291,6 +2291,40 @@ guarded the same receiver for its `method.load`.
   that drops that guard's layout test passes the test: the foreign
   receiver still exits later, in the inlined method.
 
+**M5v. Rows laid out superclass first (2026-10-03; M5r's 2c).** A
+constructor's row was its fields in the order its construction adds them,
+its `.call` delegates' (a base constructor's) spliced where the call
+sits. Subclasses that add their own fields before calling their base
+(deltablue's `ScaleConstraint`: `direction`, `scale`, `offset`, then
+`BinaryConstraint.call`) then put the base's fields at other slots than
+their siblings, and a base method's `this.v1` over both read through the
+IC.
+- **The order.** `CtorRowExpander` (`SUPER_FIRST`) puts the rows of a
+  constructor's `.call`/`.apply` delegates first, wherever the calls sit,
+  then its own writes, with its `this.m(...)` init delegates (the
+  two-phase channel) still spliced where they sit, so a full row still
+  extends its ctor-exit row wherever it did. deltablue's rows: Equality
+  `strength, v1, v2, direction`; Scale `strength, v1, v2, direction,
+  scale, offset`: the shared fields agree, and `subrange_in` serves them
+  over both keys.
+- **Construction in another order** is what M5t made typed: Scale's adds
+  are `init_field`s of `constructing({3})`, `{3, 4}`, ... with the skipped
+  slots undefined; the runtime places each field at its row's slot
+  (`NightShapeForAdd`), so the shape is permuted and the visible order is
+  still insertion order.
+- Considered first and dropped: aligning the rows of an analysis region's
+  constructors on their shared fields. deltablue's region holds
+  `Variable` with the constraints, which share no field, so nothing
+  aligned; the base-first order gets the hierarchy's prefixes without
+  asking which classes meet at a site.
+- Lost: `new_this.init` for a constructor whose leading formal stores
+  precede a base call (its row no longer starts with them).
+- Fixed-work value census against M5u: deltablue -5.1%, the rest
+  unchanged; exits unchanged.
+- Night test: mir-super-first-rows.js (a base's fields added before, after
+  and around a subclass's own; base methods over the three subclasses;
+  insertion order through Object.keys, JSON and for-in; GCs).
+
 **M6. The rest of §10**: box/unbox cleanup, memory optimizations, and
 numeric optimizations, each with its guard-count and instruction-count
 tests.
