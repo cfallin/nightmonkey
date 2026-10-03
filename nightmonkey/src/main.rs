@@ -302,7 +302,7 @@ fn main() -> Result<()> {
     };
     let (ta_get_poly, ta_set_poly) =
         translate::build_ta_poly_helpers(&mut m, mem_id, env.ta_class_base);
-    let ic_get_poly = translate::build_ic_get_helper(&mut m, mem_id, env.mega_get_base);
+    let ic_get_poly = translate::build_ic_get_helper(&mut m, mem_id, env.mega_get_base, env.strlit_slot);
     let ic_set_cold =
         night_compiler::wasm::build_ic_set_cold_helper(&mut m, mem_id, env.mega_set_base);
     let (elem_mega_get, elem_mega_set_probe) = night_compiler::wasm::build_elem_mega_helpers(

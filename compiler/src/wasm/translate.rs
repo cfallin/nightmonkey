@@ -1201,6 +1201,11 @@ const TA_DATA_PAYLOAD_OFFSET: u32 = 16 + 8 * 3;
 // runtime/NightRegionShape.h -- see `crate::region_shape`.
 const SHAPE_OFFSET: u32 = 0;
 use crate::region_shape::{INLINE_IC_WAYS, INLINE_IC_WAY_BYTES};
+use crate::region_shape::{
+    GCHAIN_ENTRY_BYTES, GCHAIN_MAX_HOPS, GCHAIN_NHOPS_OFF, GCHAIN_PROTO_PTR_OFF, GCHAIN_PROTO_SHAPE_OFF,
+    GCHAIN_SIZE, GCHAIN_SLOT_ENC_OFF, IC_PRIM_BOOLEAN_SHAPE, IC_PRIM_NUMBER_SHAPE, IC_PRIM_STRING_SHAPE,
+    IC_SLOT_ENC_ABSENT, STRLIT_GCHAIN_ADDR_OFF,
+};
 /// Per-site add-transition row appended after the way (size shared through
 /// NightRegionShape.h): [oldShape, newShape, slotOff (fixed-slot byte offset; 0 =
 /// dynamic slot -> helper), absSlot, protoPtr0, protoShape0, protoPtr1,
@@ -2270,16 +2275,11 @@ impl RawEmit {
     }
 
     /// The shared hit tail: validate the holder's live shape, then read the
-    /// slot. `entry_base + hp_off` is `[holderPtr, holderShape, slotEnc]` in
-    /// both the per-site way and the mega row, which is what lets one tail
-    /// serve both probes.
-    pub(crate) fn ic_hit_tail(
-        &mut self,
-        objptr: Value,
-        entry_base: Value,
-        hp_off: u32,
-        miss: Block,
-    ) -> Value {
+    /// slot, or return `undefined` for a proven absence. `entry_base +
+    /// hp_off` is `[holderPtr, holderShape, slotEnc]` in both the per-site
+    /// way and the mega row, which is what lets one tail serve both probes.
+    /// Returns from the function.
+    pub(crate) fn ic_hit_tail(&mut self, objptr: Value, entry_base: Value, hp_off: u32, miss: Block) {
         let hp = self.ld32(entry_base, hp_off);
         let chs = self.ld32(entry_base, hp_off + 4);
         let slot_enc = self.ld32(entry_base, hp_off + 8);
@@ -2291,7 +2291,22 @@ impl RawEmit {
         let load_blk = self.body.add_block();
         self.condbr(ok, load_blk, miss);
         self.cur = load_blk;
-        self.slot_load(base, slot_enc)
+        self.slot_or_absent(base, slot_enc);
+    }
+
+    /// Return `undefined` for the absent `slot_enc`, else the slot it names
+    /// off `base`.
+    fn slot_or_absent(&mut self, base: Value, slot_enc: Value) {
+        let absent = self.i32c(IC_SLOT_ENC_ABSENT);
+        let is_absent = self.bin(Operator::I32Eq, slot_enc, absent, Type::I32);
+        let (abs_blk, ld_blk) = (self.body.add_block(), self.body.add_block());
+        self.condbr(is_absent, abs_blk, ld_blk);
+        self.cur = abs_blk;
+        let undef = self.i64c(TAG_UNDEFINED << 32);
+        self.ret(vec![undef]);
+        self.cur = ld_blk;
+        let v = self.slot_load(base, slot_enc);
+        self.ret(vec![v]);
     }
 }
 
@@ -2305,9 +2320,12 @@ impl RawEmit {
 /// one direct call; the alternative it replaces is ~290 bytes of holder tail,
 /// poly sentinel, mega hash and a duplicate hit tail at every site.
 ///
+/// A primitive receiver (a string, number or boolean) is keyed by its pseudo
+/// shape, its rows naming a holder on its prototype chain.
+///
 /// Pure leaf: linear-memory reads only, no GC, no engine crossing, so the
 /// caller keeps its facts and its track across the call.
-pub fn build_ic_get_helper(m: &mut Module, mem: Memory, mega_get_base: u32) -> Func {
+pub fn build_ic_get_helper(m: &mut Module, mem: Memory, mega_get_base: u32, strlit_slot: u32) -> Func {
     let sig = m.signatures.push(SignatureData {
         params: vec![Type::I64, Type::I32, Type::I32],
         returns: vec![Type::I64],
@@ -2319,16 +2337,46 @@ pub fn build_ic_get_helper(m: &mut Module, mem: Memory, mega_get_base: u32) -> F
 
     let miss = e.body.add_block();
     let way0 = e.body.add_block();
+    let shape = e.body.add_blockparam(way0, Type::I32);
+    let (obj_blk, prim_blk) = (e.body.add_block(), e.body.add_block());
+    let objptr = e.un(Operator::I32WrapI64, recv_boxed, Type::I32);
     let is_obj = e.tag_is(recv_boxed, TAG_OBJECT);
-    e.condbr(is_obj, way0, miss);
+    e.condbr(is_obj, obj_blk, prim_blk);
 
     e.cur = miss;
     let magic = e.i64c(TAG_MAGIC << 32);
     e.ret(vec![magic]);
 
+    e.cur = obj_blk;
+    let oshape = e.ld32(objptr, SHAPE_OFFSET);
+    e.body.set_terminator(e.cur, Terminator::Br { target: BlockTarget { block: way0, args: vec![oshape] } });
+    // A primitive's pseudo shape (its rows always name a holder, so the
+    // own-slot arms below never read off the non-pointer `objptr`).
+    e.cur = prim_blk;
+    let sh32 = e.i64c(32);
+    let hi = e.bin(Operator::I64ShrU, recv_boxed, sh32, Type::I64);
+    let tag = e.un(Operator::I32WrapI64, hi, Type::I32);
+    let mut pseudo = e.i32c(0);
+    for (t, ps) in [
+        (TAG_INT32 as u32, IC_PRIM_NUMBER_SHAPE),
+        (TAG_BOOLEAN as u32, IC_PRIM_BOOLEAN_SHAPE),
+        (TAG_STRING as u32, IC_PRIM_STRING_SHAPE),
+    ] {
+        let k = e.i32c(t);
+        let is = e.bin(Operator::I32Eq, tag, k, Type::I32);
+        let v = e.i32c(ps);
+        pseudo = e.sel(Type::I32, v, pseudo, is);
+    }
+    let clear = e.i32c(TAG_CLEAR);
+    let is_dbl = e.bin(Operator::I32LtU, tag, clear, Type::I32);
+    let num = e.i32c(IC_PRIM_NUMBER_SHAPE);
+    let pseudo = e.sel(Type::I32, num, pseudo, is_dbl);
+    let keyed = e.body.add_block();
+    e.condbr(pseudo, keyed, miss);
+    e.cur = keyed;
+    e.body.set_terminator(e.cur, Terminator::Br { target: BlockTarget { block: way0, args: vec![pseudo] } });
+
     e.cur = way0;
-    let objptr = e.un(Operator::I32WrapI64, recv_boxed, Type::I32);
-    let shape = e.ld32(objptr, SHAPE_OFFSET);
     // The way chain, sharing one hit block (the inline arm's twin): the
     // matched way's address is the block parameter.
     let hit_blk = e.body.add_block();
@@ -2380,26 +2428,20 @@ pub fn build_ic_get_helper(m: &mut Module, mem: Memory, mega_get_base: u32) -> F
     let fast = e.load(Operator::I64Load { memory }, addr, Type::I64);
     e.ret(vec![fast]);
     e.cur = tail_blk;
-    let r = e.ic_hit_tail(objptr, way, IC_WAY_HOLDERPTR, miss);
-    e.ret(vec![r]);
+    e.ic_hit_tail(objptr, way, IC_WAY_HOLDERPTR, miss);
 
     // Past the ways. A site with a free way (the fill is in order, so the
-    // last way empty means one is free) MISSES here, so the C++ helper's
-    // populate fills the way: the mega table is keyed by (shape, atom) alone
-    // and another site may already have seeded this pair, which would
-    // otherwise serve this site from the hash forever with its ways empty.
-    // A full site probes the mega table for its extra shapes.
+    // last way empty means one is free) skips the mega table, so the C++
+    // helper's populate fills the way: the mega table is keyed by (shape,
+    // atom) alone and another site may already have seeded this pair, which
+    // would otherwise serve this site from the hash forever with its ways
+    // empty. A full site probes the mega table for its extra shapes. Both
+    // then probe the guarded chain, whose rows no way can hold.
     e.cur = poly_blk;
-    let last_off = e.i32c((INLINE_IC_WAYS - 1) * INLINE_IC_WAY_BYTES);
-    let last_way = e.bin(Operator::I32Add, way_base, last_off, Type::I32);
-    let last_shape = e.ld32(last_way, IC_WAY_RECVSHAPE);
-    let last_empty = e.un(Operator::I32Eqz, last_shape, Type::I32);
-    let mega_blk = e.body.add_block();
-    e.condbr(last_empty, miss, mega_blk);
-    e.cur = mega_blk;
-    // The hash mirrors NightRuntime.cpp's MegaGetSlot.
-    // Inlined, the atom half folds into an immediate; here the atom is a
-    // parameter, so it costs one multiply on a path that is never hot.
+    // The hash mirrors NightRuntime.cpp's CacheHash (the mega table's and
+    // the guarded chain's). Inlined, the atom half folds into an
+    // immediate; here the atom is a parameter, so it costs one multiply on
+    // a path that is never hot.
     let three = e.i32c(3);
     let sh = e.bin(Operator::I32ShrU, shape, three, Type::I32);
     let k1 = e.i32c(2654435761);
@@ -2407,6 +2449,14 @@ pub fn build_ic_get_helper(m: &mut Module, mem: Memory, mega_get_base: u32) -> F
     let k2c = e.i32c(0x9e37_79b9);
     let k2 = e.bin(Operator::I32Mul, atom_v, k2c, Type::I32);
     let h = e.bin(Operator::I32Xor, h1, k2, Type::I32);
+    let last_off = e.i32c((INLINE_IC_WAYS - 1) * INLINE_IC_WAY_BYTES);
+    let last_way = e.bin(Operator::I32Add, way_base, last_off, Type::I32);
+    let last_shape = e.ld32(last_way, IC_WAY_RECVSHAPE);
+    let last_empty = e.un(Operator::I32Eqz, last_shape, Type::I32);
+    let mega_blk = e.body.add_block();
+    let gchain_blk = e.body.add_block();
+    e.condbr(last_empty, gchain_blk, mega_blk);
+    e.cur = mega_blk;
     let mask = e.i32c(MEGA_GET_SIZE - 1);
     let idx = e.bin(Operator::I32And, h, mask, Type::I32);
     let stride = e.i32c(MEGA_GET_ENTRY_BYTES);
@@ -2419,10 +2469,64 @@ pub fn build_ic_get_helper(m: &mut Module, mem: Memory, mega_get_base: u32) -> F
     let m_atom = e.bin(Operator::I32Eq, eatom, atom_v, Type::I32);
     let m_hit = e.bin(Operator::I32And, m_shape, m_atom, Type::I32);
     let mega_hit_blk = e.body.add_block();
-    e.condbr(m_hit, mega_hit_blk, miss);
+    e.condbr(m_hit, mega_hit_blk, gchain_blk);
     e.cur = mega_hit_blk;
-    let r = e.ic_hit_tail(objptr, entry, MEGA_HOLDERPTR, miss);
-    e.ret(vec![r]);
+    e.ic_hit_tail(objptr, entry, MEGA_HOLDERPTR, gchain_blk);
+
+    // The guarded chain: the rows the ways and the mega table cannot hold
+    // (a chain longer than one holder guard proves: deep absences, a
+    // primitive's absences, chains through an invalidated-teleporting
+    // prototype). Every hop's live shape, then the last hop's slot or
+    // `undefined`.
+    e.cur = gchain_blk;
+    let gslot = e.i32c(strlit_slot + STRLIT_GCHAIN_ADDR_OFF);
+    let gbase = e.ld32(gslot, 0);
+    let gmask = e.i32c(GCHAIN_SIZE - 1);
+    let gidx = e.bin(Operator::I32And, h, gmask, Type::I32);
+    let gstride = e.i32c(GCHAIN_ENTRY_BYTES);
+    let goff = e.bin(Operator::I32Mul, gidx, gstride, Type::I32);
+    let g = e.bin(Operator::I32Add, gbase, goff, Type::I32);
+    let gshape = e.ld32(g, MEGA_SHAPE);
+    let gatom = e.ld32(g, MEGA_ATOM);
+    let g_shape = e.bin(Operator::I32Eq, gshape, shape, Type::I32);
+    let g_atom = e.bin(Operator::I32Eq, gatom, atom_v, Type::I32);
+    let g_hit = e.bin(Operator::I32And, g_shape, g_atom, Type::I32);
+    let hops_blk = e.body.add_block();
+    e.condbr(g_hit, hops_blk, miss);
+    e.cur = hops_blk;
+    let nhops = e.ld32(g, GCHAIN_NHOPS_OFF);
+    let done = e.body.add_block();
+    let holder = e.body.add_blockparam(done, Type::I32);
+    let mut prev = e.i32c(0);
+    for hop in 0..GCHAIN_MAX_HOPS {
+        // Past the row's last hop: the previous hop is the holder.
+        if hop > 0 {
+            let k = e.i32c(hop);
+            let past = e.bin(Operator::I32GeU, k, nhops, Type::I32);
+            let next = e.body.add_block();
+            e.body.set_terminator(
+                e.cur,
+                Terminator::CondBr {
+                    cond: past,
+                    if_true: BlockTarget { block: done, args: vec![prev] },
+                    if_false: BlockTarget { block: next, args: vec![] },
+                },
+            );
+            e.cur = next;
+        }
+        let p = e.ld32(g, GCHAIN_PROTO_PTR_OFF + 4 * hop);
+        let ps = e.ld32(g, GCHAIN_PROTO_SHAPE_OFF + 4 * hop);
+        let live = e.ld32(p, SHAPE_OFFSET);
+        let same = e.bin(Operator::I32Eq, live, ps, Type::I32);
+        let next = e.body.add_block();
+        e.condbr(same, next, miss);
+        e.cur = next;
+        prev = p;
+    }
+    e.body.set_terminator(e.cur, Terminator::Br { target: BlockTarget { block: done, args: vec![prev] } });
+    e.cur = done;
+    let genc = e.ld32(g, GCHAIN_SLOT_ENC_OFF);
+    e.slot_or_absent(holder, genc);
 
     m.funcs
         .push(FuncDecl::Body(sig, "night_ic_get".to_string(), e.body))
@@ -3675,7 +3779,7 @@ mod tests {
             "night_runtime_optimize_spread_call",
         );
         let (ta_get_poly, ta_set_poly) = build_ta_poly_helpers(&mut m, mem, 64 + 8 * BC_COUNT);
-        let ic_get_poly = build_ic_get_helper(&mut m, mem, 64 + 8 * BC_COUNT);
+        let ic_get_poly = build_ic_get_helper(&mut m, mem, 64 + 8 * BC_COUNT, 64 + 8 * BC_COUNT + 40 + 16);
         let ic_set_cold = crate::wasm::build_ic_set_cold_helper(
             &mut m,
             mem,

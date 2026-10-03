@@ -99,8 +99,9 @@ namespace night {
   _(argsClassDataArgsOff, 8)                                                   \
   _(argsDynCodeFuseOff, 12)                                                    \
   /* Inline string block, right after the args metadata: [emptyString @0, */  \
-  /* string nursery header @4, its alloc site's count address @8, unused  */  \
-  /* @12..@28, stamp-epoch address @28, unused (0) @32,                   */  \
+  /* string nursery header @4, its alloc site's count address @8, the    */  \
+  /* guarded-chain table's address @12, unused @16..@28, stamp-epoch      */  \
+  /* address @28, unused (0) @32,                                         */  \
   /* &PlainObject::class_ @36]. The header word is 0 while the zone does  */  \
   /* not allocate strings in the nursery; the runtime refreshes it after  */  \
   /* every GC, the only place the zone's flag moves.                      */  \
@@ -108,6 +109,27 @@ namespace night {
   _(strlitEmptyStringOff, 0)                                                   \
   _(strlitStrHeaderOff, 4)                                                     \
   _(strlitStrCountAddrOff, 8)                                                  \
+  _(strlitGchainAddrOff, 12)                                                   \
+  /* The guarded-chain GET table (its address in the strlit block):        */  \
+  /* (shape, atom)-hashed as the mega table, rows [shape @0, atomId @4,     */  \
+  /* nHops @8, slotEnc @12, protoPtr[4] @16, protoShape[4] @32]; a hit      */  \
+  /* checks every hop's live shape, then reads the last hop's slot or       */  \
+  /* serves undefined for the absent slotEnc.                               */  \
+  _(gchainSize, 4096)                                                          \
+  _(gchainEntryBytes, 48)                                                      \
+  _(gchainMaxHops, 4)                                                          \
+  _(gchainNhopsOff, 8)                                                         \
+  _(gchainSlotEncOff, 12)                                                      \
+  _(gchainProtoPtrOff, 16)                                                     \
+  _(gchainProtoShapeOff, 32)                                                   \
+  /* A get row's slotEnc for a proven absence (kNightSlotEncAbsent).        */  \
+  _(icSlotEncAbsent, 4294967295)                                               \
+  /* The receiver key a get row holds for a primitive (whose lookup starts */  \
+  /* at its prototype): never a shape pointer (8-aligned), an empty row    */  \
+  /* (0) or the set sites' poly sentinel (1).                              */  \
+  _(icPrimNumberShape, 2)                                                      \
+  _(icPrimBooleanShape, 3)                                                     \
+  _(icPrimStringShape, 6)                                                      \
   _(strlitStampEpochAddrOff, 28)                                               \
   _(strlitBindEpochAddrOff, 32)                                                \
   _(strlitPlainClassOff, 36)                                                   \
@@ -163,8 +185,8 @@ static_assert((Night_bindingFuseArmed & 1) && (Night_bindingFusePredicted & 1) &
               "a binding fuse is armed exactly when bit 0 is set");
 static_assert(Night_strlitPlainClassOff + 4 <= Night_strlitBlockBytes,
               "the plain-object class must fit the strlit block");
-static_assert(Night_strlitStrCountAddrOff + 4 <= Night_strlitStampEpochAddrOff,
-              "the string-alloc words must not overlap the epoch address");
+static_assert(Night_strlitGchainAddrOff + 4 <= Night_strlitStampEpochAddrOff,
+              "the strlit host words must not overlap the epoch address");
 
 // The three block bases C++ recomputes off propicGenPtr, in one place so the
 // arithmetic exists once. `genBase` is `gEnv.propicGenPtr`.

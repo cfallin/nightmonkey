@@ -516,8 +516,7 @@ pub fn build_elem_mega_helpers(
         let hit_blk = e.body.add_block();
         e.condbr(m_hit, hit_blk, miss);
         e.cur = hit_blk;
-        let r = e.ic_hit_tail(objptr, entry, MEGA_GET_HOLDERPTR, miss);
-        e.ret(vec![r]);
+        e.ic_hit_tail(objptr, entry, MEGA_GET_HOLDERPTR, miss);
         m.funcs.push(FuncDecl::Body(
             get_sig,
             "night_elem_mega_get".to_string(),

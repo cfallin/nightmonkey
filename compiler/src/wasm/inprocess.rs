@@ -303,7 +303,7 @@ pub fn build_inprocess_batch(
     };
     let (ta_get_poly, ta_set_poly) =
         translate::build_ta_poly_helpers(&mut m, mem, env.ta_class_base);
-    let ic_get_poly = translate::build_ic_get_helper(&mut m, mem, env.mega_get_base);
+    let ic_get_poly = translate::build_ic_get_helper(&mut m, mem, env.mega_get_base, env.strlit_slot);
     let call_classify = super::build_call_classify_helper(&mut m, mem, env.fn_class_slot);
     let elem_append_check =
         super::build_elem_append_helper(&mut m, mem, env.append_cache_base, opts.instrument.guards);

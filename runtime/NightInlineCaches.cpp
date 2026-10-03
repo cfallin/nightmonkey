@@ -274,15 +274,24 @@ bool NightTryInitAddTransition(JSContext* cx, uint64_t objBits,
 // shape (low 32), and the W1-encoded slot (bit1 = is-dynamic, bits[31:2] =
 // index) and returns true; else false (the way is left untouched, so the site
 // keeps calling the miss helper). Leaf (lookupPure / static-proto walk: no GC).
-bool NightPopulateInlineGetIC(JSContext* cx, JSObject* obj, jsid id,
-                              uint32_t* recvShapeOut, uint32_t* holderPtrOut,
-                              uint32_t* holderShapeOut, uint32_t* slotEncOut) {
-  if (!obj->is<NativeObject>()) {
+// The walk both populates share. `start` is where the lookup begins and
+// `hops` its distance from the receiver: the receiver itself (0), or, for a
+// primitive receiver, which has no own properties the caches serve, its
+// prototype (1). `recvShape` is the key the hit path compares: the
+// receiver's shape, or the primitive's pseudo shape.
+static bool PopulateGetFrom(JSContext* cx, JSObject* start, uint32_t hops,
+                            uint32_t recvShape, jsid id,
+                            uint32_t* recvShapeOut, uint32_t* holderPtrOut,
+                            uint32_t* holderShapeOut, uint32_t* slotEncOut) {
+  JSObject* holder = start;
+  // The object whose shape the hit path checks besides the receiver key:
+  // for a proven absence, the receiver's last prototype.
+  JSObject* last = hops == 0 ? nullptr : start;
+  // A primitive's prototype is entered without the teleporting check the
+  // walk makes on every later hop (see below).
+  if (hops == 1 && start->hasInvalidatedTeleporting()) {
     return false;
   }
-  uint32_t recvShape = uint32_t(reinterpret_cast<uintptr_t>(obj->shape()));
-  JSObject* holder = obj;
-  uint32_t hops = 0;
   for (;;) {
     if (!holder->is<NativeObject>()) {
       return false;
@@ -336,10 +345,31 @@ bool NightPopulateInlineGetIC(JSContext* cx, JSObject* obj, jsid id,
     if (!holder->hasStaticPrototype()) {
       return false;  // dynamic prototype (proxy): not cacheable.
     }
-    holder = holder->staticPrototype();
-    if (!holder) {
-      return false;  // end of chain without finding `id`.
+    JSObject* proto = holder->staticPrototype();
+    if (!proto) {
+      // A proven ABSENCE, where two guards pin it: the receiver key (its
+      // own properties and its prototype's identity) and the last
+      // prototype's shape (its own properties and its null prototype). No
+      // hop could resolve `id` (checked above), and an integer key is not
+      // shape-pinned (dense elements). Longer chains are the guarded
+      // chain's.
+      if (hops > 1 || id.isInt()) {
+        return false;
+      }
+      if (last && js::gc::IsInsideNursery(last)) {
+        return false;
+      }
+      *recvShapeOut = recvShape;
+      *holderPtrOut =
+          last ? uint32_t(reinterpret_cast<uintptr_t>(last)) : 0;
+      *holderShapeOut =
+          last ? uint32_t(reinterpret_cast<uintptr_t>(last->shape()))
+               : recvShape;
+      *slotEncOut = kNightSlotEncAbsent;
+      return true;
     }
+    holder = proto;
+    last = proto;
     // Shape-teleporting validity (see the CacheIR comment): the receiver+
     // holder shape guards catch a shadowing add on an intermediate proto only
     // while shadowed adds still reshape the old holder (Watchtower's
@@ -354,6 +384,27 @@ bool NightPopulateInlineGetIC(JSContext* cx, JSObject* obj, jsid id,
   }
 }
 
+bool NightPopulateInlineGetIC(JSContext* cx, JSObject* obj, jsid id,
+                              uint32_t* recvShapeOut, uint32_t* holderPtrOut,
+                              uint32_t* holderShapeOut, uint32_t* slotEncOut) {
+  if (!obj->is<NativeObject>()) {
+    return false;
+  }
+  uint32_t recvShape = uint32_t(reinterpret_cast<uintptr_t>(obj->shape()));
+  return PopulateGetFrom(cx, obj, 0, recvShape, id, recvShapeOut, holderPtrOut,
+                         holderShapeOut, slotEncOut);
+}
+
+bool NightPopulateInlineGetICPrim(JSContext* cx, JSObject* proto,
+                                  uint32_t pseudoShape, jsid id,
+                                  uint32_t* recvShapeOut,
+                                  uint32_t* holderPtrOut,
+                                  uint32_t* holderShapeOut,
+                                  uint32_t* slotEncOut) {
+  return PopulateGetFrom(cx, proto, 1, pseudoShape, id, recvShapeOut,
+                         holderPtrOut, holderShapeOut, slotEncOut);
+}
+
 // Guarded proto-chain populate: the fallback when
 // NightPopulateInlineGetIC refuses (typically an invalidated-teleporting chain
 // object -- e.g. a deep subclass hierarchy). Mirrors CacheIR's non-teleporting
@@ -363,15 +414,21 @@ bool NightPopulateInlineGetIC(JSContext* cx, JSObject* obj, jsid id,
 // Chain objects must be tenured (their pointers are cached; the major-GC zero
 // resets the table before compaction can move them). Own properties (hops == 0)
 // are the mono-way/mega path's job -- refuse.
-bool NightPopulateGuardedChain(JSContext* cx, JSObject* obj, jsid id,
-                               uint32_t maxHops, uint32_t* nHopsOut,
-                               uint32_t* protoPtrs, uint32_t* protoShapes,
-                               uint32_t* slotEncOut) {
-  if (!obj->is<NativeObject>()) {
-    return false;
+// `start` and `hops` as in PopulateGetFrom; a primitive's walk records its
+// prototype as the first hop.
+static bool PopulateGuardedChainFrom(JSContext* cx, JSObject* start,
+                                     uint32_t hops, jsid id, uint32_t maxHops,
+                                     uint32_t* nHopsOut, uint32_t* protoPtrs,
+                                     uint32_t* protoShapes,
+                                     uint32_t* slotEncOut) {
+  JSObject* holder = start;
+  if (hops == 1) {
+    if (js::gc::IsInsideNursery(start)) {
+      return false;
+    }
+    protoPtrs[0] = uint32_t(reinterpret_cast<uintptr_t>(start));
+    protoShapes[0] = uint32_t(reinterpret_cast<uintptr_t>(start->shape()));
   }
-  JSObject* holder = obj;
-  uint32_t hops = 0;
   bool sawResolveHook = false;
   for (;;) {
     if (!holder->is<NativeObject>()) {
@@ -425,7 +482,7 @@ bool NightPopulateGuardedChain(JSContext* cx, JSObject* obj, jsid id,
         return false;
       }
       *nHopsOut = hops;
-      *slotEncOut = UINT32_MAX;  // the ABSENT sentinel (see GChainEntry)
+      *slotEncOut = kNightSlotEncAbsent;
       return true;
     }
     if (hops == maxHops) {
@@ -438,6 +495,25 @@ bool NightPopulateGuardedChain(JSContext* cx, JSObject* obj, jsid id,
     protoShapes[hops] = uint32_t(reinterpret_cast<uintptr_t>(holder->shape()));
     hops++;
   }
+}
+
+bool NightPopulateGuardedChain(JSContext* cx, JSObject* obj, jsid id,
+                               uint32_t maxHops, uint32_t* nHopsOut,
+                               uint32_t* protoPtrs, uint32_t* protoShapes,
+                               uint32_t* slotEncOut) {
+  if (!obj->is<NativeObject>()) {
+    return false;
+  }
+  return PopulateGuardedChainFrom(cx, obj, 0, id, maxHops, nHopsOut, protoPtrs,
+                                  protoShapes, slotEncOut);
+}
+
+bool NightPopulateGuardedChainPrim(JSContext* cx, JSObject* proto, jsid id,
+                                   uint32_t maxHops, uint32_t* nHopsOut,
+                                   uint32_t* protoPtrs, uint32_t* protoShapes,
+                                   uint32_t* slotEncOut) {
+  return PopulateGuardedChainFrom(cx, proto, 1, id, maxHops, nHopsOut,
+                                  protoPtrs, protoShapes, slotEncOut);
 }
 
 // Accessor-call cache populate: resolve `id` on the receiver's proto chain

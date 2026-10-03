@@ -624,6 +624,8 @@ static constexpr uint32_t kIcPolySentinel = 1;
 // re-validates EVERY hop's live shape (CacheIR non-teleporting semantics)
 // then serves the holder slot. Chain pointers are tenured-only and the
 // whole table is zeroed on major GC.
+// The compiled get probe reads it too (its address is in the strlit block;
+// the layout is shared through NightRegionShape.h).
 struct GChainEntry {
   uint32_t shape;  // receiver shape word; 0 = empty
   uint32_t atomId;
@@ -632,9 +634,23 @@ struct GChainEntry {
   uint32_t protoPtr[4];
   uint32_t protoShape[4];
 };
-static constexpr uint32_t kGChainMaxHops = 4;
-static constexpr size_t kGChainSize = 4096;  // power of two
-static GChainEntry gGChain[kGChainSize];
+static constexpr uint32_t kGChainMaxHops = js::night::Night_gchainMaxHops;
+static constexpr size_t kGChainSize = js::night::Night_gchainSize;
+static_assert((kGChainSize & (kGChainSize - 1)) == 0, "a power of two");
+static_assert(sizeof(GChainEntry) == js::night::Night_gchainEntryBytes &&
+                  offsetof(GChainEntry, nHops) == js::night::Night_gchainNhopsOff &&
+                  offsetof(GChainEntry, slotEnc) ==
+                      js::night::Night_gchainSlotEncOff &&
+                  offsetof(GChainEntry, protoPtr) ==
+                      js::night::Night_gchainProtoPtrOff &&
+                  offsetof(GChainEntry, protoShape) ==
+                      js::night::Night_gchainProtoShapeOff &&
+                  kGChainMaxHops == 4,
+              "GChainEntry must match NightRegionShape.h");
+static_assert(js::night::kNightSlotEncAbsent ==
+                  js::night::Night_icSlotEncAbsent,
+              "the absent slotEnc");
+alignas(16) static GChainEntry gGChain[kGChainSize];
 
 static inline GChainEntry* GChainSlot(uint32_t shape, uint32_t atomId) {
   uint32_t h = CacheHash(shape, atomId);
@@ -1678,6 +1694,10 @@ bool night_runtime_install_env(JSContext* cx,
       gState.strLitBase = js::night::NightStrLitBase(env.propicGenPtr);
       *LinMem<uint32_t>(gState.strLitBase) =
           static_cast<uint32_t>(reinterpret_cast<uintptr_t>(cx->emptyString()));
+      // The guarded-chain GET table, which the compiled get probe reads.
+      *LinMem<uint32_t>(gState.strLitBase +
+                        js::night::Night_strlitGchainAddrOff) =
+          static_cast<uint32_t>(reinterpret_cast<uintptr_t>(gGChain));
       // The strlit block's tail pad (Night_strlitStampEpochAddrOff)
       // publishes the address of the
       // stamp-invalidation epoch (vm/JSObject.h): compiled code compares
@@ -2252,14 +2272,15 @@ bool night_runtime_set_property(JSContext* cx, uint32_t top, uint64_t recv,
 }
 
 // Leaf GET probes (the linmem mega table and the guarded chain): pure loads, no
-// GC, no rooting. `robj` is the receiver or its primitive wrapper. Writes
-// the result to the out-slot at `top` and returns true on a hit; a mega hit
-// also fills a free inline way for the shape.
-static bool TryLeafGetProbesV(JSObject* robj, uint32_t atomId,
-                              uint32_t cacheIdx, JS::Value* out) {
-  uint32_t shape = js::night::NightObjectShape(robj);
+// GC, no rooting. `shape` is the rows' receiver key: the receiver's shape, or
+// a primitive's pseudo shape (whose rows always name a prototype holder;
+// `robj` is then null). Writes the result to `out` and returns true on a hit;
+// a mega hit also fills a free inline way for the key.
+static bool TryLeafGetProbesShape(JSObject* robj, uint32_t shape,
+                                  uint32_t atomId, uint32_t cacheIdx,
+                                  JS::Value* out) {
   MegaGetEntry& e = *MegaGet(shape, atomId);
-  if (e.shape == shape && e.atomId == atomId) {
+  if (e.shape == shape && e.atomId == atomId && (e.holderPtr || robj)) {
     js::NativeObject* holder;
     bool holderOk = true;
     if (e.holderPtr) {
@@ -2270,7 +2291,9 @@ static bool TryLeafGetProbesV(JSObject* robj, uint32_t atomId,
       holder = &robj->as<js::NativeObject>();
     }
     if (holderOk) {
-      *out = SlotEncRead(holder, e.slotEnc);
+      *out = e.slotEnc == js::night::kNightSlotEncAbsent
+                 ? JS::UndefinedValue()
+                 : SlotEncRead(holder, e.slotEnc);
       NoteGetWay(cacheIdx, e.shape, e.holderPtr, e.holderShape, e.slotEnc);
       return true;
     }
@@ -2288,7 +2311,7 @@ static bool TryLeafGetProbesV(JSObject* robj, uint32_t atomId,
       }
     }
     if (ok) {
-      if (g.slotEnc == UINT32_MAX) {
+      if (g.slotEnc == js::night::kNightSlotEncAbsent) {
         *out = JS::UndefinedValue();
         return true;
       }
@@ -2299,6 +2322,33 @@ static bool TryLeafGetProbesV(JSObject* robj, uint32_t atomId,
     }
   }
   return false;
+}
+
+static bool TryLeafGetProbesV(JSObject* robj, uint32_t atomId,
+                              uint32_t cacheIdx, JS::Value* out) {
+  return TryLeafGetProbesShape(robj, js::night::NightObjectShape(robj), atomId,
+                               cacheIdx, out);
+}
+
+// A primitive's pseudo shape (the get rows' receiver key) and the prototype
+// its lookup starts at; false for a kind without one.
+static bool PrimGetKey(JSContext* cx, const JS::Value& v, uint32_t* shapeOut,
+                       JSObject** protoOut) {
+  JSProtoKey key;
+  if (v.isString()) {
+    key = JSProto_String;
+    *shapeOut = js::night::Night_icPrimStringShape;
+  } else if (v.isNumber()) {
+    key = JSProto_Number;
+    *shapeOut = js::night::Night_icPrimNumberShape;
+  } else if (v.isBoolean()) {
+    key = JSProto_Boolean;
+    *shapeOut = js::night::Night_icPrimBooleanShape;
+  } else {
+    return false;
+  }
+  *protoOut = cx->global()->maybeGetPrototype(key);
+  return *protoOut != nullptr;
 }
 
 static bool TryLeafGetProbes(JSObject* robj, uint32_t atomId, uint32_t cacheIdx,
@@ -2412,6 +2462,38 @@ static bool PureLengthRead(JSContext* cx, JS::Value rv, JS::HandleId id,
   return true;
 }
 
+// Record a coordinate (or a proven absence) in the site's inline ways and
+// the mega table.
+static void NoteGetRow(uint32_t cacheIdx, uint32_t atomId, uint32_t recvShape,
+                       uint32_t holderPtr, uint32_t holderShape,
+                       uint32_t slotEnc) {
+  NoteGetWay(cacheIdx, recvShape, holderPtr, holderShape, slotEnc);
+  // Fill the linmem mega entry unconditionally (direct-mapped overwrite).
+  MegaGetEntry& e = *MegaGet(recvShape, atomId);
+  e.atomId = atomId;
+  e.holderPtr = holderPtr;
+  e.holderShape = holderShape;
+  e.slotEnc = slotEnc;
+  e.pad = 0;
+  e.shape = recvShape;
+}
+
+// Record a guarded chain keyed by `shape`.
+static void NoteGChain(uint32_t shape, uint32_t atomId, uint32_t nHops,
+                       uint32_t slotEnc, const uint32_t* pp,
+                       const uint32_t* ps) {
+  GChainEntry& g = *GChainSlot(shape, atomId);
+  g.shape = 0;
+  g.atomId = atomId;
+  g.nHops = nHops;
+  g.slotEnc = slotEnc;
+  for (uint32_t h = 0; h < kGChainMaxHops; h++) {
+    g.protoPtr[h] = h < nHops ? pp[h] : 0;
+    g.protoShape[h] = h < nHops ? ps[h] : 0;
+  }
+  g.shape = shape;  // validity marker last
+}
+
 // Fill the site's inline ways and the mega table (or the guarded-chain
 // table) for `id` on native `obj`, where it resolves to a plain data slot
 // (or a proven absence). Leaf. False where neither populate applies.
@@ -2420,15 +2502,7 @@ static bool PopulateGetCaches(JSContext* cx, JSObject* obj, jsid id,
   uint32_t recvShape, holderPtr, holderShape, slotEnc;
   if (js::night::NightPopulateInlineGetIC(cx, obj, id, &recvShape, &holderPtr,
                                           &holderShape, &slotEnc)) {
-    NoteGetWay(cacheIdx, recvShape, holderPtr, holderShape, slotEnc);
-    // Fill the linmem mega entry unconditionally (direct-mapped overwrite).
-    MegaGetEntry& e = *MegaGet(recvShape, atomId);
-    e.atomId = atomId;
-    e.holderPtr = holderPtr;
-    e.holderShape = holderShape;
-    e.slotEnc = slotEnc;
-    e.pad = 0;
-    e.shape = recvShape;
+    NoteGetRow(cacheIdx, atomId, recvShape, holderPtr, holderShape, slotEnc);
     return true;
   }
   if (!obj->is<js::NativeObject>()) {
@@ -2444,16 +2518,31 @@ static bool PopulateGetCaches(JSContext* cx, JSObject* obj, jsid id,
                                             pp, ps, &gSlotEnc)) {
     return false;
   }
-  uint32_t shape = js::night::NightObjectShape(obj);
-  GChainEntry& g = *GChainSlot(shape, atomId);
-  g.atomId = atomId;
-  g.nHops = nHops;
-  g.slotEnc = gSlotEnc;
-  for (uint32_t h = 0; h < kGChainMaxHops; h++) {
-    g.protoPtr[h] = h < nHops ? pp[h] : 0;
-    g.protoShape[h] = h < nHops ? ps[h] : 0;
+  NoteGChain(js::night::NightObjectShape(obj), atomId, nHops, gSlotEnc, pp, ps);
+  return true;
+}
+
+// The same for a primitive receiver keyed by `pseudoShape`, whose lookup
+// starts at `proto`.
+static bool PopulatePrimGetCaches(JSContext* cx, JSObject* proto,
+                                  uint32_t pseudoShape, jsid id,
+                                  uint32_t atomId, uint32_t cacheIdx) {
+  uint32_t recvShape, holderPtr, holderShape, slotEnc;
+  if (js::night::NightPopulateInlineGetICPrim(cx, proto, pseudoShape, id,
+                                              &recvShape, &holderPtr,
+                                              &holderShape, &slotEnc)) {
+    NoteGetRow(cacheIdx, atomId, recvShape, holderPtr, holderShape, slotEnc);
+    return true;
   }
-  g.shape = shape;  // validity marker last
+  uint32_t nHops = 0;
+  uint32_t gSlotEnc = 0;
+  uint32_t pp[kGChainMaxHops];
+  uint32_t ps[kGChainMaxHops];
+  if (!js::night::NightPopulateGuardedChainPrim(cx, proto, id, kGChainMaxHops,
+                                                &nHops, pp, ps, &gSlotEnc)) {
+    return false;
+  }
+  NoteGChain(pseudoShape, atomId, nHops, gSlotEnc, pp, ps);
   return true;
 }
 
@@ -2470,36 +2559,42 @@ uint64_t night_runtime_get_prop_pure(JSContext* cx, uint64_t recv,
   if (PureLengthRead(cx, rv, id, &out)) {
     return out.asRawBits();
   }
-  JSObject* obj;
   if (rv.isObject()) {
-    obj = &rv.toObject();
+    JSObject* obj = &rv.toObject();
     if (TryLeafGetProbesV(obj, atomId, cacheIdx, &out)) {
       return out.asRawBits();
     }
-  } else {
-    // A primitive's own properties are its length and indices (a string
-    // wrapper's), which the arms above and the atom check rule out: the
-    // lookup starts at its prototype. No wrapper, so no populate (the
-    // ways key on receiver shapes).
-    JSProtoKey key = rv.isString()    ? JSProto_String
-                     : rv.isNumber()  ? JSProto_Number
-                     : rv.isBoolean() ? JSProto_Boolean
-                     : rv.isSymbol()  ? JSProto_Symbol
-                     : rv.isBigInt()  ? JSProto_BigInt
-                                      : JSProto_Null;
-    if (key == JSProto_Null) {
+    if (!js::GetPropertyPure(cx, obj, id, &out)) {
       return fail;
     }
-    obj = cx->global()->maybeGetPrototype(key);
-    if (!obj) {
-      return fail;
-    }
+    PopulateGetCaches(cx, obj, id, atomId, cacheIdx);
+    return out.asRawBits();
   }
-  if (!js::GetPropertyPure(cx, obj, id, &out)) {
+  // A primitive's own properties are its length and indices (a string
+  // wrapper's), which the arms above and the atom check rule out: the
+  // lookup starts at its prototype, and the rows key on the primitive's
+  // pseudo shape.
+  uint32_t pseudo;
+  JSObject* proto;
+  if (PrimGetKey(cx, rv, &pseudo, &proto)) {
+    if (TryLeafGetProbesShape(nullptr, pseudo, atomId, cacheIdx, &out)) {
+      return out.asRawBits();
+    }
+    if (!js::GetPropertyPure(cx, proto, id, &out)) {
+      return fail;
+    }
+    PopulatePrimGetCaches(cx, proto, pseudo, id, atomId, cacheIdx);
+    return out.asRawBits();
+  }
+  JSProtoKey key = rv.isSymbol()   ? JSProto_Symbol
+                   : rv.isBigInt() ? JSProto_BigInt
+                                   : JSProto_Null;
+  if (key == JSProto_Null) {
     return fail;
   }
-  if (rv.isObject()) {
-    PopulateGetCaches(cx, obj, id, atomId, cacheIdx);
+  JSObject* obj = cx->global()->maybeGetPrototype(key);
+  if (!obj || !js::GetPropertyPure(cx, obj, id, &out)) {
+    return fail;
   }
   return out.asRawBits();
 }
@@ -2572,15 +2667,27 @@ uint32_t night_runtime_get_prop_ic_miss(JSContext* cx, uint32_t top,
   // are leaf (pure loads, no GC), and together they serve the vast majority of
   // the helper's calls -- the Rooted construction and ReceiverObjectAtom call
   // below are pure waste for them. A raw JSObject* is safe here: nothing
-  // between entry and these probes can GC. Primitive receivers probe again
-  // after wrapping (their cache entries are keyed on the WRAPPER's shape).
+  // between entry and these probes can GC. A primitive receiver's rows are
+  // keyed by its pseudo shape.
+  uint32_t pseudo = 0;
+  JSObject* primProto = nullptr;
   {
     JS::Value rv = JS::Value::fromRawBits(recv);
-    if (rv.isObject() &&
-        TryLeafGetProbes(&rv.toObject(), atomId, cacheIdx, top)) {
-      return kMissClean;
+    if (rv.isObject()) {
+      if (TryLeafGetProbes(&rv.toObject(), atomId, cacheIdx, top)) {
+        return kMissClean;
+      }
+    } else if (PrimGetKey(cx, rv, &pseudo, &primProto)) {
+      JS::Value out;
+      if (TryLeafGetProbesShape(nullptr, pseudo, atomId, cacheIdx, &out)) {
+        WriteNightOut(top, out.asRawBits());
+        return kMissClean;
+      }
     }
   }
+  // (Not a pointer held across the generic get below, which may GC.)
+  const bool primitive = primProto != nullptr;
+  primProto = nullptr;
   // Everything below may allocate (wrapping a primitive receiver) or run
   // the engine's generic get: the counters decide whether the caller's
   // raw carriers and stamp-guarded facts survived (`MissQuiet`). Without
@@ -2591,12 +2698,6 @@ uint32_t night_runtime_get_prop_ic_miss(JSContext* cx, uint32_t top,
   JS::RootedObject obj(cx, ReceiverObjectAtom(cx, recv, "ic-get ", atomId));
   if (!obj) {
     return kMissErr;
-  }
-  // Primitive receiver: re-probe on the wrapper (entries for these sites are
-  // keyed on the wrapper's shape, e.g. absent reads on string receivers).
-  if (!JS::Value::fromRawBits(recv).isObject() &&
-      TryLeafGetProbes(obj, atomId, cacheIdx, top)) {
-    return quiet.still(cx) ? kMissClean : kMissOk;
   }
   // The leaf mega/gchain probes ran pre-rooting above; reaching here means
   // both missed, so the site takes the generic get + populate path.
@@ -2609,8 +2710,13 @@ uint32_t night_runtime_get_prop_ic_miss(JSContext* cx, uint32_t top,
     return kMissErr;
   }
   // The populate paths' clean proof: a plain data slot on a native holder
-  // (populate succeeds only for those) and the counters unmoved.
-  if (PopulateGetCaches(cx, obj, id, atomId, cacheIdx)) {
+  // (populate succeeds only for those) and the counters unmoved. A
+  // primitive's rows start at its prototype, keyed by its pseudo shape (the
+  // prototype re-read: the get above may have run code and GC'd).
+  if (primitive ? PrimGetKey(cx, recvv, &pseudo, &primProto) &&
+                      PopulatePrimGetCaches(cx, primProto, pseudo, id, atomId,
+                                            cacheIdx)
+                : PopulateGetCaches(cx, obj, id, atomId, cacheIdx)) {
     if (quiet.still(cx)) {
       WriteNightOut(top, res.asRawBits());
       return kMissClean;
@@ -5883,9 +5989,59 @@ bool night_runtime_in(JSContext* cx, uint32_t top, uint64_t id,
   return true;
 }
 
+// The has-own rows: the mega get table's third key namespace, `atomPtr | 2`
+// (the property rows hold small atom ids, the element rows `atomPtr | 1`),
+// whose slotEnc is 1 when the receiver has the property as its own and 0
+// when it does not. The receiver's shape pins that for a native object
+// without a resolve hook that could define the key and a key that is a
+// non-index atom (the shape does not pin dense elements, nor a typed
+// array's canonical numeric strings). The compiled `hasOwn` probes them.
+static bool HasOwnRow(JSContext* cx, const JS::Value& v, const JS::Value& k,
+                      bool* found) {
+  JS::AutoCheckCannotGC nogc;
+  uint32_t idx;
+  if (!v.isObject() || !k.isString() || !k.toString()->isAtom() ||
+      k.toString()->asAtom().isIndex(&idx)) {
+    return false;
+  }
+  JSObject* obj = &v.toObject();
+  if (!obj->is<js::NativeObject>() || obj->is<js::TypedArrayObject>() ||
+      obj->getOpsLookupProperty()) {
+    return false;
+  }
+  js::NativeObject* nobj = &obj->as<js::NativeObject>();
+  JSAtom* atom = &k.toString()->asAtom();
+  jsid id = JS::PropertyKey::NonIntAtom(atom);
+  if (js::ClassMayResolveId(cx->names(), nobj->getClass(), id, nobj)) {
+    return false;
+  }
+  *found = nobj->lookupPure(id).isSome();
+  uint32_t key = uint32_t(reinterpret_cast<uintptr_t>(atom)) | 2u;
+  if (key > gNames.atoms.size()) {
+    uint32_t shape = js::night::NightObjectShape(nobj);
+    MegaGetEntry& e = *MegaGet(shape, key);
+    e.shape = 0;
+    e.atomId = key;
+    e.holderPtr = 0;
+    e.holderShape = shape;
+    e.slotEnc = *found ? 1 : 0;
+    e.pad = 0;
+    e.shape = shape;
+  }
+  return true;
+}
+
 bool night_runtime_has_own(JSContext* cx, uint32_t top, uint64_t id,
                            uint64_t val) {
   SetNightTop(cx, top);
+  {
+    bool found;
+    if (HasOwnRow(cx, JS::Value::fromRawBits(val), JS::Value::fromRawBits(id),
+                  &found)) {
+      WriteNightOut(top, JS::BooleanValue(found).asRawBits());
+      return true;
+    }
+  }
   JS::RootedValue v(cx, JS::Value::fromRawBits(val));
   JS::RootedValue idv(cx, JS::Value::fromRawBits(id));
   bool found;

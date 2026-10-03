@@ -3647,7 +3647,10 @@ impl<'a> Lower<'a> {
                         (h.instanceof_, vec![a[0], a[1], cell])
                     }
                     RtOp::In => (h.in_, vec![a[0], a[1]]),
-                    RtOp::HasOwn => (h.has_own, vec![a[0], a[1]]),
+                    RtOp::HasOwn => {
+                        self.has_own_arm(inst, a[0], a[1])?;
+                        (h.has_own, vec![a[0], a[1]])
+                    }
                     RtOp::DelProp(name, strict) => {
                         let (at, sv) = (self.atom(name), self.i32c(u32::from(strict)));
                         (h.del_prop, vec![a[0], at, sv])
@@ -4640,6 +4643,57 @@ impl<'a> Lower<'a> {
         (self.vmap, self.slotted, self.dirty, self.framed, self.cold) = saved;
         self.epoch_same = None;
         self.cur = other;
+        Ok(())
+    }
+
+    /// `Object.hasOwn(obj, key)` for an object and a string key inline,
+    /// taking edge 0: the runtime's has-own row for (the object's shape,
+    /// the key's atom), whose slotEnc is the answer (`HasOwnRow`). A key
+    /// that is not an atom matches no row; a miss takes the helper, which
+    /// fills the row.
+    fn has_own_arm(&mut self, inst: mir::Inst, key: Value, obj: Value) -> R<()> {
+        use crate::wasm::translate::{MEGA_GET_ENTRY_BYTES, MEGA_GET_SIZE};
+        let (kt, ot) = (self.tag_of(key), self.tag_of(obj));
+        let ks = self.tag_is(kt, TAG_STRING as u32);
+        let oo = self.tag_is(ot, TAG_OBJECT as u32);
+        let both = self.bin(Operator::I32And, ks, oo, Type::I32);
+        let (probe, miss) = (self.body.add_block(), self.body.add_block());
+        self.cond_br(both, Self::to(probe), Self::to(miss));
+        self.cur = probe;
+        let kp = self.un(Operator::I32WrapI64, key, Type::I32);
+        let two = self.i32c(2);
+        let ekey = self.bin(Operator::I32Or, kp, two, Type::I32);
+        let op = self.un(Operator::I32WrapI64, obj, Type::I32);
+        let shape = self.load_i32(op, SHAPE_OFFSET);
+        // NightRuntime.cpp's CacheHash.
+        let three = self.i32c(3);
+        let sh = self.bin(Operator::I32ShrU, shape, three, Type::I32);
+        let k1 = self.i32c(2654435761);
+        let h1 = self.bin(Operator::I32Mul, sh, k1, Type::I32);
+        let k2c = self.i32c(0x9e37_79b9);
+        let k2 = self.bin(Operator::I32Mul, ekey, k2c, Type::I32);
+        let hh = self.bin(Operator::I32Xor, h1, k2, Type::I32);
+        let mask = self.i32c(MEGA_GET_SIZE - 1);
+        let idx = self.bin(Operator::I32And, hh, mask, Type::I32);
+        let stride = self.i32c(MEGA_GET_ENTRY_BYTES);
+        let off = self.bin(Operator::I32Mul, idx, stride, Type::I32);
+        let base = self.i32c(self.h.mega_get_base);
+        let row = self.bin(Operator::I32Add, base, off, Type::I32);
+        let rshape = self.load_i32(row, 0);
+        let rkey = self.load_i32(row, 4);
+        let ms = self.bin(Operator::I32Eq, rshape, shape, Type::I32);
+        let mk = self.bin(Operator::I32Eq, rkey, ekey, Type::I32);
+        let hit = self.bin(Operator::I32And, ms, mk, Type::I32);
+        let hit_b = self.body.add_block();
+        self.cond_br(hit, Self::to(hit_b), Self::to(miss));
+        self.cur = hit_b;
+        let own = self.load_i32(row, 16);
+        let own = self.un(Operator::I64ExtendI32U, own, Type::I64);
+        let tag = self.i64c(TAG_BOOLEAN << 32);
+        let r = self.bin(Operator::I64Or, own, tag, Type::I64);
+        let t = self.edge(inst, 0, &[r])?;
+        self.terminate(Terminator::Br { target: t });
+        self.cur = miss;
         Ok(())
     }
 
@@ -6066,6 +6120,16 @@ impl<'a> Lower<'a> {
         let live = self.load_i32(base, SHAPE_OFFSET);
         let same = self.bin(Operator::I32Eq, live, chs, Type::I32);
         self.check(same, probe);
+        // A proven absence.
+        let absent = self.i32c(crate::region_shape::IC_SLOT_ENC_ABSENT);
+        let is_absent = self.bin(Operator::I32Eq, enc, absent, Type::I32);
+        let (abs_b, ld_b) = (self.body.add_block(), self.body.add_block());
+        self.cond_br(is_absent, Self::to(abs_b), Self::to(ld_b));
+        self.cur = abs_b;
+        let undef = self.i64c(TAG_UNDEFINED << 32);
+        let t = self.edge(inst, 0, &[undef])?;
+        self.terminate(Terminator::Br { target: t });
+        self.cur = ld_b;
         let one = self.i32c(1);
         let dynamic = self.bin(Operator::I32And, enc, one, Type::I32);
         let not1 = self.i32c(!1);
