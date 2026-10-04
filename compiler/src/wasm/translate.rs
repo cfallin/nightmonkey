@@ -1190,6 +1190,8 @@ pub const BC_OBJ_HASOWN: u32 = 26;
 /// callee identities.
 pub const BC_REGEXP_EXEC: u32 = 27;
 pub const BC_REGEXP_TEST: u32 = 28;
+/// `Map.prototype.get`: the inline map lookup's callee identity.
+pub const BC_MAP_GET: u32 = 29;
 pub use crate::region_shape::BUILTIN_CELL_COUNT as BC_COUNT;
 const SHAPE_BASESHAPE_OFFSET: u32 = 0; // Shape::offsetOfBaseShape (header word)
 const BASESHAPE_CLASP_OFFSET: u32 = 0; // BaseShape::offsetOfClasp (header word)

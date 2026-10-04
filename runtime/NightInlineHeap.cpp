@@ -11,6 +11,9 @@
  */
 
 #include "runtime/NightInlineHeap.h"
+#include "builtin/MapObject.h"
+#include "vm/Iteration.h"
+#include "vm/StringType.h"
 
 #include "gc/Nursery.h"
 #include "gc/StoreBuffer.h"  // js::gc::StoreBuffer::putSlot (post-barrier)
@@ -140,6 +143,46 @@ static_assert(JSTYPE_UNDEFINED == 0 && JSTYPE_OBJECT == 1 &&
                   JSTYPE_NUMBER == 4 && JSTYPE_BOOLEAN == 5 &&
                   JSTYPE_SYMBOL == 6 && JSTYPE_BIGINT == 7,
               "the JSType numbering typeof_eq decodes");
+
+// --- MapObject: the inline Map.prototype.get ------------------------------
+//
+// The compiled get hashes an atom or int32 key as the table does
+// (`OrderedHashTableImpl::prepareHash`), finds the bucket by the hash shift
+// and walks the chain comparing key bits.
+static_assert(MapObject::offsetOfHashTable() == 16, "MAP_HASH_TABLE_OFFSET");
+static_assert(MapObject::offsetOfLiveCount() == 48, "MAP_LIVE_COUNT_OFFSET");
+static_assert(MapObject::offsetOfHashShift() == 56, "MAP_HASH_SHIFT_OFFSET");
+static_assert(MapObject::Table::offsetOfEntryKey() == 0, "MAP_ENTRY_KEY_OFFSET");
+static_assert(MapObject::Table::Entry::offsetOfValue() == 8, "MAP_ENTRY_VALUE_OFFSET");
+static_assert(MapObject::Table::offsetOfImplDataChain() == 16, "MAP_ENTRY_CHAIN_OFFSET");
+static_assert(NormalAtom::offsetOfHash() == 20, "ATOM_HASH_OFFSET");
+static_assert(FatInlineAtom::offsetOfHash() == 28, "FAT_ATOM_HASH_OFFSET");
+static_assert(JSString::FAT_INLINE_MASK == 0xC0, "STRING_FAT_INLINE_MASK");
+static_assert(mozilla::kGoldenRatioU32 == 0x9E3779B9U, "GOLDEN_RATIO");
+
+// --- NativeIterator: the inline for-in steps ------------------------------
+//
+// A for-in's `more` and `end` run in compiled code as the JIT's
+// iteratorMore / iteratorClose do. (The iterator object's slot offset is
+// not constexpr: NightCheckIteratorLayout checks it.)
+static_assert(NativeIterator::offsetOfObjectBeingIterated() == 8, "NI_OBJECT_OFFSET");
+static_assert(NativeIterator::offsetOfPropertyCursor() == 24, "NI_CURSOR_OFFSET");
+static_assert(NativeIterator::offsetOfPropertyCount() == 20, "NI_COUNT_OFFSET");
+static_assert(NativeIterator::offsetOfFlags() == 38, "NI_FLAGS_OFFSET (a byte)");
+static_assert(NativeIterator::offsetOfFirstProperty() == 40, "NI_FIRST_PROPERTY_OFFSET");
+static_assert(NativeIterator::offsetOfNext() == 4, "NI_NEXT_OFFSET");
+static_assert(NativeIterator::offsetOfPrev() == 0, "NI_PREV_OFFSET");
+static_assert(sizeof(IteratorProperty) == 4, "NI_PROPERTY_BYTES");
+static_assert(IteratorProperty::DeletedBit == 1, "NI_DELETED_BIT");
+static_assert(NativeIterator::Flags::Active == 2, "NI_FLAG_ACTIVE");
+static_assert(NativeIterator::Flags::HasUnvisitedPropertyDeletion == 4,
+              "NI_FLAG_UNVISITED_DELETION");
+static_assert(NativeIterator::Flags::IsEmptyIteratorSingleton == 8,
+              "NI_FLAG_EMPTY_SINGLETON");
+
+bool NightCheckIteratorLayout() {
+  return PropertyIteratorObject::offsetOfIteratorSlot() == 16;
+}
 
 // --- JSString and the inline rope -----------------------------------------
 //

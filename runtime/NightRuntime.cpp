@@ -57,6 +57,7 @@
 #include "runtime/NightInlineHeap.h"  // js::night::NightAllocCell, the barriers
 #include "runtime/NightOps.h"  // js::night::Night* (bytecode-op engine half)
 #include "runtime/NightOpsInterp.h"  // js::night::NightDirectEval (baseline)
+#include "builtin/MapObject.h"         // MapObject::class_ (the inline map get)
 #include "runtime/NightRegionShape.h"   // Night_* region shape constants
 #include "runtime/NightRegistration.h"  // js::night::gNightActivated
 #include "runtime/NightRuntimeData.h"  // js::night::NightRuntimeData (regex table)
@@ -1694,6 +1695,10 @@ bool night_runtime_install_env(JSContext* cx,
       gState.strLitBase = js::night::NightStrLitBase(env.propicGenPtr);
       *LinMem<uint32_t>(gState.strLitBase) =
           static_cast<uint32_t>(reinterpret_cast<uintptr_t>(cx->emptyString()));
+      // The MapObject class: the inline map lookup's receiver check.
+      *LinMem<uint32_t>(gState.strLitBase +
+                        js::night::Night_strlitMapClassOff) =
+          static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&js::MapObject::class_));
       // The guarded-chain GET table, which the compiled get probe reads.
       *LinMem<uint32_t>(gState.strLitBase +
                         js::night::Night_strlitGchainAddrOff) =
@@ -1725,6 +1730,7 @@ bool night_runtime_install_env(JSContext* cx,
       MOZ_RELEASE_ASSERT(sizeof(JSString) == 16);
       MOZ_RELEASE_ASSERT(sizeof(JSFatInlineString) == 32);
       MOZ_RELEASE_ASSERT(js::night::NightCheckRopeLayout(cx));
+      MOZ_RELEASE_ASSERT(js::night::NightCheckIteratorLayout());
     }
     // Per-binding value fuses: enable the cells (right after the
     // gGlobalSlots rows) unless the kill switch is set; the nursery-end
@@ -1996,6 +2002,16 @@ bool night_runtime_install_env(JSContext* cx,
     // 28): the compiled call's regexp arm matches its callee against them.
     gFns.builtins[27] = gFns.regExpExec;
     gFns.builtins[28] = gFns.regExpTest;
+    // `Map.prototype.get` (BC_MAP_GET = 29): the inline map lookup's callee.
+    JS::RootedObject mapProto(cx);
+    JS::RootedValue mg(cx);
+    if (JS_GetClassPrototype(cx, JSProto_Map, &mapProto) && mapProto &&
+        JS_GetProperty(cx, mapProto, "get", &mg) && mg.isObject()) {
+      gFns.builtins[29] = new JS::PersistentRootedValue(cx, mg);
+    }
+    if (JS_IsExceptionPending(cx)) {
+      JS_ClearPendingException(cx);
+    }
     RearmBuiltinCells();
   }
 

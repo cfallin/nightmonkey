@@ -84,7 +84,7 @@ namespace night {
   _(hostBuiltinCellsOff, 64)                                                   \
   /* Builtin callee-identity cells, in translate::BC_* order. The count is */  \
   /* what positions everything after them.                                 */  \
-  _(builtinCellCount, 29)                                                      \
+  _(builtinCellCount, 30)                                                      \
   _(builtinCellBytes, 8)                                                       \
   /* TA-clasp table, right after the builtin cells: 9 fixed-length         */  \
   /* typed-array class pointers (element kind 1..=9 at index kind-1), 36   */  \
@@ -100,7 +100,8 @@ namespace night {
   _(argsDynCodeFuseOff, 12)                                                    \
   /* Inline string block, right after the args metadata: [emptyString @0, */  \
   /* string nursery header @4, its alloc site's count address @8, the    */  \
-  /* guarded-chain table's address @12, unused @16..@28, stamp-epoch      */  \
+  /* guarded-chain table's address @12, &MapObject::class_ @16, unused   */  \
+  /* @20..@28, stamp-epoch                                                */  \
   /* address @28, unused (0) @32,                                         */  \
   /* &PlainObject::class_ @36]. The header word is 0 while the zone does  */  \
   /* not allocate strings in the nursery; the runtime refreshes it after  */  \
@@ -110,6 +111,7 @@ namespace night {
   _(strlitStrHeaderOff, 4)                                                     \
   _(strlitStrCountAddrOff, 8)                                                  \
   _(strlitGchainAddrOff, 12)                                                   \
+  _(strlitMapClassOff, 16)                                                     \
   /* The guarded-chain GET table (its address in the strlit block):        */  \
   /* (shape, atom)-hashed as the mega table, rows [shape @0, atomId @4,     */  \
   /* nHops @8, slotEnc @12, protoPtr[4] @16, protoShape[4] @32]; a hit      */  \
@@ -185,7 +187,7 @@ static_assert((Night_bindingFuseArmed & 1) && (Night_bindingFusePredicted & 1) &
               "a binding fuse is armed exactly when bit 0 is set");
 static_assert(Night_strlitPlainClassOff + 4 <= Night_strlitBlockBytes,
               "the plain-object class must fit the strlit block");
-static_assert(Night_strlitGchainAddrOff + 4 <= Night_strlitStampEpochAddrOff,
+static_assert(Night_strlitMapClassOff + 4 <= Night_strlitStampEpochAddrOff,
               "the strlit host words must not overlap the epoch address");
 
 // The three block bases C++ recomputes off propicGenPtr, in one place so the

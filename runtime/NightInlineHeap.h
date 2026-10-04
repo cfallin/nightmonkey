@@ -124,6 +124,10 @@ bool NightNurseryStringAlloc(JSContext* cx, uint32_t* header,
 // static_assert say so are private.
 bool NightCheckRopeLayout(JSContext* cx);
 
+// Whether a for-in iterator object keeps its NativeIterator in the fixed
+// slot the compiled for-in steps read (+16).
+bool NightCheckIteratorLayout();
+
 // Fill a site's row from the first object the generic helper allocated
 // there. Both return whether they filled it: only an object the inline path
 // can reproduce exactly qualifies (see the definitions for the conditions).

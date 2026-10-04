@@ -165,6 +165,43 @@ pub(crate) const JSCLASSOPS_CALL_OFFSET: u32 = 28;
 pub(crate) const JSCLASS_EMULATES_UNDEFINED: u32 = 1 << 6;
 pub(crate) const JSCLASS_IS_PROXY: u32 = 1 << 19;
 
+// --- PropertyIteratorObject / NativeIterator: the inline for-in steps ------
+//
+//   iterator object  +16 the NativeIterator (a private slot's low word)
+//   NativeIterator   +0 prev  +4 next  +8 object being iterated
+//                    +20 property count  +24 cursor  +38 flags (u8)
+//                    +40 the properties (4 bytes each, bit 0: deleted)
+
+pub(crate) const ITER_SLOT_OFFSET: u32 = 16;
+pub(crate) const NI_PREV_OFFSET: u32 = 0;
+pub(crate) const NI_NEXT_OFFSET: u32 = 4;
+pub(crate) const NI_OBJECT_OFFSET: u32 = 8;
+pub(crate) const NI_COUNT_OFFSET: u32 = 20;
+pub(crate) const NI_CURSOR_OFFSET: u32 = 24;
+pub(crate) const NI_FLAGS_OFFSET: u32 = 38;
+pub(crate) const NI_FIRST_PROPERTY_OFFSET: u32 = 40;
+pub(crate) const NI_DELETED_BIT: u32 = 1;
+pub(crate) const NI_FLAG_ACTIVE: u32 = 2;
+pub(crate) const NI_FLAG_UNVISITED_DELETION: u32 = 4;
+pub(crate) const NI_FLAG_EMPTY_SINGLETON: u32 = 8;
+
+// --- MapObject and atoms: the inline Map.prototype.get -------------------
+//
+//   MapObject  +16 hash table (bucket pointers)  +48 live count  +56 shift
+//   entry      +0 key  +8 value  +16 next in chain
+//   atom       hash at +20, or +28 for a fat inline atom
+
+pub(crate) const MAP_HASH_TABLE_OFFSET: u32 = 16;
+pub(crate) const MAP_LIVE_COUNT_OFFSET: u32 = 48;
+pub(crate) const MAP_HASH_SHIFT_OFFSET: u32 = 56;
+pub(crate) const MAP_ENTRY_KEY_OFFSET: u32 = 0;
+pub(crate) const MAP_ENTRY_VALUE_OFFSET: u32 = 8;
+pub(crate) const MAP_ENTRY_CHAIN_OFFSET: u32 = 16;
+pub(crate) const ATOM_HASH_OFFSET: u32 = 20;
+pub(crate) const FAT_ATOM_HASH_OFFSET: u32 = 28;
+pub(crate) const STRING_FAT_INLINE_MASK: u32 = 0xC0;
+pub(crate) const GOLDEN_RATIO_U32: u32 = 0x9E37_79B9;
+
 // --- JSFunction / BaseScript ----------------------------------------------
 //
 // A JSFunction's own fields live in its fixed slots:
