@@ -8,11 +8,13 @@
  * RegExpShared::execute takes ahead of the irregexp jit/interpreter.
  */
 
-#include "mozilla/ArrayUtils.h"  // mozilla::ArrayEqual
+#include "mozilla/ArrayUtils.h"     // mozilla::ArrayEqual
+#include "mozilla/PodOperations.h"  // mozilla::PodCopy
 
 #include "builtin/RegExp.h"
 #include "irregexp/RegExpAPI.h"  // js::irregexp::kExternalMatcher*
 #include "js/GCAPI.h"            // JS::AutoCheckCannotGC
+#include "runtime/NightContext.h"
 #include "runtime/NightRegExp.h"
 #include "runtime/NightRuntimeData.h"
 #include "vm/GlobalObject.h"
@@ -29,6 +31,23 @@
 using namespace js;
 
 #ifdef ENABLE_JS_NIGHTMONKEY
+/*
+ * Run a compiled shared's match: an atom by the engine's own atom matcher (a
+ * plain string search, no GC), a regexp by its AOT matcher. False to fall
+ * back (no matcher, or the matcher gave up).
+ */
+static bool NightMatch(JSContext* cx, MutableHandleRegExpShared shared,
+                       Handle<JSLinearString*> input, size_t start,
+                       VectorMatchPairs* matches, RegExpRunStatus* status) {
+  if (shared->kind() == RegExpShared::Kind::Atom) {
+    *status = RegExpShared::executeAtom(shared, input, start, matches);
+    return true;
+  }
+  MOZ_ASSERT(shared->kind() == RegExpShared::Kind::RegExp);
+  return irregexp::TryNightRegexMatch(cx, shared, input, start, matches,
+                                      input->hasLatin1Chars(), status);
+}
+
 /*
  * Collapsed AOT fast path for the RegExpMatcher/RegExpSearcher intrinsics,
  * called from the AOT runtime's native dispatch with the rooted call frame
@@ -53,10 +72,11 @@ bool js::NightRegExpBuiltinFast(JSContext* cx, Value* frame, unsigned argc,
   if (!shared) {
     return false;
   }
-  // Fully-compiled regexps only: pairCount / named captures / the groups
-  // template are set during compilation, and CreateRegExpMatchResult needs
-  // them. The first execution per regex runs the generic path and compiles.
-  if (shared->kind() != RegExpShared::Kind::RegExp) {
+  // Fully-compiled regexps and atoms only: pairCount / named captures /
+  // the groups template are set during compilation, and
+  // CreateRegExpMatchResult needs them. The first execution per regex runs
+  // the generic path and compiles.
+  if (shared->kind() == RegExpShared::Kind::Unparsed) {
     return true;
   }
   int32_t lastIndex = frame[4].toInt32();
@@ -79,9 +99,7 @@ bool js::NightRegExpBuiltinFast(JSContext* cx, Value* frame, unsigned argc,
   }
 #  endif
   RegExpRunStatus status;
-  if (!irregexp::TryNightRegexMatch(cx, &shared, input, size_t(lastIndex),
-                                    &matches, input->hasLatin1Chars(),
-                                    &status)) {
+  if (!NightMatch(cx, &shared, input, size_t(lastIndex), &matches, &status)) {
     return true;
   }
   if (status == RegExpRunStatus::Success) {
@@ -129,7 +147,7 @@ bool js::NightRegExpExecTestFast(JSContext* cx, Value* frame, bool forTest,
   if (!shared) {
     return false;
   }
-  if (shared->kind() != RegExpShared::Kind::RegExp) {
+  if (shared->kind() == RegExpShared::Kind::Unparsed) {
     return true;
   }
   RootedString string(cx, frame[2].toString());
@@ -166,9 +184,17 @@ bool js::NightRegExpExecTestFast(JSContext* cx, Value* frame, bool forTest,
     return false;
   }
   RegExpRunStatus status;
-  if (!irregexp::TryNightRegexMatch(cx, &shared, input, size_t(lastIndex),
-                                    &matches, input->hasLatin1Chars(),
-                                    &status)) {
+  // The match the compiled call's leaf just ran for this exec(), if it is
+  // this one's: its pairs, not a second run of the matcher.
+  nightrt::NightLeafMatch& leaf = nightrt::NightStateOf(cx)->leafMatch;
+  if (leaf.pairCount != 0 && !globalOrSticky && leaf.shared == shared &&
+      leaf.input == input && leaf.pairCount == matches.pairCount() &&
+      leaf.gcNumber == cx->runtime()->gc.gcNumber()) {
+    mozilla::PodCopy(matches.pairsRaw(), leaf.pairs, 2 * leaf.pairCount);
+    leaf.pairCount = 0;
+    status = RegExpRunStatus::Success;
+  } else if (!NightMatch(cx, &shared, input, size_t(lastIndex), &matches,
+                         &status)) {
     return true;
   }
   if (status == RegExpRunStatus::Success) {
@@ -200,11 +226,12 @@ bool js::NightRegExpExecTestFast(JSContext* cx, Value* frame, bool forTest,
  * rooting) that decides the call without a frame when it can. `thisv` must be
  * an optimizable RegExpObject that is neither global nor sticky (so lastIndex
  * is read but never written: the call leaves the heap as it found it), with a
- * compiled shared and an AOT matcher; `strv` a linear string. Returns 1 with
- * *out the result for a failed match (null / false) and a successful test()
- * (true), updating the statics as the engine does; 2 for a successful exec(),
- * whose result object the caller's generic path builds (it runs the match
- * again); 0 where any of that does not hold.
+ * compiled shared (an atom, or a regexp with an AOT matcher); `strv` a linear
+ * string. Returns 1 with *out the result for a failed match (null / false)
+ * and a successful test() (true), updating the statics as the engine does; 2
+ * for a successful exec(), whose result object the caller's generic path
+ * builds from the pairs kept in the context's NightLeafMatch; 0 where any of
+ * that does not hold.
  */
 int js::NightRegExpLeaf(JSContext* cx, const Value& thisv, const Value& strv,
                         bool forTest, Value* out) {
@@ -219,7 +246,7 @@ int js::NightRegExpLeaf(JSContext* cx, const Value& thisv, const Value& strv,
     return 0;
   }
   RegExpShared* shared = reobj->getShared();
-  if (shared->kind() != RegExpShared::Kind::RegExp ||
+  if (shared->kind() == RegExpShared::Kind::Unparsed ||
       !strv.toString()->isLinear()) {
     return 0;
   }
@@ -233,10 +260,10 @@ int js::NightRegExpLeaf(JSContext* cx, const Value& thisv, const Value& strv,
     return 0;
   }
   RegExpRunStatus status;
-  if (!irregexp::TryNightRegexMatch(
-          cx, JS::MutableHandle<RegExpShared*>::fromMarkedLocation(&shared),
-          JS::Handle<JSLinearString*>::fromMarkedLocation(&input), 0, &matches,
-          input->hasLatin1Chars(), &status)) {
+  if (!NightMatch(cx,
+                  JS::MutableHandle<RegExpShared*>::fromMarkedLocation(&shared),
+                  JS::Handle<JSLinearString*>::fromMarkedLocation(&input), 0,
+                  &matches, &status)) {
     return 0;
   }
   if (status == RegExpRunStatus::Success_NotFound) {
@@ -244,6 +271,16 @@ int js::NightRegExpLeaf(JSContext* cx, const Value& thisv, const Value& strv,
     return 1;
   }
   if (!forTest) {
+    // The generic path builds the result (it allocates); keep the pairs
+    // for it (NightRegExpExecTestFast).
+    nightrt::NightLeafMatch& leaf = nightrt::NightStateOf(cx)->leafMatch;
+    if (matches.pairCount() <= nightrt::NightLeafMatch::kMaxPairs) {
+      leaf.shared = shared;
+      leaf.input = input;
+      leaf.gcNumber = cx->runtime()->gc.gcNumber();
+      leaf.pairCount = uint32_t(matches.pairCount());
+      mozilla::PodCopy(leaf.pairs, matches.pairsRaw(), 2 * leaf.pairCount);
+    }
     return 2;
   }
   res->updateLazily(cx, input, shared, 0);

@@ -11,14 +11,35 @@
 
 #include "mozilla/Assertions.h"
 
+#include <stdint.h>
+
 #include "runtime/NightStack.h"
 #include "vm/JSContext.h"  // JSContext::getExternalCompilerState
 
+class JSLinearString;
+
 namespace js {
+class RegExpShared;
+
 namespace nightrt {
+
+// A successful exec() the compiled call's leaf decided (NightRegExpLeaf):
+// its match pairs, so the generic path that builds the result object need
+// not run the matcher again. Valid for the same shared and input, from
+// position 0, while no GC has run (the pointers identify the objects only
+// until one may move or free them).
+struct NightLeafMatch {
+  static constexpr uint32_t kMaxPairs = 16;
+  RegExpShared* shared = nullptr;
+  JSLinearString* input = nullptr;
+  uint64_t gcNumber = 0;
+  uint32_t pairCount = 0;  // 0: nothing cached
+  int32_t pairs[2 * kMaxPairs] = {};
+};
 
 struct NightContextState {
   NightStack stack;
+  NightLeafMatch leafMatch;
 };
 
 // Null when the context has no state (the hooks are not installed, or the
