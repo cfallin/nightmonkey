@@ -8270,9 +8270,9 @@ impl<'a> Lower<'a> {
     }
 
     /// `InitElemArray index` filling an array literal:
-    /// with a value that is neither a GC thing
-    /// (no barrier) nor the hole, dense elements with no flag but FIXED,
-    /// and the initialized length at `index` with room, store and bump it
+    /// with a value that is not the hole, dense elements with no flag but
+    /// FIXED, and the initialized length at `index` with room, store (with
+    /// the post-barrier a tenured literal owes a nursery value) and bump it
     /// (clearing RANGES under the store's `duty`), taking `ok_clean`;
     /// `cur` is left on the miss.
     fn init_elem_inline(&mut self, inst: mir::Inst, arr: Value, index: u32, val: Value, duty: bool) -> R<()> {
@@ -8280,7 +8280,7 @@ impl<'a> Lower<'a> {
         let slow = self.body.add_block();
         let vt = self.tag_of(val);
         let magic = self.i32c(TAG_MAGIC as u32);
-        let v_ok = self.bin(Operator::I32LtU, vt, magic, Type::I32);
+        let v_ok = self.bin(Operator::I32Ne, vt, magic, Type::I32);
         let at = self.tag_of(arr);
         let a_obj = self.tag_is(at, TAG_OBJECT as u32);
         let ok = self.bin(Operator::I32And, v_ok, a_obj, Type::I32);
@@ -8308,6 +8308,10 @@ impl<'a> Lower<'a> {
         self.store_i64(elems, index * 8, val);
         let nl = self.i32c(index + 1);
         self.set_elem_header(elems, ELEMENTS_INITLEN_BACK, nl);
+        if !value_tags(&self.ty(self.f.insts[inst].args[2])).subset_of(GC_FREE_TAGS) {
+            let f = self.h.post_write_barrier_elem;
+            self.post_barrier(f, obj, iv, val);
+        }
         let t = self.edge(inst, 0, &[])?;
         self.terminate(Terminator::Br { target: t });
         self.cur = slow;
