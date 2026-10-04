@@ -306,7 +306,7 @@ bool TryNightRegexMatch(JSContext* cx, MutableHandleRegExpShared re,
                         Handle<JSLinearString*> input, size_t startIndex,
                         VectorMatchPairs* matches, bool latin1,
                         RegExpRunStatus* out) {
-  js::night::NightRuntimeData& aot = js::night::NightData();
+  js::night::NightRuntimeData& aot = js::night::NightData(cx);
   if (aot.regexTableCount == 0) {
     return false;
   }

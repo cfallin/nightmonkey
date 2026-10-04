@@ -55,10 +55,6 @@ namespace nightrt {
 // same, or a body entered near the limit writes past the stack.
 static constexpr size_t kNightStackHeadroomSlots = (64 * 1024) / sizeof(JS::Value);
 
-// `NIGHT_GC_STATS`: the traces of the stack, and the slots they covered.
-extern uint64_t gNightStackTraces;
-extern uint64_t gNightStackTracedSlots;
-
 // The region's size in bytes and in slots.
 static constexpr size_t kNightStackBytes = size_t(1) << js::night::Night_valueStackLog2;
 static constexpr size_t kNightStackSlots = kNightStackBytes / sizeof(JS::Value);
@@ -84,7 +80,13 @@ class NightStack {
   // for non-GC Values (numbers, undefined, ...).
   void trace(JSTracer* trc);
 
+  // `NIGHT_GC_STATS`: the traces of the stack, and the slots they covered.
+  uint64_t traces() const { return traces_; }
+  uint64_t tracedSlots() const { return tracedSlots_; }
+
  private:
+  uint64_t traces_ = 0;
+  uint64_t tracedSlots_ = 0;
   JS::Value* base_;
   JS::Value* top_;
   JS::Value* limit_;

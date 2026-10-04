@@ -6,6 +6,8 @@
 
 #include <stdint.h>  // uint32_t
 
+#include "js/TypeDecls.h"  // JSContext
+
 namespace js {
 namespace night {
 
@@ -49,8 +51,8 @@ struct NightRuntimeData {
   uint64_t regexNightFallbacks = 0;
 };
 
-// The process-wide instance (one runtime per wasm instance).
-NightRuntimeData& NightData();
+// The runtime's instance (runtime/NightRuntime.cpp's NightRuntimeState).
+NightRuntimeData& NightData(JSContext* cx);
 
 }  // namespace night
 }  // namespace js

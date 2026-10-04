@@ -45,17 +45,25 @@ static uint32_t BumpSiteOf(JS::ExternalObjectMutation why) {
 // The tier's per-context state (NightStack.h): the context's value stack.
 // A context whose state cannot be made (or whose stack region cannot) runs
 // no compiled code: every entry checks for it.
+static void NightDestroyContext(JSContext* cx, void* state) {
+  auto* s = static_cast<nightrt::NightContextState*>(state);
+  if (s->runtime) {
+    js::night::DeleteNightRuntimeState(s->runtime);
+  }
+  js_delete(s);
+}
+
 static void* NightNewContext(JSContext* cx) {
   auto* state = js_new<nightrt::NightContextState>();
-  if (state && !state->stack.valid()) {
-    js_delete(state);
+  if (!state) {
+    return nullptr;
+  }
+  state->runtime = js::night::NewNightRuntimeState();
+  if (!state->stack.valid() || !state->runtime) {
+    NightDestroyContext(cx, state);
     return nullptr;
   }
   return state;
-}
-
-static void NightDestroyContext(JSContext* cx, void* state) {
-  js_delete(static_cast<nightrt::NightContextState*>(state));
 }
 
 extern "C" void NightCensusTraceConstructing(uint32_t oldWord,

@@ -285,9 +285,18 @@ survive a may-GC operation must be in the live stack prefix or another root.
 Inline heap writes mirror SpiderMonkey barriers using offsets pinned by static
 assertions.
 
-Most installed state, caches, persistent roots, and callbacks are process-global
-and have no teardown. This matches the single-image shell deployment but must
-be enforced or redesigned before runtime destruction and recreation.
+The runtime's installed state -- the region table, name and binding tables,
+pristine functions, layout table, side caches, census and regex matcher table
+-- is one `NightRuntimeState` (runtime/NightRuntime.cpp), owned by the
+context's tier state and freed with it (its persistent roots included).
+SpiderMonkey runs one JSContext per JSRuntime, so state keyed by shapes and
+atoms is per runtime as it must be. Helpers reach it through their `cx`;
+entry points with no context argument use the engine's current context
+(`js::TlsContext`). Still process-global: the registration block and its
+roots and digest (the wire format the tool finds through the
+`night.registration` export), the activation flag, the snapshot extras
+(`gShMirror`, `gWizening`), the in-process option string, and the engine's
+stamp epoch.
 
 ## 10. Generators, async, exceptions, and regexps
 

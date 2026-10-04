@@ -21,6 +21,13 @@ class JSLinearString;
 namespace js {
 class RegExpShared;
 
+namespace night {
+// runtime/NightRuntime.cpp's state: its caches, tables and flags.
+struct NightRuntimeState;
+NightRuntimeState* NewNightRuntimeState();
+void DeleteNightRuntimeState(NightRuntimeState* state);
+}  // namespace night
+
 namespace nightrt {
 
 // A successful exec() the compiled call's leaf decided (NightRegExpLeaf):
@@ -40,6 +47,7 @@ struct NightLeafMatch {
 struct NightContextState {
   NightStack stack;
   NightLeafMatch leafMatch;
+  js::night::NightRuntimeState* runtime = nullptr;
 };
 
 // Null when the context has no state (the hooks are not installed, or the

@@ -322,8 +322,8 @@ static void NightStatsDump() {
           "%llu stack-slots %llu\n",
           (unsigned long long)gStatsMinor, (unsigned long long)gStatsPromoted,
           unsigned(JS_GetGCParameter(gStatsCx, JSGC_MAJOR_GC_NUMBER)),
-          (unsigned long long)js::nightrt::gNightStackTraces,
-          (unsigned long long)js::nightrt::gNightStackTracedSlots);
+          (unsigned long long)js::nightrt::TheNightStack(gStatsCx).traces(),
+          (unsigned long long)js::nightrt::TheNightStack(gStatsCx).tracedSlots());
 }
 
 JS_PUBLIC_API bool JS::NightActivate(JSContext* cx) {

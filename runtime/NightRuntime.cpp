@@ -151,34 +151,30 @@ static inline uint32_t CacheHash(uint32_t shape, uint32_t atomId) {
 // Runtime state
 // ===========================================================================
 //
-// Everything this file keeps between calls, in four aggregates: the region
+// Everything this file keeps between calls lives in one NightRuntimeState
+// (defined at the end of the file, once every member's type is): the region
 // table the image published, the interned name and binding tables, the
 // pristine engine functions the compiled module's identity cells are armed
-// from, the predicted this-layout table, and the assorted derived addresses
-// and one-way flags. (The five direct-mapped side caches further down own
-// their own storage, next to the accessor that indexes them.)
-//
-// NightMonkey is single-runtime by construction -- one wizened image, one
-// JSContext, one AOT module, and the registration block records that context
-// by address -- so this is process state, and it is reached here without a
-// `cx`: several entry points the engine and the compiled module use have no
-// context argument (the write barriers,
-// `night_runtime_global_lexical_shadow_added`, the leaf probes). Per-runtime
-// state that a `cx` can always reach belongs on the JSRuntime instead, in
-// `JSRuntime::nightData()` (NightRuntimeData.h) -- the AOT regex matcher
-// table already lives there. Moving these there too would want a teardown
-// hook for the PersistentRooted values and would drag <vector>, <deque> and
-// the rooting headers into vm/Runtime.h, so it is a deliberate stop rather
-// than an oversight; docs/TODO 4.7 records what the move would take.
+// from, the predicted this-layout table, the assorted derived addresses and
+// one-way flags, the direct-mapped side caches, and the census. It belongs
+// to the context's external-tier state (runtime/NightContext.h); SpiderMonkey
+// runs one JSContext per JSRuntime, so state keyed by shapes and atoms (which
+// are per runtime) is per runtime too. Each part is reached through an
+// accessor taking the context (RtEnv(cx), RtNames(cx), ...): one load more
+// than a global's address. Entry points the engine or the compiled module
+// call with no context argument (the write barriers, the leaf probes) use
+// CurrentNightContext(), the engine's current context for the thread.
+
+static inline JSContext* CurrentNightContext() { return js::TlsContext.get(); }
 
 // The region table `night_runtime_install_env` was handed: every reserved
 // linear-memory base and length the helpers address, kept as the one table
 // the image published rather than as a global per field. Zero means the
 // image left that region out (older tool, or the feature disabled).
-static js::night::NightEnvDesc gEnv;
+static js::night::NightEnvDesc& RtEnv(JSContext* cx);
 
 // Fused constant globals: predicted (atomId -> literal bits), sorted by
-// atomId. The fuse-cell region (`gEnv.fuseCellsPtr`) holds a u32 per
+// atomId. The fuse-cell region (`RtEnv(cx).fuseCellsPtr`) holds a u32 per
 // binding, index == table position: 0 unarmed, 1 armed (compiled reads fold
 // to the literal), 2 blown. Armed by the write helpers seeing exactly the
 // predicted value; blown by any other write or delete; all blown at startup
@@ -209,7 +205,7 @@ struct NightNameTables {
   std::deque<JS::PersistentRooted<JS::PropertyKey>>* ids = nullptr;
 
   // The pre-interned global-binding names (binding-id -> PropertyKey), the
-  // resolver's keys (mirrors `ids` above), in the order the `gEnv.gslotsPtr`
+  // resolver's keys (mirrors `ids` above), in the order the `RtEnv(cx).gslotsPtr`
   // region the inlined `GetGName` reads uses.
   std::deque<JS::PersistentRooted<JS::PropertyKey>>* bindingKeys = nullptr;
   // atomId -> binding index (UINT32_MAX = none), and its inverse by name:
@@ -226,7 +222,7 @@ struct NightNameTables {
 
   std::vector<GnameFuse> fuses;
 };
-static NightNameTables gNames;
+static NightNameTables& RtNames(JSContext* cx);
 
 // The pristine engine functions the compiled module's identity cells are
 // armed from. Each is a `PersistentRootedValue` because the cells hold raw
@@ -253,11 +249,11 @@ struct NightPristineFns {
   static const uint32_t kCount = js::night::Night_builtinCellCount;
   JS::PersistentRootedValue* builtins[kCount] = {};
 };
-static NightPristineFns gFns;
+static NightPristineFns& RtFns(JSContext* cx);
 
 // Likely this-layout table, parsed from the merge's data segment at startup:
 // per layout id, the predicted field list (atomIds ordered by slot). The
-// guard-cell region is `gEnv.layoutCellsPtr` ([shape u32, gen u32] per
+// guard-cell region is `RtEnv(cx).layoutCellsPtr` ([shape u32, gen u32] per
 // layout); the validator publishes a shape word (or the INVALID sentinel 1)
 // into a cell, and the generation stamp invalidates it across major GCs like
 // the property ICs.
@@ -272,9 +268,9 @@ struct NightLayoutTable {
   // Whether TYPES has the any-type meaning, so the claims may keep it.
   bool anyTypes = false;
 };
-static NightLayoutTable gLayouts;
+static NightLayoutTable& RtLayouts(JSContext* cx);
 
-// The rest: the embedding's context, the addresses derived from `gEnv` at
+// The rest: the embedding's context, the addresses derived from `RtEnv(cx)` at
 // install time, and the one-way flags.
 struct NightState {
   // The embedding's long-lived context, captured by
@@ -283,13 +279,13 @@ struct NightState {
   JSContext* cx = nullptr;
 
   // Per-binding value-fuse cells (u32 per binding, right after the
-  // `gEnv.gslotsPtr` rows).
+  // `RtEnv(cx).gslotsPtr` rows).
   uint32_t globalValsBase = 0;
   // Inline string block (mirrors mod.rs strlit_slot): emptyString @0, the
   // string nursery header @4 and its alloc site's count address @8
   // (RefreshStringAlloc).
   uint32_t strLitBase = 0;
-  // Inline string-method call guard cells (gEnv.propicGenPtr + 32/40/48) and
+  // Inline string-method call guard cells (RtEnv(cx).propicGenPtr + 32/40/48) and
   // the builtin identity cells (+64): the boxed bits of the originals,
   // armed at startup and re-written after every major GC (function objects
   // move under compaction; the PersistentRooted values track them).
@@ -297,7 +293,7 @@ struct NightState {
   uint32_t strCharAtCell = 0;
   uint32_t strFromCharCodeCell = 0;
   uint32_t builtinCellsBase = 0;
-  // Flat mirror of gFns.builtins[0]'s bits (Array.prototype.push) for the
+  // Flat mirror of RtFns(cx).builtins[0]'s bits (Array.prototype.push) for the
   // native-dispatch fast-arm compare: one load, no PersistentRooted deref.
   // Rewritten wherever the cells are rearmed.
   uint64_t pushFnBits = 0;
@@ -340,8 +336,14 @@ struct NightState {
   // The slice callback that was installed before ours (the shell installs
   // one), chained rather than clobbered.
   JS::GCSliceCallback prevSliceCallback = nullptr;
+
+  // What the string-char-ops fuse word points at when the realm has no
+  // fuse: never 0, the "fuse unavailable" sentinel.
+  size_t poppedWord = 1;
+  // The MIR guard-failure stress mode's call count.
+  uint32_t stressCount = 0;
 };
-static NightState gState;
+static NightState& RtState(JSContext* cx);
 
 // Dense-append cache region (the inline SetElem append arm's probe table;
 // sized through NightRegionShape.h). Rows [shape, protoPtr0, protoShape0,
@@ -362,14 +364,14 @@ static const uint32_t kAccessorCacheRows = js::night::Night_accessorCacheRows;
 static const uint32_t kAccessorCacheRowBytes =
     js::night::Night_accessorCacheRowBytes;
 
-static void WriteAccessorEntry(uint32_t recvShape, uint32_t atomId,
+static void WriteAccessorEntry(JSContext* cx, uint32_t recvShape, uint32_t atomId,
                                uint32_t kind, uint64_t callee,
                                uint32_t holderPtr, uint32_t holderShape) {
   uint32_t ak = (atomId << 1) | kind;
   uint32_t h = ((recvShape >> 3) * 2654435761u) ^ (ak * 0x9e3779b9u);
   uint32_t idx = h & (kAccessorCacheRows - 1);
   uint32_t* e =
-      LinMem<uint32_t>(gEnv.accessorCachePtr + idx * kAccessorCacheRowBytes);
+      LinMem<uint32_t>(RtEnv(cx).accessorCachePtr + idx * kAccessorCacheRowBytes);
   e[2] = 0;  // shape word first cleared, last written: validity marker
   memcpy(e, &callee, sizeof(callee));
   e[3] = ak;
@@ -392,7 +394,7 @@ static void WriteAccessorEntry(uint32_t recvShape, uint32_t atomId,
 // UsedAsPrototype receivers may need teleport bookkeeping: not cached.
 // Tenured protos only (minor GC must not invalidate); shapes are always
 // tenured.
-static void PrimeAppendRow(js::NativeObject* no) {
+static void PrimeAppendRow(JSContext* cx, js::NativeObject* no) {
   js::Shape* shape = no->shape();
   if (!shape->isShared()) {
     return;
@@ -412,7 +414,7 @@ static void PrimeAppendRow(js::NativeObject* no) {
   }
   uint32_t s = uint32_t(reinterpret_cast<uintptr_t>(shape));
   uint32_t* row =
-      LinMem<uint32_t>(gEnv.appendCachePtr +
+      LinMem<uint32_t>(RtEnv(cx).appendCachePtr +
                        (((s >> 3) * 2654435761u) & (kAppendCacheRows - 1)) *
                            kAppendCacheRowBytes);
   row[1] = protos[0][0];
@@ -428,8 +430,8 @@ static void PrimeAppendRow(js::NativeObject* no) {
 // which populates this linear-memory cache. Per site there are
 // `INLINE_IC_WAYS` ways of 5 `u32` fields: [recvShape, ownFixedOff,
 // holderPtr, holderShape, slotEnc] (`recvShape==0` = empty). The cache lives
-// in the module's linear memory (reserved by the merge); `gEnv.propicPtr` is
-// its base, `gEnv.propicGenPtr` a single `u32` generation counter the GC
+// in the module's linear memory (reserved by the merge); `RtEnv(cx).propicPtr` is
+// its base, `RtEnv(cx).propicGenPtr` a single `u32` generation counter the GC
 // callback bumps on every major GC (so a moved/freed shape or holder
 // invalidates the way at once -- the cheap blanket-invalidation validity
 // model, whose cost stays low when major GCs are infrequent). Both addresses
@@ -467,7 +469,8 @@ static const uint32_t INLINE_IC_STRIDE = js::night::Night_inlineIcStride;
 // GC-heavy workloads whose protos tenure at the first minor GC.
 
 double night_runtime_math_unary(uint32_t kind, double x) {
-  if (gState.useFdlibmSinCos) {
+  JSContext* cx = CurrentNightContext();
+  if (RtState(cx).useFdlibmSinCos) {
     return kind ? js::math_cos_fdlibm_impl(x) : js::math_sin_fdlibm_impl(x);
   }
   return kind ? js::math_cos_native_impl(x) : js::math_sin_native_impl(x);
@@ -478,44 +481,46 @@ double night_runtime_math_pow(double x, double y) { return js::ecmaPow(x, y); }
 double night_runtime_fmod(double x, double y) { return js::NumberMod(x, y); }
 
 static void RearmBuiltinCells() {
-  if (gFns.builtins[0]) {
-    gState.pushFnBits = gFns.builtins[0]->get().asRawBits();
+  JSContext* cx = CurrentNightContext();
+  if (RtFns(cx).builtins[0]) {
+    RtState(cx).pushFnBits = RtFns(cx).builtins[0]->get().asRawBits();
   }
-  if (!gState.builtinCellsBase) {
+  if (!RtState(cx).builtinCellsBase) {
     return;
   }
   for (uint32_t i = 0; i < NightPristineFns::kCount; i++) {
-    if (gFns.builtins[i]) {
-      *LinMem<uint64_t>(gState.builtinCellsBase + 8 * i) =
-          gFns.builtins[i]->get().asRawBits();
+    if (RtFns(cx).builtins[i]) {
+      *LinMem<uint64_t>(RtState(cx).builtinCellsBase + 8 * i) =
+          RtFns(cx).builtins[i]->get().asRawBits();
     }
   }
 }
 
 static void RearmStringMethodCells() {
-  if (gState.strCharCodeAtCell && gFns.strCharCodeAt) {
-    *LinMem<uint64_t>(gState.strCharCodeAtCell) =
-        gFns.strCharCodeAt->get().asRawBits();
+  JSContext* cx = CurrentNightContext();
+  if (RtState(cx).strCharCodeAtCell && RtFns(cx).strCharCodeAt) {
+    *LinMem<uint64_t>(RtState(cx).strCharCodeAtCell) =
+        RtFns(cx).strCharCodeAt->get().asRawBits();
   }
-  if (gState.strCharAtCell && gFns.strCharAt) {
-    *LinMem<uint64_t>(gState.strCharAtCell) = gFns.strCharAt->get().asRawBits();
+  if (RtState(cx).strCharAtCell && RtFns(cx).strCharAt) {
+    *LinMem<uint64_t>(RtState(cx).strCharAtCell) = RtFns(cx).strCharAt->get().asRawBits();
   }
-  if (gState.strFromCharCodeCell && gFns.strFromCharCode) {
-    *LinMem<uint64_t>(gState.strFromCharCodeCell) =
-        gFns.strFromCharCode->get().asRawBits();
+  if (RtState(cx).strFromCharCodeCell && RtFns(cx).strFromCharCode) {
+    *LinMem<uint64_t>(RtState(cx).strFromCharCodeCell) =
+        RtFns(cx).strFromCharCode->get().asRawBits();
   }
 }
 
 // True when `callee` is the pristine String.prototype.charCodeAt/charAt and
 // `recv` is a rope: the call site flattens the rope once (mirrors CacheIR's
 // LinearizeForCharAccess) so later calls hit the compiled linear-string arm.
-static inline bool IsRopeCharAccess(const JS::Value& callee,
+static inline bool IsRopeCharAccess(JSContext* cx, const JS::Value& callee,
                                     const JS::Value& recv) {
   return recv.isString() && !recv.toString()->isLinear() &&
-         ((gFns.strCharCodeAt &&
-           callee.asRawBits() == gFns.strCharCodeAt->get().asRawBits()) ||
-          (gFns.strCharAt &&
-           callee.asRawBits() == gFns.strCharAt->get().asRawBits()));
+         ((RtFns(cx).strCharCodeAt &&
+           callee.asRawBits() == RtFns(cx).strCharCodeAt->get().asRawBits()) ||
+          (RtFns(cx).strCharAt &&
+           callee.asRawBits() == RtFns(cx).strCharAt->get().asRawBits()));
 }
 
 // defineProperty intercept: the ORIGINAL Object.defineProperty /
@@ -551,10 +556,10 @@ struct SetAddRow {
   bool skip = false;
 };
 static const uint32_t kSetAddSize = 4096;
-static SetAddRow gSetAdd[kSetAddSize];
-static inline SetAddRow& SetAddAt(uint32_t shape, uint32_t atomId) {
+static SetAddRow* RtSetAdd(JSContext* cx);
+static inline SetAddRow& SetAddAt(JSContext* cx, uint32_t shape, uint32_t atomId) {
   uint32_t h = CacheHash(shape, atomId);
-  return gSetAdd[h & (kSetAddSize - 1)];
+  return RtSetAdd(cx)[h & (kSetAddSize - 1)];
 }
 
 // Init-define add-transition cache: direct-mapped on (oldShape, atomId), no
@@ -569,10 +574,10 @@ struct InitAddRow {
   bool skip = false;  // as SetAddRow's
 };
 static const uint32_t kInitAddSize = 4096;
-static InitAddRow gInitAdd[kInitAddSize];
-static inline InitAddRow& InitAddAt(uint32_t shape, uint32_t atomId) {
+static InitAddRow* RtInitAdd(JSContext* cx);
+static inline InitAddRow& InitAddAt(JSContext* cx, uint32_t shape, uint32_t atomId) {
   uint32_t h = CacheHash(shape, atomId);
-  return gInitAdd[h & (kInitAddSize - 1)];
+  return RtInitAdd(cx)[h & (kInitAddSize - 1)];
 }
 // Cache of function shapes proven to have the default @@hasInstance (direct
 // proto == Function.prototype, no own @@hasInstance). Direct-mapped
@@ -580,7 +585,7 @@ static inline InitAddRow& InitAddAt(uint32_t shape, uint32_t atomId) {
 // freed+reused shape pointer can't false-hit. Lets hot instanceof calls skip
 // the per-call LookupPropertyPure verification.
 static const uint32_t kHasInstCacheN = 64;
-static uint32_t gHasInstCache[kHasInstCacheN * 2];
+static uint32_t* RtHasInst(JSContext* cx);
 
 // Megamorphic secondary GET cache: a global direct-mapped (receiver shape,
 // atomId) -> property coordinate table consulted by the miss helper BEFORE the
@@ -611,8 +616,8 @@ static inline size_t MegaGetSlot(uint32_t shape, uint32_t atomId) {
   uint32_t h = CacheHash(shape, atomId);
   return h & (kMegaGetSize - 1);
 }
-static inline MegaGetEntry* MegaGet(uint32_t shape, uint32_t atomId) {
-  return LinMem<MegaGetEntry>(gEnv.megaGetPtr) + MegaGetSlot(shape, atomId);
+static inline MegaGetEntry* MegaGet(JSContext* cx, uint32_t shape, uint32_t atomId) {
+  return LinMem<MegaGetEntry>(RtEnv(cx).megaGetPtr) + MegaGetSlot(shape, atomId);
 }
 // The poly-site marker in a SET site's way-0 recvShape (wasm/mir/abi.rs
 // IC_POLY_SENTINEL); never a valid shape pointer. Get sites have no
@@ -652,11 +657,11 @@ static_assert(sizeof(GChainEntry) == js::night::Night_gchainEntryBytes &&
 static_assert(js::night::kNightSlotEncAbsent ==
                   js::night::Night_icSlotEncAbsent,
               "the absent slotEnc");
-alignas(16) static GChainEntry gGChain[kGChainSize];
+static GChainEntry* RtGChain(JSContext* cx);
 
-static inline GChainEntry* GChainSlot(uint32_t shape, uint32_t atomId) {
+static inline GChainEntry* GChainSlot(JSContext* cx, uint32_t shape, uint32_t atomId) {
   uint32_t h = CacheHash(shape, atomId);
-  return &gGChain[h & (kGChainSize - 1)];
+  return &RtGChain(cx)[h & (kGChainSize - 1)];
 }
 
 // Megamorphic secondary SET cache: the write-side mirror of `gMegaGet`.
@@ -680,13 +685,13 @@ struct MegaSetEntry {
 static_assert(sizeof(MegaSetEntry) == js::night::Night_megaSetEntryBytes,
               "must match MEGA_SET_ENTRY_BYTES");
 static const uint32_t kMegaSetSize = js::night::Night_megaSetSize;
-static inline MegaSetEntry* MegaSet(uint32_t shape, uint32_t atomId) {
+static inline MegaSetEntry* MegaSet(JSContext* cx, uint32_t shape, uint32_t atomId) {
   uint32_t h = CacheHash(shape, atomId);
-  return LinMem<MegaSetEntry>(gEnv.megaSetPtr) + (h & (kMegaSetSize - 1));
+  return LinMem<MegaSetEntry>(RtEnv(cx).megaSetPtr) + (h & (kMegaSetSize - 1));
 }
 // Likely this-layout table (parsed from the merge's data segment at
 // startup): per layout id, the predicted (atomId ordered by slot) field
-// list; `gEnv.layoutCellsPtr` is the guard-cell region ([shape u32, gen u32]
+// list; `RtEnv(cx).layoutCellsPtr` is the guard-cell region ([shape u32, gen u32]
 // per layout). The validator publishes a shape word (or the INVALID
 // sentinel 1) into a cell; the generation stamp invalidates across major
 // GCs like the property ICs.
@@ -701,18 +706,18 @@ static inline MegaSetEntry* MegaSet(uint32_t shape, uint32_t atomId) {
 // blown by any other write/delete; all blown at startup if ANY script stays
 // interpreted (its global writes would bypass the compiled hooks).
 
-static uint32_t* GnameFuseCell(uint32_t idx) {
-  return LinMem<uint32_t>(gEnv.fuseCellsPtr + 4 * idx);
+static uint32_t* GnameFuseCell(JSContext* cx, uint32_t idx) {
+  return LinMem<uint32_t>(RtEnv(cx).fuseCellsPtr + 4 * idx);
 }
 
-static const GnameFuse* FindGnameFuse(uint32_t atomId) {
-  if (gNames.fuses.empty() || !gEnv.fuseCellsPtr) {
+static const GnameFuse* FindGnameFuse(JSContext* cx, uint32_t atomId) {
+  if (RtNames(cx).fuses.empty() || !RtEnv(cx).fuseCellsPtr) {
     return nullptr;
   }
   auto it = std::lower_bound(
-      gNames.fuses.begin(), gNames.fuses.end(), atomId,
+      RtNames(cx).fuses.begin(), RtNames(cx).fuses.end(), atomId,
       [](const GnameFuse& f, uint32_t a) { return f.atom < a; });
-  if (it == gNames.fuses.end() || it->atom != atomId) {
+  if (it == RtNames(cx).fuses.end() || it->atom != atomId) {
     return nullptr;
   }
   return &*it;
@@ -726,25 +731,28 @@ static const GnameFuse* FindGnameFuse(uint32_t atomId) {
 // binding holding its old value while an armed fuse would fold reads to the
 // literal.
 static void MaybeGnameFuseBlow(uint32_t atomId, uint64_t valueBits) {
-  if (const GnameFuse* f = FindGnameFuse(atomId)) {
+  JSContext* cx = CurrentNightContext();
+  if (const GnameFuse* f = FindGnameFuse(cx, atomId)) {
     if (valueBits != f->literal) {
-      *GnameFuseCell(f->cell) = 2;
+      *GnameFuseCell(cx, f->cell) = 2;
     }
   }
 }
 
 static void BlowGnameFuse(uint32_t atomId) {
-  if (const GnameFuse* f = FindGnameFuse(atomId)) {
-    *GnameFuseCell(f->cell) = 2;
+  JSContext* cx = CurrentNightContext();
+  if (const GnameFuse* f = FindGnameFuse(cx, atomId)) {
+    *GnameFuseCell(cx, f->cell) = 2;
   }
 }
 
 static void BlowAllGnameFuses() {
-  if (!gEnv.fuseCellsPtr) {
+  JSContext* cx = CurrentNightContext();
+  if (!RtEnv(cx).fuseCellsPtr) {
     return;
   }
-  for (const GnameFuse& f : gNames.fuses) {
-    *GnameFuseCell(f.cell) = 2;
+  for (const GnameFuse& f : RtNames(cx).fuses) {
+    *GnameFuseCell(cx, f.cell) = 2;
   }
 }
 
@@ -753,10 +761,11 @@ static void BlowAllGnameFuses() {
 // global has one); writes through it land on the global, so unwrap before
 // the identity check.
 static bool IsActiveGlobal(JSObject* obj) {
-  if (!gState.cx) {
+  JSContext* cx = CurrentNightContext();
+  if (!RtState(cx).cx) {
     return false;
   }
-  JSObject* global = JS::CurrentGlobalOrNull(gState.cx);
+  JSObject* global = JS::CurrentGlobalOrNull(RtState(cx).cx);
   return global && js::ToWindowIfWindowProxy(obj) == global;
 }
 
@@ -769,29 +778,30 @@ static void BlowBindingFuseKey(JS::PropertyKey id);
 static void BlowAllBindingFuses();
 
 extern "C" void night_runtime_distrust_global_fuses() {
+  JSContext* cx = CurrentNightContext();
   BlowAllGnameFuses();
   BlowAllBindingFuses();
-  gState.bindingFuseArmingAllowed = false;
+  RtState(cx).bindingFuseArmingAllowed = false;
 }
 
 // Pointer to way `way`'s first field for site `cacheIdx` in the linear-memory
 // inline cache.
-static inline uint32_t* InlineWay(uint32_t cacheIdx, uint32_t way) {
-  uintptr_t addr = static_cast<uintptr_t>(gEnv.propicPtr) +
+static inline uint32_t* InlineWay(JSContext* cx, uint32_t cacheIdx, uint32_t way) {
+  uintptr_t addr = static_cast<uintptr_t>(RtEnv(cx).propicPtr) +
                    static_cast<uintptr_t>(cacheIdx) * INLINE_IC_STRIDE +
                    way * INLINE_IC_WAY_BYTES;
   return reinterpret_cast<uint32_t*>(addr);
 }
 
 // Pointer to site `cacheIdx`'s add-transition row.
-static inline uint32_t* InlineTransRow(uint32_t cacheIdx) {
-  uintptr_t addr = static_cast<uintptr_t>(gEnv.propicPtr) +
+static inline uint32_t* InlineTransRow(JSContext* cx, uint32_t cacheIdx) {
+  uintptr_t addr = static_cast<uintptr_t>(RtEnv(cx).propicPtr) +
                    static_cast<uintptr_t>(cacheIdx) * INLINE_IC_STRIDE +
                    INLINE_IC_TRANS_OFF;
   return reinterpret_cast<uint32_t*>(addr);
 }
-static inline uint32_t InlineGen() {
-  return *LinMem<uint32_t>(gEnv.propicGenPtr + js::night::Night_hostGenOff);
+static inline uint32_t InlineGen(JSContext* cx) {
+  return *LinMem<uint32_t>(RtEnv(cx).propicGenPtr + js::night::Night_hostGenOff);
 }
 
 // The slot a cache row names, read off its holder.
@@ -811,9 +821,10 @@ static inline const JS::Value& SlotEncRead(const js::NativeObject* holder,
 static void NoteGetWay(uint32_t cacheIdx, uint32_t recvShape,
                        uint32_t holderPtr, uint32_t holderShape,
                        uint32_t slotEnc) {
+  JSContext* cx = CurrentNightContext();
   uint32_t* way = nullptr;
   for (uint32_t w = 0; w < INLINE_IC_WAYS; w++) {
-    uint32_t* cand = InlineWay(cacheIdx, w);
+    uint32_t* cand = InlineWay(cx, cacheIdx, w);
     if (cand[0] == recvShape) {
       way = cand;
       break;
@@ -844,9 +855,10 @@ static void NoteGetWay(uint32_t cacheIdx, uint32_t recvShape,
 // shape-pinned, so it is rechecked per hit. The generation stamp (bumped
 // on major GC) guards freed-pointer reuse.
 static const uint32_t kNoExtraCacheN = 16;
-static uintptr_t gNoExtraCache[kNoExtraCacheN * 5];  // p0, s0, p1, s1, gen
+// p0, s0, p1, s1, gen per entry.
+static uintptr_t* RtNoExtra(JSContext* cx);
 
-static bool NoExtraIndexedFast(JSObject* o) {
+static bool NoExtraIndexedFast(JSContext* cx, JSObject* o) {
   if (js::ObjectMayHaveExtraIndexedOwnProperties(o)) {
     return false;
   }
@@ -855,9 +867,9 @@ static bool NoExtraIndexedFast(JSObject* o) {
   if (!p0) {
     return true;
   }
-  uint32_t gen = InlineGen();
+  uint32_t gen = InlineGen(cx);
   uintptr_t* e =
-      &gNoExtraCache[((uintptr_t(p0) >> 4) & (kNoExtraCacheN - 1)) * 5];
+      &RtNoExtra(cx)[((uintptr_t(p0) >> 4) & (kNoExtraCacheN - 1)) * 5];
   if (e[0] == uintptr_t(p0) && e[4] == uintptr_t(gen) &&
       uintptr_t(p0->shape()) == e[1]) {
     js::NativeObject* n0 = &p0->as<js::NativeObject>();
@@ -925,19 +937,19 @@ static void NightGcSliceCallback(JSContext* cx, JS::GCProgress progress,
 // name.
 static void MaybeGnameFuseArmAfterStore(JSContext* cx, uint32_t atomId,
                                         uint64_t valueBits) {
-  const GnameFuse* f = FindGnameFuse(atomId);
+  const GnameFuse* f = FindGnameFuse(cx, atomId);
   if (!f || valueBits != f->literal) {
     return;
   }
-  uint32_t* cell = GnameFuseCell(f->cell);
+  uint32_t* cell = GnameFuseCell(cx, f->cell);
   if (*cell != 0) {
     return;
   }
   JSObject* global = JS::CurrentGlobalOrNull(cx);
-  if (!global || !gNames.ids || atomId >= gNames.ids->size()) {
+  if (!global || !RtNames(cx).ids || atomId >= RtNames(cx).ids->size()) {
     return;
   }
-  JS::PropertyKey id = (*gNames.ids)[atomId].get();
+  JS::PropertyKey id = (*RtNames(cx).ids)[atomId].get();
   js::NativeObject* holder = nullptr;
   js::PropertyResult prop;
   if (js::LookupPropertyPure(cx, global, id, &holder, &prop) &&
@@ -955,12 +967,13 @@ static void MaybeGnameFuseArmAfterStore(JSContext* cx, uint32_t atomId,
 // so a program that writes many computed-key globals at startup would
 // otherwise pay that cost everywhere.
 static void BlowGnameFuseKey(JS::PropertyKey id) {
-  if (!gNames.ids) {
+  JSContext* cx = CurrentNightContext();
+  if (!RtNames(cx).ids) {
     return;
   }
-  for (const GnameFuse& f : gNames.fuses) {
-    if ((*gNames.ids)[f.atom] == id) {
-      *GnameFuseCell(f.cell) = 2;
+  for (const GnameFuse& f : RtNames(cx).fuses) {
+    if ((*RtNames(cx).ids)[f.atom] == id) {
+      *GnameFuseCell(cx, f.cell) = 2;
       return;
     }
   }
@@ -1139,26 +1152,26 @@ extern "C++" JSFunction* js::night::ResolveGlobalPath(JSContext* cx,
 
 // Bounds-checked atomId -> pre-interned PropertyKey. An out-of-range id
 // is a merge/compiler invariant violation, so it aborts. The returned HandleId
-// wraps the stable PersistentRooted in `gNames.ids`, so it stays valid across
+// wraps the stable PersistentRooted in `RtNames(cx).ids`, so it stays valid across
 // GC.
-static inline JS::HandleId AtomIdChecked(uint32_t atomId) {
-  if (atomId >= gNames.atoms.size()) {
+static inline JS::HandleId AtomIdChecked(JSContext* cx, uint32_t atomId) {
+  if (atomId >= RtNames(cx).atoms.size()) {
     MOZ_CRASH("night-rt: atomId out of range");
   }
-  return (*gNames.ids)[atomId];
+  return (*RtNames(cx).ids)[atomId];
 }
 
 // Intern each atom-table name to a `PropertyKey` once, after the realm is
 // entered. Must run with `cx` in a realm (atomization needs one).
 static bool BuildAtomIds(JSContext* cx) {
-  gNames.ids = new std::deque<JS::PersistentRooted<JS::PropertyKey>>();
-  for (const std::u16string& s : gNames.atoms) {
+  RtNames(cx).ids = new std::deque<JS::PersistentRooted<JS::PropertyKey>>();
+  for (const std::u16string& s : RtNames(cx).atoms) {
     JS::RootedId id(cx);
     JS::TwoByteChars chars(s.data(), s.size());
     if (!JS_CharsToId(cx, chars, &id)) {
       return false;
     }
-    gNames.ids->emplace_back(cx, id);
+    RtNames(cx).ids->emplace_back(cx, id);
   }
   return true;
 }
@@ -1166,13 +1179,13 @@ static bool BuildAtomIds(JSContext* cx) {
 // Fill the literal-atom table: a linear-memory array of `JSAtom*` indexed
 // by atom-table id, its address written to the host slot at `slotAddr`.
 static bool BuildAtomTable(JSContext* cx, uint32_t slotAddr) {
-  size_t n = gNames.atoms.size();
+  size_t n = RtNames(cx).atoms.size();
   uint32_t* tbl = static_cast<uint32_t*>(malloc(n * sizeof(uint32_t)));
   if (!tbl) {
     return false;
   }
   for (size_t i = 0; i < n; i++) {
-    const std::u16string& s = gNames.atoms[i];
+    const std::u16string& s = RtNames(cx).atoms[i];
     JSAtom* atom = js::AtomizeChars(cx, s.data(), s.size());
     if (!atom || !js::PinAtom(cx, atom)) {
       return false;
@@ -1197,17 +1210,17 @@ static void NightNurseryEndCallback(JSContext* cx,
 // only inside a GC, so a refresh at startup, after every minor GC and at the
 // end of every cycle tracks it the way discarding JIT code does for Ion.
 static void RefreshStringAlloc(JSContext* cx) {
-  if (!gState.strLitBase) {
+  if (!RtState(cx).strLitBase) {
     return;
   }
   uint32_t header = 0;
   uint32_t countAddr = 0;
-  if (gState.nurseryInlineOK) {
+  if (RtState(cx).nurseryInlineOK) {
     js::night::NightNurseryStringAlloc(cx, &header, &countAddr);
   }
-  *LinMem<uint32_t>(gState.strLitBase +
+  *LinMem<uint32_t>(RtState(cx).strLitBase +
                     js::night::Night_strlitStrCountAddrOff) = countAddr;
-  *LinMem<uint32_t>(gState.strLitBase + js::night::Night_strlitStrHeaderOff) =
+  *LinMem<uint32_t>(RtState(cx).strLitBase + js::night::Night_strlitStrHeaderOff) =
       header;
 }
 
@@ -1228,15 +1241,16 @@ static void NightStringAllocNurseryCallback(JSContext* cx,
 // defineProperty. The major-GC zero resets cells to 0 (unarmed) and the next
 // resolve re-arms with the then-current value. No engine ObjectFuse, no
 // Watchtower slow path on global writes. GC-zeroed with the rows.
-static uint32_t* BindingFuseCell(uint32_t bindingId) {
-  return LinMem<uint32_t>(gState.globalValsBase + 16 * bindingId);
+static uint32_t* BindingFuseCell(JSContext* cx, uint32_t bindingId) {
+  return LinMem<uint32_t>(RtState(cx).globalValsBase + 16 * bindingId);
 }
 
 static void BlowBindingFuseId(uint32_t bindingId) {
-  if (!gState.globalValsBase) {
+  JSContext* cx = CurrentNightContext();
+  if (!RtState(cx).globalValsBase) {
     return;
   }
-  uint32_t* cell = BindingFuseCell(bindingId);
+  uint32_t* cell = BindingFuseCell(cx, bindingId);
   if (cell[2] & 1) {
     cell[2] = js::night::Night_bindingFuseBlown;
   }
@@ -1250,10 +1264,11 @@ static void BlowBindingFuseId(uint32_t bindingId) {
 // every run would otherwise put every one of its global reads on the
 // slower slot prologue instead of the fuse arm.
 static void MaybeBlowBindingFuseId(uint32_t bindingId, uint64_t newBits) {
-  if (!gState.globalValsBase) {
+  JSContext* cx = CurrentNightContext();
+  if (!RtState(cx).globalValsBase) {
     return;
   }
-  uint32_t* cell = BindingFuseCell(bindingId);
+  uint32_t* cell = BindingFuseCell(cx, bindingId);
   if ((cell[2] & 1) && *reinterpret_cast<uint64_t*>(cell) != newBits) {
     cell[2] = 0;
   }
@@ -1265,35 +1280,38 @@ static void MaybeArmBindingFuse(JSContext* cx, uint32_t bindingId,
 // After a successful global store through a generic helper: re-arm the
 // binding's cell from the stored (rooted) value.
 static void MaybeRearmBindingFuseAtom(JSContext* cx, uint32_t atomId) {
-  if (atomId < gNames.bindingOfAtom.size() &&
-      gNames.bindingOfAtom[atomId] != UINT32_MAX && gNames.bindingKeys) {
-    uint32_t bid = gNames.bindingOfAtom[atomId];
-    MaybeArmBindingFuse(cx, bid, (*gNames.bindingKeys)[bid].get());
+  if (atomId < RtNames(cx).bindingOfAtom.size() &&
+      RtNames(cx).bindingOfAtom[atomId] != UINT32_MAX && RtNames(cx).bindingKeys) {
+    uint32_t bid = RtNames(cx).bindingOfAtom[atomId];
+    MaybeArmBindingFuse(cx, bid, (*RtNames(cx).bindingKeys)[bid].get());
   }
 }
 
 static void MaybeBlowBindingFuseAtom(uint32_t atomId, uint64_t newBits) {
-  if (atomId < gNames.bindingOfAtom.size() &&
-      gNames.bindingOfAtom[atomId] != UINT32_MAX) {
-    MaybeBlowBindingFuseId(gNames.bindingOfAtom[atomId], newBits);
+  JSContext* cx = CurrentNightContext();
+  if (atomId < RtNames(cx).bindingOfAtom.size() &&
+      RtNames(cx).bindingOfAtom[atomId] != UINT32_MAX) {
+    MaybeBlowBindingFuseId(RtNames(cx).bindingOfAtom[atomId], newBits);
   }
 }
 
 static void BlowBindingFuseAtom(uint32_t atomId) {
-  if (atomId < gNames.bindingOfAtom.size() &&
-      gNames.bindingOfAtom[atomId] != UINT32_MAX) {
-    BlowBindingFuseId(gNames.bindingOfAtom[atomId]);
+  JSContext* cx = CurrentNightContext();
+  if (atomId < RtNames(cx).bindingOfAtom.size() &&
+      RtNames(cx).bindingOfAtom[atomId] != UINT32_MAX) {
+    BlowBindingFuseId(RtNames(cx).bindingOfAtom[atomId]);
   }
 }
 
 // Cold (defineProperty intercept): match a runtime jsid against the
 // pre-interned binding keys.
 static void BlowBindingFuseKey(JS::PropertyKey id) {
-  if (!gState.globalValsBase || !gNames.bindingKeys) {
+  JSContext* cx = CurrentNightContext();
+  if (!RtState(cx).globalValsBase || !RtNames(cx).bindingKeys) {
     return;
   }
-  for (size_t i = 0; i < gNames.bindingKeys->size(); i++) {
-    if ((*gNames.bindingKeys)[i].get() == id) {
+  for (size_t i = 0; i < RtNames(cx).bindingKeys->size(); i++) {
+    if ((*RtNames(cx).bindingKeys)[i].get() == id) {
       BlowBindingFuseId(uint32_t(i));
       return;
     }
@@ -1301,20 +1319,21 @@ static void BlowBindingFuseKey(JS::PropertyKey id) {
 }
 
 static void BlowAllBindingFuses() {
-  if (!gState.globalValsBase || !gNames.bindingKeys) {
+  JSContext* cx = CurrentNightContext();
+  if (!RtState(cx).globalValsBase || !RtNames(cx).bindingKeys) {
     return;
   }
-  for (size_t i = 0; i < gNames.bindingKeys->size(); i++) {
+  for (size_t i = 0; i < RtNames(cx).bindingKeys->size(); i++) {
     BlowBindingFuseId(uint32_t(i));
   }
 }
 
-// Build `gNames.bindingKeys` from the merge-embedded binding table: per
+// Build `RtNames(cx).bindingKeys` from the merge-embedded binding table: per
 // entry the UTF-16 name (like the atom table) plus a u32 predicted-script
 // word. Must run with `cx` in a realm.
 static bool BuildGlobalBindingKeys(JSContext* cx, uint32_t gbind_ptr,
                                    uint32_t gbind_len) {
-  gNames.bindingKeys = new std::deque<JS::PersistentRooted<JS::PropertyKey>>();
+  RtNames(cx).bindingKeys = new std::deque<JS::PersistentRooted<JS::PropertyKey>>();
   if (gbind_len < sizeof(uint32_t)) {
     return true;
   }
@@ -1338,21 +1357,22 @@ static bool BuildGlobalBindingKeys(JSContext* cx, uint32_t gbind_ptr,
     if (!JS_CharsToId(cx, chars, &id)) {
       return false;
     }
-    gNames.bindingIdOfName.emplace(std::move(s), i);
-    gNames.bindingPredictedScript.push_back(predicted);
-    gNames.bindingKeys->emplace_back(cx, id);
+    RtNames(cx).bindingIdOfName.emplace(std::move(s), i);
+    RtNames(cx).bindingPredictedScript.push_back(predicted);
+    RtNames(cx).bindingKeys->emplace_back(cx, id);
   }
   return true;
 }
 
-// Fill `gNames.bindingOfAtom` (atomId -> bindingId) once both name tables
+// Fill `RtNames(cx).bindingOfAtom` (atomId -> bindingId) once both name tables
 // exist.
 static void BuildBindingOfAtom() {
-  gNames.bindingOfAtom.assign(gNames.atoms.size(), UINT32_MAX);
-  for (size_t a = 0; a < gNames.atoms.size(); a++) {
-    auto it = gNames.bindingIdOfName.find(gNames.atoms[a]);
-    if (it != gNames.bindingIdOfName.end()) {
-      gNames.bindingOfAtom[a] = it->second;
+  JSContext* cx = CurrentNightContext();
+  RtNames(cx).bindingOfAtom.assign(RtNames(cx).atoms.size(), UINT32_MAX);
+  for (size_t a = 0; a < RtNames(cx).atoms.size(); a++) {
+    auto it = RtNames(cx).bindingIdOfName.find(RtNames(cx).atoms[a]);
+    if (it != RtNames(cx).bindingIdOfName.end()) {
+      RtNames(cx).bindingOfAtom[a] = it->second;
     }
   }
 }
@@ -1360,15 +1380,16 @@ static void BuildBindingOfAtom() {
 // Build the property-name atom table from the merge-embedded data (`u32 count`,
 // then `count` x (`u32 char_len`, `char_len` x LE `u16`)).
 static void BuildAtoms(uint32_t atom_ptr, uint32_t atom_len) {
-  gNames.atoms.clear();
-  gNames.latin1.clear();
-  gNames.latin1Ok.clear();
+  JSContext* cx = CurrentNightContext();
+  RtNames(cx).atoms.clear();
+  RtNames(cx).latin1.clear();
+  RtNames(cx).latin1Ok.clear();
   if (atom_len < sizeof(uint32_t)) {
     return;
   }
   ByteReader br(atom_ptr, atom_len);
   uint32_t count = br.u32();
-  gNames.atoms.reserve(count);
+  RtNames(cx).atoms.reserve(count);
   for (uint32_t i = 0; i < count; i++) {
     if (br.remaining() < sizeof(uint32_t)) {
       return;
@@ -1395,16 +1416,17 @@ static void BuildAtoms(uint32_t atom_ptr, uint32_t atom_len) {
         l.push_back(char(c));
       }
     }
-    gNames.latin1Ok.push_back(latin1 ? 1 : 0);
-    gNames.latin1.push_back(std::move(l));
-    gNames.atoms.push_back(std::move(s));
+    RtNames(cx).latin1Ok.push_back(latin1 ? 1 : 0);
+    RtNames(cx).latin1.push_back(std::move(l));
+    RtNames(cx).atoms.push_back(std::move(s));
   }
 }
 
 int32_t night_runtime_regex_ci_compare(uint32_t a_ptr, uint32_t b_ptr,
                                        uint32_t byte_len, uint32_t unicode) {
+  JSContext* cx = CurrentNightContext();
   using MA = v8::internal::RegExpMacroAssembler;
-  js::irregexp::Isolate* iso = gState.cx->isolate;
+  js::irregexp::Isolate* iso = RtState(cx).cx->isolate;
   auto a = static_cast<v8::Address>(a_ptr);
   auto b = static_cast<v8::Address>(b_ptr);
   return unicode ? MA::CaseInsensitiveCompareUnicode(a, b, byte_len, iso)
@@ -1417,16 +1439,16 @@ int32_t night_runtime_regex_ci_compare(uint32_t a_ptr, uint32_t b_ptr,
 // blown (2) cells stay blown. Requires BuildAtomIds
 // (night_runtime_install_env).
 extern "C" void night_runtime_arm_gname_fuses_from_live(JSContext* cx) {
-  if (!gEnv.fuseCellsPtr || !gNames.ids) {
+  if (!RtEnv(cx).fuseCellsPtr || !RtNames(cx).ids) {
     return;
   }
-  for (const GnameFuse& f : gNames.fuses) {
-    uint32_t* cell = GnameFuseCell(f.cell);
+  for (const GnameFuse& f : RtNames(cx).fuses) {
+    uint32_t* cell = GnameFuseCell(cx, f.cell);
     if (*cell != 0) {
       continue;
     }
     uint64_t bits;
-    if (js::night::NightTryBindingValue(cx, AtomIdChecked(f.atom), &bits) &&
+    if (js::night::NightTryBindingValue(cx, AtomIdChecked(cx, f.atom), &bits) &&
         bits == f.literal) {
       *cell = 1;
     }
@@ -1437,10 +1459,10 @@ bool night_runtime_install_env(JSContext* cx,
                                const js::night::NightEnvDesc& env) {
   // Everything the image published about its reserved regions, taken as
   // one table rather than a global per field. Helpers with no context
-  // argument resolve theirs through gState.cx.
-  gEnv = env;
-  if (!gState.cx) {
-    gState.cx = cx;
+  // argument resolve theirs through RtState(cx).cx.
+  RtEnv(cx) = env;
+  if (!RtState(cx).cx) {
+    RtState(cx).cx = cx;
   }
 #ifdef ENABLE_JS_NIGHTMONKEY
   // The inline instanceof proto-walk reads BaseShape::proto_ at a baked offset
@@ -1484,7 +1506,7 @@ bool night_runtime_install_env(JSContext* cx,
       p += 2 * size_t(plen);
       table[n++] = e;
     }
-    js::night::NightRuntimeData& aot = js::night::NightData();
+    js::night::NightRuntimeData& aot = js::night::NightData(cx);
     bool installed = false;
     if (n > 0) {
       constexpr uint32_t kBtElems = 1u << 20;  // 4 MB backtrack scratch
@@ -1515,9 +1537,9 @@ bool night_runtime_install_env(JSContext* cx,
         memcpy(&f.atom, p, 4);
         memcpy(&f.literal, p + 4, 8);
         p += 12;
-        gNames.fuses.push_back(f);
+        RtNames(cx).fuses.push_back(f);
       }
-      std::sort(gNames.fuses.begin(), gNames.fuses.end(),
+      std::sort(RtNames(cx).fuses.begin(), RtNames(cx).fuses.end(),
                 [](const GnameFuse& a, const GnameFuse& b) {
                   return a.atom < b.atom;
                 });
@@ -1530,7 +1552,7 @@ bool night_runtime_install_env(JSContext* cx,
     if (env.layoutLen >= 8) {
       // Flags: bit 8, the field claims may keep TYPES (the any-type
       // meaning of the MIR and baseline tiers).
-      gLayouts.anyTypes = (br.u32() & 0x100) != 0;
+      RtLayouts(cx).anyTypes = (br.u32() & 0x100) != 0;
       uint32_t count = br.u32();
       for (uint32_t i = 0; i < count && br.p + 4 <= br.end; i++) {
         uint32_t nf = br.u32();
@@ -1543,21 +1565,21 @@ bool night_runtime_install_env(JSContext* cx,
         // arms) and keep the slot-index form for the engine hook's fast
         // path.
         uint32_t bound = br.p + 4 <= br.end ? br.u32() : 0;
-        if (gEnv.layoutCellsPtr) {
-          *LinMem<uint32_t>(gEnv.layoutCellsPtr + 8 * i) = bound;
+        if (RtEnv(cx).layoutCellsPtr) {
+          *LinMem<uint32_t>(RtEnv(cx).layoutCellsPtr + 8 * i) = bound;
           // The row's second word: the layout's OWN byte bound, for the
           // add checks' clear-vs-advance-ineligible split.
-          *LinMem<uint32_t>(gEnv.layoutCellsPtr + 8 * i + 4) =
+          *LinMem<uint32_t>(RtEnv(cx).layoutCellsPtr + 8 * i + 4) =
               16 + 8 * uint32_t(fields.size());
         }
-        gLayouts.extLen.push_back(bound >= 16 ? (bound - 16) / 8
+        RtLayouts(cx).extLen.push_back(bound >= 16 ? (bound - 16) / 8
                                               : uint32_t(fields.size()));
         std::vector<uint32_t> claims;
         for (uint32_t j = 0; j < nf && br.p + 4 <= br.end; j++) {
           claims.push_back(br.u32());
         }
-        gLayouts.claims.push_back(std::move(claims));
-        gLayouts.rows.push_back(std::move(fields));
+        RtLayouts(cx).claims.push_back(std::move(claims));
+        RtLayouts(cx).rows.push_back(std::move(fields));
       }
     }
   }
@@ -1585,7 +1607,7 @@ bool night_runtime_install_env(JSContext* cx,
   // Record the inline property-IC region bases (the merge reserved both,
   // zero-initialized) and install the major-GC generation-bump callback. The
   // region stays all-zero (every way empty) until the miss helper populates it.
-  gState.prevSliceCallback = JS::SetGCSliceCallback(cx, NightGcSliceCallback);
+  RtState(cx).prevSliceCallback = JS::SetGCSliceCallback(cx, NightGcSliceCallback);
   // Startup-written host constants the AOT'd module cannot embed (the merge
   // reserved u32 slots at +8/+12/+16; layout mirrored in wasm/mod.rs): the two
   // JSFunction class addresses for the inline callee classify's clasp
@@ -1615,18 +1637,18 @@ bool night_runtime_install_env(JSContext* cx,
   // OptimizeStringCharOpsFuse guard word: Watchtower pops it on any mutation
   // of those properties, so `word == 0` proves a GetProp of them on a string
   // receiver yields the cached original -- the lookup is elided entirely.
-  gState.strCharCodeAtCell =
+  RtState(cx).strCharCodeAtCell =
       env.propicGenPtr + js::night::Night_hostStrCharCodeAtOff;
-  gState.strCharAtCell = env.propicGenPtr + js::night::Night_hostStrCharAtOff;
-  gState.strFromCharCodeCell =
+  RtState(cx).strCharAtCell = env.propicGenPtr + js::night::Night_hostStrCharAtOff;
+  RtState(cx).strFromCharCodeCell =
       env.propicGenPtr + js::night::Night_hostStrFromCharCodeOff;
   {
-    static size_t poppedWord = 1;  // never 0: "fuse unavailable" sentinel
     size_t* fuseWord = js::night::NightStringCharOpsFuseWord(cx);
     *LinMem<uint32_t>(env.propicGenPtr +
                       js::night::Night_hostStrCharOpsFuseOff) =
         static_cast<uint32_t>(
-            reinterpret_cast<uintptr_t>(fuseWord ? fuseWord : &poppedWord));
+            reinterpret_cast<uintptr_t>(fuseWord ? fuseWord
+                                                : &RtState(cx).poppedWord));
     // +60: &js::ArrayObject::class_ -- the inline array-length arm's clasp
     // identity compare (was the global ObjectFuse word).
     *LinMem<uint32_t>(env.propicGenPtr + js::night::Night_hostArrayClassOff) =
@@ -1678,42 +1700,42 @@ bool night_runtime_install_env(JSContext* cx,
       // is one load and one test. Seeded from the truth flag, which is
       // already set if source was compiled after registration but before
       // the snapshot.
-      gState.dynCodeFuseAddr = argsBase + js::night::Night_argsDynCodeFuseOff;
-      *LinMem<uint32_t>(gState.dynCodeFuseAddr) = gState.dynCodeSeen ? 1u : 0u;
+      RtState(cx).dynCodeFuseAddr = argsBase + js::night::Night_argsDynCodeFuseOff;
+      *LinMem<uint32_t>(RtState(cx).dynCodeFuseAddr) = RtState(cx).dynCodeSeen ? 1u : 0u;
       // Inline string-literal block right after the args metadata
       // (NightStrLitBase, shared with mod.rs strlit_slot): [emptyString @0]
       // (permanent atom, armed here, never zeroed) + the thin/fat replay
       // triples [hdr, flags, total] the slow night_runtime_string fills (zeroed
       // on major GC
       // -- the header word embeds zone/alloc-site pointers).
-      gState.strLitBase = js::night::NightStrLitBase(env.propicGenPtr);
-      *LinMem<uint32_t>(gState.strLitBase) =
+      RtState(cx).strLitBase = js::night::NightStrLitBase(env.propicGenPtr);
+      *LinMem<uint32_t>(RtState(cx).strLitBase) =
           static_cast<uint32_t>(reinterpret_cast<uintptr_t>(cx->emptyString()));
       // The MapObject class: the inline map lookup's receiver check.
-      *LinMem<uint32_t>(gState.strLitBase +
+      *LinMem<uint32_t>(RtState(cx).strLitBase +
                         js::night::Night_strlitMapClassOff) =
           static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&js::MapObject::class_));
       // The guarded-chain GET table, which the compiled get probe reads.
-      *LinMem<uint32_t>(gState.strLitBase +
+      *LinMem<uint32_t>(RtState(cx).strLitBase +
                         js::night::Night_strlitGchainAddrOff) =
-          static_cast<uint32_t>(reinterpret_cast<uintptr_t>(gGChain));
+          static_cast<uint32_t>(reinterpret_cast<uintptr_t>(RtGChain(cx)));
       // The strlit block's tail pad (Night_strlitStampEpochAddrOff)
       // publishes the address of the
       // stamp-invalidation epoch (vm/JSObject.h): compiled code compares
       // its low word around non-quiet helper calls so a helper that ran
       // but demoted nothing keeps FLAG_STAMPS clear -- the runtime-precise
       // replacement for saturating the bit at every helper site.
-      *LinMem<uint32_t>(gState.strLitBase +
+      *LinMem<uint32_t>(RtState(cx).strLitBase +
                         js::night::Night_strlitStampEpochAddrOff) =
           static_cast<uint32_t>(
               reinterpret_cast<uintptr_t>(&js::gNightStampEpoch));
       // (Night_strlitBindEpochAddrOff is unused: nothing reads a binding
       // epoch since MIR re-tests a binding's fuse word instead.)
-      *LinMem<uint32_t>(gState.strLitBase +
+      *LinMem<uint32_t>(RtState(cx).strLitBase +
                         js::night::Night_strlitBindEpochAddrOff) = 0;
       // The plain-object class: MIR's `guard.kind Plain` compares a
       // receiver's clasp against it.
-      *LinMem<uint32_t>(gState.strLitBase +
+      *LinMem<uint32_t>(RtState(cx).strLitBase +
                         js::night::Night_strlitPlainClassOff) =
           static_cast<uint32_t>(
               reinterpret_cast<uintptr_t>(&js::PlainObject::class_));
@@ -1729,9 +1751,9 @@ bool night_runtime_install_env(JSContext* cx,
     // Per-binding value fuses: enable the cells (right after the
     // gGlobalSlots rows) unless the kill switch is set; the nursery-end
     // callback re-tries cells whose value was nursery-young at resolve.
-    if (gNames.bindingKeys) {
-      gState.globalValsBase =
-          env.gslotsPtr + uint32_t(gNames.bindingKeys->size()) * 8;
+    if (RtNames(cx).bindingKeys) {
+      RtState(cx).globalValsBase =
+          env.gslotsPtr + uint32_t(RtNames(cx).bindingKeys->size()) * 8;
       JS::AddGCNurseryCollectionCallback(cx, NightNurseryEndCallback, nullptr);
     }
   }
@@ -1744,11 +1766,11 @@ bool night_runtime_install_env(JSContext* cx,
         JS_GetProperty(cx, strProto, "charAt", &cat) &&
         JS_GetProperty(cx, strProto, "constructor", &strCtor) &&
         ccat.isObject() && cat.isObject() && strCtor.isObject()) {
-      gFns.strCharCodeAt = new JS::PersistentRootedValue(cx, ccat);
-      gFns.strCharAt = new JS::PersistentRootedValue(cx, cat);
+      RtFns(cx).strCharCodeAt = new JS::PersistentRootedValue(cx, ccat);
+      RtFns(cx).strCharAt = new JS::PersistentRootedValue(cx, cat);
       JS::RootedObject ctorObj(cx, &strCtor.toObject());
       if (JS_GetProperty(cx, ctorObj, "fromCharCode", &fcc) && fcc.isObject()) {
-        gFns.strFromCharCode = new JS::PersistentRootedValue(cx, fcc);
+        RtFns(cx).strFromCharCode = new JS::PersistentRootedValue(cx, fcc);
       }
       RearmStringMethodCells();
     } else {
@@ -1769,7 +1791,7 @@ bool night_runtime_install_env(JSContext* cx,
   // Keep in sync with translate::BC_COUNT. A fetch failure just leaves that
   // cell unarmed.
   {
-    gState.builtinCellsBase =
+    RtState(cx).builtinCellsBase =
         env.propicGenPtr + js::night::Night_hostBuiltinCellsOff;
     JS::RootedValue v(cx);
     // Only arm cells whose pristine value is a genuine C++ native: the
@@ -1783,7 +1805,7 @@ bool night_runtime_install_env(JSContext* cx,
       if (v.isObject() && v.toObject().is<JSFunction>() &&
           (v.toObject().as<JSFunction>().isNativeFun() ||
            v.toObject().as<JSFunction>().isSelfHostedBuiltin())) {
-        gFns.builtins[idx] = new JS::PersistentRootedValue(cx, v);
+        RtFns(cx).builtins[idx] = new JS::PersistentRootedValue(cx, v);
       }
     };
     JS::RootedObject g(cx, JS::CurrentGlobalOrNull(cx));
@@ -1846,7 +1868,7 @@ bool night_runtime_install_env(JSContext* cx,
     }
     if (g) {
       JS::Realm* realm = JS::GetCurrentRealmOrNull(cx);
-      gState.useFdlibmSinCos =
+      RtState(cx).useFdlibmSinCos =
           js::math_use_fdlibm_for_sin_cos_tan() ||
           (realm && JS::RealmCreationOptionsRef(realm).alwaysUseFdlibm());
       JS::RootedValue mathv(cx);
@@ -1857,14 +1879,14 @@ bool night_runtime_install_env(JSContext* cx,
         // BOTH the Math.* property functions and the std_Math_* intrinsic
         // clones (same native, different JSFunction objects). Order matches
         // translate::MN_*.
-        if (gEnv.mathNativesPtr) {
+        if (RtEnv(cx).mathNativesPtr) {
           static const char* const kMnNames[13] = {
               "max",   "min",    "pow",  "sqrt",  "abs", "floor", "ceil",
               "trunc", "fround", "imul", "clz32", "sin", "cos"};
           static_assert(sizeof(kMnNames) / sizeof(kMnNames[0]) <=
                             js::night::Night_mathNativeSlots,
                         "more MN_* names than the region reserves slots for");
-          auto* slots = LinMem<uint32_t>(gEnv.mathNativesPtr);
+          auto* slots = LinMem<uint32_t>(RtEnv(cx).mathNativesPtr);
           for (int i = 0; i < 13; i++) {
             if (JS_GetProperty(cx, math, kMnNames[i], &v) && v.isObject() &&
                 v.toObject().is<JSFunction>() &&
@@ -1937,7 +1959,7 @@ bool night_runtime_install_env(JSContext* cx,
     uint32_t posAddr = 0;
     uint32_t endAddr = 0;
     if (js::night::NightNurseryAddresses(cx, &posAddr, &endAddr)) {
-      gState.nurseryInlineOK = true;
+      RtState(cx).nurseryInlineOK = true;
     }
     *LinMem<uint32_t>(env.propicGenPtr + js::night::Night_hostNurseryPosOff) =
         posAddr;
@@ -1957,18 +1979,18 @@ bool night_runtime_install_env(JSContext* cx,
         objCtor.isObject()) {
       JS::RootedObject octor(cx, &objCtor.toObject());
       if (JS_GetProperty(cx, octor, "defineProperty", &dp) && dp.isObject()) {
-        gFns.defineProperty = new JS::PersistentRootedValue(cx, dp);
+        RtFns(cx).defineProperty = new JS::PersistentRootedValue(cx, dp);
       }
       if (JS_GetProperty(cx, octor, "defineProperties", &dps) &&
           dps.isObject()) {
-        gFns.defineProperties = new JS::PersistentRootedValue(cx, dps);
+        RtFns(cx).defineProperties = new JS::PersistentRootedValue(cx, dps);
       }
     }
     if (globalObj && JS_GetProperty(cx, globalObj, "Reflect", &reflect) &&
         reflect.isObject()) {
       JS::RootedObject robj(cx, &reflect.toObject());
       if (JS_GetProperty(cx, robj, "defineProperty", &rdp) && rdp.isObject()) {
-        gFns.reflectDefineProperty = new JS::PersistentRootedValue(cx, rdp);
+        RtFns(cx).reflectDefineProperty = new JS::PersistentRootedValue(cx, rdp);
       }
     }
     if (JS_IsExceptionPending(cx)) {
@@ -1983,10 +2005,10 @@ bool night_runtime_install_env(JSContext* cx,
     JS::RootedValue ex(cx), te(cx);
     if (JS_GetClassPrototype(cx, JSProto_RegExp, &reProto) && reProto) {
       if (JS_GetProperty(cx, reProto, "exec", &ex) && ex.isObject()) {
-        gFns.regExpExec = new JS::PersistentRootedValue(cx, ex);
+        RtFns(cx).regExpExec = new JS::PersistentRootedValue(cx, ex);
       }
       if (JS_GetProperty(cx, reProto, "test", &te) && te.isObject()) {
-        gFns.regExpTest = new JS::PersistentRootedValue(cx, te);
+        RtFns(cx).regExpTest = new JS::PersistentRootedValue(cx, te);
       }
     }
     if (JS_IsExceptionPending(cx)) {
@@ -1994,14 +2016,14 @@ bool night_runtime_install_env(JSContext* cx,
     }
     // The same two as builtin cells (BC_REGEXP_EXEC = 27, BC_REGEXP_TEST =
     // 28): the compiled call's regexp arm matches its callee against them.
-    gFns.builtins[27] = gFns.regExpExec;
-    gFns.builtins[28] = gFns.regExpTest;
+    RtFns(cx).builtins[27] = RtFns(cx).regExpExec;
+    RtFns(cx).builtins[28] = RtFns(cx).regExpTest;
     // `Map.prototype.get` (BC_MAP_GET = 29): the inline map lookup's callee.
     JS::RootedObject mapProto(cx);
     JS::RootedValue mg(cx);
     if (JS_GetClassPrototype(cx, JSProto_Map, &mapProto) && mapProto &&
         JS_GetProperty(cx, mapProto, "get", &mg) && mg.isObject()) {
-      gFns.builtins[29] = new JS::PersistentRootedValue(cx, mg);
+      RtFns(cx).builtins[29] = new JS::PersistentRootedValue(cx, mg);
     }
     if (JS_IsExceptionPending(cx)) {
       JS_ClearPendingException(cx);
@@ -2037,7 +2059,7 @@ static JSObject* ReceiverObjectAtom(JSContext* cx, uint64_t recv,
     return nullptr;
   }
   if (MOZ_UNLIKELY(!obj)) {
-    JS::Rooted<jsid> id(cx, AtomIdChecked(atomId));
+    JS::Rooted<jsid> id(cx, AtomIdChecked(cx, atomId));
     js::ReportIsNullOrUndefinedForPropertyAccess(cx, recvVal,
                                                  JSDVG_IGNORE_STACK, id);
     return nullptr;
@@ -2086,19 +2108,19 @@ static void NightCensusTraceSet(uint32_t atomId, uint32_t word,
 // a compiled store to a known field makes (`field_types`), made here for
 // the set helpers' stores, which know the field. (The engine's store choke
 // knows no field and drops the bit.)
-static bool NightStoreConforms(JSObject* obj, uint32_t atomId, JS::Value v) {
-  if (!gLayouts.anyTypes) {
+static bool NightStoreConforms(JSContext* cx, JSObject* obj, uint32_t atomId, JS::Value v) {
+  if (!RtLayouts(cx).anyTypes) {
     return false;
   }
   uint32_t w = obj->externalWord();
   uint32_t k = (w & js::night::kWordConstructing) ? (w >> 18) & 0x0FFF
                                                   : w & 0xFFFF;
-  if (k == 0 || k - 1 >= gLayouts.rows.size() ||
-      k - 1 >= gLayouts.claims.size()) {
+  if (k == 0 || k - 1 >= RtLayouts(cx).rows.size() ||
+      k - 1 >= RtLayouts(cx).claims.size()) {
     return false;
   }
-  const std::vector<uint32_t>& row = gLayouts.rows[k - 1];
-  const std::vector<uint32_t>& claims = gLayouts.claims[k - 1];
+  const std::vector<uint32_t>& row = RtLayouts(cx).rows[k - 1];
+  const std::vector<uint32_t>& claims = RtLayouts(cx).claims[k - 1];
   for (size_t i = 0; i < row.size(); i++) {
     if (row[i] != atomId) {
       continue;
@@ -2199,7 +2221,7 @@ static bool PlainStore(JSObject* obj, JS::HandleId id) {
 // TYPES, and every method call on it after that failed its entry guard.
 static bool DefineKeepsTypes(JSContext* cx, JSObject* obj, JS::PropertyKey id,
                              JS::Value desc) {
-  if (!gLayouts.anyTypes || !gNames.ids || !desc.isObject()) {
+  if (!RtLayouts(cx).anyTypes || !RtNames(cx).ids || !desc.isObject()) {
     return false;
   }
   uint32_t w = obj->externalWord();
@@ -2208,11 +2230,11 @@ static bool DefineKeepsTypes(JSContext* cx, JSObject* obj, JS::PropertyKey id,
   }
   uint32_t k = (w & js::night::kWordConstructing) ? (w >> 18) & 0x0FFF
                                                   : w & 0xFFFF;
-  if (k == 0 || k - 1 >= gLayouts.rows.size()) {
+  if (k == 0 || k - 1 >= RtLayouts(cx).rows.size()) {
     return false;
   }
-  for (uint32_t atom : gLayouts.rows[k - 1]) {
-    if (atom < gNames.ids->size() && (*gNames.ids)[atom].get() == id) {
+  for (uint32_t atom : RtLayouts(cx).rows[k - 1]) {
+    if (atom < RtNames(cx).ids->size() && (*RtNames(cx).ids)[atom].get() == id) {
       return false;
     }
   }
@@ -2261,7 +2283,7 @@ bool night_runtime_set_property(JSContext* cx, uint32_t top, uint64_t recv,
                         JS::Value::fromRawBits(recv).toObject().externalWord(),
                         flags | 4);
   }
-  JS::HandleId id = AtomIdChecked(atomId);
+  JS::HandleId id = AtomIdChecked(cx, atomId);
   JS::RootedObject obj(cx, ReceiverObject(cx, recv));
   if (!obj) {
     return false;
@@ -2274,7 +2296,7 @@ bool night_runtime_set_property(JSContext* cx, uint32_t top, uint64_t recv,
   }
   {
     bool vouched = (flags & 2) ||
-                   NightStoreConforms(obj, atomId, JS::Value::fromRawBits(val));
+                   NightStoreConforms(cx, obj, atomId, JS::Value::fromRawBits(val));
     AutoVouchedStore v(vouched && !activeGlobal && PlainStore(obj, id));
     if (!GenericSetWithStrict(cx, obj, id, val, recv, strict)) {
       return false;
@@ -2295,7 +2317,8 @@ bool night_runtime_set_property(JSContext* cx, uint32_t top, uint64_t recv,
 static bool TryLeafGetProbesShape(JSObject* robj, uint32_t shape,
                                   uint32_t atomId, uint32_t cacheIdx,
                                   JS::Value* out) {
-  MegaGetEntry& e = *MegaGet(shape, atomId);
+  JSContext* cx = CurrentNightContext();
+  MegaGetEntry& e = *MegaGet(cx, shape, atomId);
   if (e.shape == shape && e.atomId == atomId && (e.holderPtr || robj)) {
     js::NativeObject* holder;
     bool holderOk = true;
@@ -2316,7 +2339,7 @@ static bool TryLeafGetProbesShape(JSObject* robj, uint32_t shape,
   }
   // Guarded-chain probe: validates every hop's live shape, then
   // serves the holder slot or the proven-ABSENT undefined.
-  GChainEntry& g = *GChainSlot(shape, atomId);
+  GChainEntry& g = *GChainSlot(cx, shape, atomId);
   if (g.shape == shape && g.atomId == atomId) {
     bool ok = true;
     for (uint32_t h = 0; h < g.nHops; h++) {
@@ -2483,9 +2506,10 @@ static bool PureLengthRead(JSContext* cx, JS::Value rv, JS::HandleId id,
 static void NoteGetRow(uint32_t cacheIdx, uint32_t atomId, uint32_t recvShape,
                        uint32_t holderPtr, uint32_t holderShape,
                        uint32_t slotEnc) {
+  JSContext* cx = CurrentNightContext();
   NoteGetWay(cacheIdx, recvShape, holderPtr, holderShape, slotEnc);
   // Fill the linmem mega entry unconditionally (direct-mapped overwrite).
-  MegaGetEntry& e = *MegaGet(recvShape, atomId);
+  MegaGetEntry& e = *MegaGet(cx, recvShape, atomId);
   e.atomId = atomId;
   e.holderPtr = holderPtr;
   e.holderShape = holderShape;
@@ -2498,7 +2522,8 @@ static void NoteGetRow(uint32_t cacheIdx, uint32_t atomId, uint32_t recvShape,
 static void NoteGChain(uint32_t shape, uint32_t atomId, uint32_t nHops,
                        uint32_t slotEnc, const uint32_t* pp,
                        const uint32_t* ps) {
-  GChainEntry& g = *GChainSlot(shape, atomId);
+  JSContext* cx = CurrentNightContext();
+  GChainEntry& g = *GChainSlot(cx, shape, atomId);
   g.shape = 0;
   g.atomId = atomId;
   g.nHops = nHops;
@@ -2566,7 +2591,7 @@ uint64_t night_runtime_get_prop_pure(JSContext* cx, uint64_t recv,
                                      uint32_t atomId, uint32_t cacheIdx) {
   JS::AutoCheckCannotGC nogc;
   const uint64_t fail = JS::MagicValue(JS_GENERIC_MAGIC).asRawBits();
-  JS::HandleId id = AtomIdChecked(atomId);
+  JS::HandleId id = AtomIdChecked(cx, atomId);
   if (!id.isAtom()) {
     return fail;
   }
@@ -2671,7 +2696,7 @@ uint32_t night_runtime_get_prop_ic_miss(JSContext* cx, uint32_t top,
                                         uint64_t recv, uint32_t atomId,
                                         uint32_t cacheIdx) {
   SetNightTop(cx, top);
-  JS::HandleId id = AtomIdChecked(atomId);
+  JS::HandleId id = AtomIdChecked(cx, atomId);
   {
     JS::Value out;
     if (PureLengthRead(cx, JS::Value::fromRawBits(recv), id, &out)) {
@@ -2737,14 +2762,14 @@ uint32_t night_runtime_get_prop_ic_miss(JSContext* cx, uint32_t top,
       WriteNightOut(top, res.asRawBits());
       return kMissClean;
     }
-  } else if (obj->is<js::NativeObject>() && gEnv.accessorCachePtr) {
+  } else if (obj->is<js::NativeObject>() && RtEnv(cx).accessorCachePtr) {
     // BOTH slot populates refused: likely a proto-chain GETTER --
     // prime the accessor-call cache for the compiled accessor arm.
     uint64_t callee;
     uint32_t rs, hp, hs;
     if (js::night::NightPrimeAccessor(cx, obj, id, /*wantSetter=*/false,
                                       &callee, &rs, &hp, &hs)) {
-      WriteAccessorEntry(rs, atomId, /*kind=*/0, callee, hp, hs);
+      WriteAccessorEntry(cx, rs, atomId, /*kind=*/0, callee, hp, hs);
     }
   }
   WriteNightOut(top, res.get().asRawBits());
@@ -2782,7 +2807,7 @@ uint32_t night_runtime_set_prop_ic_miss(JSContext* cx, uint32_t top,
     NightCensusTraceSet(atomId, rv.toObject().externalWord(), flags);
   }
   bool vouched = (flags & kSetVouchTypes) ||
-                 (rv.isObject() && NightStoreConforms(&rv.toObject(), atomId,
+                 (rv.isObject() && NightStoreConforms(cx, &rv.toObject(), atomId,
                                                       JS::Value::fromRawBits(val)));
   return SetPropIcMiss(cx, top, recv, atomId, val, cacheIdx, flags & 1,
                        vouched);
@@ -3050,7 +3075,7 @@ uint32_t night_runtime_set_prop_pure(JSContext* cx, uint32_t top,
   }
   JS::RootedObject robj(cx, &rv.toObject());
   bool vouched = (flags & kSetVouchTypes) ||
-                 NightStoreConforms(robj, atomId, JS::Value::fromRawBits(val));
+                 NightStoreConforms(cx, robj, atomId, JS::Value::fromRawBits(val));
   // The IC's cached replays first: populated only from plain data stores,
   // they run no code (and need no lookup here).
   uint32_t before = robj->externalWord();
@@ -3058,7 +3083,7 @@ uint32_t night_runtime_set_prop_pure(JSContext* cx, uint32_t top,
     return DemotedForMir(before, robj->externalWord()) ? 2 : 1;
   }
   JSObject* obj = robj;
-  JS::HandleId id = AtomIdChecked(atomId);
+  JS::HandleId id = AtomIdChecked(cx, atomId);
   if (!id.isAtom() || !NoCodeStore(cx, obj, id)) {
     return 0;
   }
@@ -3081,7 +3106,8 @@ uint32_t night_runtime_set_prop_pure(JSContext* cx, uint32_t top,
 // by the C++ mega-SET cache from here on.
 static void NoteSetShape(uint32_t cacheIdx, uint32_t recvShape,
                          uint32_t slotEnc, uint32_t absSlot) {
-  uint32_t* way0 = InlineWay(cacheIdx, 0);
+  JSContext* cx = CurrentNightContext();
+  uint32_t* way0 = InlineWay(cx, cacheIdx, 0);
   if (way0[0] == 0 || way0[0] == recvShape) {
     way0[1] = 0;
     way0[2] = slotEnc;
@@ -3105,7 +3131,7 @@ static bool SetPropCached(JSContext* cx, uint32_t top, uint64_t recv,
   // mismatch). Replay in C++ (no lookup, no JS_SetPropertyById machinery);
   // the region is GC-zeroed so every cached word is a live pointer.
   {
-    uint32_t* row = InlineTransRow(cacheIdx);
+    uint32_t* row = InlineTransRow(cx, cacheIdx);
     if (row[0]) {
       uint32_t protoPtrs[4] = {row[4], row[6], row[8], row[10]};
       uint32_t protoShapes[4] = {row[5], row[7], row[9], row[11]};
@@ -3124,9 +3150,9 @@ static bool SetPropCached(JSContext* cx, uint32_t top, uint64_t recv,
   if (JS::Value::fromRawBits(recv).isObject()) {
     uint32_t shapeW =
         js::night::NightObjectShape(&JS::Value::fromRawBits(recv).toObject());
-    SetAddRow& trow = SetAddAt(shapeW, atomId);
+    SetAddRow& trow = SetAddAt(cx, shapeW, atomId);
     AutoVouchedStore v(vouched);
-    if (trow.gen == InlineGen() && trow.oldShape == shapeW &&
+    if (trow.gen == InlineGen(cx) && trow.oldShape == shapeW &&
         trow.atomId == atomId &&
         js::night::NightTryAddPropTransition(
             cx, recv, trow.oldShape, trow.newShape, trow.slot, trow.protoPtrs,
@@ -3138,7 +3164,7 @@ static bool SetPropCached(JSContext* cx, uint32_t top, uint64_t recv,
       // and lands here instead. The site row replays two proto hops; deeper
       // chains stay on the table alone.
       if (trow.numProtos <= 4 && (!trow.skip || skipRows)) {
-        uint32_t* srow = InlineTransRow(cacheIdx);
+        uint32_t* srow = InlineTransRow(cx, cacheIdx);
         uint32_t nfixed = JS::Value::fromRawBits(recv)
                               .toObject()
                               .as<js::NativeObject>()
@@ -3154,7 +3180,7 @@ static bool SetPropCached(JSContext* cx, uint32_t top, uint64_t recv,
     js::NativeObject* nobj = static_cast<js::NativeObject*>(
         &JS::Value::fromRawBits(recv).toObject());
     uint32_t shape = js::night::NightObjectShape(nobj);
-    MegaSetEntry& e = *MegaSet(shape, atomId);
+    MegaSetEntry& e = *MegaSet(cx, shape, atomId);
     if (e.shape == shape && e.atomId == atomId) {
       AutoVouchedStore v(vouched);
       nobj->setSlot(e.absSlot, JS::Value::fromRawBits(val));
@@ -3171,7 +3197,7 @@ static uint32_t SetPropIcMiss(JSContext* cx, uint32_t top, uint64_t recv,
                               uint32_t atomId, uint64_t val, uint32_t cacheIdx,
                               bool strict, bool vouched, bool skipRows) {
   SetNightTop(cx, top);
-  JS::HandleId id = AtomIdChecked(atomId);
+  JS::HandleId id = AtomIdChecked(cx, atomId);
   // Fused globals: a fused global's write must never be served by the
   // inline/mega set caches (their hits bypass this helper): do the write
   // generically, arm or blow the fuses, and cache nothing for this (shape,
@@ -3179,7 +3205,7 @@ static uint32_t SetPropIcMiss(JSContext* cx, uint32_t top, uint64_t recv,
   if (JS::Value::fromRawBits(recv).isObject() &&
       IsActiveGlobal(&JS::Value::fromRawBits(recv).toObject())) {
     MaybeBlowBindingFuseAtom(atomId, val);
-    if (FindGnameFuse(atomId)) {
+    if (FindGnameFuse(cx, atomId)) {
       MaybeGnameFuseBlow(atomId, val);
       JS::RootedObject gobj(cx, &JS::Value::fromRawBits(recv).toObject());
       if (!GenericSetWithStrict(cx, gobj, id, val, recv, strict)) {
@@ -3231,20 +3257,20 @@ static uint32_t SetPropIcMiss(JSContext* cx, uint32_t top, uint64_t recv,
             &numProtos, &nurseryProto, &skip)) {
       populated = true;
       if (nurseryProto) {
-        gState.transRowsHoldNursery = true;
+        RtState(cx).transRowsHoldNursery = true;
       }
       // The site row replays two proto hops at most; deeper chains are
       // served by the global table alone (its rows carry four hops), and so
       // is a transition that skips slots (the compiled replays do not
       // initialize them).
       if (numProtos <= 4 && (!skip || skipRows)) {
-        uint32_t* row = InlineTransRow(cacheIdx);
+        uint32_t* row = InlineTransRow(cx, cacheIdx);
         uint32_t nfixed = obj->as<js::NativeObject>().numFixedSlots();
         FillTransRow(row, shapeBefore, newShape, slot, nfixed, protoPtrs,
                      protoShapes, numProtos);
       }
-      SetAddRow& trow = SetAddAt(shapeBefore, atomId);
-      trow.gen = InlineGen();
+      SetAddRow& trow = SetAddAt(cx, shapeBefore, atomId);
+      trow.gen = InlineGen(cx);
       trow.oldShape = shapeBefore;
       trow.atomId = atomId;
       trow.newShape = newShape;
@@ -3265,12 +3291,12 @@ static uint32_t SetPropIcMiss(JSContext* cx, uint32_t top, uint64_t recv,
       NoteSetShape(cacheIdx, recvShape, slotEnc, absSlot);
       // Fill the mega cache unconditionally (global, direct-mapped
       // overwrite).
-      MegaSetEntry& e = *MegaSet(recvShape, atomId);
+      MegaSetEntry& e = *MegaSet(cx, recvShape, atomId);
       e.atomId = atomId;
       e.slotEnc = slotEnc;
       e.absSlot = absSlot;
       e.shape = recvShape;
-    } else if (gEnv.accessorCachePtr && reason == 3) {
+    } else if (RtEnv(cx).accessorCachePtr && reason == 3) {
       // Populate refused with "no own property": the set may have run a
       // proto-chain SETTER -- prime the accessor-call cache so the
       // compiled accessor arm dispatches it directly from here on.
@@ -3278,7 +3304,7 @@ static uint32_t SetPropIcMiss(JSContext* cx, uint32_t top, uint64_t recv,
       uint32_t rs, hp, hs;
       if (js::night::NightPrimeAccessor(cx, obj, id, /*wantSetter=*/true,
                                         &callee, &rs, &hp, &hs)) {
-        WriteAccessorEntry(rs, atomId, /*kind=*/1, callee, hp, hs);
+        WriteAccessorEntry(cx, rs, atomId, /*kind=*/1, callee, hp, hs);
       }
     }
   }
@@ -3313,7 +3339,7 @@ uint32_t night_runtime_elem_grow(JSContext* cx, uint32_t top, uint64_t recv,
   JS::RootedValue v(cx, JS::Value::fromRawBits(val));
   if (idx != obj->getDenseInitializedLength() || idx == UINT32_MAX ||
       !obj->isExtensible() || obj->denseElementsAreFrozen() ||
-      !NoExtraIndexedFast(obj)) {
+      !NoExtraIndexedFast(cx, obj)) {
     return 0;
   }
   bool isArray = obj->is<js::ArrayObject>();
@@ -3357,7 +3383,7 @@ uint32_t night_runtime_init_field(JSContext* cx, uint32_t top, uint64_t recv,
     return 0;
   }
   JS::RootedObject obj(cx, &rv.toObject());
-  JS::HandleId id = AtomIdChecked(atomId);
+  JS::HandleId id = AtomIdChecked(cx, atomId);
   uint32_t key = obj->externalWord() & (js::night::kWordConstructing | 0x3FFC0000u);
   if (!PlainStore(obj, id) || obj->as<js::NativeObject>().lookupPure(id).isSome()) {
     return 0;
@@ -3407,28 +3433,28 @@ uint32_t night_runtime_init_field(JSContext* cx, uint32_t top, uint64_t recv,
 // follows a may-GC op) reads the value there after it. Outside a realm (no
 // compiled frame is running) the cells are zeroed and re-arm at resolve.
 static void RefreshBindingCells() {
-  if (!gState.globalValsBase || !gNames.bindingKeys) {
+  JSContext* cx = CurrentNightContext();
+  if (!RtState(cx).globalValsBase || !RtNames(cx).bindingKeys) {
     return;
   }
-  size_t n = gNames.bindingKeys->size();
-  JSContext* cx = gState.cx;
+  size_t n = RtNames(cx).bindingKeys->size();
   if (!cx || !JS::CurrentGlobalOrNull(cx)) {
-    ZeroRegion(gState.globalValsBase, n * 16);
+    ZeroRegion(RtState(cx).globalValsBase, n * 16);
     return;
   }
   for (size_t i = 0; i < n; i++) {
-    uint32_t* cell = BindingFuseCell(uint32_t(i));
+    uint32_t* cell = BindingFuseCell(cx, uint32_t(i));
     if (!(cell[2] & 1)) {
       // Unarmed or blown: reset, as the zeroing this replaces did, so the
       // next resolve may arm it again.
-      ZeroRegion(gState.globalValsBase + 16 * uint32_t(i), 16);
+      ZeroRegion(RtState(cx).globalValsBase + 16 * uint32_t(i), 16);
       continue;
     }
     // A nursery value (armed so, and listed for the nursery's end, which
     // re-arms it once moved) is kept as it is.
     uint64_t bits;
     bool nursery = false;
-    if (js::night::NightTryBindingValue(cx, (*gNames.bindingKeys)[i].get(),
+    if (js::night::NightTryBindingValue(cx, (*RtNames(cx).bindingKeys)[i].get(),
                                         &bits, &nursery)) {
       *reinterpret_cast<uint64_t*>(cell) = bits;
     } else {
@@ -3441,7 +3467,7 @@ static void RefreshBindingCells() {
 //
 // A method load whose name the analysis resolves through the receiver's
 // prototype chain to one script (`method.load`) reads its function from a
-// cell (gEnv.methodCellsPtr, Night_methodCell*): armed, the cell holds the
+// cell (RtEnv(cx).methodCellsPtr, Night_methodCell*): armed, the cell holds the
 // receivers' prototype P and the function, which a property of a holder H
 // (P or above it) holds. The receiver is CLOSED (no own property outside
 // its row), so the name is not its own, and P is its prototype, so the
@@ -3457,24 +3483,26 @@ struct MethodDep {
   uint32_t slot;
   uint32_t cell;
 };
-static std::vector<MethodDep> gMethodDeps;
+static std::vector<MethodDep>& RtMethodDeps(JSContext* cx);
 
 static void ZeroMethodCells() {
-  if (gEnv.methodCellsPtr && gEnv.methodCellsLen) {
-    ZeroRegion(gEnv.methodCellsPtr, gEnv.methodCellsLen);
+  JSContext* cx = CurrentNightContext();
+  if (RtEnv(cx).methodCellsPtr && RtEnv(cx).methodCellsLen) {
+    ZeroRegion(RtEnv(cx).methodCellsPtr, RtEnv(cx).methodCellsLen);
   }
-  gMethodDeps.clear();
+  RtMethodDeps(cx).clear();
 }
 
 // A cell found not armable stays so (poisoned) until the next GC: one
 // that tenures a function or prototype may make it armable.
 static void UnpoisonMethodCells() {
-  if (!gEnv.methodCellsPtr) {
+  JSContext* cx = CurrentNightContext();
+  if (!RtEnv(cx).methodCellsPtr) {
     return;
   }
-  for (uint32_t off = 0; off < gEnv.methodCellsLen;
+  for (uint32_t off = 0; off < RtEnv(cx).methodCellsLen;
        off += js::night::Night_methodCellBytes) {
-    uint32_t* c = LinMem<uint32_t>(gEnv.methodCellsPtr + off);
+    uint32_t* c = LinMem<uint32_t>(RtEnv(cx).methodCellsPtr + off);
     if (c[0] == js::night::Night_methodCellPoison) {
       c[0] = 0;
     }
@@ -3490,9 +3518,9 @@ static void UnpoisonMethodCells() {
 // cell poisoned. A leaf: the holder's fuse flag is set with GC suppressed.
 int32_t night_runtime_method_arm(uint64_t recvBits, uint32_t cellAddr,
                                  uint32_t atomId, uint32_t scriptAddr) {
-  JSContext* cx = gState.cx;
+  JSContext* cx = CurrentNightContext();
   uint32_t* c = LinMem<uint32_t>(cellAddr);
-  if (!cx || !gNames.ids || atomId >= gNames.ids->size() || c[0] != 0) {
+  if (!cx || !RtNames(cx).ids || atomId >= RtNames(cx).ids->size() || c[0] != 0) {
     return 0;
   }
   c[0] = js::night::Night_methodCellPoison;
@@ -3500,7 +3528,7 @@ int32_t night_runtime_method_arm(uint64_t recvBits, uint32_t cellAddr,
   if (!rv.isObject()) {
     return 0;
   }
-  JS::PropertyKey id = (*gNames.ids)[atomId].get();
+  JS::PropertyKey id = (*RtNames(cx).ids)[atomId].get();
   JSObject* proto = rv.toObject().staticPrototype();
   js::NativeObject* holder = nullptr;
   mozilla::Maybe<js::PropertyInfo> prop;
@@ -3546,7 +3574,7 @@ int32_t night_runtime_method_arm(uint64_t recvBits, uint32_t cellAddr,
       return 0;
     }
   }
-  gMethodDeps.push_back({fuse, prop->slot(), cellAddr});
+  RtMethodDeps(cx).push_back({fuse, prop->slot(), cellAddr});
   *reinterpret_cast<uint64_t*>(c + js::night::Night_methodCellFnOff / 4) =
       fv.asRawBits();
   c[0] = uint32_t(reinterpret_cast<uintptr_t>(proto));
@@ -3559,12 +3587,13 @@ int32_t night_runtime_method_arm(uint64_t recvBits, uint32_t cellAddr,
 extern "C++" {
 void js::night::NightObjectFuseInvalidated(js::ObjectFuse* fuse,
                                            uint32_t slot) {
-  for (size_t i = 0; i < gMethodDeps.size();) {
-    const MethodDep& d = gMethodDeps[i];
+  JSContext* cx = CurrentNightContext();
+  for (size_t i = 0; i < RtMethodDeps(cx).size();) {
+    const MethodDep& d = RtMethodDeps(cx)[i];
     if (d.fuse == fuse && (slot == UINT32_MAX || d.slot == slot)) {
       ZeroRegion(d.cell, js::night::Night_methodCellBytes);
-      gMethodDeps[i] = gMethodDeps.back();
-      gMethodDeps.pop_back();
+      RtMethodDeps(cx)[i] = RtMethodDeps(cx).back();
+      RtMethodDeps(cx).pop_back();
     } else {
       i++;
     }
@@ -3573,42 +3602,43 @@ void js::night::NightObjectFuseInvalidated(js::ObjectFuse* fuse,
 }  // extern "C++"
 
 static void NightPurgeMovableCaches() {
-  if (gEnv.propicGenPtr) {
-    *LinMem<uint32_t>(gEnv.propicGenPtr + js::night::Night_hostGenOff) += 1;
+  JSContext* cx = CurrentNightContext();
+  if (RtEnv(cx).propicGenPtr) {
+    *LinMem<uint32_t>(RtEnv(cx).propicGenPtr + js::night::Night_hostGenOff) += 1;
   }
   // The per-site ways and the linmem mega-GET table cache raw shape /
   // holder pointers with NO generation field; zero them so a compacting GC
   // can never leave a false-hittable stale pointer. (Way sentinels are
   // cleared too: a poly site re-learns, costing one extra miss round.)
-  if (gEnv.propicPtr && gEnv.propicLen) {
-    ZeroRegion(gEnv.propicPtr, gEnv.propicLen);
+  if (RtEnv(cx).propicPtr && RtEnv(cx).propicLen) {
+    ZeroRegion(RtEnv(cx).propicPtr, RtEnv(cx).propicLen);
   }
-  if (gEnv.megaGetPtr) {
-    ZeroRegion(gEnv.megaGetPtr, kMegaGetSize * sizeof(MegaGetEntry));
+  if (RtEnv(cx).megaGetPtr) {
+    ZeroRegion(RtEnv(cx).megaGetPtr, kMegaGetSize * sizeof(MegaGetEntry));
   }
   // Guarded-chain table: caches tenured proto pointers + shape words.
-  memset(gGChain, 0, sizeof(gGChain));
+  memset(RtGChain(cx), 0, sizeof(GChainEntry) * kGChainSize);
   // Dense-append cache rows pin receiver shape + proto (ptr, shape) pairs; a
   // compacting major GC can move any of them, so zero the region (the prime
   // path refills).
-  if (gEnv.appendCachePtr) {
-    ZeroRegion(gEnv.appendCachePtr, kAppendCacheRows * kAppendCacheRowBytes);
+  if (RtEnv(cx).appendCachePtr) {
+    ZeroRegion(RtEnv(cx).appendCachePtr, kAppendCacheRows * kAppendCacheRowBytes);
   }
   // The accessor-call cache holds raw callee/holder/shape pointers.
-  if (gEnv.accessorCachePtr) {
-    ZeroRegion(gEnv.accessorCachePtr,
+  if (RtEnv(cx).accessorCachePtr) {
+    ZeroRegion(RtEnv(cx).accessorCachePtr,
                kAccessorCacheRows * kAccessorCacheRowBytes);
   }
-  if (gEnv.megaSetPtr) {
-    ZeroRegion(gEnv.megaSetPtr, kMegaSetSize * sizeof(MegaSetEntry));
+  if (RtEnv(cx).megaSetPtr) {
+    ZeroRegion(RtEnv(cx).megaSetPtr, kMegaSetSize * sizeof(MegaSetEntry));
   }
   // The guarded gname entries cache a raw shape pointer; a major (compacting)
   // GC can move shapes, and a freed-then-reused shape address would FALSE-HIT
   // the guard. Zero the whole region: every entry re-resolves on next read
   // (the TI-proven entries re-resolve too -- harmless, one leaf call each).
-  if (gEnv.gslotsPtr && gNames.bindingKeys) {
+  if (RtEnv(cx).gslotsPtr && RtNames(cx).bindingKeys) {
     // The rows (n*8) cache raw shape pointers: zeroed, re-resolved on use.
-    ZeroRegion(gEnv.gslotsPtr, gNames.bindingKeys->size() * 8);
+    ZeroRegion(RtEnv(cx).gslotsPtr, RtNames(cx).bindingKeys->size() * 8);
     RefreshBindingCells();
   }
   // This region holds the STATIC per-layout add-check bound table (filled
@@ -3619,20 +3649,20 @@ static void NightPurgeMovableCaches() {
   // move or free either (compact/sweep), and a reused address must never
   // false-hit, so zero the region. (The store path caches tenured callees
   // only, so minor GCs cannot invalidate a row.)
-  if (gEnv.callCellsPtr && gEnv.callCellsLen) {
-    ZeroRegion(gEnv.callCellsPtr, gEnv.callCellsLen);
+  if (RtEnv(cx).callCellsPtr && RtEnv(cx).callCellsLen) {
+    ZeroRegion(RtEnv(cx).callCellsPtr, RtEnv(cx).callCellsLen);
   }
   // Inline-alloc cells (32-byte rows; see translate.rs ALLOC_CELL_BYTES)
   // cache shape and alloc-site pointers; zero so a compacting major GC can
   // never leave a stale replayable row.
-  if (gEnv.allocCellsPtr && gEnv.allocCellsLen) {
-    ZeroRegion(gEnv.allocCellsPtr, gEnv.allocCellsLen);
+  if (RtEnv(cx).allocCellsPtr && RtEnv(cx).allocCellsLen) {
+    ZeroRegion(RtEnv(cx).allocCellsPtr, RtEnv(cx).allocCellsLen);
   }
   // Intrinsic value cells cache boxed Value bits (functions, mostly); a
   // compacting major GC can move them, so zero and re-resolve. (The fill
   // helper caches tenured values only, so minor GCs cannot invalidate.)
-  if (gEnv.intrinsicCellsPtr && gEnv.intrinsicCellsLen) {
-    ZeroRegion(gEnv.intrinsicCellsPtr, gEnv.intrinsicCellsLen);
+  if (RtEnv(cx).intrinsicCellsPtr && RtEnv(cx).intrinsicCellsLen) {
+    ZeroRegion(RtEnv(cx).intrinsicCellsPtr, RtEnv(cx).intrinsicCellsLen);
   }
   js::night::NightPurgeAddMemo();
   // The string-method and builtin guard cells hold raw function bits;
@@ -3663,8 +3693,8 @@ static void NightGcSliceCallback(JSContext* cx, JS::GCProgress progress,
   if (progress == JS::GC_CYCLE_END) {
     RefreshStringAlloc(cx);
   }
-  if (gState.prevSliceCallback) {
-    gState.prevSliceCallback(cx, progress, desc);
+  if (RtState(cx).prevSliceCallback) {
+    RtState(cx).prevSliceCallback(cx, progress, desc);
   }
 }
 
@@ -3692,37 +3722,37 @@ static void NightNurseryEndCallback(JSContext* cx,
   // the truth. Unarm and re-arm from it (a program that re-creates its
   // heap-view globals on every run never lets that view tenure, so it
   // never arms and every read of it pays the slot prologue).
-  if (!gState.nurseryArmedBindings.empty() && gNames.bindingKeys) {
+  if (!RtState(cx).nurseryArmedBindings.empty() && RtNames(cx).bindingKeys) {
     std::vector<uint32_t> pending;
-    pending.swap(gState.nurseryArmedBindings);
+    pending.swap(RtState(cx).nurseryArmedBindings);
     for (uint32_t bid : pending) {
-      uint32_t* cell = BindingFuseCell(bid);
+      uint32_t* cell = BindingFuseCell(cx, bid);
       if (cell[2] & 1) {
         cell[2] = 0;
-        MaybeArmBindingFuse(cx, bid, (*gNames.bindingKeys)[bid].get());
+        MaybeArmBindingFuse(cx, bid, (*RtNames(cx).bindingKeys)[bid].get());
       }
     }
   }
   // Trans rows / the SET-add table that cached nursery proto pointers die
   // with this minor GC.
-  if (gState.transRowsHoldNursery) {
-    if (gEnv.propicPtr && gEnv.propicLen) {
-      for (uint32_t off = INLINE_IC_TRANS_OFF; off < gEnv.propicLen;
+  if (RtState(cx).transRowsHoldNursery) {
+    if (RtEnv(cx).propicPtr && RtEnv(cx).propicLen) {
+      for (uint32_t off = INLINE_IC_TRANS_OFF; off < RtEnv(cx).propicLen;
            off += INLINE_IC_STRIDE) {
-        ZeroRegion(gEnv.propicPtr + off, INLINE_IC_TRANS_BYTES);
+        ZeroRegion(RtEnv(cx).propicPtr + off, INLINE_IC_TRANS_BYTES);
       }
     }
-    memset(gSetAdd, 0, sizeof(gSetAdd));
-    gState.transRowsHoldNursery = false;
+    memset(RtSetAdd(cx), 0, sizeof(SetAddRow) * kSetAddSize);
+    RtState(cx).transRowsHoldNursery = false;
   }
-  if (!gEnv.gslotsPtr || !gState.globalValsBase || !gNames.bindingKeys) {
+  if (!RtEnv(cx).gslotsPtr || !RtState(cx).globalValsBase || !RtNames(cx).bindingKeys) {
     return;
   }
-  for (size_t i = 0; i < gNames.bindingKeys->size(); i++) {
-    uint32_t row = *LinMem<uint32_t>(gEnv.gslotsPtr + 8 * i);
-    uint32_t* cell = LinMem<uint32_t>(gState.globalValsBase + 16 * i);
+  for (size_t i = 0; i < RtNames(cx).bindingKeys->size(); i++) {
+    uint32_t row = *LinMem<uint32_t>(RtEnv(cx).gslotsPtr + 8 * i);
+    uint32_t* cell = LinMem<uint32_t>(RtState(cx).globalValsBase + 16 * i);
     if ((row & 1) && !cell[2]) {
-      MaybeArmBindingFuse(cx, uint32_t(i), (*gNames.bindingKeys)[i].get());
+      MaybeArmBindingFuse(cx, uint32_t(i), (*RtNames(cx).bindingKeys)[i].get());
     }
   }
 }
@@ -3733,18 +3763,19 @@ static void NightNurseryEndCallback(JSContext* cx,
 // Slot*, and stays generic) and blow the name's value/gname fuses. Rare
 // (global-script declaration instantiation), so linear scans are fine.
 extern "C" void night_runtime_global_lexical_shadow_added(uintptr_t idBits) {
+  JSContext* cx = CurrentNightContext();
   JS::PropertyKey id = JS::PropertyKey::fromRawBits(idBits);
-  if (gEnv.gslotsPtr && gNames.bindingKeys) {
-    for (size_t i = 0; i < gNames.bindingKeys->size(); i++) {
-      if ((*gNames.bindingKeys)[i].get() == id) {
-        ZeroRegion(gEnv.gslotsPtr + 8 * i, 8);
+  if (RtEnv(cx).gslotsPtr && RtNames(cx).bindingKeys) {
+    for (size_t i = 0; i < RtNames(cx).bindingKeys->size(); i++) {
+      if ((*RtNames(cx).bindingKeys)[i].get() == id) {
+        ZeroRegion(RtEnv(cx).gslotsPtr + 8 * i, 8);
       }
     }
   }
   BlowBindingFuseKey(id);
-  if (gNames.ids) {
-    for (size_t i = 0; i < gNames.ids->size(); i++) {
-      if ((*gNames.ids)[i].get() == id) {
+  if (RtNames(cx).ids) {
+    for (size_t i = 0; i < RtNames(cx).ids->size(); i++) {
+      if ((*RtNames(cx).ids)[i].get() == id) {
         BlowGnameFuse(uint32_t(i));
       }
     }
@@ -3754,7 +3785,7 @@ extern "C" void night_runtime_global_lexical_shadow_added(uintptr_t idBits) {
 bool night_runtime_get_gname(JSContext* cx, uint32_t top, uint32_t atomId,
                              uint32_t forTypeof) {
   SetNightTop(cx, top);
-  JS::HandleId id = AtomIdChecked(atomId);
+  JS::HandleId id = AtomIdChecked(cx, atomId);
   JS::RootedValue res(cx);
   if (!js::night::NightGetGName(cx, id, forTypeof != 0, &res)) {
     return false;
@@ -3769,10 +3800,10 @@ bool night_runtime_get_gname(JSContext* cx, uint32_t top, uint32_t atomId,
 // resolve re-arms with the then-current value.
 static void MaybeArmBindingFuse(JSContext* cx, uint32_t bindingId,
                                 JS::PropertyKey id) {
-  if (!gState.globalValsBase || !gState.bindingFuseArmingAllowed) {
+  if (!RtState(cx).globalValsBase || !RtState(cx).bindingFuseArmingAllowed) {
     return;
   }
-  uint32_t* cell = BindingFuseCell(bindingId);
+  uint32_t* cell = BindingFuseCell(cx, bindingId);
   if (cell[2] != 0) {
     return;
   }
@@ -3784,15 +3815,15 @@ static void MaybeArmBindingFuse(JSContext* cx, uint32_t bindingId,
   // A compiled function of the predicted script arms the predicted state,
   // which compiled reads typed as that function test; anything else arms
   // plainly.
-  uint32_t predicted = bindingId < gNames.bindingPredictedScript.size()
-                           ? gNames.bindingPredictedScript[bindingId]
+  uint32_t predicted = bindingId < RtNames(cx).bindingPredictedScript.size()
+                           ? RtNames(cx).bindingPredictedScript[bindingId]
                            : 0;
   bool isPredicted =
       predicted && js::night::NightIsCompiledFunctionOf(bits, predicted);
   *reinterpret_cast<uint64_t*>(cell) = bits;
   cell[2] = isPredicted ? js::night::Night_bindingFusePredicted : js::night::Night_bindingFuseArmed;
   if (nursery) {
-    gState.nurseryArmedBindings.push_back(bindingId);
+    RtState(cx).nurseryArmedBindings.push_back(bindingId);
   }
 }
 
@@ -3803,22 +3834,23 @@ static void MaybeArmBindingFuse(JSContext* cx, uint32_t bindingId,
 static constexpr uint32_t kBindingFlipLimit = 1024;
 
 void night_runtime_binding_written(uint32_t bindingId) {
-  if (!gState.cx || !gNames.bindingKeys ||
-      bindingId >= gNames.bindingKeys->size()) {
+  JSContext* cx = CurrentNightContext();
+  if (!RtState(cx).cx || !RtNames(cx).bindingKeys ||
+      bindingId >= RtNames(cx).bindingKeys->size()) {
     return;
   }
-  if (gState.bindingFlips.size() < gNames.bindingKeys->size()) {
-    gState.bindingFlips.resize(gNames.bindingKeys->size(), 0);
+  if (RtState(cx).bindingFlips.size() < RtNames(cx).bindingKeys->size()) {
+    RtState(cx).bindingFlips.resize(RtNames(cx).bindingKeys->size(), 0);
   }
-  if (++gState.bindingFlips[bindingId] > kBindingFlipLimit) {
-    uint32_t* cell = BindingFuseCell(bindingId);
+  if (++RtState(cx).bindingFlips[bindingId] > kBindingFlipLimit) {
+    uint32_t* cell = BindingFuseCell(cx, bindingId);
     if (cell[2] == 0) {
       cell[2] = 2;
     }
     return;
   }
-  MaybeArmBindingFuse(gState.cx, bindingId,
-                      (*gNames.bindingKeys)[bindingId].get());
+  MaybeArmBindingFuse(RtState(cx).cx, bindingId,
+                      (*RtNames(cx).bindingKeys)[bindingId].get());
 }
 
 // The guarded (no-TI) resolve: cache [entry, globalShape] for an own plain
@@ -3827,14 +3859,14 @@ void night_runtime_binding_written(uint32_t bindingId) {
 // A leaf (lookupPure + shape read; no allocation, no GC).
 uint32_t night_runtime_resolve_global_slot_guarded(JSContext* cx,
                                                    uint32_t bindingId) {
-  if (!gNames.bindingKeys || bindingId >= gNames.bindingKeys->size()) {
+  if (!RtNames(cx).bindingKeys || bindingId >= RtNames(cx).bindingKeys->size()) {
     MOZ_CRASH(
         "night_runtime_resolve_global_slot_guarded: bindingId out of range");
   }
-  JS::PropertyKey id = (*gNames.bindingKeys)[bindingId].get();
+  JS::PropertyKey id = (*RtNames(cx).bindingKeys)[bindingId].get();
   uint32_t shape = 0;
   uint32_t entry = js::night::NightResolveGlobalSlotGuarded(cx, id, &shape);
-  uint32_t* row = LinMem<uint32_t>(gEnv.gslotsPtr + 8 * bindingId);
+  uint32_t* row = LinMem<uint32_t>(RtEnv(cx).gslotsPtr + 8 * bindingId);
   row[0] = entry;
   row[1] = shape;
   if (entry) {
@@ -3848,7 +3880,7 @@ uint32_t night_runtime_resolve_global_slot_guarded(JSContext* cx,
 bool night_runtime_bind_unqualified_gname(JSContext* cx, uint32_t top,
                                           uint32_t atomId) {
   SetNightTop(cx, top);
-  JS::HandleId id = AtomIdChecked(atomId);
+  JS::HandleId id = AtomIdChecked(cx, atomId);
   JS::RootedValue res(cx);
   if (!js::night::NightBindUnqualifiedGName(cx, id, &res)) {
     return false;
@@ -3863,7 +3895,7 @@ bool night_runtime_bind_unqualified_gname(JSContext* cx, uint32_t top,
 bool night_runtime_set_name(JSContext* cx, uint32_t top, uint64_t env,
                             uint32_t atomId, uint64_t val, uint32_t strict) {
   SetNightTop(cx, top);
-  JS::HandleId id = AtomIdChecked(atomId);
+  JS::HandleId id = AtomIdChecked(cx, atomId);
   // Every compiled unqualified/global name write funnels through here;
   // blow the binding's fuses against the predicted literal before the store
   // (arming happens after the store succeeds, below). same for the
@@ -3953,11 +3985,11 @@ static bool TryPureElementRead(JSContext* cx, uint32_t top, uint64_t recv,
           JSAtom* atom = &kv2.toString()->asAtom();
           uint32_t akey = uint32_t(reinterpret_cast<uintptr_t>(atom)) | 1u;
           uint32_t recvShape, holderPtr, holderShape, slotEnc;
-          if (akey > gNames.atoms.size() &&
+          if (akey > RtNames(cx).atoms.size() &&
               js::night::NightPopulateInlineGetIC(
                   cx, &rv.toObject(), JS::PropertyKey::NonIntAtom(atom),
                   &recvShape, &holderPtr, &holderShape, &slotEnc)) {
-            MegaGetEntry& e = *MegaGet(recvShape, akey);
+            MegaGetEntry& e = *MegaGet(cx, recvShape, akey);
             e.atomId = akey;
             e.holderPtr = holderPtr;
             e.holderShape = holderShape;
@@ -4051,7 +4083,7 @@ bool night_runtime_get_element(JSContext* cx, uint32_t top, uint64_t recv,
 // The elem key namespace's word for an element store whose rows the set
 // paths may cache: an atom (non-index) key on a native receiver that is not
 // the active global (whose stores blow fuses); 0 otherwise.
-static uint32_t ElemAtomKey(uint64_t recv, uint64_t key) {
+static uint32_t ElemAtomKey(JSContext* cx, uint64_t recv, uint64_t key) {
   JS::Value rv = JS::Value::fromRawBits(recv);
   JS::Value kv = JS::Value::fromRawBits(key);
   uint32_t idx;
@@ -4062,7 +4094,7 @@ static uint32_t ElemAtomKey(uint64_t recv, uint64_t key) {
   }
   uint32_t k =
       uint32_t(reinterpret_cast<uintptr_t>(&kv.toString()->asAtom())) | 1u;
-  return k > gNames.atoms.size() ? k : 0;
+  return k > RtNames(cx).atoms.size() ? k : 0;
 }
 
 bool night_runtime_set_element(JSContext* cx, uint32_t top, uint64_t recv,
@@ -4138,7 +4170,7 @@ bool night_runtime_set_element(JSContext* cx, uint32_t top, uint64_t recv,
       js::NativeObject* nobj = &rv.toObject().as<js::NativeObject>();
       uint32_t idx = uint32_t(kv.toInt32());
       if (idx <= nobj->getDenseInitializedLength() &&
-          NoExtraIndexedFast(nobj)) {
+          NoExtraIndexedFast(cx, nobj)) {
         JS::Rooted<js::NativeObject*> robj(cx, nobj);
         JS::RootedValue v(cx, JS::Value::fromRawBits(val));
         js::DenseElementResult r =
@@ -4147,9 +4179,9 @@ bool night_runtime_set_element(JSContext* cx, uint32_t top, uint64_t recv,
           return false;
         }
         if (r == js::DenseElementResult::Success) {
-          if (gEnv.appendCachePtr) {
+          if (RtEnv(cx).appendCachePtr) {
             // `robj`, not `nobj`: the extend path can GC-move the receiver.
-            PrimeAppendRow(robj);
+            PrimeAppendRow(cx, robj);
           }
           return true;
         }
@@ -4160,13 +4192,13 @@ bool night_runtime_set_element(JSContext* cx, uint32_t top, uint64_t recv,
   // global add table's row for (shape, atomPtr | 1) -- the elem key
   // namespace, as the elem-mega rows -- replays the transition with no
   // lookup. Filled below from the generic set.
-  uint32_t addKey = ElemAtomKey(recv, key);
+  uint32_t addKey = ElemAtomKey(cx, recv, key);
   if (addKey) {
     js::NativeObject* nobj =
         &JS::Value::fromRawBits(recv).toObject().as<js::NativeObject>();
     uint32_t shapeW = js::night::NightObjectShape(nobj);
-    SetAddRow& trow = SetAddAt(shapeW, addKey);
-    if (trow.gen == InlineGen() && trow.oldShape == shapeW &&
+    SetAddRow& trow = SetAddAt(cx, shapeW, addKey);
+    if (trow.gen == InlineGen(cx) && trow.oldShape == shapeW &&
         trow.atomId == addKey && !trow.skip &&
         js::night::NightTryAddPropTransition(
             cx, recv, trow.oldShape, trow.newShape, trow.slot, trow.protoPtrs,
@@ -4205,8 +4237,8 @@ bool night_runtime_set_element(JSContext* cx, uint32_t top, uint64_t recv,
             cx, obj, id, spanBefore, &newShape, &slot, protoPtrs, protoShapes,
             &numProtos, &nurseryProto, &skip) &&
         !nurseryProto && !skip) {
-      SetAddRow& trow = SetAddAt(shapeBefore, addKey);
-      trow.gen = InlineGen();
+      SetAddRow& trow = SetAddAt(cx, shapeBefore, addKey);
+      trow.gen = InlineGen(cx);
       trow.oldShape = shapeBefore;
       trow.atomId = addKey;
       trow.newShape = newShape;
@@ -4231,10 +4263,10 @@ bool night_runtime_set_element(JSContext* cx, uint32_t top, uint64_t recv,
     JSAtom* atom = id.toAtom();
     uint32_t akey = uint32_t(reinterpret_cast<uintptr_t>(atom)) | 1u;
     uint32_t recvShape, slotEnc, absSlot, reason;
-    if (akey > gNames.atoms.size() &&
+    if (akey > RtNames(cx).atoms.size() &&
         js::night::NightPopulateInlineSetIC(cx, obj, id, &recvShape, &slotEnc,
                                             &absSlot, &reason)) {
-      MegaSetEntry& e = *MegaSet(recvShape, akey);
+      MegaSetEntry& e = *MegaSet(cx, recvShape, akey);
       e.atomId = akey;
       e.slotEnc = slotEnc;
       e.absSlot = absSlot;
@@ -4280,7 +4312,7 @@ bool night_runtime_new_object(JSContext* cx, uint32_t top, uint32_t cell,
   if (!obj) {
     return false;
   }
-  if (cell && gState.nurseryInlineOK) {
+  if (cell && RtState(cx).nurseryInlineOK) {
     js::night::NightFillAllocCellObject(LinMem<js::night::NightAllocCell>(cell),
                                         obj);
   }
@@ -4296,7 +4328,7 @@ bool night_runtime_new_array(JSContext* cx, uint32_t top, uint32_t length,
   if (!arr) {
     return false;
   }
-  if (cell && gState.nurseryInlineOK) {
+  if (cell && RtState(cx).nurseryInlineOK) {
     js::night::NightFillAllocCellArray(
         LinMem<js::night::NightArrayAllocCell>(cell), arr, length);
   }
@@ -4312,7 +4344,7 @@ bool night_runtime_init_prop(JSContext* cx, uint32_t top, uint64_t obj,
                              uint32_t atomId, uint64_t val, uint32_t attrs,
                              uint32_t cacheIdx) {
   SetNightTop(cx, top);
-  JS::HandleId id = AtomIdChecked(atomId);
+  JS::HandleId id = AtomIdChecked(cx, atomId);
   JS::RootedValue objv(cx, JS::Value::fromRawBits(obj));
   if (!objv.isObject()) {
     JS_ReportErrorASCII(cx,
@@ -4323,15 +4355,15 @@ bool night_runtime_init_prop(JSContext* cx, uint32_t top, uint64_t obj,
   // without the define machinery. Populated below from the generic path.
   if (attrs == 0) {
     uint32_t shapeW = js::night::NightObjectShape(&objv.toObject());
-    InitAddRow& row = InitAddAt(shapeW, atomId);
+    InitAddRow& row = InitAddAt(cx, shapeW, atomId);
     if (row.oldShape == shapeW && row.atomId == atomId &&
-        row.gen == InlineGen() &&
+        row.gen == InlineGen(cx) &&
         js::night::NightTryInitAddTransition(cx, obj, shapeW, row.newShape,
                                              row.slot, val)) {
       // Seed the SITE row too so subsequent inits replay inline (the early
       // return would otherwise starve it forever).
       if (cacheIdx != UINT32_MAX && !row.skip) {
-        uint32_t* srow = InlineTransRow(cacheIdx);
+        uint32_t* srow = InlineTransRow(cx, cacheIdx);
         uint32_t nfixed =
             objv.toObject().as<js::NativeObject>().numFixedSlots();
         FillTransRow(srow, shapeW, row.newShape, row.slot, nfixed, nullptr,
@@ -4354,15 +4386,15 @@ bool night_runtime_init_prop(JSContext* cx, uint32_t top, uint64_t obj,
     if (js::night::NightPopulateAddTransition(
             cx, o, id, spanBefore, &row.newShape, &row.slot, protoPtrs,
             protoShapes, &numProtos, &nurseryProto, &row.skip)) {
-      row.gen = InlineGen();
+      row.gen = InlineGen(cx);
       row.oldShape = shapeBefore;
       row.atomId = atomId;
-      InitAddAt(shapeBefore, atomId) = row;
+      InitAddAt(cx, shapeBefore, atomId) = row;
       // Site row for the inline replay arm (defines never consult the proto
       // chain, so the proto-guard pairs stay zero == always-pass); not for a
       // transition that skips slots, which the inline arm cannot replay.
       if (cacheIdx != UINT32_MAX && !row.skip) {
-        uint32_t* srow = InlineTransRow(cacheIdx);
+        uint32_t* srow = InlineTransRow(cx, cacheIdx);
         uint32_t nfixed = o->as<js::NativeObject>().numFixedSlots();
         FillTransRow(srow, shapeBefore, row.newShape, row.slot, nfixed, nullptr,
                      nullptr, 0);
@@ -4566,19 +4598,19 @@ bool night_runtime_compare(JSContext* cx, uint32_t top, uint32_t kind,
 // String constant: materialize the atom-table name as a JS string.
 bool night_runtime_string(JSContext* cx, uint32_t top, uint32_t atomId) {
   SetNightTop(cx, top);
-  if (atomId >= gNames.atoms.size()) {
+  if (atomId >= RtNames(cx).atoms.size()) {
     MOZ_CRASH("night_runtime_string: atomId out of range");
   }
   // NB: return a fresh copy rather than the pre-interned atom -- fresh short
   // literals are cheap nursery inline strings with better locality than a
   // tenured-atom pointer chase in a GC/latency-bound loop.
   JSString* str;
-  if (gNames.latin1Ok[atomId]) {
-    const std::string& l = gNames.latin1[atomId];
+  if (RtNames(cx).latin1Ok[atomId]) {
+    const std::string& l = RtNames(cx).latin1[atomId];
     str = js::NewStringCopyN<js::CanGC>(
         cx, reinterpret_cast<const JS::Latin1Char*>(l.data()), l.size());
   } else {
-    const std::u16string& s = gNames.atoms[atomId];
+    const std::u16string& s = RtNames(cx).atoms[atomId];
     str = JS_NewUCStringCopyN(cx, s.data(), s.size());
   }
   if (!str) {
@@ -4611,7 +4643,6 @@ int32_t night_runtime_str_chars_eq(uint32_t a, uint32_t b) {
 // leaves those ratios intact.
 namespace {
 
-std::map<uint64_t, uint64_t>* gNightCensus = nullptr;
 
 // Downstream attribution: a stack of departure-site cell pairs, bracketed
 // by FRAME_PUSH/POP ticks (kinds 60/61) around may-run-user-code calls.
@@ -4641,30 +4672,46 @@ struct NightDepartCells {
   bool rootIntact;
   uint64_t epochAtPush;
 };
-std::vector<NightDepartCells>* gNightDepart = nullptr;
-// Kind 70 (the per-block execution census, MIR's `block_census`) ticks once per
-// executed lowered block -- several per bytecode op -- so it keeps a flat
-// per-id counter instead of paying the map on every tick.
-std::vector<uint64_t>* gNightBlockCensus = nullptr;
-bool gNightLastCallIntact = false;
+}  // namespace
+
+// The census's counts and attribution state (all null/off in a module
+// compiled without census calls).
+struct NightCensusState {
+  std::map<uint64_t, uint64_t>* counts = nullptr;
+  std::vector<NightDepartCells>* depart = nullptr;
+  // Kind 70 (the per-block execution census, MIR's `block_census`) ticks
+  // once per executed lowered block -- several per bytecode op -- so it
+  // keeps a flat per-id counter instead of paying the map on every tick.
+  std::vector<uint64_t>* block = nullptr;
+  bool lastCallIntact = false;
+  // `NIGHT_CENSUS_TRACE=N`: also print the first N MIR exits (kind 90),
+  // guard failures (92) and epoch bumps (kind 66) in the order they happen,
+  // with the epoch: the counts say what is hot, the order says what started
+  // it.
+  int64_t trace = -1;
+};
+static NightCensusState& RtCensus(JSContext* cx);
+
+namespace {
 constexpr uint32_t kNightNoDepart = 0xffffffffu;
 constexpr size_t kNightDepartMaxDepth = 1u << 16;
 
 void NightCensusDump() {
-  if (!gNightCensus) {
+  JSContext* cx = CurrentNightContext();
+  if (!RtCensus(cx).counts) {
     return;
   }
-  fprintf(stderr, "night: census sites %zu\n", gNightCensus->size());
-  for (const auto& entry : *gNightCensus) {
+  fprintf(stderr, "night: census sites %zu\n", RtCensus(cx).counts->size());
+  for (const auto& entry : *RtCensus(cx).counts) {
     fprintf(stderr, "night: census kind %u id %u n %llu\n",
             unsigned(entry.first >> 32), unsigned(entry.first & 0xffffffffu),
             static_cast<unsigned long long>(entry.second));
   }
-  if (gNightBlockCensus) {
-    for (size_t i = 0; i < gNightBlockCensus->size(); i++) {
-      if ((*gNightBlockCensus)[i]) {
+  if (RtCensus(cx).block) {
+    for (size_t i = 0; i < RtCensus(cx).block->size(); i++) {
+      if ((*RtCensus(cx).block)[i]) {
         fprintf(stderr, "night: census kind 70 id %zu n %llu\n", i,
-                static_cast<unsigned long long>((*gNightBlockCensus)[i]));
+                static_cast<unsigned long long>((*RtCensus(cx).block)[i]));
       }
     }
   }
@@ -4680,17 +4727,14 @@ uint64_t gNightStampEpoch = 0;
 }  // namespace js
 }
 
+static js::night::NightRuntimeData& RtRegex(JSContext* cx);
+
 extern "C++" {
-js::night::NightRuntimeData& js::night::NightData() {
-  static NightRuntimeData data;
-  return data;
+js::night::NightRuntimeData& js::night::NightData(JSContext* cx) {
+  return RtRegex(cx);
 }
 }
 
-// `NIGHT_CENSUS_TRACE=N`: also print the first N MIR exits (kind 90),
-// guard failures (92) and epoch bumps (kind 66) in the order they happen, with the epoch: the
-// counts say what is hot, the order says what started it.
-static int64_t gNightCensusTrace = -1;
 // Re-read after wizer resume (`JS::NightActivate`): the program's top level
 // runs while wizening, so a setting latched then would be the snapshot's.
 #ifdef __wasi__
@@ -4698,24 +4742,26 @@ void __wasilibc_deinitialize_environ(void);
 void __wasilibc_initialize_environ(void);
 #endif
 void NightCensusTraceRearm() {
+  JSContext* cx = CurrentNightContext();
 #ifdef __wasi__
   // The environment wasi-libc read while wizening is the snapshot's.
   __wasilibc_deinitialize_environ();
   __wasilibc_initialize_environ();
 #endif
   const char* e = getenv("NIGHT_CENSUS_TRACE");
-  gNightCensusTrace = e ? atoll(e) : 0;
+  RtCensus(cx).trace = e ? atoll(e) : 0;
 }
 static void NightCensusTrace(uint32_t kind, uint64_t id);
 // The trace line of a set-helper store to a published object with TYPES:
 // the property, the word, and whether the compiled caller vouched.
 static void NightCensusTraceSet(uint32_t atomId, uint32_t word,
                                 uint32_t flags) {
-  if (gNightCensusTrace > 0 && (word & js::night::kWordTypes) &&
+  JSContext* cx = CurrentNightContext();
+  if (RtCensus(cx).trace > 0 && (word & js::night::kWordTypes) &&
       (!(word & js::night::kWordConstructing) || !(flags & 2))) {
     fprintf(stderr, "night: trace set %s word %x flags %u\n",
-            std::string(gNames.atoms[atomId].begin(),
-                        gNames.atoms[atomId].end())
+            std::string(RtNames(cx).atoms[atomId].begin(),
+                        RtNames(cx).atoms[atomId].end())
                 .c_str(),
             word, flags);
   }
@@ -4753,7 +4799,8 @@ static void NightCensusTraceObject(JSObject* obj) {
 // layout claims it (`keepBits`): the object lost it before.
 void NightCensusTraceStamp(const char* what, uint32_t layoutId,
                            uint32_t oldWord, uint32_t keepBits) {
-  if (gNightCensusTrace > 0 && (keepBits & js::night::kWordTypes) &&
+  JSContext* cx = CurrentNightContext();
+  if (RtCensus(cx).trace > 0 && (keepBits & js::night::kWordTypes) &&
       !(oldWord & js::night::kWordTypes)) {
     fprintf(stderr, "night: trace %s-notypes layout %u word %x\n", what,
             layoutId, oldWord);
@@ -4763,19 +4810,21 @@ void NightCensusTraceStamp(const char* what, uint32_t layoutId,
 // (no epoch bump, so the ordered trace would not show it otherwise).
 void NightCensusTraceConstructing(uint32_t oldWord, uint32_t newWord,
                                   uint32_t site) {
-  if (gNightCensusTrace > 0 && (oldWord & js::night::kWordConstructing) &&
+  JSContext* cx = CurrentNightContext();
+  if (RtCensus(cx).trace > 0 && (oldWord & js::night::kWordConstructing) &&
       (oldWord & js::night::kWordTypes) && !(newWord & js::night::kWordTypes)) {
     fprintf(stderr, "night: trace ctor-demote site %u word %x -> %x\n", site,
             oldWord, newWord);
   }
 }
 static void NightCensusTrace(uint32_t kind, uint64_t id) {
-  if (gNightCensusTrace < 0) {
+  JSContext* cx = CurrentNightContext();
+  if (RtCensus(cx).trace < 0) {
     const char* e = getenv("NIGHT_CENSUS_TRACE");
-    gNightCensusTrace = e ? atoll(e) : 0;
+    RtCensus(cx).trace = e ? atoll(e) : 0;
   }
-  if (gNightCensusTrace > 0) {
-    gNightCensusTrace--;
+  if (RtCensus(cx).trace > 0) {
+    RtCensus(cx).trace--;
     fprintf(stderr, "night: trace kind %u id %llu epoch %llu\n", kind,
             (unsigned long long)id,
             (unsigned long long)js::gNightStampEpoch);
@@ -4783,87 +4832,89 @@ static void NightCensusTrace(uint32_t kind, uint64_t id) {
 }
 
 int32_t night_runtime_census(uint32_t kind, uint32_t id) {
+  JSContext* cx = CurrentNightContext();
   if (kind == 90 || kind == 92) {
     NightCensusTrace(kind, id);
   }
   if (kind == 96) {
     // A layout guard's failing object (`id` its address): printed while
     // tracing, never counted.
-    if (gNightCensusTrace > 0) {
+    if (RtCensus(cx).trace > 0) {
       NightCensusTraceObject(LinMem<JSObject>(id));
     }
     return 0;
   }
-  if (!gNightCensus) {
-    gNightCensus = new std::map<uint64_t, uint64_t>();
-    gNightDepart = new std::vector<NightDepartCells>{
+  if (!RtCensus(cx).counts) {
+    RtCensus(cx).counts = new std::map<uint64_t, uint64_t>();
+    RtCensus(cx).depart = new std::vector<NightDepartCells>{
         {kNightNoDepart, kNightNoDepart, false, js::gNightStampEpoch}};
     atexit(NightCensusDump);
   }
   if (kind == 70) {
-    if (!gNightBlockCensus) {
-      gNightBlockCensus = new std::vector<uint64_t>();
+    if (!RtCensus(cx).block) {
+      RtCensus(cx).block = new std::vector<uint64_t>();
     }
-    if (id >= gNightBlockCensus->size()) {
-      gNightBlockCensus->resize(size_t(id) + 1024, 0);
+    if (id >= RtCensus(cx).block->size()) {
+      RtCensus(cx).block->resize(size_t(id) + 1024, 0);
     }
-    (*gNightBlockCensus)[id] += 1;
+    (*RtCensus(cx).block)[id] += 1;
     return 0;
   }
   uint32_t base = kind < 200 ? kind : (kind < 400 ? kind - 200 : kind - 400);
   if (kind == 60) {
-    if (gNightDepart->size() < kNightDepartMaxDepth) {
-      NightDepartCells c = gNightDepart->back();
+    if (RtCensus(cx).depart->size() < kNightDepartMaxDepth) {
+      NightDepartCells c = RtCensus(cx).depart->back();
       c.epochAtPush = js::gNightStampEpoch;
-      gNightDepart->push_back(c);
+      RtCensus(cx).depart->push_back(c);
     }
   } else if (kind == 61) {
-    if (gNightDepart->size() > 1) {
-      gNightLastCallIntact =
-          gNightDepart->back().epochAtPush == js::gNightStampEpoch;
-      gNightDepart->pop_back();
+    if (RtCensus(cx).depart->size() > 1) {
+      RtCensus(cx).lastCallIntact =
+          RtCensus(cx).depart->back().epochAtPush == js::gNightStampEpoch;
+      RtCensus(cx).depart->pop_back();
     }
   } else if (kind == 65) {
     // Inline demote arm marker (counting only): the compiled arms bump the
     // epoch themselves in production now.
   } else if (base >= 150 && base <= 158) {
-    gNightDepart->back().recent = id;
-    (*gNightCensus)[((gNightLastCallIntact ? 11ull : 12ull) << 32) | id] += 1;
+    RtCensus(cx).depart->back().recent = id;
+    (*RtCensus(cx).counts)[((RtCensus(cx).lastCallIntact ? 11ull : 12ull) << 32) | id] += 1;
     if (kind < 200) {
-      gNightDepart->back().root = id;
-      gNightDepart->back().rootIntact = gNightLastCallIntact;
+      RtCensus(cx).depart->back().root = id;
+      RtCensus(cx).depart->back().rootIntact = RtCensus(cx).lastCallIntact;
     }
   } else if (kind == 3) {
-    (*gNightCensus)[(5ull << 32) | gNightDepart->back().recent] += 1;
-    (*gNightCensus)[(7ull << 32) | gNightDepart->back().root] += 1;
-    if (gNightDepart->back().rootIntact) {
-      (*gNightCensus)[(13ull << 32) | gNightDepart->back().root] += 1;
+    (*RtCensus(cx).counts)[(5ull << 32) | RtCensus(cx).depart->back().recent] += 1;
+    (*RtCensus(cx).counts)[(7ull << 32) | RtCensus(cx).depart->back().root] += 1;
+    if (RtCensus(cx).depart->back().rootIntact) {
+      (*RtCensus(cx).counts)[(13ull << 32) | RtCensus(cx).depart->back().root] += 1;
     }
   } else if (kind == 2) {
-    (*gNightCensus)[(6ull << 32) | gNightDepart->back().recent] += 1;
-    (*gNightCensus)[(8ull << 32) | gNightDepart->back().root] += 1;
-    if (gNightDepart->back().rootIntact) {
-      (*gNightCensus)[(14ull << 32) | gNightDepart->back().root] += 1;
+    (*RtCensus(cx).counts)[(6ull << 32) | RtCensus(cx).depart->back().recent] += 1;
+    (*RtCensus(cx).counts)[(8ull << 32) | RtCensus(cx).depart->back().root] += 1;
+    if (RtCensus(cx).depart->back().rootIntact) {
+      (*RtCensus(cx).counts)[(14ull << 32) | RtCensus(cx).depart->back().root] += 1;
     }
   }
-  (*gNightCensus)[(static_cast<uint64_t>(kind) << 32) | id] += 1;
+  (*RtCensus(cx).counts)[(static_cast<uint64_t>(kind) << 32) | id] += 1;
   return 0;
 }
 
 // The C++ half of the bump-site census (JSObject.h chokes call this on
 // every ACTUAL epoch bump): kind 66, id = (engine site << 16) | the
 // demoted word's class idx. Only records while a census module is running
-// (gNightCensus exists); the compiled inline demote arms are the other
+// (RtCensus(cx).counts exists); the compiled inline demote arms are the other
 // bump source and carry their own kind (65).
 extern "C++" {
 namespace js {
 void NightNoteEpochBump(uint32_t site, uint32_t oldWord) {
-  if (!gNightCensus) {
+  JSContext* cx = CurrentNightContext();
+  if (!RtCensus(cx).counts) {
     return;
   }
   uint64_t id = (static_cast<uint64_t>(site) << 16) | (oldWord & 0xFFFFu);
   NightCensusTrace(66, id);
-  (*gNightCensus)[(66ull << 32) | id] += 1;
+  (*RtCensus(cx).counts)[(66ull << 32) | id] += 1;
 }
 }  // namespace js
 }  // extern "C++"
@@ -4873,11 +4924,11 @@ void NightNoteEpochBump(uint32_t site, uint32_t oldWord) {
 // intrinsic from the self-hosting zone (GC/throw -> full handshake).
 bool night_runtime_get_intrinsic(JSContext* cx, uint32_t top, uint32_t atomId) {
   SetNightTop(cx, top);
-  if (!gNames.ids || atomId >= gNames.ids->size()) {
+  if (!RtNames(cx).ids || atomId >= RtNames(cx).ids->size()) {
     MOZ_CRASH("night_runtime_get_intrinsic: atomId out of range");
   }
   JS::Rooted<js::PropertyName*> name(
-      cx, (*gNames.ids)[atomId].get().toAtom()->asPropertyName());
+      cx, (*RtNames(cx).ids)[atomId].get().toAtom()->asPropertyName());
   JS::RootedValue v(cx);
   if (!js::GlobalObject::getIntrinsicValue(cx, cx->global(), name, &v)) {
     return false;
@@ -4896,11 +4947,11 @@ bool night_runtime_get_intrinsic(JSContext* cx, uint32_t top, uint32_t atomId) {
 bool night_runtime_get_intrinsic_cell(JSContext* cx, uint32_t top,
                                       uint32_t atomId, uint32_t cellAddr) {
   SetNightTop(cx, top);
-  if (!gNames.ids || atomId >= gNames.ids->size()) {
+  if (!RtNames(cx).ids || atomId >= RtNames(cx).ids->size()) {
     MOZ_CRASH("night_runtime_get_intrinsic_cell: atomId out of range");
   }
   JS::Rooted<js::PropertyName*> name(
-      cx, (*gNames.ids)[atomId].get().toAtom()->asPropertyName());
+      cx, (*RtNames(cx).ids)[atomId].get().toAtom()->asPropertyName());
   JS::RootedValue v(cx);
   if (!js::GlobalObject::getIntrinsicValue(cx, cx->global(), name, &v)) {
     return false;
@@ -4965,9 +5016,9 @@ bool night_runtime_instanceof(JSContext* cx, uint32_t top, uint64_t l,
     if (rv.isObject() && rv.toObject().is<JSFunction>()) {
       JSFunction* fun = &rv.toObject().as<JSFunction>();
       uint32_t shapeBits = uint32_t(reinterpret_cast<uintptr_t>(fun->shape()));
-      uint32_t gen = gEnv.propicGenPtr ? InlineGen() : 0;
+      uint32_t gen = RtEnv(cx).propicGenPtr ? InlineGen(cx) : 0;
       uint32_t* e =
-          &gHasInstCache[2 * ((shapeBits >> 3) & (kHasInstCacheN - 1))];
+          &RtHasInst(cx)[2 * ((shapeBits >> 3) & (kHasInstCacheN - 1))];
       bool isDefault = (e[0] == shapeBits && e[1] == gen);
       if (!isDefault) {
         // Cache miss: verify the default. The cached fact is keyed on the
@@ -5031,7 +5082,7 @@ bool night_runtime_instanceof(JSContext* cx, uint32_t top, uint64_t l,
 bool night_runtime_del_prop(JSContext* cx, uint32_t top, uint64_t val,
                             uint32_t atomId, uint32_t strict) {
   SetNightTop(cx, top);
-  JS::HandleId id = AtomIdChecked(atomId);
+  JS::HandleId id = AtomIdChecked(cx, atomId);
   // Fused globals: deleting a fused global unbinds it; blow its fuses.
   if (JS::Value::fromRawBits(val).isObject() &&
       IsActiveGlobal(&JS::Value::fromRawBits(val).toObject())) {
@@ -5103,7 +5154,7 @@ bool night_runtime_get_prop_super(JSContext* cx, uint32_t top,
                                   uint64_t recvBits, uint64_t lvalBits,
                                   uint32_t atomId) {
   SetNightTop(cx, top);
-  JS::HandleId id = AtomIdChecked(atomId);
+  JS::HandleId id = AtomIdChecked(cx, atomId);
   JS::RootedValue lval(cx, JS::Value::fromRawBits(lvalBits));
   JS::RootedValue receiver(cx, JS::Value::fromRawBits(recvBits));
   JS::RootedObject obj(cx, js::ToObjectFromStackForPropertyAccess(
@@ -5155,7 +5206,7 @@ bool night_runtime_set_prop_super(JSContext* cx, uint32_t top,
                                   uint32_t atomId, uint64_t valBits,
                                   uint32_t strict) {
   SetNightTop(cx, top);
-  JS::Rooted<JS::PropertyKey> id(cx, AtomIdChecked(atomId));
+  JS::Rooted<JS::PropertyKey> id(cx, AtomIdChecked(cx, atomId));
   JS::RootedValue lval(cx, JS::Value::fromRawBits(lvalBits));
   JS::RootedValue receiver(cx, JS::Value::fromRawBits(recvBits));
   JS::RootedValue rval(cx, JS::Value::fromRawBits(valBits));
@@ -5292,7 +5343,8 @@ int32_t night_runtime_gen_is_closing(JSContext* cx) {
 // calls this, and fails when it returns 1, which it does on every
 // `period`-th call. Leaf.
 int32_t night_runtime_mir_stress(uint32_t period) {
-  static uint32_t count = 0;
+  JSContext* cx = CurrentNightContext();
+  uint32_t& count = RtState(cx).stressCount;
   return period != 0 && ++count % period == 0 ? 1 : 0;
 }
 
@@ -5590,7 +5642,7 @@ bool night_runtime_init_glexical(JSContext* cx, uint32_t top, uint64_t val,
 bool night_runtime_get_name(JSContext* cx, uint32_t top, uint64_t env,
                             uint32_t atomId, uint32_t forTypeof) {
   SetNightTop(cx, top);
-  JS::HandleId id = AtomIdChecked(atomId);
+  JS::HandleId id = AtomIdChecked(cx, atomId);
   JS::Rooted<js::PropertyName*> name(cx, id.toAtom()->asPropertyName());
   JS::RootedObject envChain(cx, &JS::Value::fromRawBits(env).toObject());
   JS::RootedValue rval(cx);
@@ -5610,7 +5662,7 @@ bool night_runtime_get_name(JSContext* cx, uint32_t top, uint64_t env,
 bool night_runtime_bind_name(JSContext* cx, uint32_t top, uint64_t env,
                              uint32_t atomId) {
   SetNightTop(cx, top);
-  JS::HandleId id = AtomIdChecked(atomId);
+  JS::HandleId id = AtomIdChecked(cx, atomId);
   JS::Rooted<js::PropertyName*> name(cx, id.toAtom()->asPropertyName());
   JS::RootedObject envChain(cx, &JS::Value::fromRawBits(env).toObject());
   JSObject* bound = js::LookupNameWithGlobalDefault(cx, name, envChain);
@@ -5626,7 +5678,7 @@ bool night_runtime_bind_name(JSContext* cx, uint32_t top, uint64_t env,
 bool night_runtime_get_bound_name(JSContext* cx, uint32_t top, uint64_t env,
                                   uint32_t atomId) {
   SetNightTop(cx, top);
-  JS::HandleId id = AtomIdChecked(atomId);
+  JS::HandleId id = AtomIdChecked(cx, atomId);
   JS::RootedObject envObj(cx, &JS::Value::fromRawBits(env).toObject());
   JS::RootedValue rval(cx);
   if (!js::GetNameBoundInEnvironment(cx, envObj, id, &rval)) {
@@ -5642,7 +5694,7 @@ bool night_runtime_get_bound_name(JSContext* cx, uint32_t top, uint64_t env,
 bool night_runtime_bind_unqualified_name(JSContext* cx, uint32_t top,
                                          uint64_t env, uint32_t atomId) {
   SetNightTop(cx, top);
-  JS::HandleId id = AtomIdChecked(atomId);
+  JS::HandleId id = AtomIdChecked(cx, atomId);
   JS::Rooted<js::PropertyName*> name(cx, id.toAtom()->asPropertyName());
   JS::RootedObject envChain(cx, &JS::Value::fromRawBits(env).toObject());
   JSObject* bound = js::LookupNameUnqualified(cx, name, envChain);
@@ -5668,7 +5720,7 @@ bool night_runtime_bind_var(JSContext* cx, uint32_t top, uint64_t env) {
 bool night_runtime_del_name(JSContext* cx, uint32_t top, uint64_t env,
                             uint32_t atomId) {
   SetNightTop(cx, top);
-  JS::HandleId id = AtomIdChecked(atomId);
+  JS::HandleId id = AtomIdChecked(cx, atomId);
   JS::Rooted<js::PropertyName*> name(cx, id.toAtom()->asPropertyName());
   JS::RootedObject envChain(cx, &JS::Value::fromRawBits(env).toObject());
   JS::RootedValue res(cx, JS::BooleanValue(true));
@@ -6096,9 +6148,9 @@ static bool HasOwnRow(JSContext* cx, const JS::Value& v, const JS::Value& k,
   }
   *found = nobj->lookupPure(id).isSome();
   uint32_t key = uint32_t(reinterpret_cast<uintptr_t>(atom)) | 2u;
-  if (key > gNames.atoms.size()) {
+  if (key > RtNames(cx).atoms.size()) {
     uint32_t shape = js::night::NightObjectShape(nobj);
-    MegaGetEntry& e = *MegaGet(shape, key);
+    MegaGetEntry& e = *MegaGet(cx, shape, key);
     e.shape = 0;
     e.atomId = key;
     e.holderPtr = 0;
@@ -6227,7 +6279,7 @@ bool night_runtime_init_prop_getset(JSContext* cx, uint32_t top, uint64_t obj,
                                     uint32_t atomId, uint64_t fn,
                                     uint32_t kind) {
   SetNightTop(cx, top);
-  JS::RootedId id(cx, AtomIdChecked(atomId));
+  JS::RootedId id(cx, AtomIdChecked(cx, atomId));
   JS::RootedObject o(cx, &JS::Value::fromRawBits(obj).toObject());
   JS::RootedObject f(cx, &JS::Value::fromRawBits(fn).toObject());
   return DefineAccessorFromKind(cx, o, id, f, kind);
@@ -6304,10 +6356,10 @@ bool night_runtime_new_private_name(JSContext* cx, uint32_t top,
   // (a private BRAND symbol is described by the inferred class name, e.g.
   // "0" for `{0: class { #m() {} }}`), which AtomIdChecked would have
   // interned as an INT PropertyKey with no atom to recover.
-  if (atomId >= gNames.atoms.size()) {
+  if (atomId >= RtNames(cx).atoms.size()) {
     MOZ_CRASH("night_runtime_new_private_name: atomId out of range");
   }
-  const std::u16string& s = gNames.atoms[atomId];
+  const std::u16string& s = RtNames(cx).atoms[atomId];
   JS::Rooted<JSString*> desc(cx, JS_AtomizeUCStringN(cx, s.data(), s.size()));
   if (!desc) {
     return false;
@@ -6454,11 +6506,11 @@ bool night_runtime_call(JSContext* cx, uint32_t top, uint32_t sp,
     // be SELF-HOSTED JS (isNativeFun() false), in which case the call
     // proceeds via JS::Call -- the fuse blow must not depend on native-ness.
     if (MOZ_UNLIKELY(
-            (gFns.defineProperty &&
-             frame[0].asRawBits() == gFns.defineProperty->get().asRawBits()) ||
-            (gFns.reflectDefineProperty &&
+            (RtFns(cx).defineProperty &&
+             frame[0].asRawBits() == RtFns(cx).defineProperty->get().asRawBits()) ||
+            (RtFns(cx).reflectDefineProperty &&
              frame[0].asRawBits() ==
-                 gFns.reflectDefineProperty->get().asRawBits()))) {
+                 RtFns(cx).reflectDefineProperty->get().asRawBits()))) {
       if (argc >= 2 && frame[2].isObject() &&
           IsActiveGlobal(&frame[2].toObject())) {
         JS::RootedId defId(cx);
@@ -6474,7 +6526,7 @@ bool night_runtime_call(JSContext* cx, uint32_t top, uint32_t sp,
       } else if (argc >= 3 && frame[2].isObject() && frame[3].isString() &&
                  frame[3].toString()->isAtom() &&
                  frame[0].asRawBits() ==
-                     gFns.defineProperty->get().asRawBits()) {
+                     RtFns(cx).defineProperty->get().asRawBits()) {
         // A define on a stamped object that leaves its TYPES true keeps
         // the bit (`DefineKeepsTypes`), as a vouched set does.
         JSObject* target = &frame[2].toObject();
@@ -6494,9 +6546,9 @@ bool night_runtime_call(JSContext* cx, uint32_t top, uint32_t sp,
           return true;
         }
       }
-    } else if (MOZ_UNLIKELY(gFns.defineProperties &&
+    } else if (MOZ_UNLIKELY(RtFns(cx).defineProperties &&
                             frame[0].asRawBits() ==
-                                gFns.defineProperties->get().asRawBits())) {
+                                RtFns(cx).defineProperties->get().asRawBits())) {
       if (argc >= 1 && frame[2].isObject() &&
           IsActiveGlobal(&frame[2].toObject())) {
         BlowAllBindingFuses();
@@ -6509,11 +6561,11 @@ bool night_runtime_call(JSContext* cx, uint32_t top, uint32_t sp,
     // directly, bypassing the interpreted self-hosted frame. The identity
     // guard means an instance-level `.exec` override still takes the generic
     // path (its callee would not match this cell).
-    if (MOZ_UNLIKELY(gFns.regExpExec || gFns.regExpTest)) {
-      bool isExec = gFns.regExpExec &&
-                    frame[0].asRawBits() == gFns.regExpExec->get().asRawBits();
-      bool isTest = gFns.regExpTest &&
-                    frame[0].asRawBits() == gFns.regExpTest->get().asRawBits();
+    if (MOZ_UNLIKELY(RtFns(cx).regExpExec || RtFns(cx).regExpTest)) {
+      bool isExec = RtFns(cx).regExpExec &&
+                    frame[0].asRawBits() == RtFns(cx).regExpExec->get().asRawBits();
+      bool isTest = RtFns(cx).regExpTest &&
+                    frame[0].asRawBits() == RtFns(cx).regExpTest->get().asRawBits();
       // The FromJit entries assume a non-negative int32 lastIndex (the JIT
       // guards it before taking them). Anything else must run the
       // self-hosted path, which applies ToLength (side effects + clamping).
@@ -6538,7 +6590,7 @@ bool night_runtime_call(JSContext* cx, uint32_t top, uint32_t sp,
         }
         // Collapsed one-frame path when the regex has an AOT wasm matcher:
         // matcher + lazy statics + lastIndex, no result object for test().
-        if (js::night::NightData().regexTableCount != 0) {
+        if (js::night::NightData(cx).regexTableCount != 0) {
           bool handled = false;
           if (!js::NightRegExpExecTestFast(cx, frame, isTest, &handled)) {
             return false;
@@ -6600,7 +6652,7 @@ bool night_runtime_call(JSContext* cx, uint32_t top, uint32_t sp,
       // call takes the compiled inline arm (the native reads ropes without
       // flattening, so the arm's linear guard would miss forever). Mirrors
       // CacheIR's LinearizeForCharAccess.
-      if (IsRopeCharAccess(frame[0], frame[1])) {
+      if (IsRopeCharAccess(cx, frame[0], frame[1])) {
         if (!frame[1].toString()->ensureLinear(cx)) {
           return false;
         }
@@ -6657,13 +6709,13 @@ bool night_runtime_native_dispatch(JSContext* cx, uint32_t top, uint32_t sp,
   // intercept (a global-binding redefinition bypasses every compiled write
   // hook otherwise).
   if (MOZ_UNLIKELY(
-          (gFns.defineProperty &&
-           frame[0].asRawBits() == gFns.defineProperty->get().asRawBits()) ||
-          (gFns.reflectDefineProperty &&
+          (RtFns(cx).defineProperty &&
+           frame[0].asRawBits() == RtFns(cx).defineProperty->get().asRawBits()) ||
+          (RtFns(cx).reflectDefineProperty &&
            frame[0].asRawBits() ==
-               gFns.reflectDefineProperty->get().asRawBits()) ||
-          (gFns.defineProperties &&
-           frame[0].asRawBits() == gFns.defineProperties->get().asRawBits()))) {
+               RtFns(cx).reflectDefineProperty->get().asRawBits()) ||
+          (RtFns(cx).defineProperties &&
+           frame[0].asRawBits() == RtFns(cx).defineProperties->get().asRawBits()))) {
     return night_runtime_call(cx, top, sp, argc);
   }
   // RegExpMatcher/RegExpSearcher with an AOT wasm matcher: run the collapsed
@@ -6671,7 +6723,7 @@ bool night_runtime_native_dispatch(JSContext* cx, uint32_t top, uint32_t sp,
   // Matcher/Impl/ExecuteRegExp/execute stack. Unhandled falls through to the
   // ordinary native invoke below.
   if ((native == js::RegExpMatcher || native == js::RegExpSearcher) &&
-      js::night::NightData().regexTableCount != 0) {
+      js::night::NightData(cx).regexTableCount != 0) {
     bool handled = false;
     if (!js::NightRegExpBuiltinFast(cx, frame, argc,
                                     native == js::RegExpSearcher, &handled)) {
@@ -6684,7 +6736,7 @@ bool night_runtime_native_dispatch(JSContext* cx, uint32_t top, uint32_t sp,
   }
   // Char-access method on a rope receiver: flatten once so later calls take
   // the compiled inline arm (mirrors the night_runtime_call arm; see there).
-  if (MOZ_UNLIKELY(IsRopeCharAccess(frame[0], frame[1]))) {
+  if (MOZ_UNLIKELY(IsRopeCharAccess(cx, frame[0], frame[1]))) {
     if (!frame[1].toString()->ensureLinear(cx)) {
       return false;
     }
@@ -6697,14 +6749,14 @@ bool night_runtime_native_dispatch(JSContext* cx, uint32_t top, uint32_t sp,
   // `Set(O, len, v)`, which a proto indexed accessor/non-writable element
   // intercepts); setOrExtendDenseElements handles growth, barriers, and
   // the length update, and reports Incomplete for anything odd -> generic.
-  if (MOZ_UNLIKELY(frame[0].asRawBits() == gState.pushFnBits) &&
-      gState.pushFnBits && argc >= 1 && frame[1].isObject() &&
+  if (MOZ_UNLIKELY(frame[0].asRawBits() == RtState(cx).pushFnBits) &&
+      RtState(cx).pushFnBits && argc >= 1 && frame[1].isObject() &&
       frame[1].toObject().is<js::ArrayObject>()) {
     auto* arr = &frame[1].toObject().as<js::ArrayObject>();
     uint32_t initlen = arr->getDenseInitializedLength();
     uint32_t len = arr->length();
     if (len == initlen && arr->lengthIsWritable() && arr->isExtensible() &&
-        !arr->getElementsHeader()->isSealed() && NoExtraIndexedFast(arr) &&
+        !arr->getElementsHeader()->isSealed() && NoExtraIndexedFast(cx, arr) &&
         uint64_t(len) + argc <= uint64_t(INT32_MAX)) {
       // Rooted: the extend path can GC-move the receiver, and the append
       // row must be primed with the LIVE object.
@@ -6715,8 +6767,8 @@ bool night_runtime_native_dispatch(JSContext* cx, uint32_t top, uint32_t sp,
         return false;
       }
       if (r == js::DenseElementResult::Success) {
-        if (gEnv.appendCachePtr) {
-          PrimeAppendRow(rarr);
+        if (RtEnv(cx).appendCachePtr) {
+          PrimeAppendRow(cx, rarr);
         }
         WriteNightOut(top, JS::Int32Value(int32_t(len + argc)).asRawBits());
         return true;
@@ -6851,7 +6903,7 @@ static void FillConstructCell(JSContext* cx, uint32_t cellAddr, uint64_t out,
       cell->protoPtr =
           uint32_t(reinterpret_cast<uintptr_t>(thisObj->staticPrototype()));
       cell->protoSlotEnc = slotEnc;
-      cell->gen = gEnv.propicGenPtr ? InlineGen() : 0;
+      cell->gen = RtEnv(cx).propicGenPtr ? InlineGen(cx) : 0;
       // The ctor shape arms the guard, so it is written last.
       cell->ctorShape =
           uint32_t(reinterpret_cast<uintptr_t>(callee->shape()));
@@ -6925,14 +6977,14 @@ bool night_runtime_new_this(JSContext* cx, uint32_t top, uint64_t calleeBits,
 // (what the inline path's stores write), the alloc part is current (this
 // generation's), and the prototype chain is at most two tenured objects,
 // whose shapes the inline path re-checks.
-static void FillConstructCellFinal(uint32_t cellAddr, JSObject* obj,
+static void FillConstructCellFinal(JSContext* cx, uint32_t cellAddr, JSObject* obj,
                                    const std::vector<uint32_t>& row,
                                    uint32_t n) {
-  if (!cellAddr || !gNames.ids || !obj->is<js::NativeObject>()) {
+  if (!cellAddr || !RtNames(cx).ids || !obj->is<js::NativeObject>()) {
     return;
   }
   auto* cell = LinMem<js::night::NightConstructCell>(cellAddr);
-  if (!cell->ctorShape || cell->gen != (gEnv.propicGenPtr ? InlineGen() : 0)) {
+  if (!cell->ctorShape || cell->gen != (RtEnv(cx).propicGenPtr ? InlineGen(cx) : 0)) {
     return;
   }
   auto& nobj = obj->as<js::NativeObject>();
@@ -6941,7 +6993,7 @@ static void FillConstructCellFinal(uint32_t cellAddr, JSObject* obj,
   }
   for (uint32_t i = 0; i < n; i++) {
     mozilla::Maybe<js::PropertyInfo> prop =
-        nobj.lookupPure((*gNames.ids)[row[i]].get());
+        nobj.lookupPure((*RtNames(cx).ids)[row[i]].get());
     if (prop.isNothing() || !prop->isDataProperty() || prop->slot() != i) {
       return;
     }
@@ -6973,11 +7025,11 @@ uint32_t night_runtime_new_this_init(JSContext* cx, uint32_t top,
   // The layout under construction: the stamp word's early key.
   uint32_t half = stampWord >> 16;
   uint32_t k = (half & 0x8000) ? (half >> 2) & 0xfff : 0;
-  if (k == 0 || k - 1 >= gLayouts.rows.size() ||
-      gLayouts.rows[k - 1].size() < n) {
+  if (k == 0 || k - 1 >= RtLayouts(cx).rows.size() ||
+      RtLayouts(cx).rows[k - 1].size() < n) {
     return 2;
   }
-  const std::vector<uint32_t>& row = gLayouts.rows[k - 1];
+  const std::vector<uint32_t>& row = RtLayouts(cx).rows[k - 1];
   uint64_t out = 0;
   if (!js::night::NightNewThis(cx, calleeBits, protoBits, nSlots, &out,
                                stampWord)) {
@@ -6996,7 +7048,7 @@ uint32_t night_runtime_new_this_init(JSContext* cx, uint32_t top,
       return cx->isExceptionPending() ? 0 : 2;
     }
   }
-  FillConstructCellFinal(cellAddr, obj, row, n);
+  FillConstructCellFinal(cx, cellAddr, obj, row, n);
   WriteNightOut(top, JS::ObjectValue(*obj).asRawBits());
   return 1;
 #else
@@ -7030,13 +7082,13 @@ bool night_runtime_env_setup(JSContext* cx, uint32_t top, uint32_t sp,
   auto* cell = LinMem<js::night::NightEnvCell>(cellAddr);
   JS::Value out = JS::Value::fromRawBits(*LinMem<uint64_t>(top));
   JSScript* s = LinMem<JSScript>(script);
-  if (cellAddr && gEnv.propicGenPtr && !s->isGlobalCode() &&
+  if (cellAddr && RtEnv(cx).propicGenPtr && !s->isGlobalCode() &&
       out.isObject()) {
     JS::Value calleeV = LinMem<JS::Value>(sp)[0];
     JSFunction* callee = &calleeV.toObject().as<JSFunction>();
     if (callee->needsCallObject() && !callee->needsNamedLambdaEnvironment() &&
         js::night::NightFillEnvCell(cell, &out.toObject())) {
-      cell->gen = InlineGen();
+      cell->gen = InlineGen(cx);
       // The slot span (enclosing, callee, bindings) arms the row.
       cell->armed = out.toObject().as<js::NativeObject>().slotSpan();
     }
@@ -7084,7 +7136,7 @@ bool night_runtime_lambda(JSContext* cx, uint32_t top, uint64_t env,
   // what the replay copies.
   auto* cell = LinMem<js::night::NightLambdaCell>(cellAddr);
   JS::Value out = JS::Value::fromRawBits(*LinMem<uint64_t>(top));
-  if (cellAddr && gEnv.propicGenPtr && out.isObject()) {
+  if (cellAddr && RtEnv(cx).propicGenPtr && out.isObject()) {
     JSObject* clone = &out.toObject();
     JSFunction* canonical =
         LinMem<JSScript>(script)->getFunction(js::GCThingIndex(funcIndex));
@@ -7100,7 +7152,7 @@ bool night_runtime_lambda(JSContext* cx, uint32_t top, uint64_t env,
               canonical->getAllocKind() &&
           memcmp(a, b, env) == 0 &&
           memcmp(a + env + 8, b + env + 8, size - env - 8) == 0) {
-        cell->gen = InlineGen();
+        cell->gen = InlineGen(cx);
         // The canonical function arms the row.
         cell->templateFun = uint32_t(reinterpret_cast<uintptr_t>(canonical));
       }
@@ -7143,19 +7195,20 @@ bool night_runtime_get_exception_for_finally(JSContext* cx, uint64_t* excOut,
 // BigInt. Conservative by construction: the fuse says "unscanned code
 // exists", not "a BigInt exists".
 void js::night::NightGlobalDataStore(JS::PropertyKey id, uint64_t valueBits) {
-  if (gNames.ids) {
-    for (const GnameFuse& f : gNames.fuses) {
-      if ((*gNames.ids)[f.atom] == id) {
+  JSContext* cx = CurrentNightContext();
+  if (RtNames(cx).ids) {
+    for (const GnameFuse& f : RtNames(cx).fuses) {
+      if ((*RtNames(cx).ids)[f.atom] == id) {
         if (valueBits != f.literal) {
-          *GnameFuseCell(f.cell) = 2;
+          *GnameFuseCell(cx, f.cell) = 2;
         }
         break;
       }
     }
   }
-  if (gState.globalValsBase && gNames.bindingKeys) {
-    for (size_t i = 0; i < gNames.bindingKeys->size(); i++) {
-      if ((*gNames.bindingKeys)[i].get() == id) {
+  if (RtState(cx).globalValsBase && RtNames(cx).bindingKeys) {
+    for (size_t i = 0; i < RtNames(cx).bindingKeys->size(); i++) {
+      if ((*RtNames(cx).bindingKeys)[i].get() == id) {
         MaybeBlowBindingFuseId(uint32_t(i), valueBits);
         break;
       }
@@ -7169,16 +7222,18 @@ void js::night::NightGlobalKeyBlow(JS::PropertyKey id) {
 }
 
 void js::night::NightBlowDynamicCodeFuse() {
-  gState.dynCodeSeen = true;
-  if (gState.dynCodeFuseAddr) {
-    *LinMem<uint32_t>(gState.dynCodeFuseAddr) = 1;
+  JSContext* cx = CurrentNightContext();
+  RtState(cx).dynCodeSeen = true;
+  if (RtState(cx).dynCodeFuseAddr) {
+    *LinMem<uint32_t>(RtState(cx).dynCodeFuseAddr) = 1;
   }
 }
 
 void js::night::NightRearmDynamicCodeFuse() {
-  gState.dynCodeSeen = false;
-  if (gState.dynCodeFuseAddr) {
-    *LinMem<uint32_t>(gState.dynCodeFuseAddr) = 0;
+  JSContext* cx = CurrentNightContext();
+  RtState(cx).dynCodeSeen = false;
+  if (RtState(cx).dynCodeFuseAddr) {
+    *LinMem<uint32_t>(RtState(cx).dynCodeFuseAddr) = 0;
   }
 }
 
@@ -7197,25 +7252,27 @@ struct NightSlotTable {
   bool built = false;
   std::vector<std::pair<uint64_t, uint32_t>> slots;  // (jsid bits, slot)
 };
-static std::vector<NightSlotTable> gSlotTables;
+static std::vector<NightSlotTable>& RtSlotTables(JSContext* cx);
 
-static const NightSlotTable& NightSlotTableFor(uint32_t layout) {
-  if (gSlotTables.size() < gLayouts.rows.size()) {
-    gSlotTables.resize(gLayouts.rows.size());
+static const NightSlotTable& NightSlotTableFor(JSContext* cx, uint32_t layout) {
+  if (RtSlotTables(cx).size() < RtLayouts(cx).rows.size()) {
+    RtSlotTables(cx).resize(RtLayouts(cx).rows.size());
   }
-  NightSlotTable& t = gSlotTables[layout];
+  NightSlotTable& t = RtSlotTables(cx)[layout];
   if (t.built) {
     return t;
   }
   t.built = true;
-  const std::vector<uint32_t>& atoms = gLayouts.rows[layout];
-  auto key = [](uint32_t atom) { return (*gNames.ids)[atom].get().asRawBits(); };
+  const std::vector<uint32_t>& atoms = RtLayouts(cx).rows[layout];
+  auto key = [cx](uint32_t atom) {
+    return (*RtNames(cx).ids)[atom].get().asRawBits();
+  };
   for (uint32_t i = 0; i < atoms.size(); i++) {
     t.slots.emplace_back(key(atoms[i]), i);
   }
   // Extensions: (jsid, slot), with UINT32_MAX where two rows disagree.
   std::vector<std::pair<uint64_t, uint32_t>> ext;
-  for (const auto& cand : gLayouts.rows) {
+  for (const auto& cand : RtLayouts(cx).rows) {
     if (cand.size() <= atoms.size() ||
         !std::equal(atoms.begin(), atoms.end(), cand.begin())) {
       continue;
@@ -7241,10 +7298,10 @@ static const NightSlotTable& NightSlotTableFor(uint32_t layout) {
 
 // The layout a class word names: the early key while constructing, else the
 // stamped idx; UINT32_MAX for none.
-static uint32_t NightWordLayout(uint32_t w) {
+static uint32_t NightWordLayout(JSContext* cx, uint32_t w) {
   uint32_t half = w >> 16;
   uint32_t k = (half & 0x8000) ? (half >> 2) & 0xfff : w & 0xffff;
-  if (k == 0 || k - 1 >= gLayouts.rows.size()) {
+  if (k == 0 || k - 1 >= RtLayouts(cx).rows.size()) {
     return UINT32_MAX;
   }
   return k - 1;
@@ -7269,10 +7326,14 @@ struct NightAddMemoHash {
     return size_t(h ^ (h >> 29));
   }
 };
-static std::unordered_map<NightAddMemoKey, js::SharedShape*, NightAddMemoHash>
-    gAddMemo;
+using NightAddMemo =
+    std::unordered_map<NightAddMemoKey, js::SharedShape*, NightAddMemoHash>;
+static NightAddMemo& RtAddMemo(JSContext* cx);
 
-void js::night::NightPurgeAddMemo() { gAddMemo.clear(); }
+void js::night::NightPurgeAddMemo() {
+  JSContext* cx = CurrentNightContext();
+  RtAddMemo(cx).clear();
+}
 
 // The engine's slot-placement hook (JS::ExternalCompilerHooks::shapeForAdd):
 // a plain data property named by the object's layout goes in its row slot,
@@ -7285,17 +7346,17 @@ bool js::night::NightShapeForAdd(JSContext* cx,
                                  js::SharedShape** result) {
   *result = nullptr;
   uint32_t w = obj->externalWord();
-  if (!(w & kWordSlots) || !gNames.ids ||
+  if (!(w & kWordSlots) || !RtNames(cx).ids ||
       flags != js::PropertyFlags::defaultDataPropFlags.toRaw()) {
     return true;
   }
-  uint32_t layout = NightWordLayout(w);
+  uint32_t layout = NightWordLayout(cx, w);
   if (layout == UINT32_MAX) {
     return true;
   }
   uint64_t idBits = id.get().asRawBits();
   uint32_t slot = UINT32_MAX;
-  for (const auto& e : NightSlotTableFor(layout).slots) {
+  for (const auto& e : NightSlotTableFor(cx, layout).slots) {
     if (e.first == idBits) {
       slot = e.second;
       break;
@@ -7307,8 +7368,8 @@ bool js::night::NightShapeForAdd(JSContext* cx,
     return true;
   }
   NightAddMemoKey key{uintptr_t(shape), idBits, slot};
-  auto it = gAddMemo.find(key);
-  if (it != gAddMemo.end()) {
+  auto it = RtAddMemo(cx).find(key);
+  if (it != RtAddMemo(cx).end()) {
     *result = it->second;
     return true;
   }
@@ -7321,7 +7382,7 @@ bool js::night::NightShapeForAdd(JSContext* cx,
   // The allocation may have run a GC (which purges the memo and may move
   // the parent): key by where the parent is now.
   key.shape = uintptr_t(parent.get());
-  gAddMemo.emplace(key, chosen);
+  RtAddMemo(cx).emplace(key, chosen);
   *result = chosen;
   return true;
 }
@@ -7357,6 +7418,7 @@ bool js::night::NightSlotsCovered(js::NativeObject* obj, uint32_t n) {
 // SLOTS bit.
 void js::night::NightAddPropCheck(JSObject* obj, JS::PropertyKey id,
                                   uint32_t slot, uint32_t nfixed) {
+  JSContext* cx = CurrentNightContext();
   js::night::NightClearClosedBit(obj);
   uint32_t w = obj->externalWord();
   if (MOZ_LIKELY((w & 0x00020000u) == 0)) {
@@ -7383,12 +7445,12 @@ void js::night::NightAddPropCheck(JSObject* obj, JS::PropertyKey id,
     }
     layout = idx - 1;
   }
-  if (layout >= gLayouts.rows.size() || !gNames.ids) {
+  if (layout >= RtLayouts(cx).rows.size() || !RtNames(cx).ids) {
     js::night::NightClearSlotsBit(obj, js::night::NightBumpSite::SlotsAddMismatch3);
     return;
   }
-  const std::vector<uint32_t>& atoms = gLayouts.rows[layout];
-  uint32_t extLen = layout < gLayouts.extLen.size() ? gLayouts.extLen[layout]
+  const std::vector<uint32_t>& atoms = RtLayouts(cx).rows[layout];
+  uint32_t extLen = layout < RtLayouts(cx).extLen.size() ? RtLayouts(cx).extLen[layout]
                                                     : uint32_t(atoms.size());
   // Fast path: an append past the clump's longest prefix can neither sit
   // inside a guarded prefix nor be one of its predictions.
@@ -7397,7 +7459,7 @@ void js::night::NightAddPropCheck(JSObject* obj, JS::PropertyKey id,
   }
   uint32_t pos = UINT32_MAX;
   for (uint32_t i = 0; i < atoms.size(); i++) {
-    if ((*gNames.ids)[atoms[i]].get() == id) {
+    if ((*RtNames(cx).ids)[atoms[i]].get() == id) {
       pos = i;
       break;
     }
@@ -7407,14 +7469,14 @@ void js::night::NightAddPropCheck(JSObject* obj, JS::PropertyKey id,
     // Clump-aware resolution: an extending layout predicting this atom at
     // exactly the assigned slot keeps the bit (the delegate flow).
     bool ext = false;
-    for (const auto& cand : gLayouts.rows) {
+    for (const auto& cand : RtLayouts(cx).rows) {
       if (cand.size() <= atoms.size() ||
           !std::equal(atoms.begin(), atoms.end(), cand.begin())) {
         continue;
       }
       for (uint32_t i = uint32_t(atoms.size()); i < uint32_t(cand.size());
            i++) {
-        if ((*gNames.ids)[cand[i]].get() == id) {
+        if ((*RtNames(cx).ids)[cand[i]].get() == id) {
           ext = i == slot;
           break;
         }
@@ -7672,4 +7734,61 @@ bool night_runtime_resume(JSContext* cx, uint32_t top, uint64_t gen,
   }
   WriteNightOut(top, res.get().asRawBits());
   return true;
+}
+
+// ===========================================================================
+// The runtime state (see "Runtime state" at the top)
+// ===========================================================================
+
+struct js::night::NightRuntimeState {
+  js::night::NightEnvDesc env;
+  NightNameTables names;
+  NightPristineFns fns;
+  NightLayoutTable layouts;
+  NightState state;
+  SetAddRow setAdd[kSetAddSize];
+  InitAddRow initAdd[kInitAddSize];
+  uint32_t hasInst[kHasInstCacheN * 2] = {};
+  // The compiled get probe reads it too (its address is published in the
+  // strlit block at install).
+  alignas(16) GChainEntry gchain[kGChainSize] = {};
+  uintptr_t noExtra[kNoExtraCacheN * 5] = {};
+  std::vector<MethodDep> methodDeps;
+  std::vector<NightSlotTable> slotTables;
+  NightAddMemo addMemo;
+  NightCensusState census;
+  js::night::NightRuntimeData regex;
+};
+
+js::night::NightRuntimeState* js::night::NewNightRuntimeState() {
+  return js_new<NightRuntimeState>();
+}
+
+void js::night::DeleteNightRuntimeState(NightRuntimeState* state) {
+  js_delete(state);
+}
+
+static inline js::night::NightRuntimeState& Rt(JSContext* cx) {
+  return *js::nightrt::NightStateOf(cx)->runtime;
+}
+static js::night::NightEnvDesc& RtEnv(JSContext* cx) { return Rt(cx).env; }
+static NightNameTables& RtNames(JSContext* cx) { return Rt(cx).names; }
+static NightPristineFns& RtFns(JSContext* cx) { return Rt(cx).fns; }
+static NightLayoutTable& RtLayouts(JSContext* cx) { return Rt(cx).layouts; }
+static NightState& RtState(JSContext* cx) { return Rt(cx).state; }
+static SetAddRow* RtSetAdd(JSContext* cx) { return Rt(cx).setAdd; }
+static InitAddRow* RtInitAdd(JSContext* cx) { return Rt(cx).initAdd; }
+static uint32_t* RtHasInst(JSContext* cx) { return Rt(cx).hasInst; }
+static GChainEntry* RtGChain(JSContext* cx) { return Rt(cx).gchain; }
+static uintptr_t* RtNoExtra(JSContext* cx) { return Rt(cx).noExtra; }
+static std::vector<MethodDep>& RtMethodDeps(JSContext* cx) {
+  return Rt(cx).methodDeps;
+}
+static std::vector<NightSlotTable>& RtSlotTables(JSContext* cx) {
+  return Rt(cx).slotTables;
+}
+static NightAddMemo& RtAddMemo(JSContext* cx) { return Rt(cx).addMemo; }
+static NightCensusState& RtCensus(JSContext* cx) { return Rt(cx).census; }
+static js::night::NightRuntimeData& RtRegex(JSContext* cx) {
+  return Rt(cx).regex;
 }
