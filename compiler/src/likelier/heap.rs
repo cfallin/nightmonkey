@@ -181,6 +181,10 @@ pub struct Heap {
     pub dyn_named_writes: HashSet<Site>,
 }
 
+/// Whether an element access whose key is only string constants (none an
+/// index) is the named access of each (`Solver::const_key_names`).
+pub(super) const CONST_KEYS: bool = true;
+
 impl Heap {
     pub fn class_id(&self, key: ClassKey) -> Option<ClassId> {
         self.class_ids.get(&key).copied()
@@ -1344,6 +1348,10 @@ impl Solver<'_> {
             .filter(|&f| !f.is_builtin())
             .collect();
         if !ids.is_empty() {
+            let d = self.table_direct.entry(a).or_default();
+            for &f in &ids {
+                d.insert(f);
+            }
             self.add_table_members(a, &ids);
         }
     }
@@ -1549,6 +1557,130 @@ impl Solver<'_> {
         }
     }
 
+    /// An element access's key, where its value is only string constants
+    /// that are not indexes: those names, whose named accesses the access
+    /// is (an empty list where no key has arrived yet). `None` for any
+    /// other key, or no key. Each site's single agreed name is
+    /// recorded (`keyed_site_names`) for the facts.
+    fn const_key_names(
+        &mut self,
+        sid: ScriptId,
+        ctx: CtxId,
+        key: Option<super::engine::CKey>,
+        pc: Pc,
+        user: (ConId, CtxId),
+    ) -> Option<Vec<NameId>> {
+        let key = key?;
+        let k = self.engine.resolve(sid, ctx, key);
+        let kts = self.engine.read(k, user);
+        let site = Site::new(sid, pc);
+        let names = if CONST_KEYS { kts.const_names(&self.names) } else { None };
+        match &names {
+            Some(ns) => {
+                for &n in ns {
+                    self.keyed_site_names.entry(site).or_default().observe(n);
+                }
+            }
+            None => {
+                self.keyed_site_names.insert(site, Agreed::Conflict);
+            }
+        }
+        names
+    }
+
+    /// A read of `recv.name` into `dst` (`Constraint::Read`).
+    #[allow(clippy::too_many_arguments)]
+    fn eval_read(
+        &mut self,
+        sid: ScriptId,
+        ctx: CtxId,
+        user: (ConId, CtxId),
+        recv: super::engine::CKey,
+        name: NameId,
+        dst: super::engine::CKey,
+        pc: Pc,
+        callee_pos: bool,
+    ) {
+        let r = self.engine.resolve(sid, ctx, recv);
+        let rts = self.engine.read(r, user);
+        self.trace_site_eval(sid, pc, ctx, recv, r, &rts);
+        let d = self.engine.resolve(sid, ctx, dst);
+        let mut out = TypeSet::default();
+        let region_contributed = self.read_into(&rts, name, callee_pos, user, &mut out);
+        if callee_pos && region_contributed {
+            if let super::engine::CKey::Var(v) = dst {
+                if self.region_calls.insert((sid, v)) {
+                    self.engine.fire_side(SideKey::CallVar(sid, v));
+                }
+            }
+        }
+        // A method read off an unresolved receiver: the call's
+        // target is some function held under `name` (bind_by_name).
+        let unresolved_recv = rts.obj == ObjType::AnyObject
+            || (rts.obj == ObjType::Empty && rts.unknown);
+        if callee_pos && unresolved_recv && name != self.names_of.elems {
+            if let super::engine::CKey::Var(v) = dst {
+                if self.name_calls.insert((sid, v), name).is_none() {
+                    self.engine.fire_side(SideKey::CallVar(sid, v));
+                }
+            }
+        }
+        // Recorded for every elems read, not just callee position:
+        // an apply-form dispatch (`action[0].call(...)`) consumes
+        // the read's result as its TARGET, and the fn-table
+        // fallback needs the same provenance there.
+        if name == self.names_of.elems {
+            if let super::engine::CKey::Var(v) = dst {
+                if self.elems_callee_vars.insert((sid, v), recv) != Some(recv) {
+                    self.engine.fire_side(SideKey::CallVar(sid, v));
+                }
+            }
+        }
+        self.note_site_recv(sid, pc, &rts);
+        self.note_site_evidence(sid, pc, name, &rts, Some(&out));
+        self.engine.raise(d, &out, user);
+    }
+
+    /// A write of `src` into `recv.name` (`Constraint::Write`).
+    #[allow(clippy::too_many_arguments)]
+    fn eval_write(
+        &mut self,
+        sid: ScriptId,
+        ctx: CtxId,
+        user: (ConId, CtxId),
+        recv: super::engine::CKey,
+        name: NameId,
+        src: super::engine::CKey,
+        pc: Pc,
+    ) {
+        let r = self.engine.resolve(sid, ctx, recv);
+        let rts = self.engine.read(r, user);
+        let s = self.engine.resolve(sid, ctx, src);
+        let v = self.engine.read(s, user);
+        if name == self.names_of.elems {
+            if let ObjType::One(a) = rts.obj {
+                // A non-function element beside a table's
+                // functions: the pair's scope.
+                let mut scope = v.clone();
+                scope.fns = Default::default();
+                if super::TABLE_SCOPES && !scope.is_empty() {
+                    let c = self.engine.cell(CellKey::TableScope { abs: a });
+                    self.engine.raise(c, &scope, user);
+                }
+                self.note_table_members(a, src, sid, &v);
+                if let AbsKey::Alloc { script, pc, .. } = self.heap[a].key {
+                    self.heap.dyn_named_writes.insert(Site::new(script, pc));
+                }
+            }
+        }
+        self.note_site_evidence(sid, pc, name, &rts, None);
+        let this_recv = recv == super::engine::CKey::This && name != self.names_of.elems;
+        if this_recv {
+            self.this_field_raise(sid, name, &v, user);
+        }
+        self.write_into(&rts, name, &v, this_recv, user);
+    }
+
     pub(super) fn eval_heap(&mut self, con: ConId, ctx: CtxId) -> bool {
         let sid = self.engine.con_script[con.0 as usize];
         let user = (con, ctx);
@@ -1559,45 +1691,17 @@ impl Solver<'_> {
                 dst,
                 pc,
                 callee_pos,
+                key,
             } => {
-                let r = self.engine.resolve(sid, ctx, recv);
-                let rts = self.engine.read(r, user);
-                self.trace_site_eval(sid, pc, ctx, recv, r, &rts);
-                let d = self.engine.resolve(sid, ctx, dst);
-                let mut out = TypeSet::default();
-                let region_contributed = self.read_into(&rts, name, callee_pos, user, &mut out);
-                if callee_pos && region_contributed {
-                    if let super::engine::CKey::Var(v) = dst {
-                        if self.region_calls.insert((sid, v)) {
-                            self.engine.fire_side(SideKey::CallVar(sid, v));
-                        }
+                // A string constant key reads its names; and, like any
+                // key, the elements, where writes under keys that were not
+                // constants went (any of which may have been one of them).
+                if let Some(names) = self.const_key_names(sid, ctx, key, pc, user) {
+                    for n in names {
+                        self.eval_read(sid, ctx, user, recv, n, dst, pc, callee_pos);
                     }
                 }
-                // A method read off an unresolved receiver: the call's
-                // target is some function held under `name` (bind_by_name).
-                let unresolved_recv = rts.obj == ObjType::AnyObject
-                    || (rts.obj == ObjType::Empty && rts.unknown);
-                if callee_pos && unresolved_recv && name != self.names_of.elems {
-                    if let super::engine::CKey::Var(v) = dst {
-                        if self.name_calls.insert((sid, v), name).is_none() {
-                            self.engine.fire_side(SideKey::CallVar(sid, v));
-                        }
-                    }
-                }
-                // Recorded for every elems read, not just callee position:
-                // an apply-form dispatch (`action[0].call(...)`) consumes
-                // the read's result as its TARGET, and the fn-table
-                // fallback needs the same provenance there.
-                if name == self.names_of.elems {
-                    if let super::engine::CKey::Var(v) = dst {
-                        if self.elems_callee_vars.insert((sid, v), recv) != Some(recv) {
-                            self.engine.fire_side(SideKey::CallVar(sid, v));
-                        }
-                    }
-                }
-                self.note_site_recv(sid, pc, &rts);
-                self.note_site_evidence(sid, pc, name, &rts, Some(&out));
-                self.engine.raise(d, &out, user);
+                self.eval_read(sid, ctx, user, recv, name, dst, pc, callee_pos);
                 true
             }
             Constraint::Write {
@@ -1605,30 +1709,29 @@ impl Solver<'_> {
                 name,
                 src,
                 pc,
+                key,
             } => {
-                let r = self.engine.resolve(sid, ctx, recv);
-                let rts = self.engine.read(r, user);
-                let s = self.engine.resolve(sid, ctx, src);
-                let v = self.engine.read(s, user);
-                if name == self.names_of.elems {
-                    if let ObjType::One(a) = rts.obj {
-                        self.note_table_members(a, src, sid, &v);
-                        if let AbsKey::Alloc { script, pc, .. } = self.heap[a].key {
-                            self.heap.dyn_named_writes.insert(Site::new(script, pc));
+                // A string constant key writes its names only; a key with no
+                // evidence (which may be anything at run time) or any other
+                // writes the elements, as before.
+                match self.const_key_names(sid, ctx, key, pc, user) {
+                    Some(names) if !names.is_empty() => {
+                        for n in names {
+                            self.eval_write(sid, ctx, user, recv, n, src, pc);
                         }
                     }
+                    _ => self.eval_write(sid, ctx, user, recv, name, src, pc),
                 }
-                self.note_site_evidence(sid, pc, name, &rts, None);
-                let this_recv = recv == super::engine::CKey::This && name != self.names_of.elems;
-                if this_recv {
-                    self.this_field_raise(sid, name, &v, user);
-                }
-                self.write_into(&rts, name, &v, this_recv, user);
                 true
             }
             Constraint::KeyedRead { recv, key, dst, .. } => {
                 let k = self.engine.resolve(sid, ctx, key);
                 let kts = self.engine.read(k, user);
+                // A string constant key: the element read beside this one
+                // reads those names (`const_key_names`), not every field.
+                if CONST_KEYS && kts.const_names(&self.names).is_some() {
+                    return true;
+                }
                 let named = kts.unknown
                     || kts.prims.intersects(PRIM_STRING | PRIM_SYMBOL)
                     || kts.obj != ObjType::Empty;

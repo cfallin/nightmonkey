@@ -518,6 +518,60 @@ pub enum ObjType {
     AnyObject,
 }
 
+/// How many distinct string constants a value's strings may be before
+/// they are just strings ([`StrConsts::Any`]).
+pub const STR_CONSTS_CAP: usize = 8;
+
+/// Which string constants the strings in a [`TypeSet`] may be: a short set
+/// of atoms, or any string. Meaningful only where the set's prims hold
+/// `PRIM_STRING`; the default is `Any`, so a set made without knowing
+/// which string it holds claims nothing about it. Keyed reads and writes
+/// with a key of known atoms are the named reads and writes of those
+/// names.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum StrConsts {
+    Any,
+    /// Sorted and distinct; at most [`STR_CONSTS_CAP`].
+    Atoms { n: u8, atoms: [NameId; STR_CONSTS_CAP] },
+}
+
+impl StrConsts {
+    pub fn one(a: NameId) -> StrConsts {
+        let mut atoms = [NameId(0); STR_CONSTS_CAP];
+        atoms[0] = a;
+        StrConsts::Atoms { n: 1, atoms }
+    }
+
+    pub fn atoms(&self) -> Option<&[NameId]> {
+        match self {
+            StrConsts::Any => None,
+            StrConsts::Atoms { n, atoms } => Some(&atoms[..usize::from(*n)]),
+        }
+    }
+
+    /// The union, or `Any` past the cap.
+    pub fn union(&self, o: &StrConsts) -> StrConsts {
+        let (Some(a), Some(b)) = (self.atoms(), o.atoms()) else {
+            return StrConsts::Any;
+        };
+        let mut v: Vec<NameId> = a.iter().chain(b).copied().collect();
+        v.sort_unstable_by_key(|x| x.0);
+        v.dedup();
+        if v.len() > STR_CONSTS_CAP {
+            return StrConsts::Any;
+        }
+        let mut atoms = [NameId(0); STR_CONSTS_CAP];
+        atoms[..v.len()].copy_from_slice(&v);
+        StrConsts::Atoms { n: v.len() as u8, atoms }
+    }
+}
+
+impl Default for StrConsts {
+    fn default() -> StrConsts {
+        StrConsts::Any
+    }
+}
+
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct TypeSet {
     pub prims: Prims,
@@ -541,6 +595,9 @@ pub struct TypeSet {
     /// numeric-or-unknown values without a known interval carries `Any`
     /// (or `Num`), never `Empty`.
     pub interval: Interval,
+    /// Which string constants the strings may be (only where `prims`
+    /// holds `PRIM_STRING`).
+    pub strs: StrConsts,
 }
 
 /// Upper bound on the number of changing raises a single cell can take:
@@ -563,6 +620,7 @@ impl Default for TypeSet {
             obj: ObjType::Empty,
             range: Range::I32,
             interval: Interval::Empty,
+            strs: StrConsts::Any,
         }
     }
 }
@@ -592,6 +650,7 @@ impl TypeSet {
             obj: ObjType::AnyObject,
             range: Range::Top,
             interval: Interval::Any,
+            strs: StrConsts::Any,
         }
     }
 
@@ -626,6 +685,7 @@ impl TypeSet {
             obj: ObjType::AnyObject,
             range: Range::Top,
             interval: Interval::Any,
+            strs: StrConsts::Any,
         }
     }
 
@@ -686,6 +746,20 @@ impl TypeSet {
         self.prims.is_empty() && !self.unknown && self.fns.is_empty() && self.obj == ObjType::Empty
     }
 
+    /// The names a property key of this type is, where it is only string
+    /// constants none of which is an array index: an empty slice where
+    /// nothing has reached it yet. `None` where it may be anything else.
+    pub fn const_names(&self, names: &Names) -> Option<Vec<NameId>> {
+        if self.is_empty() {
+            return Some(vec![]);
+        }
+        if self.prims != PRIM_STRING || self.unknown || !self.fns.is_empty() || self.obj != ObjType::Empty {
+            return None;
+        }
+        let atoms = self.strs.atoms()?;
+        atoms.iter().all(|&a| !is_index_name(names.get(a).chars())).then(|| atoms.to_vec())
+    }
+
     /// Monotone join; `meta` maps an abstraction to its (immutable,
     /// assigned-at-creation) class label and snap bit, which is what makes
     /// the join order-independent. `sink` records One+One absorptions
@@ -709,6 +783,16 @@ impl TypeSet {
         sink: &mut JoinSink,
     ) -> (bool, bool) {
         let mut changed = false;
+        // The string constants: either side's own, where it has strings.
+        let strs = match (self.prims.intersects(PRIM_STRING), o.prims.intersects(PRIM_STRING)) {
+            (true, true) => self.strs.union(&o.strs),
+            (false, true) => o.strs,
+            _ => self.strs,
+        };
+        if strs != self.strs {
+            self.strs = strs;
+            changed = true;
+        }
         if !o.prims.subset_of(self.prims) {
             self.prims |= o.prims;
             changed = true;
@@ -1364,4 +1448,20 @@ mod tests {
             In(iv(-7, 0))
         );
     }
+}
+
+/// Whether `chars` is a canonical array index (`0`, or digits with no
+/// leading zero, below 2^32 - 1): a key that names an element.
+pub fn is_index_name(chars: &[u16]) -> bool {
+    if chars.is_empty() || chars.len() > 10 || (chars.len() > 1 && chars[0] == u16::from(b'0')) {
+        return false;
+    }
+    let mut v: u64 = 0;
+    for &c in chars {
+        if !(u16::from(b'0')..=u16::from(b'9')).contains(&c) {
+            return false;
+        }
+        v = v * 10 + u64::from(c - u16::from(b'0'));
+    }
+    v < u64::from(u32::MAX)
 }

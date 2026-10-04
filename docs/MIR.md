@@ -2440,6 +2440,51 @@ value is live at some exit (am3's `m`, `l`).
   m's digits in a number). It fails against a mutant that leaves the exits
   holding the wrapped values.
 
+**M5z. String-constant keys; table scopes (2026-10-04; pdfjs's exits).**
+pdfjs's two worst exits (~38k a run) guard `current.fontSize` as an int32,
+which setFont writes from operands the analysis never sees: the operator
+list reaches `executeOperatorList` with no types, through its message
+handler (`ah[action] = [handler, scope]`, dispatched as
+`action[0].call(action[1], data)`).
+- **Table scopes.** The dispatch bound every handler's `this` to the join
+  of every registered scope (AnyObject here), so the handler's
+  `this.pageCache[...]` and the call through it were unresolved. A
+  `t[0].call(t[1], ...)` whose receiver is an element of the same table
+  variable as the callee now binds each table's members to that table's
+  own scope (`CellKey::TableScope`, `TABLE_SCOPES`), for the tables a
+  member was written into beside its scope (`table_direct`: the
+  generic-context copy of the literal also holds members a degraded arg
+  row added, with no scope there).
+- **String constants in types.** `TypeSet::strs` is the string constants
+  a value's strings may be (up to eight atoms, else any string; any by
+  default, so a set made without knowing its strings claims nothing). A
+  string literal is its atom.
+- **Keyed accesses with constant keys.** An element `Read`/`Write` carries
+  its key; where the key's value is only string constants none of which is
+  an index (`TypeSet::const_names`), a write is the named write of each,
+  and a read the named read of each plus the elements read (where writes
+  under keys that were not constants went: any may have been one of the
+  names), delegating to the named paths (`Solver::const_key_names`); the
+  keyed read's join over every field stands aside. A key with no evidence
+  yet keeps the elements read and write: such keys are common (a value
+  through an unresolved flow reads as Empty), and a first version that
+  read and wrote nothing for them dropped box2d's double evidence for
+  `m_normalImpulse`, whose int32 claim then failed every step (-58%). A
+  site whose key agreed on one name (`keyed_site_names`) gets that name's
+  property facts (`Solver::access_name`).
+- **MIR.** An element access whose key MIR knows is a non-index string
+  constant (a literal, or one through a local's boxing) is built as the
+  property access of that name (`get_prop_op`, `set_prop_op`,
+  `CONST_KEY_PROPS`).
+- pdfjs: unchanged. `on`'s literal writes the handler tables under their
+  action names now, but `onmessage`'s generic context sees every message
+  (13 actions, past the atom cap), its dispatch binds the handlers from
+  there, and their `data` is still every message's joined (AnyObject).
+  Fixing that needs context-sensitive dispatch (deferred: cost and caps).
+- Night test: mir-const-keys.js. Two mutants pass it, each equivalent: an
+  index string built as a name (the engine canonicalizes the key), and a
+  strict element store built sloppy (strictness also follows the script).
+
 **M6. The rest of §10**: box/unbox cleanup, memory optimizations, and
 numeric optimizations, each with its guard-count and instruction-count
 tests.

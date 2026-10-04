@@ -5,6 +5,12 @@
 
 use crate::facts::CallForm;
 use crate::ids::{FormalIndex, ScriptId, Site, VarId};
+
+/// Whether a `t[0].call(t[1], ...)` dispatch binds each fn table's members'
+/// `this` to that table's own scope (`engine::CellKey::TableScope`) rather
+/// than to the join of every table's scope.
+pub(crate) const TABLE_SCOPES: bool = true;
+
 pub mod builtins;
 pub mod calls;
 pub mod dump;
@@ -242,6 +248,17 @@ pub struct Solver<'a> {
     /// `[handler, scope]` pair sharing one literal-site class) still
     /// finds the member population.
     pub class_table_members: HashMap<types::ClassId, rustc_hash::FxHashSet<types::FnId>>,
+    /// The fn tables (abstractions with `table_members`) of each class:
+    /// a dispatch through a `ClassAny` table read pairs each table's
+    /// members with that table's own scope (`CellKey::TableScope`).
+    pub class_tables: HashMap<types::ClassId, Vec<types::AbsId>>,
+    /// Element-access sites whose key was only string constants: the one
+    /// name every evaluation agreed on (`Conflict` past one, or where the
+    /// key was anything else). Such a site's facts are its named access's.
+    pub keyed_site_names: HashMap<Site, types::Agreed<NameId>>,
+    /// The members written into each table's elements directly (beside
+    /// that table's scope), as opposed to those a degraded arg row added.
+    pub table_direct: HashMap<types::AbsId, rustc_hash::FxHashSet<types::FnId>>,
     /// Scripted fn ids observed flowing into a callee's arg row, keyed
     /// (callee sid, arg index), recorded at call binding from the site's
     /// value before the row join can saturate.
@@ -339,6 +356,9 @@ impl<'a> Solver<'a> {
             dyn_named_fns: HashMap::default(),
             table_members: HashMap::default(),
             class_table_members: HashMap::default(),
+            class_tables: HashMap::default(),
+            keyed_site_names: HashMap::default(),
+            table_direct: HashMap::default(),
             arg_fn_members: HashMap::default(),
             arg_row_tables: HashMap::default(),
             elems_callee_vars: HashMap::default(),

@@ -14,7 +14,7 @@
 
 use super::builtins;
 use super::engine::{AllocKind, CKey, Constraint, ElemBuiltinKind, Engine};
-use super::types::{arith_transfer, FnId, Interval, NameId, Names, NumOp, TypeSet, ValueRange};
+use super::types::{arith_transfer, FnId, Interval, NameId, Names, NumOp, StrConsts, TypeSet, ValueRange};
 use crate::bytecode::{JSOp, OpcodeVisitor, Script};
 use crate::constants::{PRIMARY_EVENT_CAP, TOTAL_EVENT_CAP};
 use crate::facts::CallForm;
@@ -380,10 +380,12 @@ impl<'a, 'b> Scan<'a, 'b> {
             Val::Imm(p) => {
                 let v = self.fresh_var();
                 if p != Prims::EMPTY {
-                    self.con(Constraint::Const {
-                        dst: CKey::Var(v),
-                        ts: Self::imm_ts(p, e.num),
-                    });
+                    let mut ts = Self::imm_ts(p, e.num);
+                    // A string literal is that string.
+                    if let (true, Some(a)) = (p == PRIM_STRING, e.str_const) {
+                        ts.strs = StrConsts::one(a);
+                    }
+                    self.con(Constraint::Const { dst: CKey::Var(v), ts });
                 }
                 CKey::Var(v)
             }
@@ -727,6 +729,7 @@ impl<'a, 'b> Scan<'a, 'b> {
                 dst: CKey::Var(v),
                 pc,
                 callee_pos: false,
+                key: None,
             },
         );
         out.read_con = Some(cid);
@@ -785,6 +788,7 @@ impl<'a, 'b> Scan<'a, 'b> {
                 name: name_id,
                 src,
                 pc,
+                key: None,
             });
         }
         self.push_e(if is_init { obj } else { val });
@@ -793,17 +797,20 @@ impl<'a, 'b> Scan<'a, 'b> {
     fn elem_write(&mut self) {
         // [obj, key, val] -> [val]
         let val = self.pop_e();
-        self.pop_e();
+        let key = self.pop_e();
         let obj = self.pop_e();
         let recv = self.key_of(&obj);
         let src = self.key_of(&val);
         let name = self.names.intern(ELEMS);
         let pc = self.cur_pc;
+        // A key that may be a name: a string constant key is a named write.
+        let key = (!matches!(key.val, Val::Imm(p) if p.subset_of(crate::opsem::NUM))).then(|| self.key_of(&key));
         self.con(Constraint::Write {
             recv,
             name,
             src,
             pc,
+            key,
         });
         self.push_e(val);
     }
@@ -855,6 +862,7 @@ impl<'a, 'b> Scan<'a, 'b> {
             name,
             src,
             pc,
+            key: None,
         });
     }
 
@@ -957,6 +965,7 @@ impl<'a, 'b> Scan<'a, 'b> {
                         dst: v,
                         pc,
                         callee_pos: false,
+                        key: None,
                     });
                     from = v;
                 }
@@ -965,6 +974,7 @@ impl<'a, 'b> Scan<'a, 'b> {
                     name: elems,
                     src: from,
                     pc,
+                    key: None,
                 });
             }
             self.push_e(Entry::key(ret));
@@ -1442,6 +1452,10 @@ impl OpcodeVisitor for Scan<'_, '_> {
         let v = self.fresh_var();
         let name = self.names.intern(ELEMS);
         let pc = self.cur_pc;
+        // A key that may be a name also reads named properties (a string
+        // constant key is a named read). A numeric literal key cannot.
+        let named = !matches!(key.val, Val::Imm(p) if p.subset_of(crate::opsem::NUM));
+        let k = named.then(|| self.key_of(&key));
         let cid = self.engine.add_con(
             self.script_id,
             Constraint::Read {
@@ -1450,12 +1464,10 @@ impl OpcodeVisitor for Scan<'_, '_> {
                 dst: CKey::Var(v),
                 pc,
                 callee_pos: false,
+                key: k,
             },
         );
-        // A key that may be a name also reads named properties. A numeric
-        // literal key cannot.
-        if !matches!(key.val, Val::Imm(p) if p.subset_of(crate::opsem::NUM)) {
-            let k = self.key_of(&key);
+        if let Some(k) = k {
             self.engine.add_con(
                 self.script_id,
                 Constraint::KeyedRead {

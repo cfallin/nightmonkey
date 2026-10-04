@@ -1799,6 +1799,22 @@ struct SiteFactTotals {
 }
 
 impl Solver<'_> {
+    /// The property constraint `ci` accesses: its own name, or for an
+    /// element access whose key every evaluation found to be one string
+    /// constant, that name (`Solver::const_key_names`), whose named
+    /// access it is.
+    fn access_name(&self, ci: usize, name: NameId) -> NameId {
+        let (key, pc) = match &self.engine.cons[ci] {
+            super::engine::Constraint::Read { key, pc, .. } | super::engine::Constraint::Write { key, pc, .. } => (*key, *pc),
+            _ => return name,
+        };
+        if key.is_none() {
+            return name;
+        }
+        let site = Site::new(self.engine.con_script[ci], pc);
+        self.keyed_site_names.get(&site).and_then(Agreed::get).copied().unwrap_or(name)
+    }
+
     /// Non-minting class lookup for a ctor script.
     fn class_lookup_fn(&self, f: ScriptId) -> Option<ClassId> {
         let key = match self.heap.script_proto.get(&f) {
@@ -2123,6 +2139,7 @@ impl Solver<'_> {
                     _ => continue,
                 };
                 let sid = self.engine.con_script[ci];
+                let name = self.access_name(ci, name);
                 let site = Site::new(sid, pc);
                 let Some(&c) = self.site_recv_class.get(&site).and_then(Agreed::get) else {
                     continue;
@@ -2308,6 +2325,7 @@ impl Solver<'_> {
                 _ => continue,
             };
             let sid = self.engine.con_script[ci];
+            let name = self.access_name(ci, name);
             let site = Site::new(sid, pc);
             // The value-CLASS tier, elems included: the agreed class of the
             // loaded object, mapped through the same plan ranges the

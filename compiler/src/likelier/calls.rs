@@ -235,6 +235,12 @@ impl Solver<'_> {
         // protects: a single-owner pin binds its asserted class (strictly
         // better evidence than the lost receiver), a conflicted pin (a
         // genuinely shared method) binds the receiver itself.
+        self.bind_this_value(at, f, cx, v);
+    }
+
+    /// `bind_this`'s binding of a receiver value `v` into `f`'s `this` at
+    /// `cx`.
+    fn bind_this_value(&mut self, at: CallAt, f: ScriptId, cx: CtxId, v: TypeSet) {
         let bound = if self.bind_this_ok(f, &v) {
             v
         } else if let Some(&owner) = self.this_pin.get(&f).and_then(super::types::Agreed::get) {
@@ -585,6 +591,17 @@ impl Solver<'_> {
                             if let Some(&rk) = self.elems_callee_vars.get(&(script, v)) {
                                 let rcell = self.engine.resolve(script, ctx, rk);
                                 let rts = self.engine.read(rcell, user);
+                                // `t[0].call(t[1], ...)`: the receiver is
+                                // the same table's element, so each
+                                // table's members take that table's scope.
+                                let paired = super::TABLE_SCOPES
+                                    && matches!(args.first(), Some(&super::engine::CKey::Var(tv))
+                                        if self.elems_callee_vars.get(&(script, tv)) == Some(&rk));
+                                let tables: Vec<super::types::AbsId> = match rts.obj {
+                                    ObjType::One(a) => vec![a],
+                                    ObjType::ClassAny(c) => self.class_tables.get(&c).cloned().unwrap_or_default(),
+                                    _ => vec![],
+                                };
                                 let members: Vec<FnId> = match rts.obj {
                                     ObjType::One(a) => {
                                         self.engine.subscribe_side(SideKey::Table(a), user);
@@ -618,7 +635,30 @@ impl Solver<'_> {
                                     if self.engine.instantiate(f, cx) {
                                         self.stats.ctxs_spent += 1;
                                     }
-                                    if let Some(&recv) = args.first() {
+                                    // The tables `f` was written into
+                                    // beside its scope (a member a degraded
+                                    // arg row added has no scope there).
+                                    let own: Vec<super::types::AbsId> = if paired {
+                                        tables
+                                            .iter()
+                                            .copied()
+                                            .filter(|a| {
+                                                self.table_direct.get(a).is_some_and(|m| m.contains(&FnId::script(f)))
+                                            })
+                                            .collect()
+                                    } else {
+                                        vec![]
+                                    };
+                                    if !own.is_empty() {
+                                        // Their scopes (subscribed: a
+                                        // table's scope may grow later).
+                                        for &a in &own {
+                                            self.engine.subscribe_side(SideKey::Table(a), user);
+                                            let sc = self.engine.cell(CellKey::TableScope { abs: a });
+                                            let v = self.engine.read(sc, user);
+                                            self.bind_this_value(at, f, cx, v);
+                                        }
+                                    } else if let Some(&recv) = args.first() {
                                         self.bind_this(at, f, cx, recv, false);
                                     }
                                     self.bind_args(at, f, cx, &args, 1);
@@ -889,6 +929,10 @@ impl Solver<'_> {
             self.engine.fire_side(SideKey::Table(a));
         }
         if let Some(c) = self.heap[a].class {
+            let tables = self.class_tables.entry(c).or_default();
+            if !tables.contains(&a) {
+                tables.push(a);
+            }
             let ce = self.class_table_members.entry(c).or_default();
             let mut grew = false;
             for &f in ids {

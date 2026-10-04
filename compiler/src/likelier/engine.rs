@@ -111,6 +111,13 @@ pub enum CellKey {
         abs: AbsId,
         arg: FormalIndex,
     },
+    /// What a fn table's elements hold besides its functions: the scope a
+    /// `[handler, scope]` pair registers beside its handler. A dispatch
+    /// `t[0].call(t[1], ...)` binds each table's members' `this` to their
+    /// own table's scope (`TABLE_SCOPES`).
+    TableScope {
+        abs: AbsId,
+    },
 }
 
 /// Context-relative cell reference inside a constraint. Constraint identity
@@ -145,6 +152,10 @@ pub enum Constraint {
         dst: CKey,
         pc: Pc,
         callee_pos: bool,
+        /// An element read's key (`name` is `[]`): where its value is
+        /// only string constants that are not indexes, the read is the
+        /// named read of each (`TypeSet::const_names`).
+        key: Option<CKey>,
     },
     /// receiver.name <- src (heap semantics).
     Write {
@@ -152,6 +163,8 @@ pub enum Constraint {
         name: NameId,
         src: CKey,
         pc: Pc,
+        /// An element write's key, as `Read::key`.
+        key: Option<CKey>,
     },
     /// Call binding. `args` resolve against the caller's ctx
     /// (Rc: constraints are cloned per eval; a Vec here allocated on the

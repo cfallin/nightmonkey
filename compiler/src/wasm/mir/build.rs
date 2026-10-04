@@ -183,6 +183,10 @@ impl Ty {
 /// am3 gains 17%); property reads and call results often hold doubles
 /// the claim does not flag (raytrace's vectors), and an exit per double
 /// costs far more than the ToInt32s int-first saves.
+/// An element access whose key MIR knows is a non-index string constant is
+/// built as the property access of that name.
+const CONST_KEY_PROPS: bool = true;
+
 const SPECULATE_INT_FIRST: bool = true;
 
 /// Whether a dense element load's miss (a hole, out of bounds) exits
@@ -2931,7 +2935,228 @@ impl<'s, 'a> Run<'s, 'a> {
     /// runtime's accessor-call cache (`accessor.probe`), the getter it
     /// finds called with `recv` as `this` (directly, where the site
     /// resolves it); any other receiver reads through the IC.
-    fn accessor_get(&mut self, pc: Pc, a: mir::entity::AtomId, recv: Slot) -> bool {
+    /// The name a property key slot is, where MIR knows it is one string
+    /// constant that is not an array index. (An index string named so would
+    /// be right too, the engine canonicalizing its key; it is left to the
+    /// element paths, which are faster for it.)
+    fn const_key_atom(&self, key: Slot) -> Option<mir::entity::AtomId> {
+        // Through the boxing a local's store adds.
+        let mut v = key.v;
+        let a = loop {
+            if let MType::Str(info) = self.f.ty(v) {
+                if let Some(a) = info.atom {
+                    break a;
+                }
+            }
+            match self.f.values[v].def {
+                mir::func::ValueDef::Result(i, 0) => match self.f.insts[i].op {
+                    Opcode::Box | Opcode::Weaken => v = self.f.insts[i].args[0],
+                    Opcode::ConstStr(a) => break a,
+                    _ => return None,
+                },
+                _ => return None,
+            }
+        };
+        (!crate::likelier::types::is_index_name(self.mm.atoms[a].chars())).then_some(a)
+    }
+
+    /// `GetProp` of name `a` off `recv` at `pc` (`next` its successor): an
+    /// element read whose key is a string constant builds this too.
+    fn get_prop_op(&mut self, pc: Pc, next: Pc, a: mir::entity::AtomId, recv: Slot) -> R<()> {
+        // The elided arguments object's length: the actual count.
+        if self.s.args_reads.as_ref().is_some_and(|r| r.contains(&pc)) {
+            let n = self.inst(Opcode::ArgsLength, vec![], Some(MType::i32_range(0, i64::from(i32::MAX))));
+            self.push(n, Ty::I32);
+            return Ok(());
+        }
+        // A typed array's length: its length slot.
+        if let (Ty::Ta(_), true) = (recv.ty, LENGTH_TA) {
+            if self.mm.atoms[a].chars() == "length".encode_utf16().collect::<Vec<u16>>().as_slice() {
+                let n = self.inst(Opcode::LengthTa, vec![recv.v], Some(MType::i32_range(0, i64::from(i32::MAX))));
+                self.push(n, Ty::I32);
+                return Ok(());
+            }
+        }
+        if self.mm.atoms[a].chars() == "length".encode_utf16().collect::<Vec<u16>>().as_slice()
+            && self.length_op(recv)
+        {
+            return Ok(());
+        }
+        if self.ctor_get(next, a, recv) {
+            return Ok(());
+        }
+        if self.accessor_get(pc, next, a, recv) {
+            return Ok(());
+        }
+        if self.method_get(next, a, recv) {
+            return Ok(());
+        }
+        let site = self
+            .typed_site(pc, a)
+            .or_else(|| self.hinted_site(recv.v, a))
+            .or_else(|| self.named_site(recv, a));
+        if let Some((o, site)) = site.and_then(|site| self.proven_recv(recv, &site)) {
+            let r = self
+                .js_dirty_exits(Opcode::LoadField(a), vec![o], Some(site.claim_ty()), next, None)
+                .unwrap();
+            let r = self.weaken(r, MType::VAL_TOP);
+            self.push(r, Ty::Val(TagSet::ALL));
+            self.guard_result(site.claim, next, false);
+        } else if let Some(site) = site {
+            // The predicted layout: guard the receiver's class
+            // locally, then load the field (§4.3). A receiver of
+            // another layout reads through the IC instead of
+            // exiting: a prediction that is wrong for some receivers
+            // must not send the rest of the activation to baseline
+            // every time. The claim is guarded after the join. The
+            // IC arm keeps facts, a kill exiting; where it cannot,
+            // it is a fence, and `Obj` slots meet as `ObjHint`.
+            // A data read (`getprop.data`) kills nothing; a generic
+            // one fences.
+            let data = self.data_get_ok(a);
+            if !data {
+                self.demote_for_generic_arm(1);
+            }
+            let x = self.boxed(recv);
+            let join = self.new_block();
+            let jr = self.f.add_param(join, MType::VAL_TOP);
+            let generic = self.new_block();
+            let o = self.guard_layout_or(x, &site, generic);
+            let r = self
+                .js_dirty_exits(Opcode::LoadField(a), vec![o], Some(site.claim_ty()), next, None)
+                .unwrap();
+            let r = self.weaken(r, MType::VAL_TOP);
+            self.term(
+                Opcode::Jump,
+                vec![],
+                vec![Edge {
+                    block: join,
+                    args: vec![EdgeArg::Value(r)],
+                }],
+            );
+            self.at(generic);
+            let r = if data {
+                self.data_get(a, x)
+            } else {
+                self.js(Opcode::JsGetProp(a), vec![x], MType::VAL_TOP)
+            };
+            self.term(
+                Opcode::Jump,
+                vec![],
+                vec![Edge {
+                    block: join,
+                    args: vec![EdgeArg::Value(r)],
+                }],
+            );
+            self.at(join);
+            self.push(jr, Ty::Val(TagSet::ALL));
+            self.guard_result(site.claim, next, false);
+        } else {
+            let x = self.boxed(recv);
+            let r = if self.data_get_ok(a) {
+                self.data_get(a, x)
+            } else {
+                self.js(Opcode::JsGetProp(a), vec![x], MType::VAL_TOP)
+            };
+            // `Math.<fn>`, for a typed call (`math_call`).
+            if self.gname_vals.get(&recv.v).is_some_and(|&g| self.atom_is(g, "Math")) {
+                if let Some(m) = math_fn_named(&std::string::String::from_utf16_lossy(self.mm.atoms[a].chars())) {
+                    self.math_fns.insert(r, m);
+                }
+            }
+            self.push(r, Ty::Val(TagSet::ALL));
+            let claim = self.s.ctx.facts.field_sites.get(&self.site(pc)).copied();
+            self.guard_result(claim.unwrap_or_default(), next, false);
+        }
+        Ok(())
+    }
+
+    /// `SetProp` (`strict`: `StrictSetProp`) of `v` into name `a` of
+    /// `recv` at `pc` (`next` its successor), the value pushed back: an
+    /// element write whose key is a string constant builds this too.
+    fn set_prop_op(&mut self, pc: Pc, next: Pc, a: mir::entity::AtomId, recv: Slot, v: Slot, strict: bool) {
+        if self.ctor_set(next, a, recv, v) {
+            self.repush(v);
+            return;
+        }
+        if self.accessor_set(pc, a, recv, v, strict) {
+            self.repush(v);
+            return;
+        }
+        self.store_mask = self.field_claim(pc, a, recv);
+        // A field of the predicted layout: a value of its predicted
+        // type (statically) keeps TYPES as a typed store; another
+        // goes through the IC, whose store keeps the bit by the
+        // value's tag or leaves it to the engine, which clears it.
+        // A value not statically of the field's type still stores
+        // to the slot, as a store without the TYPES claim: its
+        // lowering keeps the bit by the value's tag, or leaves the
+        // store to the engine, which clears it.
+        let vtags = v.ty.tags();
+        let site = self
+            .typed_site(pc, a)
+            .or_else(|| self.hinted_site(recv.v, a))
+            .or_else(|| self.named_site(recv, a))
+            .map(|mut s| {
+            s.types &= vtags.is_nonempty_subset_of(s.store_tags);
+            s
+        });
+        let proven = site.and_then(|site| self.proven_recv(recv, &site));
+        // The IC arm of an unproven typed store keeps facts, a kill
+        // exiting; where it cannot, it is a fence the two arms meet
+        // after: `Obj` slots (and the value, pushed back after it)
+        // go in as `ObjHint`.
+        let v = if site.is_some() && proven.is_none() {
+            self.demote_value_for_generic_arm(v)
+        } else {
+            v
+        };
+        match site {
+            Some(_) if proven.is_some() => {
+                let (mut o, site) = proven.unwrap();
+                if !site.types {
+                    // Its TYPES claim is not the store's to keep.
+                    if let MType::Obj(mut info) = self.f.ty(o) {
+                        if let Some(c) = info.layout.as_mut() {
+                            c.types = false;
+                        }
+                        o = self.weaken(o, MType::Obj(info));
+                    }
+                }
+                let mut x = self.boxed(v);
+                if site.types {
+                    x = self.weaken(x, MType::val(site.store_tags));
+                }
+                self.js_dirty_exits(Opcode::StoreField(a), vec![o, x], None, next, Some(v));
+            }
+            Some(site) => {
+                // As for a typed read: another layout's receiver
+                // stores through the IC rather than exiting.
+                let r = self.boxed(recv);
+                let join = self.new_block();
+                let generic = self.new_block();
+                let o = self.guard_layout_or(r, &site, generic);
+                let mut x = self.boxed(v);
+                if site.types {
+                    x = self.weaken(x, MType::val(site.store_tags));
+                }
+                self.js_dirty_exits(Opcode::StoreField(a), vec![o, x], None, next, Some(v));
+                self.term(Opcode::Jump, vec![], vec![Self::goto(join)]);
+                self.at(generic);
+                let y = self.boxed(v);
+                self.set_prop(a, strict, r, y, v);
+                self.term(Opcode::Jump, vec![], vec![Self::goto(join)]);
+                self.at(join);
+            }
+            None => {
+                let (x, y) = (self.boxed(recv), self.boxed(v));
+                self.set_prop(a, strict, x, y, v);
+            }
+        }
+        self.repush(v);
+    }
+
+    fn accessor_get(&mut self, pc: Pc, next: Pc, a: mir::entity::AtomId, recv: Slot) -> bool {
         let Some(target) = self.accessor_site(pc, a, false) else {
             return false;
         };
@@ -2939,7 +3164,7 @@ impl<'s, 'a> Run<'s, 'a> {
         let r = self.accessor_call(a, false, target, vec![x], MType::VAL_TOP, Opcode::JsGetProp(a));
         self.push(r, Ty::Val(TagSet::ALL));
         let claim = self.s.ctx.facts.field_sites.get(&self.site(pc)).copied();
-        self.guard_result(claim.unwrap_or_default(), pc + JSOp::GetProp.len(), false);
+        self.guard_result(claim.unwrap_or_default(), next, false);
         true
     }
 
@@ -6279,195 +6504,13 @@ impl<'s, 'a> Run<'s, 'a> {
             GetProp => {
                 let a = self.atom(p.next_uint32().unwrap())?;
                 let recv = self.pop();
-                // The elided arguments object's length: the actual count.
-                if self.s.args_reads.as_ref().is_some_and(|r| r.contains(&pc)) {
-                    let n = self.inst(Opcode::ArgsLength, vec![], Some(MType::i32_range(0, i64::from(i32::MAX))));
-                    self.push(n, Ty::I32);
-                    return Ok(());
-                }
-                // A typed array's length: its length slot.
-                if let (Ty::Ta(_), true) = (recv.ty, LENGTH_TA) {
-                    if self.mm.atoms[a].chars() == "length".encode_utf16().collect::<Vec<u16>>().as_slice() {
-                        let n = self.inst(Opcode::LengthTa, vec![recv.v], Some(MType::i32_range(0, i64::from(i32::MAX))));
-                        self.push(n, Ty::I32);
-                        return Ok(());
-                    }
-                }
-                if self.mm.atoms[a].chars() == "length".encode_utf16().collect::<Vec<u16>>().as_slice()
-                    && self.length_op(recv)
-                {
-                    return Ok(());
-                }
-                if self.ctor_get(pc + op.len(), a, recv) {
-                    return Ok(());
-                }
-                if self.accessor_get(pc, a, recv) {
-                    return Ok(());
-                }
-                if self.method_get(pc + op.len(), a, recv) {
-                    return Ok(());
-                }
-                let site = self
-                    .typed_site(pc, a)
-                    .or_else(|| self.hinted_site(recv.v, a))
-                    .or_else(|| self.named_site(recv, a));
-                if let Some((o, site)) = site.and_then(|site| self.proven_recv(recv, &site)) {
-                    let r = self
-                        .js_dirty_exits(Opcode::LoadField(a), vec![o], Some(site.claim_ty()), pc + op.len(), None)
-                        .unwrap();
-                    let r = self.weaken(r, MType::VAL_TOP);
-                    self.push(r, Ty::Val(TagSet::ALL));
-                    self.guard_result(site.claim, pc + op.len(), false);
-                } else if let Some(site) = site {
-                    // The predicted layout: guard the receiver's class
-                    // locally, then load the field (§4.3). A receiver of
-                    // another layout reads through the IC instead of
-                    // exiting: a prediction that is wrong for some receivers
-                    // must not send the rest of the activation to baseline
-                    // every time. The claim is guarded after the join. The
-                    // IC arm keeps facts, a kill exiting; where it cannot,
-                    // it is a fence, and `Obj` slots meet as `ObjHint`.
-                    // A data read (`getprop.data`) kills nothing; a generic
-                    // one fences.
-                    let data = self.data_get_ok(a);
-                    if !data {
-                        self.demote_for_generic_arm(1);
-                    }
-                    let x = self.boxed(recv);
-                    let join = self.new_block();
-                    let jr = self.f.add_param(join, MType::VAL_TOP);
-                    let generic = self.new_block();
-                    let o = self.guard_layout_or(x, &site, generic);
-                    let r = self
-                        .js_dirty_exits(Opcode::LoadField(a), vec![o], Some(site.claim_ty()), pc + op.len(), None)
-                        .unwrap();
-                    let r = self.weaken(r, MType::VAL_TOP);
-                    self.term(
-                        Opcode::Jump,
-                        vec![],
-                        vec![Edge {
-                            block: join,
-                            args: vec![EdgeArg::Value(r)],
-                        }],
-                    );
-                    self.at(generic);
-                    let r = if data {
-                        self.data_get(a, x)
-                    } else {
-                        self.js(Opcode::JsGetProp(a), vec![x], MType::VAL_TOP)
-                    };
-                    self.term(
-                        Opcode::Jump,
-                        vec![],
-                        vec![Edge {
-                            block: join,
-                            args: vec![EdgeArg::Value(r)],
-                        }],
-                    );
-                    self.at(join);
-                    self.push(jr, Ty::Val(TagSet::ALL));
-                    self.guard_result(site.claim, pc + op.len(), false);
-                } else {
-                    let x = self.boxed(recv);
-                    let r = if self.data_get_ok(a) {
-                        self.data_get(a, x)
-                    } else {
-                        self.js(Opcode::JsGetProp(a), vec![x], MType::VAL_TOP)
-                    };
-                    // `Math.<fn>`, for a typed call (`math_call`).
-                    if self.gname_vals.get(&recv.v).is_some_and(|&g| self.atom_is(g, "Math")) {
-                        if let Some(m) = math_fn_named(&std::string::String::from_utf16_lossy(self.mm.atoms[a].chars())) {
-                            self.math_fns.insert(r, m);
-                        }
-                    }
-                    self.push(r, Ty::Val(TagSet::ALL));
-                    let claim = self.s.ctx.facts.field_sites.get(&self.site(pc)).copied();
-                    self.guard_result(claim.unwrap_or_default(), pc + op.len(), false);
-                }
+                self.get_prop_op(pc, pc + op.len(), a, recv)?;
             }
             SetProp | StrictSetProp => {
                 let a = self.atom(p.next_uint32().unwrap())?;
                 let v = self.pop();
                 let recv = self.pop();
-                if self.ctor_set(pc + op.len(), a, recv, v) {
-                    self.repush(v);
-                    return Ok(());
-                }
-                if self.accessor_set(pc, a, recv, v, op == StrictSetProp) {
-                    self.repush(v);
-                    return Ok(());
-                }
-                self.store_mask = self.field_claim(pc, a, recv);
-                // A field of the predicted layout: a value of its predicted
-                // type (statically) keeps TYPES as a typed store; another
-                // goes through the IC, whose store keeps the bit by the
-                // value's tag or leaves it to the engine, which clears it.
-                // A value not statically of the field's type still stores
-                // to the slot, as a store without the TYPES claim: its
-                // lowering keeps the bit by the value's tag, or leaves the
-                // store to the engine, which clears it.
-                let vtags = v.ty.tags();
-                let site = self
-                    .typed_site(pc, a)
-                    .or_else(|| self.hinted_site(recv.v, a))
-                    .or_else(|| self.named_site(recv, a))
-                    .map(|mut s| {
-                    s.types &= vtags.is_nonempty_subset_of(s.store_tags);
-                    s
-                });
-                let proven = site.and_then(|site| self.proven_recv(recv, &site));
-                // The IC arm of an unproven typed store keeps facts, a kill
-                // exiting; where it cannot, it is a fence the two arms meet
-                // after: `Obj` slots (and the value, pushed back after it)
-                // go in as `ObjHint`.
-                let v = if site.is_some() && proven.is_none() {
-                    self.demote_value_for_generic_arm(v)
-                } else {
-                    v
-                };
-                match site {
-                    Some(_) if proven.is_some() => {
-                        let (mut o, site) = proven.unwrap();
-                        if !site.types {
-                            // Its TYPES claim is not the store's to keep.
-                            if let MType::Obj(mut info) = self.f.ty(o) {
-                                if let Some(c) = info.layout.as_mut() {
-                                    c.types = false;
-                                }
-                                o = self.weaken(o, MType::Obj(info));
-                            }
-                        }
-                        let mut x = self.boxed(v);
-                        if site.types {
-                            x = self.weaken(x, MType::val(site.store_tags));
-                        }
-                        self.js_dirty_exits(Opcode::StoreField(a), vec![o, x], None, pc + op.len(), Some(v));
-                    }
-                    Some(site) => {
-                        // As for a typed read: another layout's receiver
-                        // stores through the IC rather than exiting.
-                        let r = self.boxed(recv);
-                        let join = self.new_block();
-                        let generic = self.new_block();
-                        let o = self.guard_layout_or(r, &site, generic);
-                        let mut x = self.boxed(v);
-                        if site.types {
-                            x = self.weaken(x, MType::val(site.store_tags));
-                        }
-                        self.js_dirty_exits(Opcode::StoreField(a), vec![o, x], None, pc + op.len(), Some(v));
-                        self.term(Opcode::Jump, vec![], vec![Self::goto(join)]);
-                        self.at(generic);
-                        let y = self.boxed(v);
-                        self.set_prop(a, op == StrictSetProp, r, y, v);
-                        self.term(Opcode::Jump, vec![], vec![Self::goto(join)]);
-                        self.at(join);
-                    }
-                    None => {
-                        let (x, y) = (self.boxed(recv), self.boxed(v));
-                        self.set_prop(a, op == StrictSetProp, x, y, v);
-                    }
-                }
-                self.repush(v);
+                self.set_prop_op(pc, pc + op.len(), a, recv, v, op == StrictSetProp);
             }
             GetElem if self.s.args_reads.as_ref().is_some_and(|r| r.contains(&pc)) => {
                 // An element of the elided arguments object: an int32 index
@@ -6495,6 +6538,13 @@ impl<'s, 'a> Run<'s, 'a> {
                 self.pop();
                 let v = self.inst(Opcode::ActualArg, vec![ki], Some(MType::VAL_TOP));
                 self.push(v, Ty::Val(TagSet::ALL));
+            }
+            GetElem if CONST_KEY_PROPS && self.st.last().and_then(|k| self.const_key_atom(*k)).is_some() => {
+                // `o["name"]` (a key MIR knows is that string): `o.name`.
+                let key = self.pop();
+                let a = self.const_key_atom(key).unwrap();
+                let recv = self.pop();
+                self.get_prop_op(pc, pc + op.len(), a, recv)?;
             }
             GetElem => {
                 self.ta_poly_site = TA_POLY && self.s.ctx.facts.elem_poly_sites.contains(&self.site(pc));
@@ -6616,6 +6666,18 @@ impl<'s, 'a> Run<'s, 'a> {
                 self.push(r, Ty::Val(TagSet::ALL));
                 let claim = self.s.ctx.facts.elem_sites.get(&self.site(pc)).copied();
                 self.guard_result(claim.unwrap_or_default(), pc + op.len(), true);
+            }
+            SetElem | StrictSetElem
+                if CONST_KEY_PROPS
+                    && self.st.len() >= 2
+                    && self.const_key_atom(self.st[self.st.len() - 2]).is_some() =>
+            {
+                // `o["name"] = v`: `o.name = v`.
+                let v = self.pop();
+                let key = self.pop();
+                let a = self.const_key_atom(key).unwrap();
+                let recv = self.pop();
+                self.set_prop_op(pc, pc + op.len(), a, recv, v, op == StrictSetElem);
             }
             SetElem | StrictSetElem => {
                 self.ta_poly_site = TA_POLY && self.s.ctx.facts.elem_poly_sites.contains(&self.site(pc));
