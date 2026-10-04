@@ -4038,6 +4038,23 @@ bool night_runtime_get_element(JSContext* cx, uint32_t top, uint64_t recv,
   return true;
 }
 
+// The elem key namespace's word for an element store whose rows the set
+// paths may cache: an atom (non-index) key on a native receiver that is not
+// the active global (whose stores blow fuses); 0 otherwise.
+static uint32_t ElemAtomKey(uint64_t recv, uint64_t key) {
+  JS::Value rv = JS::Value::fromRawBits(recv);
+  JS::Value kv = JS::Value::fromRawBits(key);
+  uint32_t idx;
+  if (!rv.isObject() || !rv.toObject().is<js::NativeObject>() ||
+      IsActiveGlobal(&rv.toObject()) || !kv.isString() ||
+      !kv.toString()->isAtom() || kv.toString()->asAtom().isIndex(&idx)) {
+    return 0;
+  }
+  uint32_t k =
+      uint32_t(reinterpret_cast<uintptr_t>(&kv.toString()->asAtom())) | 1u;
+  return k > gNames.atoms.size() ? k : 0;
+}
+
 bool night_runtime_set_element(JSContext* cx, uint32_t top, uint64_t recv,
                                uint64_t key, uint64_t val, uint32_t strict) {
   SetNightTop(cx, top);
@@ -4129,6 +4146,24 @@ bool night_runtime_set_element(JSContext* cx, uint32_t top, uint64_t recv,
       }
     }
   }
+  // An atom key's add (`props[name] = v` on an object being filled): the
+  // global add table's row for (shape, atomPtr | 1) -- the elem key
+  // namespace, as the elem-mega rows -- replays the transition with no
+  // lookup. Filled below from the generic set.
+  uint32_t addKey = ElemAtomKey(recv, key);
+  if (addKey) {
+    js::NativeObject* nobj =
+        &JS::Value::fromRawBits(recv).toObject().as<js::NativeObject>();
+    uint32_t shapeW = js::night::NightObjectShape(nobj);
+    SetAddRow& trow = SetAddAt(shapeW, addKey);
+    if (trow.gen == InlineGen() && trow.oldShape == shapeW &&
+        trow.atomId == addKey && !trow.skip &&
+        js::night::NightTryAddPropTransition(
+            cx, recv, trow.oldShape, trow.newShape, trow.slot, trow.protoPtrs,
+            trow.protoShapes, trow.numProtos, val)) {
+      return true;
+    }
+  }
   JS::RootedObject obj(cx, ReceiverObject(cx, recv));
   if (!obj) {
     return false;
@@ -4144,8 +4179,36 @@ bool night_runtime_set_element(JSContext* cx, uint32_t top, uint64_t recv,
     BlowGnameFuseKey(id);
     BlowBindingFuseKey(id);
   }
+  uint32_t shapeBefore = js::night::NightObjectShape(obj);
+  uint32_t spanBefore = js::night::NightObjectSlotSpanIfShared(obj);
   if (!GenericSetWithStrict(cx, obj, id, val, recv, strict)) {
     return false;
+  }
+  if (addKey && js::night::NightObjectShape(obj) != shapeBefore) {
+    // The set added the property: cache the transition (a GC during the
+    // set may have moved the old shape; the row then never hits, and the
+    // major-GC generation retires it).
+    uint32_t newShape, slot, protoPtrs[4], protoShapes[4], numProtos;
+    bool nurseryProto = false;
+    bool skip = false;
+    if (js::night::NightPopulateAddTransition(
+            cx, obj, id, spanBefore, &newShape, &slot, protoPtrs, protoShapes,
+            &numProtos, &nurseryProto, &skip) &&
+        !nurseryProto && !skip) {
+      SetAddRow& trow = SetAddAt(shapeBefore, addKey);
+      trow.gen = InlineGen();
+      trow.oldShape = shapeBefore;
+      trow.atomId = addKey;
+      trow.newShape = newShape;
+      trow.slot = slot;
+      trow.skip = skip;
+      trow.numProtos = numProtos;
+      for (uint32_t i = 0; i < 4; i++) {
+        trow.protoPtrs[i] = i < numProtos ? protoPtrs[i] : 0;
+        trow.protoShapes[i] = i < numProtos ? protoShapes[i] : 0;
+      }
+    }
+    return true;
   }
   // Elem-mega fill, the write-side twin of the get_element fill: an
   // atom-string key whose store landed on a writable plain data slot gets a
