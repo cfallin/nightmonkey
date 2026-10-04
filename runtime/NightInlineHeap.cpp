@@ -11,6 +11,8 @@
  */
 
 #include "runtime/NightInlineHeap.h"
+
+#include "runtime/NightContext.h"
 #include "builtin/MapObject.h"
 #include "vm/Iteration.h"
 #include "vm/StringType.h"
@@ -71,6 +73,10 @@ namespace night {
 
 // --- JSObject / NativeObject header ---------------------------------------
 static_assert(offsetof(JS::shadow::Object, shape) == 0, "SHAPE_OFFSET");
+static_assert(JSContext::offsetOfExternalCompilerState() == 144,
+              "CX_EXT_STATE_OFFSET");
+static_assert(offsetof(js::nightrt::NightContextState, propIcBase) == 0,
+              "CTX_PROPIC_BASE_OFFSET");
 static_assert(offsetof(JS::shadow::Object, externalWord_) == 4,
               "OBJ_CLASS_IDX_OFFSET (the night stamp word)");
 static_assert(JSObject::offsetOfExternalWord() == 4,

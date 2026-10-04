@@ -295,8 +295,17 @@ entry points with no context argument use the engine's current context
 (`js::TlsContext`). Still process-global: the registration block and its
 roots and digest (the wire format the tool finds through the
 `night.registration` export), the activation flag, the snapshot extras
-(`gShMirror`, `gWizening`), the in-process option string, and the engine's
-stamp epoch.
+(`gShMirror`, `gWizening`), and the in-process option string. The stamp
+epoch is a `NightRuntimeState` field too, its address published in the
+strlit block as before.
+
+Compiled code still addresses the linear-memory regions (prop-IC ways,
+caches, cells, the strlit block, global slots) by absolute addresses the
+translator bakes in. A per-function base loaded from the context
+(`IC_BASE_FROM_CX` in wasm/mir/lower.rs, prototyped on the prop-IC ways
+through `JSContext::offsetOfExternalCompilerState` and
+`NightContextState::propIcBase`) cost react 5% and box2d, deltablue,
+earley-boyer and raytrace 2-4%; it is off, pending the owner's call.
 
 ## 10. Generators, async, exceptions, and regexps
 

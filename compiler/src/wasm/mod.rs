@@ -2277,7 +2277,17 @@ pub fn translate_all(
     )? as usize;
     // Prop-IC way/row consts were emitted with the layout base already baked
     // (a no-op re-patch there); re-anchor them to the served region base.
-    patch_const(m, prop_ic_patches, u32::try_from(prop_ic_base).unwrap(), 1);
+    // A relative patch (MIR's, `abi::IC_PATCH_RELATIVE`) is the site's
+    // offset from the base its function loads from the context.
+    let (rel, abs): (Vec<_>, Vec<_>) = prop_ic_patches
+        .into_iter()
+        .partition(|&(_, _, off)| off & crate::wasm::mir::abi::IC_PATCH_RELATIVE != 0);
+    let rel = rel
+        .into_iter()
+        .map(|(f, v, off)| (f, v, off & !crate::wasm::mir::abi::IC_PATCH_RELATIVE))
+        .collect();
+    patch_const(m, rel, 0, 1);
+    patch_const(m, abs, u32::try_from(prop_ic_base).unwrap(), 1);
     // Callee value-cell region: one 16-byte row per inline-classify site (plus
     // the shared trash row 0 nursery-callee stores divert to), right after the
     // prop-IC ways. Its base is only known now (the prop-IC size is a

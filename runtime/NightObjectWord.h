@@ -29,8 +29,10 @@ namespace js {
 // full clears). Fresh-object stamping does not advance it. An unchanged
 // epoch across a call proves every stamp-guarded fact the caller held still
 // holds; compiled census builds advance it through the census helper for
-// the inline demote arms.
-extern uint64_t gNightStampEpoch;
+// the inline demote arms. Per context (NightRuntime.cpp's state; compiled
+// code reads it through the address published at install): this advances
+// the current context's, and reports the bump (NightNoteEpochBump).
+void NightBumpStampEpoch(uint32_t site, uint32_t oldWord);
 
 // Bump-site census hook: called on every ACTUAL epoch bump with the path
 // that performed it and the class word being demoted. Records into the
@@ -97,8 +99,7 @@ static constexpr uint32_t kStoreNonNumberClearMask = kWordTypes;
 // `demote_delta` exactly.
 inline void NightNoteDemotion(uint32_t oldWord, uint32_t site) {
   if (!(oldWord & kWordConstructing)) {
-    gNightStampEpoch++;
-    NightNoteEpochBump(site, oldWord);
+    NightBumpStampEpoch(site, oldWord);
   }
 }
 
@@ -148,8 +149,7 @@ inline void NightSetConstructingSentinel(JSObject* obj) {
 inline void NightSetClassWord(JSObject* obj, uint32_t w, uint32_t site = 0) {
   uint32_t old = obj->externalWord();
   if (old != 0 && !(old & kWordConstructing) && old != w) {
-    gNightStampEpoch++;
-    NightNoteEpochBump(site, old);
+    NightBumpStampEpoch(site, old);
   }
   obj->setExternalWord(w);
 }

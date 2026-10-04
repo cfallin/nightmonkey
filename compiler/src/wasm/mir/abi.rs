@@ -354,6 +354,14 @@ pub(super) use crate::region_shape::INLINE_IC_TRANS_BYTES as IC_TRANS_ROW_BYTES;
 pub(super) const INLINE_IC_STRIDE: u32 = IC_TRANS_ROW_OFF + IC_TRANS_ROW_BYTES;
 const _: () = assert!(INLINE_IC_STRIDE == crate::region_shape::INLINE_IC_STRIDE);
 pub(crate) const IC_WAY_ADDR_PLACEHOLDER: u32 = 0xDEAD_C200;
+/// `JSContext::offsetOfExternalCompilerState()`: where compiled code finds
+/// the tier's per-context state (`NightContextState`) from its context.
+pub(crate) const CX_EXT_STATE_OFFSET: u32 = 144;
+/// `NightContextState::propIcBase`: the property-IC region's base.
+pub(crate) const CTX_PROPIC_BASE_OFFSET: u32 = 0;
+/// A property-IC patch whose const is the site's offset from the region
+/// base (`ic_way`), not its address.
+pub(crate) const IC_PATCH_RELATIVE: u32 = 0x8000_0000;
 
 pub(crate) const IC_WAY_RECVSHAPE: u32 = 0;
 pub(crate) const IC_WAY_MONO_OFF: u32 = 4;

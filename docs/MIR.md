@@ -562,7 +562,7 @@ booleans, null/undefined and objects.
      - *Construction outside OPT.* Objects built by the interpreter,
        baseline or GEN never keep `TYPES`, because their initializing
        stores are generic.
-     - *Epoch churn.* Every clear bumps `gNightStampEpoch`, so callees
+     - *Epoch churn.* Every clear bumps the stamp epoch, so callees
        that run in baseline or GEN report dirty more often. Callers then take
        `ok_dirty` and re-guard, which is correct but costlier.
      - *`SLOTS` on value stores.* Clearing `SLOTS` on a plain value

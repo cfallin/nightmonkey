@@ -45,6 +45,11 @@ struct NightLeafMatch {
 };
 
 struct NightContextState {
+  // The property-IC region's base (NightEnvDesc::propicPtr), at offset 0:
+  // compiled code loads it from the state it reaches through its context
+  // (JSContext::offsetOfExternalCompilerState) and addresses each site's
+  // ways relative to it.
+  uint32_t propIcBase = 0;
   NightStack stack;
   NightLeafMatch leafMatch;
   js::night::NightRuntimeState* runtime = nullptr;

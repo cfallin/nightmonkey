@@ -342,6 +342,9 @@ struct NightState {
   size_t poppedWord = 1;
   // The MIR guard-failure stress mode's call count.
   uint32_t stressCount = 0;
+  // The stamp-invalidation epoch (NightObjectWord.h). Compiled code reads
+  // it through the address published in the strlit block.
+  uint64_t stampEpoch = 0;
 };
 static NightState& RtState(JSContext* cx);
 
@@ -1608,6 +1611,7 @@ bool night_runtime_install_env(JSContext* cx,
   // zero-initialized) and install the major-GC generation-bump callback. The
   // region stays all-zero (every way empty) until the miss helper populates it.
   RtState(cx).prevSliceCallback = JS::SetGCSliceCallback(cx, NightGcSliceCallback);
+  js::nightrt::NightStateOf(cx)->propIcBase = env.propicPtr;
   // Startup-written host constants the AOT'd module cannot embed (the merge
   // reserved u32 slots at +8/+12/+16; layout mirrored in wasm/mod.rs): the two
   // JSFunction class addresses for the inline callee classify's clasp
@@ -1728,7 +1732,7 @@ bool night_runtime_install_env(JSContext* cx,
       *LinMem<uint32_t>(RtState(cx).strLitBase +
                         js::night::Night_strlitStampEpochAddrOff) =
           static_cast<uint32_t>(
-              reinterpret_cast<uintptr_t>(&js::gNightStampEpoch));
+              reinterpret_cast<uintptr_t>(&RtState(cx).stampEpoch));
       // (Night_strlitBindEpochAddrOff is unused: nothing reads a binding
       // epoch since MIR re-tests a binding's fuse word instead.)
       *LinMem<uint32_t>(RtState(cx).strLitBase +
@@ -2678,9 +2682,10 @@ struct MissQuiet {
   uint64_t gc;
   uint64_t epoch;
   explicit MissQuiet(JSContext* cx)
-      : gc(cx->runtime()->gc.gcNumber()), epoch(js::gNightStampEpoch) {}
+      : gc(cx->runtime()->gc.gcNumber()), epoch(RtState(cx).stampEpoch) {}
   bool still(JSContext* cx) const {
-    return cx->runtime()->gc.gcNumber() == gc && js::gNightStampEpoch == epoch;
+    return cx->runtime()->gc.gcNumber() == gc &&
+           RtState(cx).stampEpoch == epoch;
   }
 };
 
@@ -4719,13 +4724,6 @@ void NightCensusDump() {
 
 }  // namespace
 
-// This region is inside the file's `extern "C"` block; the epoch is
-// declared in runtime/NightObjectWord.h with C++ linkage.
-extern "C++" {
-namespace js {
-uint64_t gNightStampEpoch = 0;
-}  // namespace js
-}
 
 static js::night::NightRuntimeData& RtRegex(JSContext* cx);
 
@@ -4827,7 +4825,7 @@ static void NightCensusTrace(uint32_t kind, uint64_t id) {
     RtCensus(cx).trace--;
     fprintf(stderr, "night: trace kind %u id %llu epoch %llu\n", kind,
             (unsigned long long)id,
-            (unsigned long long)js::gNightStampEpoch);
+            (unsigned long long)RtState(cx).stampEpoch);
   }
 }
 
@@ -4847,7 +4845,7 @@ int32_t night_runtime_census(uint32_t kind, uint32_t id) {
   if (!RtCensus(cx).counts) {
     RtCensus(cx).counts = new std::map<uint64_t, uint64_t>();
     RtCensus(cx).depart = new std::vector<NightDepartCells>{
-        {kNightNoDepart, kNightNoDepart, false, js::gNightStampEpoch}};
+        {kNightNoDepart, kNightNoDepart, false, RtState(cx).stampEpoch}};
     atexit(NightCensusDump);
   }
   if (kind == 70) {
@@ -4864,13 +4862,13 @@ int32_t night_runtime_census(uint32_t kind, uint32_t id) {
   if (kind == 60) {
     if (RtCensus(cx).depart->size() < kNightDepartMaxDepth) {
       NightDepartCells c = RtCensus(cx).depart->back();
-      c.epochAtPush = js::gNightStampEpoch;
+      c.epochAtPush = RtState(cx).stampEpoch;
       RtCensus(cx).depart->push_back(c);
     }
   } else if (kind == 61) {
     if (RtCensus(cx).depart->size() > 1) {
       RtCensus(cx).lastCallIntact =
-          RtCensus(cx).depart->back().epochAtPush == js::gNightStampEpoch;
+          RtCensus(cx).depart->back().epochAtPush == RtState(cx).stampEpoch;
       RtCensus(cx).depart->pop_back();
     }
   } else if (kind == 65) {
@@ -4907,6 +4905,12 @@ int32_t night_runtime_census(uint32_t kind, uint32_t id) {
 // bump source and carry their own kind (65).
 extern "C++" {
 namespace js {
+void NightBumpStampEpoch(uint32_t site, uint32_t oldWord) {
+  JSContext* cx = CurrentNightContext();
+  RtState(cx).stampEpoch++;
+  NightNoteEpochBump(site, oldWord);
+}
+
 void NightNoteEpochBump(uint32_t site, uint32_t oldWord) {
   JSContext* cx = CurrentNightContext();
   if (!RtCensus(cx).counts) {

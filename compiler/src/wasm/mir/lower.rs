@@ -78,7 +78,7 @@ use crate::wasm::mir::abi::{
     CONSTRUCT_CELL_GEN, CONSTRUCT_CELL_PROTOPTR, CONSTRUCT_CELL_PROTOSLOTENC, NURSERY_HEADER_BYTES,
     CONSTRUCT_CELL_FINALSHAPE, CONSTRUCT_CELL_PROTOSHAPE, CONSTRUCT_CELL_PROTO2PTR, CONSTRUCT_CELL_PROTO2SHAPE,
     IC_WAY_HOLDERPTR, IC_WAY_MONO_OFF, IC_WAY_RECVSHAPE,
-    IC_WAY_ADDR_PLACEHOLDER, NATIVE_SLOTS_OFFSET, SHAPE_BASESHAPE_OFFSET, BASESHAPE_CLASP_OFFSET,
+    IC_WAY_ADDR_PLACEHOLDER, IC_PATCH_RELATIVE, NATIVE_SLOTS_OFFSET, SHAPE_BASESHAPE_OFFSET, BASESHAPE_CLASP_OFFSET,
     BASESCRIPT_NIGHTFUNCINDEX_OFFSET, FUNC_FLAGS_SLOT_OFFSET, FUNCTION_FLAGS_CONSTRUCTOR, FUNC_ENV_SLOT_OFFSET, FUNC_SCRIPT_SLOT_OFFSET,
     SHAPE_FIXED_SLOTS_MASK_BITS, SHAPE_FIXED_SLOTS_SHIFT, JSCONTEXT_REALM_OFFSET,
     REALM_GLOBAL_OFFSET, CHUNK_STORE_BUFFER_OFFSET, CMP_EQ, CMP_GE, CMP_GT, CMP_LE, CMP_LT, CMP_NE, CMP_STRICTEQ, CMP_STRICTNE,
@@ -193,6 +193,13 @@ pub(crate) fn native_math_index(name: &str) -> Option<u32> {
     })
 }
 
+
+/// Property-IC sites address their ways from a base the function loads
+/// from its context, not as patched absolute addresses (the per-context
+/// regions prototype, KICKOFF-10 workstream 2 step 3). Off: against the
+/// absolute form it cost react 5%, box2d 3.9%, deltablue 3.3%,
+/// earley-boyer 3.1%, raytrace 2.2% (2026-10-04), so the owner decides.
+const IC_BASE_FROM_CX: bool = false;
 
 /// `guard.unbox.f64num` branches on the tag, the double first, rather
 /// than converting both ways and selecting (`unbox_num_edges`).
@@ -467,6 +474,8 @@ struct Lower<'a> {
     body_off_patches: Vec<Value>,
     /// Property-IC way-address placeholders (`Outcome::Compiled::prop_ic_patches`).
     prop_ic_patches: Vec<(Value, u32)>,
+    /// The property-IC region base, once a site needs it (`ic_base`).
+    ic_base: Option<Value>,
     /// `instanceof` cell placeholders (`Outcome::Compiled::iof_cell_patches`).
     iof_cell_patches: Vec<(Value, u32)>,
     /// Construct cell placeholders (one cell per site).
@@ -663,6 +672,7 @@ pub fn lower<'a>(
         atoms,
         body_off_patches: vec![],
         prop_ic_patches: vec![],
+        ic_base: None,
         iof_cell_patches: vec![],
         construct_cell_patches: vec![],
         call_cell_patches: vec![],
@@ -885,6 +895,43 @@ impl<'a> Lower<'a> {
         let x = self.bin(Operator::I32Xor, last, self.vp, Type::I32);
         let size = self.i32c(1 << crate::region_shape::VALUE_STACK_LOG2);
         self.bin(Operator::I32LtU, x, size, Type::I32)
+    }
+
+    /// The address `off` bytes into the property-IC region (a site's ways
+    /// or add row). With `IC_BASE_FROM_CX`, the region base the function
+    /// loads once from its context's tier state (`ic_base`) plus `off`;
+    /// else the absolute address, patched in.
+    fn ic_addr(&mut self, off: u32) -> Value {
+        let c = self.i32c(IC_WAY_ADDR_PLACEHOLDER);
+        if !IC_BASE_FROM_CX {
+            self.prop_ic_patches.push((c, off));
+            return c;
+        }
+        self.prop_ic_patches.push((c, off | IC_PATCH_RELATIVE));
+        let base = self.ic_base();
+        self.bin(Operator::I32Add, base, c, Type::I32)
+    }
+
+    /// The property-IC region's base: two loads (the context's tier state,
+    /// then its `propIcBase`) at the head of the function's entry block,
+    /// made at the first site that needs it.
+    fn ic_base(&mut self) -> Value {
+        if let Some(b) = self.ic_base {
+            return b;
+        }
+        let m1 = self.mem(2, crate::wasm::mir::abi::CX_EXT_STATE_OFFSET);
+        let args = self.body.arg_pool.from_iter([self.cx].into_iter());
+        let ty = self.body.single_type_list(Type::I32);
+        let st = self.body.add_value(ValueDef::Operator(Operator::I32Load { memory: m1 }, args, ty));
+        let m2 = self.mem(2, crate::wasm::mir::abi::CTX_PROPIC_BASE_OFFSET);
+        let args = self.body.arg_pool.from_iter([st].into_iter());
+        let ty = self.body.single_type_list(Type::I32);
+        let b = self.body.add_value(ValueDef::Operator(Operator::I32Load { memory: m2 }, args, ty));
+        let entry = self.body.entry;
+        self.body.blocks[entry].insts.insert(0, b);
+        self.body.blocks[entry].insts.insert(0, st);
+        self.ic_base = Some(b);
+        b
     }
 
     /// `v`'s value where its type pins one int32 (as an i64: `-c` cannot
@@ -3306,8 +3353,7 @@ impl<'a> Lower<'a> {
                 // the runtime's pure lookup, failing where it would run
                 // code.
                 let cache = self.atoms.next_prop_cache();
-                let way_base = self.i32c(IC_WAY_ADDR_PLACEHOLDER);
-                self.prop_ic_patches.push((way_base, cache * INLINE_IC_STRIDE));
+                let way_base = self.ic_addr(cache * INLINE_IC_STRIDE);
                 let nm = String::from_utf16_lossy(self.mm.atoms[name].chars());
                 if nm == "charCodeAt" || nm == "charAt" {
                     // A string's pristine char method, while String.prototype
@@ -6168,8 +6214,7 @@ impl<'a> Lower<'a> {
     fn set_ic(&mut self, inst: mir::Inst, name: mir::entity::AtomId, recv: Value, val: Value, strict: bool) -> R<()> {
         let at = self.atom(name);
         let cache = self.atoms.next_prop_cache();
-        let way = self.i32c(IC_WAY_ADDR_PLACEHOLDER);
-        self.prop_ic_patches.push((way, cache * INLINE_IC_STRIDE));
+        let way = self.ic_addr(cache * INLINE_IC_STRIDE);
         let (trans, slow) = (self.body.add_block(), self.body.add_block());
         self.set_ic_ways(inst, at, recv, val, way, trans, slow)?;
         self.cur = trans;
@@ -6243,8 +6288,7 @@ impl<'a> Lower<'a> {
     fn set_ic_pure(&mut self, inst: mir::Inst, name: mir::entity::AtomId, recv: Value, val: Value) -> R<()> {
         let at = self.atom(name);
         let cache = self.atoms.next_prop_cache();
-        let way = self.i32c(IC_WAY_ADDR_PLACEHOLDER);
-        self.prop_ic_patches.push((way, cache * INLINE_IC_STRIDE));
+        let way = self.ic_addr(cache * INLINE_IC_STRIDE);
         let (trans, slow) = (self.body.add_block(), self.body.add_block());
         self.set_ic_ways(inst, at, recv, val, way, trans, slow)?;
         self.cur = trans;
@@ -6308,8 +6352,7 @@ impl<'a> Lower<'a> {
             return match val {
                 None => {
                     let cache = self.atoms.next_prop_cache();
-                    let way_base = self.i32c(IC_WAY_ADDR_PLACEHOLDER);
-                    self.prop_ic_patches.push((way_base, cache * INLINE_IC_STRIDE));
+                    let way_base = self.ic_addr(cache * INLINE_IC_STRIDE);
                     self.get_ic(inst, name, boxed, way_base, cache)
                 }
                 Some(v) => self.set_ic(inst, name, boxed, v, self.strict),
@@ -6419,8 +6462,7 @@ impl<'a> Lower<'a> {
             let wb = if w == 0 {
                 way0
             } else {
-                let v = self.i32c(IC_WAY_ADDR_PLACEHOLDER);
-                self.prop_ic_patches.push((v, way_off + w * INLINE_IC_WAY_BYTES));
+                let v = self.ic_addr(way_off + w * INLINE_IC_WAY_BYTES);
                 v
             };
             let wshape = self.load_i32(wb, IC_WAY_RECVSHAPE);
@@ -7243,8 +7285,7 @@ impl<'a> Lower<'a> {
         let num = matches!(self.ty(d.args[1]), MType::Val(s) if s.tags.subset_of(TagSet::NUMBER));
         let at = self.atom(name);
         let cache = self.atoms.next_prop_cache();
-        let way = self.i32c(IC_WAY_ADDR_PLACEHOLDER);
-        self.prop_ic_patches.push((way, cache * INLINE_IC_STRIDE));
+        let way = self.ic_addr(cache * INLINE_IC_STRIDE);
         let slow = self.body.add_block();
         let row = self.add_off(way, IC_TRANS_ROW_OFF);
         let shape = self.load_i32(obj, SHAPE_OFFSET);
@@ -8448,8 +8489,7 @@ impl<'a> Lower<'a> {
         let slow = self.body.add_block();
         let obj = self.un(Operator::I32WrapI64, objv, Type::I32);
         let shape = self.load_i32(obj, SHAPE_OFFSET);
-        let row = self.i32c(IC_WAY_ADDR_PLACEHOLDER);
-        self.prop_ic_patches.push((row, cache * INLINE_IC_STRIDE + IC_TRANS_ROW_OFF));
+        let row = self.ic_addr(cache * INLINE_IC_STRIDE + IC_TRANS_ROW_OFF);
         let old = self.load_i32(row, IC_TRANS_OLDSHAPE);
         let same = self.bin(Operator::I32Eq, old, shape, Type::I32);
         self.check(same, slow);
