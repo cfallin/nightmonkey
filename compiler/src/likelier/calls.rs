@@ -151,6 +151,8 @@ struct CallAt {
     user: (ConId, CtxId),
     /// Where the call's result goes, in the caller's frame.
     ret: super::engine::CKey,
+    /// The call's receiver, if it names one.
+    this_: Option<super::engine::CKey>,
 }
 
 impl Solver<'_> {
@@ -258,6 +260,19 @@ impl Solver<'_> {
     /// Raise the result of calling a callee that is not a script: a modeled
     /// native's spec mask, or unknown evidence for anything unmodeled.
     fn raise_builtin_ret(&mut self, at: CallAt, f: FnId, args: &[super::engine::CKey]) {
+        // A collection's `add`/`set`/`get`: the `ElemBuiltin` beside the
+        // call raises the result; the native's unmodeled one would only
+        // bury it in unknown evidence.
+        if let (Some(i), Some(t)) = (self.natives.get(f), at.this_) {
+            let name = self.names.get(i.name);
+            if ["add", "set", "get"].iter().any(|n| super::builtins::name_eq(name, n)) {
+                let tc = self.engine.resolve(at.script, at.ctx, t);
+                let tts = self.engine.read(tc, at.user);
+                if self.is_coll_recv(&tts) {
+                    return;
+                }
+            }
+        }
         let v = if f.native_index().is_some() {
             let ai = self.args_integral(at.script, at.ctx, args, at.user);
             self.native_ret(f, ai)
@@ -308,6 +323,7 @@ impl Solver<'_> {
                     ctx,
                     user,
                     ret,
+                    this_,
                 };
                 let c = self.engine.resolve(script, ctx, callee);
                 let cts = self.engine.read(c, user);
@@ -544,6 +560,7 @@ impl Solver<'_> {
                     ctx,
                     user,
                     ret,
+                    this_: args.first().copied(),
                 };
                 let t = self.engine.resolve(script, ctx, target);
                 let tts = self.engine.read(t, user);

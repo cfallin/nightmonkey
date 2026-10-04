@@ -75,6 +75,14 @@ pub enum CellKey {
         class: ClassId,
         name: NameId,
     },
+    /// A region's own field (keyed by a class that was its root when a
+    /// region-typed access first named it): the writes whose receiver is
+    /// known only to the region. Region reads see it and every member's
+    /// class view; no class-level read sees it (`region_field`).
+    RegionField {
+        class: ClassId,
+        name: NameId,
+    },
     /// Sentinel: raised (with a dummy bit) when the abstraction's proto
     /// link is installed, so chain-walking reads that dead-ended re-fire.
     ProtoSentinel(AbsId),
@@ -279,6 +287,15 @@ pub enum ElemBuiltinKind {
     Write,
     /// `pop`/`shift`: an element flows out into the result.
     Read,
+    /// `Set.prototype.add(v)` on a collection receiver: `v` into its
+    /// elements; the result is the receiver.
+    CollAdd,
+    /// `Map.prototype.set(k, v)` on a collection receiver: `v` into its
+    /// elements; the result is the receiver.
+    CollSet,
+    /// `Map.prototype.get(k)` on a collection receiver: an element, or
+    /// `undefined`.
+    CollGet,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -291,6 +308,10 @@ pub enum AllocKind {
     /// `new <TypedArray>()`, with the element kind the scanner read off
     /// the constructor name.
     TypedArray(crate::opsem::TaKind),
+    /// `new Map(..)`/`new WeakMap(..)` (`map`) or `new Set(..)`/`new
+    /// WeakSet(..)`: a collection, whose values the analysis keeps in its
+    /// `ELEMS` cell as it does an array's elements.
+    Collection { map: bool },
     /// Precompiled run-once literal (`JSOp::Object`): the transcribed
     /// source object it names, one ctx-free abstraction.
     Snapshot(SourceObjectId),

@@ -811,78 +811,6 @@ struct Op {
     op: JSOp,
 }
 
-/// Backward liveness of the frame slots before the operand stack: `this`
-/// (always live: the caller's frame), formals, locals and rval, per pc.
-fn liveness(script: &Script, nargs: u32, nlocals: u32) -> BTreeMap<Pc, Vec<bool>> {
-    let n = (2 + nargs + nlocals) as usize;
-    let rval = n - 1;
-    let succs = layout::successors(script);
-    // Each op's (uses, defs) over slot indices.
-    let effect = |pc: Pc, op: JSOp| -> (Option<usize>, Option<usize>) {
-        let mut p = script.parser();
-        p.advance(usize::try_from(pc.get()).unwrap() + 1)
-            .expect("op in range");
-        match op {
-            JSOp::GetLocal => (
-                Some(1 + nargs as usize + p.next_uint24().unwrap() as usize),
-                None,
-            ),
-            JSOp::SetLocal | JSOp::InitLexical => (
-                None,
-                Some(1 + nargs as usize + p.next_uint24().unwrap() as usize),
-            ),
-            JSOp::GetArg | JSOp::GetFrameArg => (Some(1 + usize::from(p.next_uint16().unwrap())), None),
-            JSOp::SetArg => (None, Some(1 + usize::from(p.next_uint16().unwrap()))),
-            JSOp::GetRval | JSOp::RetRval | JSOp::CheckReturn | JSOp::FinalYieldRval => (Some(rval), None),
-            JSOp::SetRval => (None, Some(rval)),
-            _ => (None, None),
-        }
-    };
-    // Exception edges: an op a catch or finally covers may throw to its
-    // handler, which baseline, resumed by an exit, can reach with the
-    // frame as the exit wrote it.
-    let handlers: Vec<(Pc, u32, Pc)> = script
-        .try_notes
-        .iter()
-        .filter(|t| matches!(t.kind, crate::bytecode::TryNoteKind::Catch | crate::bytecode::TryNoteKind::Finally))
-        .map(|t| (t.start, t.length, t.start + t.length))
-        .collect();
-    let mut live: BTreeMap<Pc, Vec<bool>> = succs.keys().map(|&pc| (pc, vec![false; n])).collect();
-    let pcs: Vec<Pc> = succs.keys().copied().rev().collect();
-    let mut changed = true;
-    while changed {
-        changed = false;
-        for &pc in &pcs {
-            let (op, ss) = &succs[&pc];
-            let mut l = vec![false; n];
-            let exc = handlers
-                .iter()
-                .filter(|&&(start, len, _)| pc >= start && pc < start + len)
-                .map(|&(_, _, h)| h);
-            for s in ss.iter().copied().chain(exc).collect::<Vec<_>>().iter() {
-                if let Some(ls) = live.get(s) {
-                    for (a, b) in l.iter_mut().zip(ls) {
-                        *a |= *b;
-                    }
-                }
-            }
-            let (u, d) = effect(pc, *op);
-            if let Some(d) = d.filter(|&d| d < n) {
-                l[d] = false;
-            }
-            if let Some(u) = u.filter(|&u| u < n) {
-                l[u] = true;
-            }
-            l[0] = true;
-            if live[&pc] != l {
-                live.insert(pc, l);
-                changed = true;
-            }
-        }
-    }
-    live
-}
-
 /// The `Add`/`Sub` ops whose result is consumed, directly on the operand
 /// stack within its basic block, only by truncating ops (ToInt32 of it)
 /// or by other such adds and subs. A sum of int32s, and of such sums, is
@@ -1096,7 +1024,7 @@ impl<'a> Shape<'a> {
             .into_iter()
             .map(|(h, e)| (Pc::new(h), Pc::new(e)))
             .collect();
-        let live = liveness(script, fl.nargs, fl.nlocals);
+        let live = layout::frame_liveness(script, fl.nargs, fl.nlocals);
         let wrap_ok = int32_demand(script, &ops);
         Ok(Shape {
             ctx,

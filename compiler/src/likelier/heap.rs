@@ -111,6 +111,10 @@ pub struct Abstraction {
     /// merge into a region that keeps its element view, an array and a
     /// non-array collapse to AnyObject) and the array-claim emission.
     pub is_array: bool,
+    /// Whether this abstraction is a keyed collection (`AllocKind::
+    /// Collection`), whose `add`/`set`/`get` move values through its
+    /// `ELEMS` cell.
+    pub is_coll: bool,
     /// Whether the transcribed snapshot object's properties have been
     /// copied into this abstraction's field cells yet (`ensure_seeded`).
     /// Seeding is lazy -- a bundle has far more snapshot objects than the
@@ -142,6 +146,8 @@ pub struct ClassInfo {
     /// Site classes only: whether the allocation makes a JS Array. See
     /// [`Abstraction::is_array`].
     pub is_array: bool,
+    /// Site classes only: [`Abstraction::is_coll`].
+    pub is_coll: bool,
 }
 
 #[derive(Default)]
@@ -591,6 +597,7 @@ impl Solver<'_> {
             proto_of: None,
             ta_kind: None,
             is_array: false,
+            is_coll: false,
             seeded: false,
         });
         // The engine's parallel join-metadata vec (consulted by every
@@ -714,6 +721,7 @@ impl Solver<'_> {
             sources: Vec::new(),
             ta_kind: None,
             is_array: false,
+            is_coll: false,
         });
         self.heap.class_ids.insert(key, c);
         let pa = self.new_abs(AbsKey::ProtoOf(c));
@@ -1030,6 +1038,17 @@ impl Solver<'_> {
     fn seeded_field_cell(&mut self, abs: AbsId, name: NameId) -> CellId {
         self.ensure_seeded(abs);
         self.field_cell(abs, name)
+    }
+
+    /// Whether a receiver's object part is a keyed collection (one
+    /// abstraction or one class of them): what gates the collection
+    /// builtins, whose names user classes use too.
+    pub(super) fn is_coll_recv(&self, rts: &TypeSet) -> bool {
+        match rts.obj {
+            ObjType::One(a) => self.heap[a].is_coll,
+            ObjType::ClassAny(c) => self.heap[c].is_coll,
+            _ => false,
+        }
     }
 
     /// The bundle-wide union of every array abstraction's elements.
@@ -1637,6 +1656,14 @@ impl Solver<'_> {
                     AllocKind::TypedArray(k) => {
                         self.intern_alloc(sid, pc, ctx, None, false, Some(k))
                     }
+                    AllocKind::Collection { .. } => {
+                        let a = self.intern_alloc(sid, pc, ctx, None, false, None);
+                        self.heap[a].is_coll = true;
+                        if let Some(c) = self.heap[a].class {
+                            self.heap[c].is_coll = true;
+                        }
+                        a
+                    }
                 };
                 let d = self.engine.resolve(sid, ctx, dst);
                 self.engine.raise(d, &TypeSet::obj_one(abs), user);
@@ -1653,7 +1680,27 @@ impl Solver<'_> {
                 let rts = self.engine.read(r, user);
                 let d = self.engine.resolve(sid, ctx, ret);
                 let elems = self.names_of.elems;
-                if kind == ElemBuiltinKind::Write {
+                if matches!(
+                    kind,
+                    ElemBuiltinKind::CollAdd | ElemBuiltinKind::CollSet | ElemBuiltinKind::CollGet
+                ) {
+                    if !self.is_coll_recv(&rts) {
+                        return true;
+                    }
+                    let recv_obj = TypeSet { obj: rts.obj, ..TypeSet::default() };
+                    if kind == ElemBuiltinKind::CollGet {
+                        let mut out = TypeSet::prim(PRIM_UNDEFINED);
+                        let _ = self.read_into(&recv_obj, elems, false, user, &mut out);
+                        self.engine.raise(d, &out, user);
+                    } else {
+                        if let Some(arg) = arg {
+                            let s = self.engine.resolve(sid, ctx, arg);
+                            let v = self.engine.read(s, user);
+                            self.write_into(&recv_obj, elems, &v, false, user);
+                        }
+                        self.engine.raise(d, &recv_obj, user);
+                    }
+                } else if kind == ElemBuiltinKind::Write {
                     if let Some(arg) = arg {
                         let s = self.engine.resolve(sid, ctx, arg);
                         let v = self.engine.read(s, user);
@@ -1793,24 +1840,28 @@ impl Solver<'_> {
                         }
                         any.fns = fns;
                     }
-                    // The region's aggregated view, subscribing the reader.
-                    // The `unknown` witness is still joined alongside it
-                    // (the view is a union of the writes the analysis SAW,
-                    // and writes at an `AnyObject` receiver are dropped by
-                    // design, so it can under-approximate) -- but the
-                    // witness carries NO object component: joined as
-                    // `AnyObject` it absorbed the view's population
-                    // (`join_obj(AnyOf, AnyObject) = AnyObject`), so every
-                    // value read off a region-typed receiver degraded to
-                    // `unk|obj:any` and spread AnyObject through the pool
-                    // and free-list fields it was stored into. The region
-                    // IS the merged fact; `unknown` says the rest honestly.
+                    // The region's field: its own writes and every member
+                    // class's (`region_field`), subscribing the reader. The
+                    // union of what the analysis saw written, taken as the
+                    // value with no `unknown` witness beside it: writes at
+                    // an `AnyObject` receiver are dropped, so it can
+                    // under-approximate, which the facts' guards answer.
+                    // That is the bet: objects are typed tightly where they
+                    // are made and set up, and a read out in the world,
+                    // where they have met, does better with the union of
+                    // their classes' fields than with nothing.
                     any.obj = ObjType::Empty;
-                    if let Some(view) = self.region_view(r, name) {
-                        let v = self.engine.read(view, user);
-                        let _ = self.engine.join_ts(out, &v);
+                    match self.region_field(r, name) {
+                        Some(cell) => {
+                            let v = self.engine.read(cell, user);
+                            let _ = self.engine.join_ts(out, &v);
+                            let methods = TypeSet { fns: any.fns, ..TypeSet::default() };
+                            let _ = self.engine.join_ts(out, &methods);
+                        }
+                        None => {
+                            let _ = self.engine.join_ts(out, &any);
+                        }
                     }
-                    let _ = self.engine.join_ts(out, &any);
                 }
             }
             ObjType::AnyObject => {
@@ -1827,30 +1878,21 @@ impl Solver<'_> {
         region_contributed
     }
 
-    /// The region's field view for `name`: the ROOT class's view cell, with
-    /// every member's view linked into it and back out again.
+    /// The region's field for `name`, as a region-typed read sees it: the
+    /// region's own cell (the writes whose receiver was only known to the
+    /// region) fed by every member class's view and by the cells of the
+    /// roots merged into it. One way only: a class-level read never sees a
+    /// region write, so the classes keep the precision they were set up
+    /// with, and the fuzzier region reads pick up everything they hold.
     ///
-    /// One tier up from `class_field_cell`, and the same shape: an
-    /// abstraction's field cell is linked up into `ClassView`, so a write
-    /// through a precise receiver is seen by a `ClassAny` read; this links a
-    /// class's view up into the region's, so a write through a classed
-    /// receiver is seen by an `AnyOf` read, and back down, so a write at
-    /// region granularity is seen by class- and alloc-site-level reads. That
-    /// second direction is the point: without it, a write whose receiver
-    /// is only known to a region would be dropped outright, emptying the
-    /// field for every reader.
+    /// The root moves as later meets union regions, so the cell is keyed by
+    /// the current root and re-linked lazily on each access; `link` is
+    /// idempotent, so a repeat costs a hash lookup.
     ///
-    /// Deliberately NOT a new cell kind. The region root moves as later
-    /// meets union regions, so a view keyed by the root at creation time
-    /// would go stale; using the root's own `ClassView` and re-linking
-    /// lazily on each access makes that self-healing -- after a merge the
-    /// next access relinks against the new root and member set, and `link`
-    /// is idempotent, so the repeat costs a hash lookup.
-    ///
-    /// Capped like `region_methods`: a mega-region is honestly megamorphic,
-    /// its union is worth nothing, and the linking is O(members). Past the
-    /// cap there is no view and the caller keeps the old behaviour.
-    fn region_view(&mut self, r: ClassId, name: NameId) -> Option<CellId> {
+    /// Capped: a mega-region is honestly megamorphic, its union is worth
+    /// nothing, and the linking is O(members). Past the cap there is no
+    /// field and the caller keeps the unknown witness.
+    fn region_field(&mut self, r: ClassId, name: NameId) -> Option<CellId> {
         let root = self.engine.region_root(r);
         let members = self
             .engine
@@ -1861,16 +1903,17 @@ impl Solver<'_> {
         if members.len() > crate::constants::REGION_VIEW_CAP {
             return None;
         }
-        let view = self.engine.cell(CellKey::ClassView { class: root, name });
+        let cell = self.engine.cell(CellKey::RegionField { class: root, name });
         for m in members {
-            if m == root {
-                continue;
-            }
             let mv = self.engine.cell(CellKey::ClassView { class: m, name });
-            self.engine.link(mv, view);
-            self.engine.link(view, mv);
+            self.engine.link(mv, cell);
+            if m != root {
+                if let Some(old) = self.engine.lookup(CellKey::RegionField { class: m, name }) {
+                    self.engine.link(old, cell);
+                }
+            }
         }
-        Some(view)
+        Some(cell)
     }
 
     /// The region's method-table union for `name`: join the fn sets of each
@@ -2126,26 +2169,27 @@ impl Solver<'_> {
                 self.accessor_write(c, name, v, user);
             }
             ObjType::AnyOf(r) if !is_elems => {
-                // A write whose receiver is known to a region: raise it into
-                // the region's view, which is linked down into every
-                // member's class view, so class- and alloc-site-level reads
-                // see it. Dropping this was what emptied a field for every
-                // reader when one write site lost its receiver class.
+                // A write whose receiver is known to a region: the region's
+                // own field, which region-typed reads see and class-level
+                // reads do not (`region_field`). The value stays tracked --
+                // a function stored there is called through those reads --
+                // so it escapes only where the region is past the cap and
+                // the write is dropped.
                 //
                 // `AnyObject` deliberately keeps the drop (below): it is not
                 // a bounded set of classes that met, it is everything, and
                 // distributing a write to every object in the program would
                 // pollute far more than it recovers.
-                match self.region_view(r, name) {
-                    Some(view) => self.engine.raise(view, v, user),
+                match self.region_field(r, name) {
+                    Some(cell) => self.engine.raise(cell, v, user),
                     None => {
                         self.stats.dropped_writes += 1;
                         if this_recv {
                             self.stats.dropped_this_writes += 1;
                         }
+                        self.do_escape(v, user);
                     }
                 }
-                self.do_escape(v, user);
             }
             ObjType::AnyOf(_) | ObjType::AnyObject => {
                 if is_elems {

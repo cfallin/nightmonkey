@@ -547,6 +547,18 @@ pub(super) fn is_array_ctor_name(name: &[u16]) -> bool {
     name_eq(name, "Array")
 }
 
+/// Whether a global name is a keyed-collection constructor: `Some(true)`
+/// for a map (`Map`, `WeakMap`), `Some(false)` for a set.
+pub(super) fn collection_ctor_name(name: &[u16]) -> Option<bool> {
+    if name_eq(name, "Map") || name_eq(name, "WeakMap") {
+        Some(true)
+    } else if name_eq(name, "Set") || name_eq(name, "WeakSet") {
+        Some(false)
+    } else {
+        None
+    }
+}
+
 /// Whether the translator has an inline arm for this bare-name native.
 /// A site that resolves to one of these gets the `native_calls` fact; the
 /// rest keep their spec result mask but go through the generic call path.

@@ -29,8 +29,10 @@ pub const ELEMS: &[u16] = &['[' as u16, ']' as u16];
 const APPLY: &[u16] = &['a' as u16, 'p' as u16, 'p' as u16, 'l' as u16, 'y' as u16];
 const CALL: &[u16] = &['c' as u16, 'a' as u16, 'l' as u16, 'l' as u16];
 
-/// The element-node effect of an array builtin called by this name, if it
-/// is one the analysis models.
+/// The element-node effect of an array or keyed-collection builtin called
+/// by this name, if it is one the analysis models. (The collection ones
+/// take effect only on a receiver that is a collection: the heap gates
+/// them, since `add`/`set`/`get` are common method names.)
 fn elem_builtin_kind(name: &[u16]) -> Option<ElemBuiltinKind> {
     use ElemBuiltinKind::*;
     for (s, k) in [
@@ -38,6 +40,9 @@ fn elem_builtin_kind(name: &[u16]) -> Option<ElemBuiltinKind> {
         ("unshift", Write),
         ("pop", Read),
         ("shift", Read),
+        ("add", CollAdd),
+        ("set", CollSet),
+        ("get", CollGet),
     ] {
         if super::builtins::name_eq(name, s) {
             return Some(k);
@@ -230,6 +235,14 @@ pub struct Scan<'a, 'b> {
     join_locals: HashMap<Pc, HashMap<u32, Slot>>,
     ft_dead: bool,
     cur_pc: Pc,
+    /// Per pc, which frame slots are live into it (`frame_liveness`): a
+    /// join keeps only those, so a slot reused for unrelated values (the
+    /// minifier's scratch locals and formals) joins nothing it no longer
+    /// holds. Pruned SSA: a dead slot gets no join var, and so no meet of
+    /// the classes its branches left in it.
+    live: std::collections::BTreeMap<Pc, Vec<bool>>,
+    /// The script makes an `arguments` object, which may alias its formals.
+    uses_arguments: bool,
 }
 
 /// Formals live in the flow-sensitive slot map above every real local slot.
@@ -318,7 +331,24 @@ impl<'a, 'b> Scan<'a, 'b> {
             join_locals: HashMap::default(),
             ft_dead: false,
             cur_pc: Pc::new(0),
+            live: crate::wasm::baseline::layout::frame_liveness(
+                script,
+                u32::from(script.nargs),
+                crate::wasm::baseline::layout::local_count(script),
+            ),
+            uses_arguments: crate::wasm::translate::uses_arguments(script),
         }
+    }
+
+    /// Whether slot-map key `slot` (a local, or a formal's `arg_slot`) is
+    /// live into `pc`; true where liveness has no answer.
+    fn slot_live(&self, pc: Pc, slot: u32) -> bool {
+        let idx = if slot >= ARG_SLOT_BASE {
+            1 + (slot - ARG_SLOT_BASE) as usize
+        } else {
+            1 + usize::from(self.script.nargs) + slot as usize
+        };
+        self.live.get(&pc).is_none_or(|l| l.get(idx).copied().unwrap_or(true))
     }
 
     fn fresh_var(&mut self) -> VarId {
@@ -436,10 +466,12 @@ impl<'a, 'b> Scan<'a, 'b> {
         }
     }
 
-    /// A snapshot of the current locals, as a fresh join row.
-    fn locals_row(&self) -> HashMap<u32, Slot> {
+    /// A snapshot of the current locals live into `at`, as a fresh join
+    /// row.
+    fn locals_row(&self, at: Pc) -> HashMap<u32, Slot> {
         self.locals
             .iter()
+            .filter(|&(&s, _)| self.slot_live(at, s))
             .map(|(&s, e)| (s, Slot::Direct(e.clone())))
             .collect()
     }
@@ -456,9 +488,12 @@ impl<'a, 'b> Scan<'a, 'b> {
     /// reaches only `next_var` and the engine -- never `locals` or `stack`
     /// -- so it cannot observe the gap, and a branch edge is a hot enough
     /// path to be worth not copying the whole frame at.
-    fn merge_locals_into(&mut self, row: &mut HashMap<u32, Slot>) {
+    fn merge_locals_into(&mut self, row: &mut HashMap<u32, Slot>, at: Pc) {
         let locals = std::mem::take(&mut self.locals);
         for (slot, e) in &locals {
+            if !self.slot_live(at, *slot) {
+                continue;
+            }
             match row.get_mut(slot) {
                 Some(rs) => self.merge_slot(rs, e),
                 None => {
@@ -494,9 +529,9 @@ impl<'a, 'b> Scan<'a, 'b> {
     /// absolute `target` (table-switch targets arrive absolute).
     fn join_into_abs(&mut self, target: Pc) {
         let row = match self.join_locals.remove(&target) {
-            None => self.locals_row(),
+            None => self.locals_row(target),
             Some(mut row) => {
-                self.merge_locals_into(&mut row);
+                self.merge_locals_into(&mut row, target);
                 row
             }
         };
@@ -523,13 +558,13 @@ impl<'a, 'b> Scan<'a, 'b> {
         match self.join_locals.remove(&pc) {
             None => {
                 if loop_head || !ft_dead {
-                    let row = self.locals_row();
+                    let row = self.locals_row(pc);
                     self.join_locals.insert(pc, row);
                 }
             }
             Some(mut row) => {
                 if !ft_dead {
-                    self.merge_locals_into(&mut row);
+                    self.merge_locals_into(&mut row, pc);
                 }
                 self.locals = row
                     .iter()
@@ -884,20 +919,54 @@ impl<'a, 'b> Scan<'a, 'b> {
         // collapses the site's callee set as any other call would.
         if let Some((recv, kind)) = callee.elem {
             if !construct {
-                let arg = arg_entries.first().map(|e| self.key_of(e));
-                self.con(Constraint::ElemBuiltin {
-                    recv,
-                    arg,
-                    ret,
-                    pc,
-                    kind,
-                });
+                // Every argument of a `push`/`unshift` is an element; a
+                // map's `set` stores its second.
+                let args: Vec<Option<CKey>> = match kind {
+                    ElemBuiltinKind::Write if !arg_entries.is_empty() => {
+                        arg_entries.iter().map(|e| Some(self.key_of(e))).collect()
+                    }
+                    ElemBuiltinKind::CollSet => vec![arg_entries.get(1).map(|e| self.key_of(e))],
+                    _ => vec![arg_entries.first().map(|e| self.key_of(e))],
+                };
+                for arg in args {
+                    self.con(Constraint::ElemBuiltin {
+                        recv,
+                        arg,
+                        ret,
+                        pc,
+                        kind,
+                    });
+                }
             }
         }
         if let Some(kind) = callee.ctor_alloc {
             // `Array(n)` and `new Array(n)` are the same allocation, and so
             // is every typed-array constructor's.
             self.con(Constraint::Alloc { dst: ret, pc, kind });
+            // A collection made from an iterable holds its elements: a
+            // set, the iterable's elements; a map, the elements of its
+            // entries (keys too: the entries are pairs).
+            if let (AllocKind::Collection { map }, Some(src)) = (kind, arg_entries.first()) {
+                let elems = self.names.intern(ELEMS);
+                let mut from = self.key_of(src);
+                for _ in 0..if map { 2 } else { 1 } {
+                    let v = CKey::Var(self.fresh_var());
+                    self.con(Constraint::Read {
+                        recv: from,
+                        name: elems,
+                        dst: v,
+                        pc,
+                        callee_pos: false,
+                    });
+                    from = v;
+                }
+                self.con(Constraint::Write {
+                    recv: ret,
+                    name: elems,
+                    src: from,
+                    pc,
+                });
+            }
             self.push_e(Entry::key(ret));
             return;
         }
@@ -1440,6 +1509,12 @@ impl OpcodeVisitor for Scan<'_, '_> {
                     let mut e = self.const_entry(TypeSet::fn_one(FnId::ARRAY_CTOR));
                     e.ctor_alloc = Some(AllocKind::Array);
                     e
+                } else if let Some(map) = builtins::collection_ctor_name(n) {
+                    // The value stays the global's (it is a function the
+                    // analysis does not model); the marker serves `new`.
+                    let mut e = Entry::key(CKey::GName(self.names.intern(n)));
+                    e.ctor_alloc = Some(AllocKind::Collection { map });
+                    e
                 } else if let Some(k) = builtins::ta_kind_for_ctor_name(n) {
                     self.tables.saw_ta_ctor = true;
                     let mut e = self.const_entry(TypeSet::fn_one(FnId::typed_array_ctor(k)));
@@ -1540,16 +1615,22 @@ impl OpcodeVisitor for Scan<'_, '_> {
             .push(self.cur_pc);
         if i < self.script.nargs {
             if let Some(top) = self.stack.last().cloned() {
-                let src = self.key_of(&top);
-                // The `Move` stays: `CKey::Arg` remains the upper bound over
-                // everything the slot ever holds, which is what a mapped
-                // `arguments` object aliases and what the formal-type facts
-                // read. Precision comes from the rebind below, which is what
-                // later `GetArg`s in this body now see.
-                self.con(Constraint::Move {
-                    src,
-                    dst: CKey::Arg(FormalIndex::new(u32::from(i))),
-                });
+                // The rebind is what later `GetArg`s in this body see. The
+                // formal's `CKey::Arg` cell keeps meaning the incoming
+                // actuals -- what the callers bind, what the reads before
+                // the assignment see, and all the entry guards of the
+                // formal-type facts check -- except where an `arguments`
+                // object may alias the slot: there it is the upper bound
+                // over everything the slot ever holds. (Minified code
+                // reuses formals: react's `request = request.resumableState`
+                // otherwise put the state's class into every `request`.)
+                if self.uses_arguments {
+                    let src = self.key_of(&top);
+                    self.con(Constraint::Move {
+                        src,
+                        dst: CKey::Arg(FormalIndex::new(u32::from(i))),
+                    });
+                }
                 self.locals.insert(arg_slot(i), top);
             }
         }
