@@ -33,6 +33,10 @@ namespace night {
 //
 // A change here is an ABI change: bump NightAotAbiVersion.
 #define NIGHT_REGION_SHAPE(_)                                                  \
+  /* A context's value stack (NightStack.h): a region of 1 << this many   */   \
+  /* bytes, aligned to its size, so compiled code tests a frame's fit by  */   \
+  /* whether its last byte shares the frame base's high bits.             */   \
+  _(valueStackLog2, 21)                                                        \
   /* Per-site property IC (gEnv.propicPtr): the inline get ways (a set   */    \
   /* site uses way 0 alone), then the add-transition row. A get receiver  */   \
   /* past the last way is served by the mega table.                       */   \
@@ -70,7 +74,6 @@ namespace night {
   /* bases below are NOT in the region table -- C++ recomputes them from   */  \
   /* propicGenPtr, which is exactly why the offsets have to be shared.     */  \
   _(hostGenOff, 0)                                                             \
-  _(hostStackLimitOff, 4)                                                      \
   _(hostFnClassOff, 8)                                                         \
   _(hostStaticStringsOff, 16)                                                  \
   _(hostAtomTableOff, 20)                                                      \

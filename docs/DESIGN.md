@@ -264,9 +264,15 @@ data should use generated shared definitions rather than paired literals.
 
 ## 9. Entry, stack, and GC
 
-`NightStack` is a separately allocated array of boxed values owned by
-`JSContext`; its live prefix is traced as roots. `AutoNightReentry` restores the
-old top after interpreter-to-AOT reentry.
+`NightStack` is a separately allocated array of boxed values, one per
+`JSContext`: the tier's per-context state (`NightContextState`, made and
+freed by the generic `ExternalCompilerHooks` `newContext`/`destroyContext`
+hooks, reached through `JSContext::getExternalCompilerState`). Its live
+prefix is traced as roots by the `traceRoots` hook. The region is
+`1 << valueStackLog2` bytes (`NightRegionShape.h`), aligned to its size,
+so compiled code tests whether a frame fits by whether the frame's last
+byte has the frame base's high bits, with no load of a limit.
+`AutoNightReentry` restores the old top after interpreter-to-AOT reentry.
 
 An entry frame contains callee, receiver, actual/formal slots, locals, and
 operand storage. Missing actuals are padded with `undefined`. The complete frame

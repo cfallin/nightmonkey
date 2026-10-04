@@ -541,12 +541,6 @@ pub struct Helpers {
     /// GC-zeroed). Accessor-classified property sites probe it inline;
     /// the generic get/set miss helpers prime it.
     pub accessor_cache_base: u32,
-    /// Linear-memory address of the `u32` AOT-stack limit (one past the
-    /// region), published by `night_runtime_run_main`. The specialized-call guard
-    /// compares the callee frame top (+ headroom) against it and takes the
-    /// generic-helper arm when the region would overflow -- `EnterNight` there
-    /// bounds-checks and falls back to the interpreter gracefully.
-    pub night_stack_limit_base: u32,
     /// Linear-memory address of the startup-written pair `[&js::FunctionClass,
     /// &js::ExtendedFunctionClass]` (two u32 slots), for the inline callee
     /// classify's `is<JSFunction>` clasp compares.
@@ -3963,7 +3957,6 @@ mod tests {
                 mega_set_base: 0,
                 append_cache_base: 0,
                 accessor_cache_base: 0,
-                night_stack_limit_base: 4,
                 fn_class_slot: 8,
                 static_strings_slot: 16,
                 atom_table_slot: 20,

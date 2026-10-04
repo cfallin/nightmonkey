@@ -45,6 +45,7 @@
 #include "js/RootingAPI.h"          // JS::Rooted
 #include "js/String.h"              // JS_NewUCStringCopyN
 #include "js/Value.h"               // JS::Value
+#include "runtime/NightContext.h"
 #include "runtime/Night.h"  // js::night::NightAddPropCheck, the dyncode fuse
 #include "runtime/NightObjectWord.h"
 #include "runtime/NightHooks.h"  // js::night::gNightHooks (the vouched-store mask)
@@ -1585,13 +1586,6 @@ bool night_runtime_install_env(JSContext* cx,
   // zero-initialized) and install the major-GC generation-bump callback. The
   // region stays all-zero (every way empty) until the miss helper populates it.
   gState.prevSliceCallback = JS::SetGCSliceCallback(cx, NightGcSliceCallback);
-  // Publish the AOT stack limit right after the generation word: the section-4
-  // specialized-call guard compares candidate frame tops against it so deep
-  // direct-dispatch chains fall back to night_runtime_call/EnterNight (which
-  // bounds- check) instead of running off the region.
-  *LinMem<uint32_t>(env.propicGenPtr + js::night::Night_hostStackLimitOff) =
-      static_cast<uint32_t>(
-          reinterpret_cast<uintptr_t>(js::nightrt::TheNightStack().limit()));
   // Startup-written host constants the AOT'd module cannot embed (the merge
   // reserved u32 slots at +8/+12/+16; layout mirrored in wasm/mod.rs): the two
   // JSFunction class addresses for the inline callee classify's clasp
@@ -2056,7 +2050,7 @@ static JSObject* ReceiverObjectAtom(JSContext* cx, uint64_t recv,
 // Every may-GC helper takes `top` as its second parameter and calls this on
 // entry, rather than through a separate set-top round-trip.
 static inline void SetNightTop(JSContext* cx, uint32_t top) {
-  js::nightrt::TheNightStack().setTop(LinMem<JS::Value>(top));
+  js::nightrt::TheNightStackInline(cx).setTop(LinMem<JS::Value>(top));
 }
 
 // Write a boxed result to the scratch out-slot, which sits exactly at `top`

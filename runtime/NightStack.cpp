@@ -3,24 +3,33 @@
 
 #include "runtime/NightStack.h"
 
+#include "runtime/NightContext.h"
+
+#include <stdlib.h>  // aligned_alloc, free
+#include <string.h>  // memset
+
 #include "js/TracingAPI.h"  // JS::TraceRoot
-#include "js/Utility.h"     // js_calloc, js_free
 
 namespace js {
 namespace nightrt {
 
-// 256K boxed Values (2 MiB). AOT frames push roots here and bump `top`; the
-// stack is fixed-size, and a frame that would not fit falls back to the
-// interpreter.
-static constexpr size_t kCapacitySlots = 256 * 1024;
+// kNightStackSlots boxed Values, aligned to the region's size (see
+// NightStack.h). AOT frames push roots here and bump `top`; the stack is
+// fixed-size, and a frame that would not fit falls back to the interpreter.
+static JS::Value* AllocRegion() {
+  void* p = aligned_alloc(kNightStackBytes, kNightStackBytes);
+  if (p) {
+    memset(p, 0, kNightStackBytes);
+  }
+  return static_cast<JS::Value*>(p);
+}
 
 NightStack::NightStack()
-    : base_(static_cast<JS::Value*>(
-          js_calloc(kCapacitySlots * sizeof(JS::Value)))),
+    : base_(AllocRegion()),
       top_(base_),
-      limit_(base_ ? base_ + kCapacitySlots : nullptr) {}
+      limit_(base_ ? base_ + kNightStackSlots : nullptr) {}
 
-NightStack::~NightStack() { js_free(base_); }
+NightStack::~NightStack() { free(base_); }
 
 uint64_t gNightStackTraces = 0;
 uint64_t gNightStackTracedSlots = 0;
@@ -35,16 +44,10 @@ void NightStack::trace(JSTracer* trc) {
   }
 }
 
-NightStack* gTheNightStack = nullptr;
-
-NightStack& TheNightStackSlow() {
-  static NightStack stack;
-  gTheNightStack = &stack;
-  return stack;
-}
+NightStack& TheNightStack(JSContext* cx) { return TheNightStackInline(cx); }
 
 AutoNightReentry::AutoNightReentry(JSContext* cx)
-    : stack_(TheNightStack()), savedTop_(stack_.top()) {}
+    : stack_(TheNightStack(cx)), savedTop_(stack_.top()) {}
 
 }  // namespace nightrt
 }  // namespace js

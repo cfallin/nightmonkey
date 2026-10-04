@@ -678,7 +678,6 @@ pub struct HelperBases {
     pub this_cells_base: u32,
     pub this_slots_base: u32,
     pub mega_get_base: u32,
-    pub night_stack_limit_base: u32,
     pub fn_class_slot: u32,
     pub static_strings_slot: u32,
     pub atom_table_slot: u32,
@@ -848,7 +847,6 @@ pub fn resolve_helpers(
         this_cells_base: bases.this_cells_base,
         this_slots_base: bases.this_slots_base,
         mega_get_base: bases.mega_get_base,
-        night_stack_limit_base: bases.night_stack_limit_base,
         fn_class_slot: bases.fn_class_slot,
         static_strings_slot: bases.static_strings_slot,
         atom_table_slot: bases.atom_table_slot,
@@ -970,7 +968,6 @@ pub struct EnvLayout {
     pub global_slots_base: u32,
     pub global_vals_base: u32,
     pub prop_ic_gen_base: u32,
-    pub night_stack_limit_base: u32,
     pub fn_class_slot: u32,
     pub static_strings_slot: u32,
     pub atom_table_slot: u32,
@@ -1006,7 +1003,6 @@ impl EnvLayout {
             this_cells_base: self.this_cells_base,
             this_slots_base: self.this_slots_base,
             mega_get_base: self.mega_get_base,
-            night_stack_limit_base: self.night_stack_limit_base,
             fn_class_slot: self.fn_class_slot,
             static_strings_slot: self.static_strings_slot,
             atom_table_slot: self.atom_table_slot,
@@ -1137,13 +1133,6 @@ pub fn layout_env(
     // per-site ways follow. The region carries no data segment -> zero-init ==
     // every way empty, generation 0.
     let prop_ic_gen_base = global_slots_base + global_slots_size as u32;
-    // One more u32 right after the generation: the AOT stack limit (linear
-    // address one past the region), written once by `night_runtime_run_main`.
-    // The specialized-call
-    // specialized-call guard reads it so deep direct-dispatch chains fall back
-    // to `night_runtime_call` (whose `EnterNight` bounds-checks and can hand the frame
-    // to the interpreter) instead of running off the region.
-    let night_stack_limit_base = prop_ic_gen_base + shape::HOST_STACK_LIMIT_OFF;
     // Startup-written host-constant slots (filled by `night_runtime_run_main`, which
     // can take the addresses the AOT'd module cannot embed):
     //   +8:  &js::FunctionClass          (inline callee classify)
@@ -1717,7 +1706,6 @@ pub fn layout_env(
         global_slots_base,
         global_vals_base,
         prop_ic_gen_base,
-        night_stack_limit_base,
         fn_class_slot,
         static_strings_slot,
         atom_table_slot,

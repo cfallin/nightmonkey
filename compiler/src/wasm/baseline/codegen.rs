@@ -3296,10 +3296,12 @@ impl<'a> Gen<'a> {
         };
         let funcidx = self.push_val(ValueDef::PickOutput(cls, 0, Type::I32));
         let script = self.push_val(ValueDef::PickOutput(cls, 1, Type::I32));
-        let limit_addr = self.i32c(self.h.night_stack_limit_base);
-        let limit = self.load_i32(limit_addr, 0);
-        let hi = self.add_off(top, 8 * (2 + argc) + HEADROOM);
-        let fits = self.binop(Operator::I32LeU, hi, limit, Type::I32);
+        // The value stack is a region aligned to its size: the frame fits
+        // iff its last byte has the frame base's high bits (no load).
+        let last = self.add_off(top, 8 * (2 + argc) + HEADROOM - 1);
+        let x = self.binop(Operator::I32Xor, last, self.sp, Type::I32);
+        let size = self.i32c(1 << crate::region_shape::VALUE_STACK_LOG2);
+        let fits = self.binop(Operator::I32LtU, x, size, Type::I32);
         let z = self.i32c(0);
         let compiled = self.binop(Operator::I32Ne, funcidx, z, Type::I32);
         let direct = self.binop(Operator::I32And, compiled, fits, Type::I32);

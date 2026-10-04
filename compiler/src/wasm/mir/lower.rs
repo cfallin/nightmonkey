@@ -876,6 +876,17 @@ impl<'a> Lower<'a> {
         }
     }
 
+    /// Whether `headroom` bytes from `top` fit the value stack: the stack is
+    /// a region aligned to its size (`VALUE_STACK_LOG2`), so they do iff
+    /// their last byte has the frame base's high bits. No load: each
+    /// context's stack is its own region, wherever it is.
+    fn stack_fits(&mut self, top: Value, headroom: u32) -> Value {
+        let last = self.add_off(top, headroom - 1);
+        let x = self.bin(Operator::I32Xor, last, self.vp, Type::I32);
+        let size = self.i32c(1 << crate::region_shape::VALUE_STACK_LOG2);
+        self.bin(Operator::I32LtU, x, size, Type::I32)
+    }
+
     /// `v`'s value where its type pins one int32 (as an i64: `-c` cannot
     /// overflow).
     fn const_i32(&self, v: mir::Value) -> Option<i64> {
@@ -4325,10 +4336,7 @@ impl<'a> Lower<'a> {
                 let (funcidx, script) = self.classify(callee);
                 let z = self.i32c(0);
                 let compiled = self.bin(Operator::I32Ne, funcidx, z, Type::I32);
-                let limit_addr = self.i32c(self.h.night_stack_limit_base);
-                let limit = self.load_i32(limit_addr, 0);
-                let hi = self.add_off(top, HEADROOM);
-                let fits = self.bin(Operator::I32LeU, hi, limit, Type::I32);
+                let fits = self.stack_fits(top, HEADROOM);
                 let maybe = self.bin(Operator::I32And, compiled, fits, Type::I32);
                 let enabled = self.i32c(u32::from(DIRECT_CONSTRUCT));
                 let maybe = self.bin(Operator::I32And, maybe, enabled, Type::I32);
@@ -8152,10 +8160,7 @@ impl<'a> Lower<'a> {
         let base = self.add_off(self.vp, frame);
         let top = self.add_off(self.vp, top_off);
         let z = self.i32c(0);
-        let limit_addr = self.i32c(self.h.night_stack_limit_base);
-        let limit = self.load_i32(limit_addr, 0);
-        let hi = self.add_off(top, HEADROOM);
-        let fits = self.bin(Operator::I32LeU, hi, limit, Type::I32);
+        let fits = self.stack_fits(top, HEADROOM);
         let compiled = self.bin(Operator::I32Ne, funcidx, z, Type::I32);
         let direct = self.bin(Operator::I32And, compiled, fits, Type::I32);
         let (direct_b, generic_b, join) = (
@@ -8291,10 +8296,7 @@ impl<'a> Lower<'a> {
         let top_off = frame + 8 * (argc + 2);
         let base = self.add_off(self.vp, frame);
         let top = self.add_off(self.vp, top_off);
-        let limit_addr = self.i32c(self.h.night_stack_limit_base);
-        let limit = self.load_i32(limit_addr, 0);
-        let hi = self.add_off(top, headroom);
-        let fits = self.bin(Operator::I32LeU, hi, limit, Type::I32);
+        let fits = self.stack_fits(top, headroom);
         let (direct_b, generic_b, join) = (self.body.add_block(), self.body.add_block(), self.body.add_block());
         let ok = self.body.add_blockparam(join, Type::I32);
         self.cond_br(fits, Self::to(direct_b), Self::to(generic_b));

@@ -9,6 +9,7 @@
  * code calls on the way back out live in the other night/runtime files.
  */
 
+#include "runtime/NightContext.h"
 #include "runtime/NightEntry.h"
 
 #include "js/friend/StackLimits.h"            // js::ReportOverRecursed
@@ -57,14 +58,14 @@ static EnterNightStatus EnterNight(JSContext* cx, JSScript* script,
   if (index == 0) {
     return EnterNightStatus::NotEntered;
   }
-  if (!js::night::gNightActivated) {
+  if (!js::night::gNightActivated || !js::nightrt::NightStateOf(cx)) {
     return EnterNightStatus::NotEntered;
   }
 
   // frameBase() is the sp to build at; the saved top is restored when this
   // re-entry returns (NightStack.h re-entrancy contract).
   js::nightrt::AutoNightReentry reentry(cx);
-  js::nightrt::NightStack& stack = js::nightrt::TheNightStack();
+  js::nightrt::NightStack& stack = js::nightrt::TheNightStack(cx);
   JS::Value* sp = reentry.frameBase();
 
   uint32_t argc = args.length();
@@ -139,11 +140,11 @@ static EnterNightStatus EnterNightGlobal(JSContext* cx, JSScript* script,
   if (index == 0) {
     return EnterNightStatus::NotEntered;
   }
-  if (!js::night::gNightActivated) {
+  if (!js::night::gNightActivated || !js::nightrt::NightStateOf(cx)) {
     return EnterNightStatus::NotEntered;
   }
   js::nightrt::AutoNightReentry reentry(cx);
-  js::nightrt::NightStack& stack = js::nightrt::TheNightStack();
+  js::nightrt::NightStack& stack = js::nightrt::TheNightStack(cx);
   JS::Value* sp = reentry.frameBase();
   // Frame layout: [callee_placeholder, this]; no formals.
   JS::Value* frameTop = sp + 2;
@@ -242,12 +243,12 @@ EnterNightStatus NightApplyOrCall(JSContext* cx, const Value& targetv,
   if (index == 0) {
     return EnterNightStatus::NotEntered;
   }
-  if (!js::night::gNightActivated) {
+  if (!js::night::gNightActivated || !js::nightrt::NightStateOf(cx)) {
     return EnterNightStatus::NotEntered;
   }
 
   js::nightrt::AutoNightReentry reentry(cx);
-  js::nightrt::NightStack& stack = js::nightrt::TheNightStack();
+  js::nightrt::NightStack& stack = js::nightrt::TheNightStack(cx);
   JS::Value* sp = reentry.frameBase();
 
   // Resolve the argument source. For `apply`, `applyArr` is the (single)
@@ -354,7 +355,7 @@ EnterNightStatus EnterNightResume(JSContext* cx,
   MOZ_ASSERT(genObj->isSuspended());
 
   js::nightrt::AutoNightReentry reentry(cx);
-  js::nightrt::NightStack& stack = js::nightrt::TheNightStack();
+  js::nightrt::NightStack& stack = js::nightrt::TheNightStack(cx);
   JS::Value* sp = reentry.frameBase();
   uint32_t nargs = callee->nargs();
   JS::Value* frameTop = sp + 2 + nargs;
