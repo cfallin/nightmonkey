@@ -255,6 +255,28 @@ extern JS_PUBLIC_API bool NightRegisterRoot(JSContext* cx,
 // module was not transformed. Idempotent.
 extern JS_PUBLIC_API bool NightActivate(JSContext* cx);
 
+// Empty every cache and cell NightMonkey keeps about `cx`'s heap: the
+// property ICs and the megamorphic, append, accessor, add-transition and
+// guarded-chain tables, the callee, construct, alloc, intrinsic, method and
+// identity cells, the global binding cells and fuses. All of them live in
+// the module's linear memory, shared by every context that runs it, and
+// most are keyed by raw addresses (shapes, holders, functions) that only
+// this context's GC zeroes before it reuses them.
+//
+// So call it when a context's heap goes away by any path other than this
+// context's own garbage collection, before another context runs compiled
+// code in the same module: the addresses that heap freed may come back as
+// other cells, and a stale row would match them. Destroying the context
+// (JS_DestroyContext) does it already, through the tier's destroyContext
+// hook; call it yourself if you drop or replace a heap without that (for
+// example, recycling a context for an unrelated program, or restoring a
+// memory snapshot under a context that kept running).
+//
+// Every cleared entry is refilled on its next miss; the cost is a round of
+// slower calls and property accesses, never a wrong answer. Must not be
+// called while compiled code is running on the context.
+extern JS_PUBLIC_API void NightClearCaches(JSContext* cx);
+
 }  // namespace JS
 
 #endif /* night_runtime_NightRegistration_h */

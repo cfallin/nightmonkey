@@ -14,6 +14,7 @@
 #include "js/HashTable.h"
 #include "js/shadow/String.h"
 #include "runtime/Night.h"
+#include "runtime/NightContext.h"
 #include "runtime/NightEnv.h"
 #include "runtime/NightStack.h"
 #include "vm/ArrayObject.h"
@@ -324,6 +325,12 @@ static void NightStatsDump() {
           unsigned(JS_GetGCParameter(gStatsCx, JSGC_MAJOR_GC_NUMBER)),
           (unsigned long long)js::nightrt::TheNightStack(gStatsCx).traces(),
           (unsigned long long)js::nightrt::TheNightStack(gStatsCx).tracedSlots());
+}
+
+JS_PUBLIC_API void JS::NightClearCaches(JSContext* cx) {
+  if (gNightActivated && nightrt::NightStateOf(cx)) {
+    js::night::NightClearCaches(cx);
+  }
 }
 
 JS_PUBLIC_API bool JS::NightActivate(JSContext* cx) {

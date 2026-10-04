@@ -9,6 +9,7 @@
 #include "runtime/NightEnv.h"
 #include "runtime/NightObjectWord.h"
 #include "runtime/NightRegExp.h"
+#include "runtime/NightRegistration.h"
 #include "runtime/NightStack.h"
 #include "vm/GeneratorObject.h"
 #include "vm/Interpreter.h"
@@ -47,6 +48,12 @@ static uint32_t BumpSiteOf(JS::ExternalObjectMutation why) {
 // no compiled code: every entry checks for it.
 static void NightDestroyContext(JSContext* cx, void* state) {
   auto* s = static_cast<nightrt::NightContextState*>(state);
+  // The module's tables outlive this context's heap (JS::NightClearCaches).
+  // The engine calls this hook before it tears the heap down, with the
+  // state still attached.
+  if (s->runtime && nightrt::NightStateOf(cx) == s) {
+    JS::NightClearCaches(cx);
+  }
   if (s->runtime) {
     js::night::DeleteNightRuntimeState(s->runtime);
   }

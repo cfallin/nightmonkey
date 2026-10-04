@@ -299,6 +299,16 @@ roots and digest (the wire format the tool finds through the
 epoch is a `NightRuntimeState` field too, its address published in the
 strlit block as before.
 
+The module's linear-memory regions (prop-IC ways, mega, append, accessor
+and add-transition tables, callee/construct/alloc/intrinsic/method cells,
+identity cells, binding cells and fuses) are shared by every context that
+runs the module, and most are keyed by raw addresses only the owning
+context's GC zeroes before reusing them. A context's heap that goes away any
+other way must take them with it: the tier's `destroyContext` hook calls
+`JS::NightClearCaches(cx)` (NightRegistration.h), and an embedding that
+drops or replaces a heap without destroying the context calls it itself,
+with no compiled code running on that context.
+
 Compiled code still addresses the linear-memory regions (prop-IC ways,
 caches, cells, the strlit block, global slots) by absolute addresses the
 translator bakes in. A per-function base loaded from the context

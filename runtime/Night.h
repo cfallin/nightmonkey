@@ -51,6 +51,9 @@ void NightAddPropCheck(JSObject* obj, JS::PropertyKey id, uint32_t slot,
 bool NightShapeForAdd(JSContext* cx, JS::Handle<NativeObject*> obj,
                       JS::HandleId id, uint8_t flags, SharedShape** result);
 void NightPurgeAddMemo();
+// Empty every cache and cell the compiled code and the helpers keep about
+// this context's heap (JS::NightClearCaches).
+void NightClearCaches(JSContext* cx);
 bool NightSlotsCovered(NativeObject* obj, uint32_t n);
 
 // The engine invalidated constant-property assumptions about `fuse`'s

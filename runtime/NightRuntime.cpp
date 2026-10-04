@@ -3678,6 +3678,41 @@ static void NightPurgeMovableCaches() {
   ZeroMethodCells();
 }
 
+// Every row and cell that caches a pointer, a value or a decision about
+// this context's heap, emptied: what NightPurgeMovableCaches zeroes, and
+// the cells it re-arms from the context's live values (the builtin and
+// string-method identity cells, the binding value cells, the method cells,
+// the global literal fuses) zeroed instead, which is their unarmed state.
+// The generation word moves, so every generation-checked cell misses too.
+// Install-time tables (the layout add-check bounds, the region table) and
+// the dynamic-code fuse are kept: zero means something else there.
+extern "C++" void js::night::NightClearCaches(JSContext* cx) {
+  NightPurgeMovableCaches();
+  RtState(cx).pushFnBits = 0;
+  if (RtState(cx).builtinCellsBase) {
+    ZeroRegion(RtState(cx).builtinCellsBase, 8 * NightPristineFns::kCount);
+  }
+  for (uint32_t cell : {RtState(cx).strCharCodeAtCell, RtState(cx).strCharAtCell,
+                        RtState(cx).strFromCharCodeCell}) {
+    if (cell) {
+      ZeroRegion(cell, 8);
+    }
+  }
+  if (RtState(cx).globalValsBase && RtNames(cx).bindingKeys) {
+    ZeroRegion(RtState(cx).globalValsBase, RtNames(cx).bindingKeys->size() * 16);
+  }
+  RtState(cx).nurseryArmedBindings.clear();
+  if (RtEnv(cx).fuseCellsPtr) {
+    ZeroRegion(RtEnv(cx).fuseCellsPtr, 4 * RtNames(cx).fuses.size());
+  }
+  ZeroMethodCells();
+  memset(RtSetAdd(cx), 0, sizeof(SetAddRow) * kSetAddSize);
+  memset(RtInitAdd(cx), 0, sizeof(InitAddRow) * kInitAddSize);
+  memset(RtHasInst(cx), 0, sizeof(uint32_t) * kHasInstCacheN * 2);
+  memset(RtNoExtra(cx), 0, sizeof(uintptr_t) * kNoExtraCacheN * 5);
+  RtState(cx).transRowsHoldNursery = false;
+}
+
 // The purge points, all on the slice callback: `GC_CYCLE_BEGIN`/`GC_CYCLE_END`
 // bracket a whole collection (the single-slot `JS_SetGCCallback` is not used
 // here because an embedding or the shell's testing functions replace it, which
