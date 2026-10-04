@@ -1708,8 +1708,11 @@ pub(crate) fn compute_apply_fwd_pcs(
 /// arguments object, when those are its only uses, so the object need
 /// never be made (MIR's arguments elision; `sc_list`, `sc_append`). The
 /// object is unobservable when:
-///   - the script has no formals (nothing maps, nothing aliases) and is
-///     not a generator;
+///   - the script is not a generator, and its formals, if it has any, are
+///     `formals_pinned`: never written (no `SetArg`) and none closed over
+///     (which the caller, holding the scope, decides), so a mapped object
+///     would only ever read the actuals and an unmapped one reads them
+///     anyway;
 ///   - every value an `Arguments` op pushes, or a `GetLocal` of a local it
 ///     is stored into (the `arguments` binding, `var a = arguments`: each
 ///     stored once, before any branch), is consumed by a `GetProp` of
@@ -1718,9 +1721,15 @@ pub(crate) fn compute_apply_fwd_pcs(
 ///   - none is on the operand stack at a block leader (so the model stays
 ///     straight-line), and those locals are written by nothing else.
 /// `is_length` says whether a `GetProp`'s name index is `length`.
-pub(crate) fn compute_args_reads(script: &Script, is_length: &dyn Fn(u32) -> bool) -> Option<HashSet<Pc>> {
+pub(crate) fn compute_args_reads(
+    script: &Script,
+    is_length: &dyn Fn(u32) -> bool,
+    formals_closed_over: bool,
+) -> Option<HashSet<Pc>> {
     use crate::wasm::baseline::layout::{leaders, StackDepths};
-    if script.nargs != 0 || script.is_generator_or_async || !uses_arguments(script) {
+    let formals_pinned = script.nargs == 0
+        || (!formals_closed_over && !script.parser().opcodes().any(|op| matches!(op, JSOp::SetArg)));
+    if !formals_pinned || script.is_generator_or_async || !uses_arguments(script) {
         return None;
     }
     let depths = StackDepths::compute(script).ok()?;

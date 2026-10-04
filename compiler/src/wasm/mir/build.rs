@@ -714,7 +714,16 @@ fn build_at<'a>(
                     && matches!(ctx.source.object(gc), crate::source::SourceObject::String(s) if s.chars() == length.as_slice())
             })
         };
-        shape.args_reads = crate::wasm::translate::compute_args_reads(script, &is_length);
+        // A closed-over formal lives in the environment, where a mapped
+        // arguments object would see another function's write to it.
+        let formals_closed_over = script.body_scope.is_none_or(|b| match ctx.source.object(b) {
+            crate::source::SourceObject::Scope(sd) => {
+                sd.bindings.iter().take(usize::from(script.nargs)).any(|&(_, _, slot)| slot.is_some())
+                    || sd.bindings.len() < usize::from(script.nargs)
+            }
+            _ => true,
+        });
+        shape.args_reads = crate::wasm::translate::compute_args_reads(script, &is_length, formals_closed_over);
     }
     shape.inline_depth = ictx.depth;
     shape.ictx = ictx;
