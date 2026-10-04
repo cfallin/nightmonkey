@@ -2325,6 +2325,47 @@ IC.
   and around a subclass's own; base methods over the three subclasses;
   insertion order through Object.keys, JSON and for-in; GCs).
 
+**M5w. react's helper calls, kept in compiled code (2026-10-03; the
+owner's react-vs-Ion question).** react ran 4.75x behind Ion, and ~80% of
+that was time in runtime helpers Ion keeps inline, not compiled code and
+not missing facts. Each of these takes a helper off the common path;
+none needs a fact.
+- **Concat.** Two strings past the inline-string limit make a JSRope in
+  the nursery from compiled code (`rope_concat`), as the JIT's concat
+  stub does; an empty half is the other. The zone's catch-all string
+  site header and count address are host words in the strlit block,
+  zeroed while the zone does not allocate strings in the nursery, and
+  refreshed after every GC (the flag moves only there).
+- **typeof.** Decided by the tag, and for an object by its class: the
+  function classes, or a class with no call hook that is neither a proxy
+  nor emulates undefined. The rest ask the helper.
+- **Get rows hold absences and primitives.** A way or mega row may hold
+  a proven absence (`undefined`) pinned by the receiver key and one
+  holder shape; longer chains go to the guarded-chain table, which the
+  in-module probe now reads. A string, number or boolean receiver is
+  keyed by a pseudo shape, its lookup starting at its prototype.
+- **hasOwn rows** (`atomPtr | 2` in the mega get table): own-or-not, pinned
+  by the receiver's shape, for an atom key on a native receiver whose
+  class cannot resolve the key.
+- **push(a, b, ...)** appends up to eight values inline.
+- **RegExp exec/test** on a non-global, non-sticky regexp is decided by a
+  leaf: a failed match, and a successful test(), with no frame.
+- **Array literals** store strings and objects in place (with the
+  post-barrier a literal tenured mid-initialization owes).
+- **Dynamic-key adds** (`props[name] = v` with a for-in's atom) replay a
+  transition cached under (old shape, `atomPtr | 1`) in the global add
+  table.
+- **Arguments elision with formals**: read only for its length and
+  elements, the object is not made when no formal is written and none is
+  closed over (the mapped object would only read the actuals).
+- Octane (4 seeds, against M5v): react 38.3k -> 58.2k (+52%; Ion 183k),
+  pdfjs +9.6%, regexp +6.3%, the rest within noise. No declines; exits
+  at or below M5v's.
+- Night tests: mir-typeof-concat-inline.js, mir-get-absent-prim.js,
+  mir-has-own-rows.js, mir-push-many.js, mir-regexp-leaf.js,
+  mir-array-literal-gc-values.js, mir-elem-add-rows.js,
+  mir-args-elide-formals.js, each proved with mutants.
+
 **M6. The rest of §10**: box/unbox cleanup, memory optimizations, and
 numeric optimizations, each with its guard-count and instruction-count
 tests.
