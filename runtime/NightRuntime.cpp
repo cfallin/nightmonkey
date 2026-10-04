@@ -6733,9 +6733,16 @@ bool night_runtime_native_dispatch(JSContext* cx, uint32_t top, uint32_t sp,
   if (!recursion.check(cx)) {
     return false;
   }
-  js::AutoRealm ar(cx, fun);
-  if (!fun->native()(cx, argc, frame)) {
-    return false;
+  // A native of this realm (the common case) runs with no realm switch.
+  if (MOZ_LIKELY(fun->realm() == cx->realm())) {
+    if (!native(cx, argc, frame)) {
+      return false;
+    }
+  } else {
+    js::AutoRealm ar(cx, fun);
+    if (!fun->native()(cx, argc, frame)) {
+      return false;
+    }
   }
   WriteNightOut(top, frame[0].asRawBits());
   return true;

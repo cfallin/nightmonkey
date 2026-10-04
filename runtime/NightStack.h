@@ -31,6 +31,7 @@
 #define night_runtime_NightStack_h
 
 #include "mozilla/Attributes.h"  // MOZ_RAII
+#include "mozilla/Likely.h"      // MOZ_LIKELY
 
 #include <stddef.h>
 #include <stdint.h>
@@ -82,8 +83,18 @@ class NightStack {
 // RAII guard for a native -> AOT re-entry: saves the free top on entry and
 // restores it on scope exit (see the re-entrancy contract above). frameBase()
 // is the sp the re-entered frame should be built at.
-// The process-wide AOT value stack (one runtime per wasm instance).
-NightStack& TheNightStack();
+// The process-wide AOT value stack (one runtime per wasm instance). Made on
+// first use (its backing allocation must not run at static-initialization
+// time); every runtime helper reaches it, so the made one is published in
+// a plain pointer the inline accessor loads.
+extern NightStack* gTheNightStack;
+NightStack& TheNightStackSlow();
+inline NightStack& TheNightStack() {
+  if (MOZ_LIKELY(gTheNightStack)) {
+    return *gTheNightStack;
+  }
+  return TheNightStackSlow();
+}
 
 class MOZ_RAII AutoNightReentry {
  public:

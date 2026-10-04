@@ -35,8 +35,11 @@ void NightStack::trace(JSTracer* trc) {
   }
 }
 
-NightStack& TheNightStack() {
+NightStack* gTheNightStack = nullptr;
+
+NightStack& TheNightStackSlow() {
   static NightStack stack;
+  gTheNightStack = &stack;
   return stack;
 }
 
