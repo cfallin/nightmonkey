@@ -14,10 +14,10 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use crate::mir::entity::{Block, Inst, Value};
-use crate::mir::func::{Edge, EdgeArg, Func, ValueDef};
+use crate::mir::func::{Edge, EdgeArg, Func, RootKind, ValueDef};
 use crate::mir::module::Module;
 use crate::mir::ops::{effects, signature, ArithOp, Effects, KillSite, Opcode, SuccRole};
-use crate::mir::types::{is_subtype, Type};
+use crate::mir::types::{is_subtype, IRange, Type};
 
 /// A guard's identity: its op (with its static params) and its operand.
 type GuardKey = (Opcode, Value);
@@ -60,6 +60,7 @@ pub(super) fn is_guard(op: &Opcode) -> bool {
             | Opcode::CheckFuse(_)
             | Opcode::CheckBinding(..)
             | Opcode::IntToI32
+            | Opcode::GuardRange(_)
             | Opcode::F64ToIntExact
     )
 }
@@ -227,6 +228,9 @@ pub(crate) fn ok_output(f: &Func, ok: &Edge) -> Option<Value> {
     let k = ok.args.iter().position(|a| *a == EdgeArg::Out(0))?;
     Some(f.blocks[ok.block].params[k])
 }
+
+/// Whether `trunc_demand` also unchecks int32 products in range.
+const TRUNC_MUL: bool = true;
 
 /// Whether `trunc_demand` runs.
 const TRUNC_DEMAND: bool = true;
@@ -454,11 +458,21 @@ fn trunc_demand_once(m: &Module, f: &mut Func) -> usize {
     for b in live {
         let Some(t) = f.terminator(b) else { continue };
         let d = f.insts[t].clone();
-        let Opcode::I32Ovf(a @ (ArithOp::Add | ArithOp::Sub)) = d.op else {
+        let Opcode::I32Ovf(a @ (ArithOp::Add | ArithOp::Sub | ArithOp::Mul)) = d.op else {
             continue;
         };
         let out = ok_output(f, &d.succs[0]);
-        if let Some(r) = out {
+        if a == ArithOp::Mul {
+            // A product only ToInt32 sees, whose operands' ranges keep it
+            // an int32: its -0 (a zero product of a negative factor) is
+            // 0 to every such use, which is all the check guards then.
+            let (Type::I32(x), Type::I32(y)) = (f.values[d.args[0]].ty, f.values[d.args[1]].ty) else { continue };
+            let ps = [x.lo * y.lo, x.lo * y.hi, x.hi * y.lo, x.hi * y.hi];
+            let fits = ps.iter().all(|&p| (i64::from(i32::MIN)..=i64::from(i32::MAX)).contains(&p));
+            if !TRUNC_MUL || !fits || out.is_some_and(|r| !trunc.contains(&r)) {
+                continue;
+            }
+        } else if let Some(r) = out {
             if !trunc.contains(&r) || unit(&units, f, r) > TRUNC_UNITS_CAP {
                 continue;
             }
@@ -532,6 +546,10 @@ fn retype_ints(m: &Module, f: &mut Func) {
 pub fn optimize(m: &Module, f: &mut Func) -> usize {
     // Once, first: an overflow check it removes is a guard the rest
     // then need not keep in their dataflow.
+    if INT_RANGES {
+        onramp_ranges(m, f);
+        narrow_ints(m, f);
+    }
     let mut total = if TRUNC_DEMAND { trunc_demand(m, f) } else { 0 };
     // A loop's entry state, as values: its preheader's params now, which
     // `forward_params` may replace by the values every edge passes (a
@@ -553,11 +571,23 @@ pub fn optimize(m: &Module, f: &mut Func) -> usize {
         // First: a loop's invariant values reach its body through params
         // until forwarded, and `hoist_guards` needs them as they are.
         forward_params(m, f);
+        // Again each round: a check `fold_ints` removed was an exit
+        // holding values, which may now only reach ToInt32.
+        if TRUNC_DEMAND && INT_RANGES {
+            total += trunc_demand(m, f);
+        }
         let n = fold_guards(m, f)
             + if MEM_VN { crate::mir::mem::mem_vn(m, f) } else { 0 }
             + if SROA { crate::mir::mem::sroa(m, f) } else { 0 }
             + fold_unbox(f)
-            + fold_ints(m, f)
+            + {
+                // Types only (it changes no instruction): what forwarding
+                // sharpened reaches the params, for `fold_ints`.
+                if INT_RANGES {
+                    narrow_ints(m, f);
+                }
+                fold_ints(m, f)
+            }
             + if GVN { gvn(m, f) } else { 0 }
             + if LICM { licm(m, f) } else { 0 }
             + if HOIST_GUARDS { hoist_guards(m, f) } else { 0 }
@@ -1778,6 +1808,7 @@ fn hoistable_guard(op: &Opcode) -> bool {
             | Opcode::CheckFuse(_)
             | Opcode::CheckBinding(..)
             | Opcode::IntToI32
+            | Opcode::GuardRange(_)
             | Opcode::F64ToIntExact
     )
 }
@@ -2292,4 +2323,245 @@ pub fn hoist_reads(m: &Module, f: &mut Func) -> usize {
         }
     }
     0
+}
+
+/// Whether `narrow_ints` and `onramp_ranges` run.
+const INT_RANGES: bool = true;
+
+/// How many times a value's range may grow before it widens to its
+/// declared type (a loop-carried count, `i + 1`, grows every round).
+const RANGE_WIDEN_AFTER: u32 = 3;
+
+/// The ops whose int32 result or output `int_ranges` recomputes from its
+/// operands' ranges.
+fn ranged_op(op: &Opcode) -> bool {
+    matches!(op, Opcode::I32Ovf(_) | Opcode::I32Wrap(_) | Opcode::I32Bit(_) | Opcode::ConstI32(_) | Opcode::GuardRange(_))
+}
+
+/// The int32 ranges of a function's values, from the ops' rules and, for
+/// block params, the hull of what their edges pass (§10.6): an optimistic
+/// fixpoint in reverse postorder, where an edge not reached yet passes
+/// nothing and a value whose range keeps growing widens to its declared
+/// type. Edges from `skip` blocks do not count. Values with no entry keep
+/// their declared type.
+fn int_ranges(m: &Module, f: &Func, skip: &BTreeSet<Block>) -> HashMap<Value, IRange> {
+    let cfg = Cfg::new(f);
+    let mut cur: HashMap<Value, IRange> = HashMap::new();
+    let mut grown: HashMap<Value, u32> = HashMap::new();
+    let declared = |v: Value| match f.values[v].ty {
+        Type::I32(r) => Some(r),
+        _ => None,
+    };
+    let range_of = |cur: &HashMap<Value, IRange>, v: Value| -> Option<IRange> {
+        match f.values[v].def {
+            ValueDef::Param(..) => cur.get(&v).copied(),
+            ValueDef::Result(i, _) if ranged_op(&f.insts[i].op) => cur.get(&v).copied(),
+            _ => declared(v),
+        }
+    };
+    let mut changed = true;
+    while changed {
+        changed = false;
+        let mut set = |cur: &mut HashMap<Value, IRange>, v: Value, r: IRange| {
+            let Some(d) = declared(v) else { return };
+            let r = IRange::new(r.lo.max(d.lo), r.hi.min(d.hi));
+            let next = match cur.get(&v) {
+                None => r,
+                Some(old) if old.contains(&r) => return,
+                Some(old) => {
+                    let n = grown.entry(v).or_insert(0);
+                    *n += 1;
+                    if *n > RANGE_WIDEN_AFTER {
+                        d
+                    } else {
+                        old.hull(&r)
+                    }
+                }
+            };
+            if cur.get(&v) != Some(&next) {
+                cur.insert(v, next);
+                changed = true;
+            }
+        };
+        for &b in &cfg.rpo {
+            for &i in &f.blocks[b].insts {
+                let d = &f.insts[i];
+                let arg_tys = |cur: &HashMap<Value, IRange>| -> Option<Vec<Type>> {
+                    d.args
+                        .iter()
+                        .map(|&a| match f.values[a].ty {
+                            Type::I32(_) => range_of(cur, a).map(Type::I32),
+                            t => Some(t),
+                        })
+                        .collect()
+                };
+                let sig = if ranged_op(&d.op) {
+                    arg_tys(&cur).and_then(|t| signature(&d.op, &t, m).ok())
+                } else {
+                    None
+                };
+                if let Some(s) = &sig {
+                    for (&r, t) in d.results.iter().zip(&s.results) {
+                        if let Type::I32(x) = t {
+                            set(&mut cur, r, *x);
+                        }
+                    }
+                }
+                if skip.contains(&b) {
+                    continue;
+                }
+                for e in &d.succs {
+                    for (k, a) in e.args.iter().enumerate() {
+                        let p = f.blocks[e.block].params[k];
+                        let Some(pd) = declared(p) else { continue };
+                        let r = match *a {
+                            EdgeArg::Value(v) => match f.values[v].ty {
+                                Type::I32(_) => range_of(&cur, v),
+                                _ => Some(pd),
+                            },
+                            EdgeArg::Out(o) => match &sig {
+                                Some(s) => match s.outputs.get(o as usize) {
+                                    Some(Type::I32(x)) => Some(*x),
+                                    _ => Some(pd),
+                                },
+                                // Not ranged: the op's own output type.
+                                None => Some(pd),
+                            },
+                        };
+                        if let Some(r) = r {
+                            set(&mut cur, p, r);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    cur
+}
+
+/// Narrow int32 values to the ranges `int_ranges` finds (block params
+/// especially, whose declared type is the builder's `i32`). Returns how
+/// many types it narrowed.
+pub fn narrow_ints(m: &Module, f: &mut Func) -> usize {
+    let r = int_ranges(m, f, &BTreeSet::new());
+    let mut n = 0;
+    for (v, x) in r {
+        if let Type::I32(d) = f.values[v].ty {
+            if d.contains(&x) && d != x {
+                f.values[v].ty = Type::I32(x);
+                n += 1;
+            }
+        }
+    }
+    n
+}
+
+/// An onramp's values come from the baseline frame, so a loop param an
+/// onramp feeds has no range however narrow the loop's entry path makes
+/// it. Where the param's other edges prove a range the onramp's value
+/// lacks, the onramp guards its value into that range (exiting at the
+/// loop header, as its other guards do), so the param keeps it. The
+/// ranges hold of the program, not of a speculation, so the guard never
+/// fails in practice. Returns how many guards it added.
+pub fn onramp_ranges(m: &Module, f: &mut Func) -> usize {
+    let preheaders: BTreeSet<Block> = f.loops.iter().map(|l| l.preheader).collect();
+    // Each onramp's chain (its blocks until the preheader), its jump into
+    // the preheader, and its exit block.
+    let mut chains: Vec<(BTreeSet<Block>, Inst, Block, Block)> = vec![];
+    for r in f.roots.clone() {
+        if !matches!(r.kind, RootKind::Onramp(_)) {
+            continue;
+        }
+        let mut blocks = BTreeSet::new();
+        let (mut b, mut exit) = (r.block, None);
+        let jump = loop {
+            blocks.insert(b);
+            let Some(t) = f.terminator(b) else { break None };
+            let d = &f.insts[t];
+            if d.op == Opcode::Jump {
+                break preheaders.contains(&d.succs[0].block).then_some(t);
+            }
+            if !is_guard(&d.op) || d.succs.len() != 2 {
+                break None;
+            }
+            let fb = d.succs[1].block;
+            if f.terminator(fb).is_some_and(|x| f.insts[x].op.exit_shape().is_some()) && f.blocks[fb].params.is_empty() {
+                exit = Some(fb);
+            }
+            b = d.succs[0].block;
+        };
+        if let (Some(j), Some(x)) = (jump, exit) {
+            chains.push((blocks, j, b, x));
+        }
+    }
+    if chains.is_empty() {
+        return 0;
+    }
+    let skip: BTreeSet<Block> = chains.iter().flat_map(|c| c.0.iter().copied()).collect();
+    let others = int_ranges(m, f, &skip);
+    let mut added = 0;
+    for (_, j, b, exit) in chains {
+        let pre = f.insts[j].succs[0].block;
+        let mut args = f.insts[j].succs[0].args.clone();
+        // The onramp enters mid-loop: a value must be in the range of the
+        // header param its preheader param becomes (the loop-carried hull,
+        // back edges included), not in the entry path's own range.
+        let Some(pt) = f.terminator(pre) else { continue };
+        let pd = &f.insts[pt];
+        if pd.op != Opcode::Jump {
+            continue;
+        }
+        let header = pd.succs[0].block;
+        let mut want: Vec<(usize, Value, IRange)> = vec![];
+        for (k, a) in args.iter().enumerate() {
+            let EdgeArg::Value(v) = *a else { continue };
+            let p = f.blocks[pre].params[k];
+            let into: Vec<Value> = pd.succs[0]
+                .args
+                .iter()
+                .zip(&f.blocks[header].params)
+                .filter(|(x, _)| **x == EdgeArg::Value(p))
+                .map(|(_, &h)| h)
+                .collect();
+            let need = match into.as_slice() {
+                // Not carried by the header: the entry range is all there is.
+                [] => others.get(&p).copied(),
+                [h] => others.get(h).copied(),
+                _ => None,
+            };
+            let (Type::I32(have), Some(need)) = (f.values[v].ty, need) else { continue };
+            if have.contains(&need) && have != need {
+                want.push((k, v, need));
+            }
+        }
+        if want.is_empty() {
+            continue;
+        }
+        let frame = f.inst_frame[j];
+        // Replace the jump by a chain of guards ending in it.
+        let popped = f.blocks[b].insts.pop();
+        debug_assert_eq!(popped, Some(j));
+        let mut at = b;
+        for (k, v, need) in want {
+            let nb = f.add_block();
+            let out = f.add_param(nb, Type::I32(need));
+            let (g, _) = f.add_inst(
+                at,
+                Opcode::GuardRange(need),
+                vec![v],
+                &[],
+                vec![
+                    Edge { block: nb, args: vec![EdgeArg::Out(0)] },
+                    Edge { block: exit, args: vec![] },
+                ],
+            );
+            f.inst_frame[g] = frame;
+            args[k] = EdgeArg::Value(out);
+            at = nb;
+            added += 1;
+        }
+        let (nj, _) = f.add_inst(at, Opcode::Jump, vec![], &[], vec![Edge { block: pre, args }]);
+        f.inst_frame[nj] = frame;
+    }
+    added
 }

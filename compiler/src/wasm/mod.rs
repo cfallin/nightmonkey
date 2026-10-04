@@ -1909,7 +1909,7 @@ pub fn translate_all(
     let mut tier_census = tier::TierCensus::default();
     // `--dump-tiers`: each script's function name, for reading censuses.
     let fn_names: HashMap<u32, String> = if opts.diagnostics.tiers {
-        source
+        let mut names: HashMap<u32, String> = source
             .objects
             .iter()
             .filter_map(|o| match o {
@@ -1922,7 +1922,13 @@ pub fn translate_all(
                 }
                 _ => None,
             })
-            .collect()
+            .collect();
+        // Self-hosted scripts have no named function object in the tree;
+        // name them by their global path (marked, to tell them apart).
+        for (id, path) in &source.selfhosted {
+            names.entry(id.id()).or_insert_with(|| format!("[self-hosted] {path}"));
+        }
+        names
     } else {
         HashMap::default()
     };

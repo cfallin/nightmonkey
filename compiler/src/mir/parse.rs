@@ -1314,6 +1314,12 @@ impl Parser {
             StoreField(_) => StoreField(self.atom()?),
             InitField(_) => InitField(self.atom()?),
             GuardTags(_) => GuardTags(self.tags()?),
+            GuardRange(_) => {
+                let lo: i64 = self.int()?;
+                self.expect_punct(",")?;
+                let hi: i64 = self.int()?;
+                GuardRange(IRange::new(lo, hi))
+            }
             GuardKind(_) => GuardKind(self.kind()?),
             GuardLayout { .. } => {
                 let keys = self.keys()?;
@@ -1612,6 +1618,7 @@ fn template(mn: &str) -> Option<Opcode> {
         },
         F64ToIntExact,
         IntToI32,
+        GuardRange(IRange::I32),
         CheckFuse(FuseId::from_u32(0)),
         CheckBinding(BindingId::from_u32(0), BindingCheck::Read),
         CheckBinding(BindingId::from_u32(0), BindingCheck::Write),

@@ -83,6 +83,40 @@ On those (or any `--value-census` run's stdout and compile log):
   reason the site has no `prop_sites` row; compile with `--dump-propgap`
   too.
 
+## Where the time goes (profiles)
+
+```
+.claude/skills/nm-bench/prof.sh <bench> [tag] [nightmonkey js]
+python3 .claude/skills/nm-bench/prof.py $W/prof/<tag>-<bench>/stacks.txt \
+    --tiers $W/prof/<tag>-<bench>/tiers.txt --under '^night_runtime_call$'
+```
+
+`prof.sh` compiles with `--keep-names --dump-tiers`, precompiles, runs
+`perf record -g` on CPU 10 (`FREQ`, default 4000 Hz) and leaves
+`stacks.txt` (`perf script`) and `tiers.txt` under `$W/prof/<tag>-<bench>`.
+`prof.py` prints:
+- the split by leaf class: `script` (compiled bodies, `night_script_<sid>`),
+  `regex` (compiled matchers), `glue` (adapters, classify, `night_ic_*`),
+  `helper` (`night_*` C++ entry points), `engine` (other SpiderMonkey C++),
+  `host` (wasmtime, kernel);
+- leaf functions, what compiled scripts enter (the first non-glue frame
+  above the innermost script: the helper), scripts' self time, and
+  script -> entered helper pairs;
+- with `--under RE`: a helper's immediate callees, the leaves under it,
+  and its calling scripts.
+
+Scripts are named from the tier log, self-hosted ones as `[self-hosted]
+<path>`. For one function's machine code, `nm -S m.cwasm | grep <name>`
+gives its address and size; `objdump -d --start-address=...` on the
+`.cwasm` (an ELF) disassembles it, jump tables included (`wasmtime
+objdump` stops at the first one). The leaf frames' `+0x..` offsets in
+`stacks.txt` are per-instruction samples to annotate it with.
+
+Compare against native Ion with `perf stat -e cycles,instructions` on
+`$SYS_JS <b>.run.js`: at equal run time, instructions per score point is
+the codegen-quality ratio (crypto: Ion runs half our instructions per
+point at the same IPC).
+
 ## The cross-engine table
 
 ```
@@ -133,5 +167,10 @@ reports an Octane-style score too.
   next to a lane on the sibling CPUs swung by 50–140%.
 - **Never `pkill -f <pattern>`** where the pattern also appears in your own
   command line: it kills your shell. Kill by PID.
+- **Failed onramps are quiet.** An onramp whose guards miss re-deopts,
+  and baseline then runs the rest of that loop: one exit in the census,
+  but the loop's time moves to baseline. A wrong onramp guard (it once
+  checked a loop counter against its start value) cost mandreel 51% with
+  136 exits. Look at a regressed bench's profile, not only `excensus`.
 - **`--dump-tiers` per script** shows which tier compiled each script.
   `--dump-mir` prints a declined script's MIR with the validator's errors.

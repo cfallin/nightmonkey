@@ -553,6 +553,9 @@ pub enum Opcode {
     F64ToIntExact,
     /// An `int` known to be int32 (T: fails outside int32's range).
     IntToI32,
+    /// An int32 in the inclusive range (fails outside it): an onramp's
+    /// value brought to the range the loop's entry path proves.
+    GuardRange(IRange),
     CheckFuse(FuseId),
     /// The binding is usable as `BindingCheck` says.
     CheckBinding(BindingId, BindingCheck),
@@ -940,6 +943,7 @@ impl Opcode {
             | MethodLoad { .. }
             | F64ToIntExact
             | IntToI32
+            | GuardRange(_)
             | CheckFuse(_)
             | CheckBinding(..)
             | CheckNative(_)
@@ -1175,6 +1179,11 @@ fn bit_range(b: BitOp, x: IRange, y: IRange) -> IRange {
         BitOp::Shr if y.lo == y.hi => {
             let k = y.lo & 31;
             IRange::new(x.lo >> k, x.hi >> k)
+        }
+        // A shift by a constant that loses no bit of any value in range.
+        BitOp::Shl if y.lo == y.hi && (x.lo << (y.lo & 31)) >= I32_MIN && (x.hi << (y.lo & 31)) <= I32_MAX => {
+            let k = y.lo & 31;
+            IRange::new(x.lo << k, x.hi << k)
         }
         _ => IRange::new(I32_MIN, I32_MAX),
     }
@@ -1485,6 +1494,16 @@ pub fn signature(op: &Opcode, args: &[Type], m: &Module) -> SigResult {
             match args[0] {
                 Type::Int(r) => Sig::output(Type::I32(clamp_range(r.lo.into(), r.hi.into(), I32_MIN, I32_MAX))),
                 _ => return Err("int.to_i32: expected an int".into()),
+            }
+        }
+        GuardRange(r) => {
+            arity(args, 1)?;
+            match args[0] {
+                Type::I32(x) => {
+                    let (lo, hi) = (x.lo.max(r.lo), x.hi.min(r.hi));
+                    Sig::output(Type::I32(if lo <= hi { IRange::new(lo, hi) } else { *r }))
+                }
+                _ => return Err("guard.range: expected an i32".into()),
             }
         }
         F64ToIntExact => {

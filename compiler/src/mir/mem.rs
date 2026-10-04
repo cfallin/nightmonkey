@@ -178,15 +178,48 @@ pub fn mem_vn(m: &Module, f: &mut Func) -> usize {
             }
         }
     };
-    let mut ins: BTreeMap<Block, Vec<Version>> = BTreeMap::new();
-    for r in &f.roots {
-        ins.insert(r.block, vec![Version::Entry; locs.len()]);
+    // Each block's entry is recomputed from its predecessors' edges as
+    // they stand (an edge not reached yet contributes nothing), never
+    // merged into the block's previous entry: a single-predecessor block
+    // takes its predecessor's versions, and only a join whose incoming
+    // versions differ is a `Phi` of its own. (Merging into the previous
+    // entry made every block downstream of a loop header a phi of its own
+    // once the header's versions changed, so two reads in one iteration
+    // never matched.) Visited in reverse postorder, in place; a join's
+    // entry moves at most from one version to its `Phi`, so the passes
+    // end.
+    let root_blocks: BTreeSet<Block> = f.roots.iter().map(|r| r.block).collect();
+    let mut in_edges: BTreeMap<Block, Vec<(Inst, usize)>> = BTreeMap::new();
+    for &b in &f.layout {
+        for &i in &f.blocks[b].insts {
+            for (k, e) in f.insts[i].succs.iter().enumerate() {
+                in_edges.entry(e.block).or_default().push((i, k));
+            }
+        }
     }
+    let mut ins: BTreeMap<Block, Vec<Version>> = BTreeMap::new();
+    let mut outs: HashMap<(Inst, usize), Vec<Version>> = HashMap::new();
     let mut changed = true;
     while changed {
         changed = false;
         for &b in &cfg.rpo {
-            let Some(mut st) = ins.get(&b).cloned() else { continue };
+            let mut entry: Option<Vec<Version>> = root_blocks.contains(&b).then(|| vec![Version::Entry; locs.len()]);
+            for e in in_edges.get(&b).map(|v| v.as_slice()).unwrap_or(&[]) {
+                let Some(o) = outs.get(e) else { continue };
+                entry = Some(match entry {
+                    None => o.clone(),
+                    Some(cur) => cur
+                        .iter()
+                        .zip(o)
+                        .map(|(&a, &b2)| if a == b2 { a } else { Version::Phi(b) })
+                        .collect(),
+                });
+            }
+            let Some(mut st) = entry else { continue };
+            if ins.get(&b) != Some(&st) {
+                ins.insert(b, st.clone());
+                changed = true;
+            }
             let insts = f.blocks[b].insts.clone();
             for &i in &insts {
                 let fx = fx_of(f, i);
@@ -194,21 +227,10 @@ pub fn mem_vn(m: &Module, f: &mut Func) -> usize {
                     apply(&mut st, &writes_on(f, m, i, &fx, None), i, &mut None);
                     continue;
                 }
-                for (role, e) in f.succ_edges(i) {
+                for (k, (role, _)) in f.succ_edges(i).enumerate() {
                     let mut s2 = st.clone();
                     apply(&mut s2, &writes_on(f, m, i, &fx, Some(role)), i, &mut None);
-                    let merged = match ins.get(&e.block) {
-                        None => s2,
-                        Some(old) => old
-                            .iter()
-                            .zip(&s2)
-                            .map(|(&a, &b2)| if a == b2 { a } else { Version::Phi(e.block) })
-                            .collect(),
-                    };
-                    if ins.get(&e.block) != Some(&merged) {
-                        ins.insert(e.block, merged);
-                        changed = true;
-                    }
+                    outs.insert((i, k), s2);
                 }
             }
         }

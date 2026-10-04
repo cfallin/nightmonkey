@@ -194,6 +194,47 @@ pub(crate) fn native_math_index(name: &str) -> Option<u32> {
 }
 
 
+/// `guard.unbox.f64num` branches on the tag, the double first, rather
+/// than converting both ways and selecting (`unbox_num_edges`).
+const NUM_UNBOX_BRANCHY: bool = true;
+
+/// An int32 add or sub of a constant checks overflow with one compare of
+/// the other operand against a bound.
+const CONST_OVF_COMPARE: bool = true;
+
+/// `load_elem` tests the tag its `ok` block's unbox guard wants first
+/// (`load_elem_unboxed`).
+const FUSED_ELEM_UNBOX: bool = true;
+
+/// A loop's managed values enter its header in registers unless one may
+/// cross a GC on the loop's expected path (`gc_only_off_path`).
+const HOT_CROSSINGS_ONLY: bool = true;
+
+/// Whether `op`'s lowering reaches a may-GC call only off its expected
+/// path: an inline arm handles the common case, and the helper behind it
+/// (an IC miss, growth, a slow allocation, a generic numeric operand) or
+/// the op itself (an exit, boxing a primitive `this`) is the exception. A
+/// value live across a loop that GCs only there stays in a register on
+/// the loop's back edges; the exceptional edge reloads it (`conform`).
+/// Only a placement choice: a wrong answer costs reloads, never
+/// correctness.
+fn gc_only_off_path(op: &Opcode) -> bool {
+    matches!(
+        op,
+        Opcode::StoreElem(..)
+            | Opcode::InitField(_)
+            | Opcode::GetElemData
+            | Opcode::SetElemData(_)
+            | Opcode::GetPropData(_)
+            | Opcode::SetPropData(_)
+            | Opcode::Prim(_)
+            | Opcode::NewThis(..)
+            | Opcode::NewThisInit { .. }
+            | Opcode::ExitInline { .. }
+            | Opcode::JsBoxThis
+    )
+}
+
 /// A generator's resume dispatch over at most this many yields is a chain
 /// of compares; past it, a `br_table`.
 const RESUME_CHAIN_MAX: usize = 4;
@@ -835,6 +876,160 @@ impl<'a> Lower<'a> {
         }
     }
 
+    /// `v`'s value where its type pins one int32 (as an i64: `-c` cannot
+    /// overflow).
+    fn const_i32(&self, v: mir::Value) -> Option<i64> {
+        match self.ty(v) {
+            MType::I32(r) if r.lo == r.hi => Some(r.lo),
+            _ => None,
+        }
+    }
+
+    /// Whether guard `inst`'s miss is a plain branch to its `fail` edge
+    /// (no `--mir-stress` failures and no exit census call to emit).
+    fn plain_guard(&self, inst: mir::Inst) -> bool {
+        let fail_blk = self.f.insts[inst].succs[1].block;
+        self.stress == 0 && (self.exit_census.is_none() || self.guard_exits(fail_blk).is_none())
+    }
+
+    /// `guard.unbox.f64num`'s edges from `v`'s `tag`, the double first: a
+    /// double's bits are the f64 (one compare, no select), an int32
+    /// converts, and anything else takes `fail`. `have` (what `v` may be)
+    /// drops the arm a value cannot take.
+    fn unbox_num_edges(&mut self, inst: mir::Inst, v: Value, tag: Value, have: TagSet) -> R<()> {
+        let may_dbl = !have.intersect(TagSet::prims(PRIM_DOUBLE)).is_empty();
+        let may_int = !have.intersect(TagSet::INT32).is_empty();
+        let join = self.body.add_block();
+        let x = self.body.add_blockparam(join, Type::F64);
+        let fail = self.body.add_block();
+        let not_dbl = if may_dbl {
+            let (d_b, nd_b) = (self.body.add_block(), self.body.add_block());
+            let k = self.i32c(TAG_INT32 as u32);
+            let is_dbl = self.bin(Operator::I32LtU, tag, k, Type::I32);
+            self.cond_br(is_dbl, Self::to(d_b), Self::to(nd_b));
+            self.cur = d_b;
+            let fd = self.un(Operator::F64ReinterpretI64, v, Type::F64);
+            self.terminate(Terminator::Br {
+                target: BlockTarget { block: join, args: vec![fd] },
+            });
+            nd_b
+        } else {
+            self.cur
+        };
+        self.cur = not_dbl;
+        if may_int {
+            let i_b = self.body.add_block();
+            let is_int = self.tag_is(tag, TAG_INT32 as u32);
+            self.cond_br(is_int, Self::to(i_b), Self::to(fail));
+            self.cur = i_b;
+            let low = self.un(Operator::I32WrapI64, v, Type::I32);
+            let fi = self.un(Operator::F64ConvertI32S, low, Type::F64);
+            self.terminate(Terminator::Br {
+                target: BlockTarget { block: join, args: vec![fi] },
+            });
+        } else {
+            self.terminate(Terminator::Br { target: Self::to(fail) });
+        }
+        self.cur = fail;
+        let f = self.edge(inst, 1, &[])?;
+        self.terminate(Terminator::Br { target: f });
+        self.cur = join;
+        let t = self.edge(inst, 0, &[x])?;
+        self.terminate(Terminator::Br { target: t });
+        Ok(())
+    }
+
+    /// The unbox guard a `load_elem` may test first: its `ok` edge's block
+    /// has no other way in and begins with `guard.unbox` of the loaded
+    /// value, in the same frame. Returns the guard, its kind, and the
+    /// block param the value arrives in.
+    fn fusable_unbox(&self, inst: mir::Inst) -> Option<(mir::Inst, UnboxKind, mir::Value)> {
+        let f = self.f;
+        let e = &f.insts[inst].succs[0];
+        let k = e.args.iter().position(|a| *a == EdgeArg::Out(0))?;
+        let p = *f.blocks[e.block].params.get(k)?;
+        if self.preds.get(&e.block).map_or(0, |v| v.len()) != 1 || f.roots.iter().any(|r| r.block == e.block) {
+            return None;
+        }
+        let &g = f.blocks[e.block].insts.first()?;
+        let Opcode::GuardUnbox(kind) = f.insts[g].op else { return None };
+        (f.insts[g].args[0] == p && f.inst_frame[g] == f.inst_frame[inst] && self.plain_guard(g)).then_some((g, kind, p))
+    }
+
+    /// `load_elem` whose `ok` block begins with `guard.unbox kind` of the
+    /// value (`fusable_unbox`): the element's tag is tested for `kind`
+    /// first, and a match takes the guard's `ok` edge with the payload
+    /// directly (a hole's tag is never `kind`'s). Any other tag goes the
+    /// unfused way: a hole to `fail`, the rest to the guard's block, whose
+    /// guard then misses as it would have.
+    fn load_elem_unboxed(&mut self, inst: mir::Inst, g: mir::Inst, kind: UnboxKind, p: mir::Value, obj: Value, idx: Value) -> R<()> {
+        let fail = self.body.add_block();
+        let (addr, _) = self.elem_addr(obj, idx, fail, false);
+        let v = self.load_i64(addr, 0);
+        let tag = self.tag_of(v);
+        // The guard's edges see the loaded value as its block's param.
+        self.vmap.insert(p, v);
+        let other = self.body.add_block();
+        if kind == UnboxKind::F64Num {
+            let have = value_tags(&self.ty(p));
+            // Its `fail` is `other` here: the hole test, then the guard.
+            let join = self.body.add_block();
+            let x = self.body.add_blockparam(join, Type::F64);
+            let (d_b, nd_b, i_b) = (self.body.add_block(), self.body.add_block(), self.body.add_block());
+            let k = self.i32c(TAG_INT32 as u32);
+            let is_dbl = self.bin(Operator::I32LtU, tag, k, Type::I32);
+            self.cond_br(is_dbl, Self::to(d_b), Self::to(nd_b));
+            self.cur = d_b;
+            let fd = self.un(Operator::F64ReinterpretI64, v, Type::F64);
+            self.terminate(Terminator::Br {
+                target: BlockTarget { block: join, args: vec![fd] },
+            });
+            self.cur = nd_b;
+            let is_int = self.tag_is(tag, TAG_INT32 as u32);
+            let may_int = !have.intersect(TagSet::INT32).is_empty();
+            if may_int {
+                self.cond_br(is_int, Self::to(i_b), Self::to(other));
+            } else {
+                self.terminate(Terminator::Br { target: Self::to(other) });
+            }
+            self.cur = i_b;
+            let low = self.un(Operator::I32WrapI64, v, Type::I32);
+            let fi = self.un(Operator::F64ConvertI32S, low, Type::F64);
+            self.terminate(Terminator::Br {
+                target: BlockTarget { block: join, args: vec![fi] },
+            });
+            self.cur = join;
+            let t = self.edge(g, 0, &[x])?;
+            self.terminate(Terminator::Br { target: t });
+        } else {
+            let want = match kind {
+                UnboxKind::I32 => TAG_INT32,
+                UnboxKind::Bool => TAG_BOOLEAN,
+                UnboxKind::Obj => TAG_OBJECT,
+                UnboxKind::Str => TAG_STRING,
+                UnboxKind::F64Num => unreachable!(),
+            };
+            let hit = self.body.add_block();
+            let is_k = self.tag_is(tag, want as u32);
+            self.cond_br(is_k, Self::to(hit), Self::to(other));
+            self.cur = hit;
+            let payload = self.un(Operator::I32WrapI64, v, Type::I32);
+            let t = self.edge(g, 0, &[payload])?;
+            self.terminate(Terminator::Br { target: t });
+        }
+        self.cur = other;
+        let hole = self.tag_is(tag, TAG_MAGIC as u32);
+        let t = self.edge(inst, 0, &[v])?;
+        let f_hole = self.body.add_block();
+        self.cond_br(hole, Self::to(f_hole), t);
+        self.cur = f_hole;
+        self.terminate(Terminator::Br { target: Self::to(fail) });
+        self.cur = fail;
+        let f = self.edge(inst, 1, &[])?;
+        self.terminate(Terminator::Br { target: f });
+        Ok(())
+    }
+
     /// A number Value (int32 or double) as an f64.
     fn to_f64(&mut self, v: Value) -> Value {
         let tag = self.tag_of(v);
@@ -1401,10 +1596,13 @@ impl<'a> Lower<'a> {
                     live.remove(&r);
                 }
                 if self.may_gc(i) {
+                    let hot = HOT_CROSSINGS_ONLY && !gc_only_off_path(&d.op);
                     let g = crossed_gen.entry(b).or_default();
                     for &v in live.iter().filter(|&&v| managed(v)) {
                         cand.insert(v);
-                        g.insert(v);
+                        if hot || !HOT_CROSSINGS_ONLY {
+                            g.insert(v);
+                        }
                     }
                 }
                 for &r in &d.results {
@@ -2769,6 +2967,11 @@ impl<'a> Lower<'a> {
                 let tys: Vec<MType> = d.args.iter().map(|&v| self.ty(v)).collect();
                 self.exit(ResumeWord { pc, mode }, &a, &tys, &dead, nargs, nlocals)?;
             }
+            Opcode::GuardUnbox(UnboxKind::F64Num) if NUM_UNBOX_BRANCHY && self.plain_guard(inst) => {
+                let tag = self.tag_of(a[0]);
+                let have = value_tags(&self.ty(d.args[0]));
+                self.unbox_num_edges(inst, a[0], tag, have)?;
+            }
             Opcode::GuardUnbox(k) => {
                 let v = a[0];
                 let tag = self.tag_of(v);
@@ -2823,6 +3026,27 @@ impl<'a> Lower<'a> {
                 let not_negz = self.bin(Operator::I64Ne, bits, negz, Type::I32);
                 let ok = self.bin(Operator::I32And, exact, not_negz, Type::I32);
                 self.guard(inst, ok, &[i])?;
+            }
+            Opcode::I32Ovf(op @ (ArithOp::Add | ArithOp::Sub))
+                if CONST_OVF_COMPARE && self.const_i32(d.args[1]).or(if op == ArithOp::Add { self.const_i32(d.args[0]) } else { None }).is_some() =>
+            {
+                // `x + c` (either side) or `x - c`: overflow is `x` past
+                // one bound, one compare rather than a widened sum.
+                let (x, c) = match self.const_i32(d.args[1]) {
+                    Some(c) => (a[0], c),
+                    None => (a[1], self.const_i32(d.args[0]).unwrap()),
+                };
+                let c = if op == ArithOp::Sub { -c } else { c };
+                let o = if op == ArithOp::Add { Operator::I32Add } else { Operator::I32Sub };
+                let r = self.bin(o, a[0], a[1], Type::I32);
+                let ok = if c >= 0 {
+                    let bound = self.i32c((i64::from(i32::MAX) - c) as i32 as u32);
+                    self.bin(Operator::I32LeS, x, bound, Type::I32)
+                } else {
+                    let bound = self.i32c((i64::from(i32::MIN) - c) as i32 as u32);
+                    self.bin(Operator::I32GeS, x, bound, Type::I32)
+                };
+                self.guard(inst, ok, &[r])?;
             }
             Opcode::I32Ovf(op) => {
                 let (x, y) = (a[0], a[1]);
@@ -3268,6 +3492,15 @@ impl<'a> Lower<'a> {
                 let len = self.load_i32(a[0], STRING_LENGTH_OFFSET);
                 self.def(inst, len);
             }
+            Opcode::GuardRange(r) => {
+                // One unsigned compare: `x - lo <=u hi - lo`.
+                let x = a[0];
+                let lo = self.i32c(r.lo as i32 as u32);
+                let d = self.bin(Operator::I32Sub, x, lo, Type::I32);
+                let span = self.i32c((r.hi - r.lo) as u32);
+                let ok = self.bin(Operator::I32LeU, d, span, Type::I32);
+                self.guard(inst, ok, &[x])?;
+            }
             Opcode::IntToI32 => {
                 let x = a[0];
                 let lo = self.i64c(i64::from(i32::MIN) as u64);
@@ -3404,6 +3637,10 @@ impl<'a> Lower<'a> {
                 self.cur = fail;
                 let f = self.edge(inst, 1, &[])?;
                 self.terminate(Terminator::Br { target: f });
+            }
+            Opcode::LoadElem if FUSED_ELEM_UNBOX && self.fusable_unbox(inst).is_some() => {
+                let (g, k, p) = self.fusable_unbox(inst).unwrap();
+                self.load_elem_unboxed(inst, g, k, p, a[0], a[1])?;
             }
             Opcode::LoadElem => {
                 // An in-bounds, non-hole dense element; else `fail`.

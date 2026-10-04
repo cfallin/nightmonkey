@@ -321,6 +321,7 @@ pub fn mnemonic(op: &Opcode) -> String {
         MethodLoad { .. } => "method.load".into(),
         F64ToIntExact => "f64.to_int_exact".into(),
         IntToI32 => "int.to_i32".into(),
+        GuardRange(_) => "guard.range".into(),
         CheckFuse(_) => "check.fuse".into(),
         CheckBinding(_, BindingCheck::Read) => "check.binding".into(),
         CheckBinding(_, BindingCheck::Write) => "check.binding.write".into(),
@@ -564,6 +565,7 @@ fn immediates(m: &Module, op: &Opcode) -> Option<String> {
         | StoreField(a)
         | InitField(a) => atom(Some(m), *a),
         GuardTags(t) => tags_str(*t),
+        GuardRange(r) => format!("{}, {}", r.lo, r.hi),
         GuardKind(k) => kind_str(*k),
         GuardLayout { keys, types, slots, closed } => {
             let mut s = keys_str(keys);

@@ -2366,6 +2366,54 @@ none needs a fact.
   mir-array-literal-gc-values.js, mir-elem-add-rows.js,
   mir-args-elide-formals.js, each proved with mutants.
 
+**M5x. Instructions per element and per int op (2026-10-04; KICKOFF-10
+item 1).** Profiles (`nm-bench/prof.sh`) put 8 of 13 benches at 75-99%
+in compiled code, and on crypto native Ion runs the same instructions
+and cycles as MIR (IPC ~6) for 2.14x the score: the gap is instructions
+per unit of work, not stalls, helpers or facts. Per am3 iteration MIR
+ran ~190 Wasm values: each element load ~17, each overflow check 6-7.
+- **`mem_vn` across loops.** The version dataflow merged each block's new
+  entry into its old one, so once a loop header's versions changed every
+  block below it became a phi of its own, and two reads in one iteration
+  of a loop with any store never matched (am3's `this_array[i]`, read
+  twice). Entries are now recomputed from the predecessors' edges.
+- **Element loads test the unbox's tag first** (`load_elem_unboxed`): a
+  `load_elem` whose `ok` block begins with `guard.unbox` of the element
+  takes the guard's `ok` edge on its tag; a hole (never that tag) goes to
+  the load's own `fail` on the slow path.
+- **`guard.unbox.f64num` branches**, double first, instead of converting
+  both ways and selecting; an arm the operand's tags exclude is dropped.
+- **Int32 ranges.** Block params take the hull of what their edges pass
+  (`narrow_ints`, an optimistic fixpoint that widens a value grown three
+  times). An onramp enters with the baseline frame's values, so a loop
+  param it feeds had no range however narrow the entry path makes it:
+  `onramp_ranges` guards the onramp's value into the range of the header
+  param it becomes (back edges included; `guard.range lo, hi`, one
+  unsigned compare). `x << c` keeps a range where no bit is lost.
+  `trunc_demand` runs each round (a check `fold_ints` removed was an exit
+  holding values) and unchecks a product in range whose result only
+  ToInt32 sees (its -0 is 0 there).
+- **`x + c` / `x - c`** checks overflow with one compare of `x`.
+- **Loop headers keep values in registers** where the loop GCs only off
+  its expected path (`gc_only_off_path`: IC misses, growth, slow
+  allocations, exits); the exceptional edge reloads from the home slot.
+- A first onramp guard used the preheader param's range (a loop counter's
+  start value): every onramp failed and baseline ran the rest of each
+  loop, mandreel -51% with 136 exits in the census.
+- Octane (4 seeds, against M5w): crypto +22%, navier-stokes +22%, box2d
+  +7.4%, raytrace +3.6%, mandreel +2.6%, the rest within noise. No
+  declines; no exit storms.
+- Left in am3: the sums the frame holds at an exit stay checked (Ion
+  recomputes such values at bailout from their operands; MIR's exits
+  could do the same), and a store after a load of the same element still
+  checks bounds and holes.
+- Night tests: mir-elem-unbox-fused.js, mir-int-ranges.js,
+  mir-memvn-loop.js, each failing against a mutant (holes sent to the
+  guard; an int32 reinterpreted as a double; products unchecked out of
+  range; the `x + c` bound one too lenient; loads merged across stores).
+  A param range too narrow fails the MIR verifier instead (the script
+  declines), so no test sees it.
+
 **M6. The rest of §10**: box/unbox cleanup, memory optimizations, and
 numeric optimizations, each with its guard-count and instruction-count
 tests.
