@@ -302,13 +302,17 @@ fn trunc_demand_once(m: &Module, f: &mut Func) -> usize {
         Arg(Inst),
         Param(Value),
         Full,
+        // An exit's operand: it needs the exact value, which an exit can
+        // recompute from a sum's operands (`recover_at_exits`).
+        Exit,
     }
     let mut uses: HashMap<Value, Vec<Use>> = HashMap::new();
     for &b in &live {
         for &i in &f.blocks[b].insts {
             let d = &f.insts[i];
+            let is_exit = RECOVER_AT_EXITS && matches!(d.op, Opcode::Exit { .. });
             for &a in &d.args {
-                uses.entry(a).or_default().push(Use::Arg(i));
+                uses.entry(a).or_default().push(if is_exit { Use::Exit } else { Use::Arg(i) });
             }
             for e in &d.succs {
                 for (k, a) in e.args.iter().enumerate() {
@@ -356,13 +360,34 @@ fn trunc_demand_once(m: &Module, f: &mut Func) -> usize {
         }
         Use::Param(p) => trunc.contains(&p),
         Use::Full => false,
+        // Only a sum or product an exit can recompute: one an add, sub or
+        // mul makes directly (not a param, whose producing iteration's
+        // operands are gone).
+        Use::Exit => false,
+    };
+    // `use_ok`, with an exit fine for a value the arithmetic makes here.
+    let recoverable: BTreeSet<Value> = live
+        .iter()
+        .flat_map(|&b| f.blocks[b].insts.iter().copied())
+        .filter(|&i| {
+            matches!(
+                f.insts[i].op,
+                Opcode::I32Ovf(ArithOp::Add | ArithOp::Sub | ArithOp::Mul)
+                    | Opcode::I32Wrap(ArithOp::Add | ArithOp::Sub | ArithOp::Mul)
+            )
+        })
+        .filter_map(|i| produced(f, &f.insts[i]))
+        .collect();
+    let use_ok = |trunc: &BTreeSet<Value>, v: Value, u: &Use| match *u {
+        Use::Exit => recoverable.contains(&v),
+        _ => use_ok(trunc, u),
     };
     let mut work: Vec<Value> = trunc.iter().copied().collect();
     while let Some(v) = work.pop() {
         if !trunc.contains(&v) {
             continue;
         }
-        let ok = uses.get(&v).map_or(true, |us| us.iter().all(|u| use_ok(&trunc, u)));
+        let ok = uses.get(&v).map_or(true, |us| us.iter().all(|u| use_ok(&trunc, v, u)));
         if !ok {
             trunc.remove(&v);
             if let Some(fs) = feeds.get(&v) {
@@ -494,7 +519,124 @@ fn trunc_demand_once(m: &Module, f: &mut Func) -> usize {
         f.add_inst(b, Opcode::Jump, vec![], &[], vec![Edge { block: ok.block, args }]);
         n += 1;
     }
+    if n > 0 && RECOVER_AT_EXITS {
+        recover_at_exits(m, f);
+    }
     n
+}
+
+/// Whether an exit recomputes the exact value of a wrapped sum or product
+/// it holds (so `trunc_demand` may wrap one an exit needs).
+const RECOVER_AT_EXITS: bool = true;
+
+/// How deep `recover_at_exits` follows wrapped operands (a deeper chain's
+/// exact value could leave a double's exact range; `trunc_demand`'s unit
+/// bound already keeps a chain it wraps far shallower).
+const RECOVER_DEPTH: u32 = 16;
+
+/// The wrapped arithmetic that makes `v`, if any: an `i32.*.wrap`'s result,
+/// or a param whose only way in is a jump passing one (a rewritten check's
+/// `ok` param).
+fn wrap_recipe(f: &Func, v: Value, preds: &BTreeMap<Block, Vec<Inst>>) -> Option<(ArithOp, Value, Value)> {
+    let w = match f.values[v].def {
+        ValueDef::Param(b, k) => {
+            let &[t] = preds.get(&b)?.as_slice() else { return None };
+            let d = &f.insts[t];
+            if d.op != Opcode::Jump {
+                return None;
+            }
+            match d.succs[0].args.get(k as usize)? {
+                EdgeArg::Value(w) => *w,
+                _ => return None,
+            }
+        }
+        _ => v,
+    };
+    match f.values[w].def {
+        ValueDef::Result(i, 0) => match f.insts[i].op {
+            Opcode::I32Wrap(op @ (ArithOp::Add | ArithOp::Sub | ArithOp::Mul)) => {
+                Some((op, f.insts[i].args[0], f.insts[i].args[1]))
+            }
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Exits that hold a wrapped sum or product (one `trunc_demand` unchecked
+/// because only ToInt32 sees it, the exit aside) get its exact value
+/// instead, recomputed in doubles from the operands just before the exit
+/// (as Ion's recover instructions do at a bailout): the int32 operands are
+/// exact, a wrapped operand recomputed in turn, and `trunc_demand`'s bounds
+/// keep each result within a double's exact range.
+fn recover_at_exits(m: &Module, f: &mut Func) {
+    let mut preds: BTreeMap<Block, Vec<Inst>> = BTreeMap::new();
+    for &b in &f.layout {
+        if let Some(t) = f.terminator(b) {
+            for e in &f.insts[t].succs {
+                preds.entry(e.block).or_default().push(t);
+            }
+        }
+    }
+    let live = Cfg::new(f).rpo;
+    for b in live {
+        let Some(t) = f.terminator(b) else { continue };
+        if !matches!(f.insts[t].op, Opcode::Exit { .. }) {
+            continue;
+        }
+        let args = f.insts[t].args.clone();
+        if !args.iter().any(|&a| wrap_recipe(f, a, &preds).is_some()) {
+            continue;
+        }
+        let frame = f.inst_frame[t];
+        // Rebuild the block's tail: the recomputations, then the exit.
+        f.blocks[b].insts.pop();
+        let mut memo: BTreeMap<Value, Value> = BTreeMap::new();
+        fn exact(
+            m: &Module,
+            f: &mut Func,
+            b: Block,
+            frame: u32,
+            v: Value,
+            depth: u32,
+            preds: &BTreeMap<Block, Vec<Inst>>,
+            memo: &mut BTreeMap<Value, Value>,
+        ) -> Value {
+            if let Some(&x) = memo.get(&v) {
+                return x;
+            }
+            let push = |f: &mut Func, op: Opcode, args: Vec<Value>| -> Value {
+                let tys: Vec<Type> = args.iter().map(|&a| f.values[a].ty).collect();
+                let t = signature(&op, &tys, m).ok().and_then(|s| s.results.first().copied()).unwrap_or(Type::F64_TOP);
+                let (i, r) = f.add_inst(b, op, args, &[t], vec![]);
+                f.inst_frame[i] = frame;
+                r[0]
+            };
+            let x = match wrap_recipe(f, v, preds).filter(|_| depth < RECOVER_DEPTH) {
+                Some((op, a, c)) => {
+                    let ea = exact(m, f, b, frame, a, depth + 1, preds, memo);
+                    let ec = exact(m, f, b, frame, c, depth + 1, preds, memo);
+                    let fo = match op {
+                        ArithOp::Add => crate::mir::ops::F64Op::Add,
+                        ArithOp::Sub => crate::mir::ops::F64Op::Sub,
+                        _ => crate::mir::ops::F64Op::Mul,
+                    };
+                    push(f, Opcode::F64Arith(fo), vec![ea, ec])
+                }
+                None => push(f, Opcode::I32ToF64, vec![v]),
+            };
+            memo.insert(v, x);
+            x
+        }
+        let mut new_args = args.clone();
+        for (k, &a) in args.iter().enumerate() {
+            if wrap_recipe(f, a, &preds).is_some() {
+                new_args[k] = exact(m, f, b, frame, a, 0, &preds, &mut memo);
+            }
+        }
+        f.insts[t].args = new_args;
+        f.blocks[b].insts.push(t);
+    }
 }
 
 /// Widen int32 types after `trunc_demand`: a wrapped sum may take any

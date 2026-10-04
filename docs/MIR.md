@@ -2414,6 +2414,32 @@ ran ~190 Wasm values: each element load ~17, each overflow check 6-7.
   A param range too narrow fails the MIR verifier instead (the script
   declines), so no test sees it.
 
+**M5y. Exits recompute wrapped sums (2026-10-04; M5x's leftover).** An
+exit is a use that needs a value exactly: baseline continues from it with
+whatever the frame holds. So a sum whose every other use is ToInt32 kept
+its overflow check if any exit held it, and in a loop body nearly every
+value is live at some exit (am3's `m`, `l`).
+- **`recover_at_exits`.** An exit operand that is a wrapped add, sub or
+  mul (an `i32.*.wrap`, or the param a rewritten check's jump feeds) is
+  replaced by its exact value, recomputed in doubles just before the exit:
+  int32 operands converted, a wrapped operand recomputed in turn (to depth
+  16), as Ion's recover instructions rebuild a value at a bailout.
+  Exactness: `trunc_demand`'s unit bound keeps a wrapped sum's exact value
+  under 2^53, and a product it unchecks is one whose range fits int32.
+- **`trunc_demand`** counts an exit's operand as a fine use where the
+  value is made right there by an add, sub or mul (not a param, whose
+  producing iteration's operands are gone).
+- crypto: am3's `m` and `l` chains (two products, four sums) are wraps;
+  what stays checked is the decrement, the two counters, `xh * h` (past
+  int32) and the sums into `c`, which is returned.
+- Octane (4 seeds, against the commit before): crypto +18.1%, the rest
+  within noise. No declines; no exit storms.
+- Night test: mir-recover-at-exits.js (a field the analysis predicts
+  int32 that a computed-name call sets to a string: the field's guard
+  fails with the wrapped sums in the frame, and baseline's `m + s` puts
+  m's digits in a number). It fails against a mutant that leaves the exits
+  holding the wrapped values.
+
 **M6. The rest of §10**: box/unbox cleanup, memory optimizations, and
 numeric optimizations, each with its guard-count and instruction-count
 tests.
