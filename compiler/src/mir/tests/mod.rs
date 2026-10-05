@@ -392,6 +392,37 @@ fn fences() {
 }
 
 #[test]
+fn dead_params_leave_throw_blocks() {
+    // A throw block that boxes `v3` (whose TYPES the calls kill) and has a
+    // param nothing reads, fed different values by its two `err` edges
+    // (`pea` puts its object on every block of its real part): with the
+    // param it is not a throw block, so `v3` is live across both fences.
+    // `optimize` drops the param, and the block is a throw block again.
+    let src = with_module(
+        "  layout L3 = { x: val{int32} }",
+        &format!(
+            "b0(v0: obj{{Function(s1)}}, v1: val):\n  guard.unbox.obj v1 -> ok b1(v2: obj), fail b99\n\
+             b1(v2: obj):\n  guard.layout v2 L3 types -> ok b2(v3: obj{{L3 types}}), fail b99\n\
+             b2(v3: obj{{L3 types}}):\n  v4 = const.val undefined\n  \
+             call v1, v4 -> ok_clean b3(v3), ok_dirty b3(v3), err b98(v2)\n\
+             b3(v5: obj):\n  call v1, v4 -> ok_clean b4, ok_dirty b4, err b98(v5)\n\
+             b4:\n  v6 = box v5\n  return v6\n{EXIT0}\
+             b98(v9: obj):\n  v7 = box v3\n  v8: val = weaken v7\n  exit.throw pc=4 this=v1 args=[] locals=[] rval=v1 stack=[v8]\n"
+        ),
+    );
+    verify_err(&src, Check::Fence, "v3 (obj{L3 types}) is live into b98 across the err edge of call");
+    let mut m = parse_ok(&src);
+    let mut f = m.funcs.pop().unwrap();
+    crate::mir::opt::optimize(&m, &mut f);
+    m.funcs.push(f);
+    let text = print_module(&m);
+    if let Err(es) = verify_module(&m) {
+        panic!("invalid after optimizing: {:?}\n{text}", es);
+    }
+    assert!(text.contains("\nb98:\n"), "{text}");
+}
+
+#[test]
 fn predictions() {
     let m = "  layout L6 = { a: val }";
     let ctor = |witness: &str| {

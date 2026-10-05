@@ -1168,6 +1168,96 @@ pub fn thread_jumps(f: &mut Func) -> usize {
 /// what weakens it (§5's fence rule). To a fixpoint: forwarding one param
 /// can make another redundant.
 pub fn forward_params(m: &Module, f: &mut Func) {
+    forward_params_only(m, f);
+    if PRUNE_DEAD_PARAMS {
+        prune_dead_params(f);
+    }
+}
+
+/// Drop block params nothing reads (`prune_dead_params`).
+const PRUNE_DEAD_PARAMS: bool = true;
+
+/// Remove the params of (non-root) blocks that no instruction, edge or loop
+/// entry state uses and every incoming edge passes a value (not a
+/// terminator's output), with their incoming edges' args, to a fixpoint
+/// (dropping an edge arg can leave the param it came from unused). A pass
+/// that adds params wherever a value may be needed (`pea`'s object on every
+/// block of its real part) leaves one where its incoming values differ but
+/// nothing reads it, and `forward_params` keeps any param whose edges
+/// disagree. Such a param on a shared throw block makes it a block with
+/// params, so the validator holds its uses to the fences of every `err`
+/// edge into it (§5.3). A loop's header and preheader keep theirs: the
+/// preheader's are the loop's entry slots by position.
+fn prune_dead_params(f: &mut Func) {
+    let mut keep: BTreeSet<Block> = f.roots.iter().map(|r| r.block).collect();
+    for l in &f.loops {
+        keep.insert(l.header);
+        keep.insert(l.preheader);
+    }
+    let mut incoming: BTreeMap<Block, Vec<(Inst, usize)>> = BTreeMap::new();
+    for &b in &f.layout {
+        if let Some(t) = f.terminator(b) {
+            for (k, e) in f.insts[t].succs.iter().enumerate() {
+                incoming.entry(e.block).or_default().push((t, k));
+            }
+        }
+    }
+    loop {
+        let mut used: BTreeSet<Value> = BTreeSet::new();
+        for &b in &f.layout {
+            for &i in &f.blocks[b].insts {
+                let d = &f.insts[i];
+                used.extend(d.args.iter().copied());
+                for e in &d.succs {
+                    for a in &e.args {
+                        if let EdgeArg::Value(v) = a {
+                            used.insert(*v);
+                        }
+                    }
+                }
+            }
+        }
+        for l in &f.loops {
+            if let Some(e) = &l.entry {
+                used.extend(e.state.iter().copied());
+            }
+        }
+        let mut changed = false;
+        for &b in &f.layout {
+            if keep.contains(&b) {
+                continue;
+            }
+            let params = f.blocks[b].params.clone();
+            let inc = incoming.get(&b).map_or(&[][..], |v| &v[..]);
+            // A terminator's output stays even unused: a later guard of
+            // the same value folds into it (`fold_guards`).
+            let passed = |n: usize| inc.iter().all(|&(t, k)| matches!(f.insts[t].succs[k].args[n], EdgeArg::Value(_)));
+            let dead: Vec<usize> = (0..params.len()).filter(|&n| !used.contains(&params[n]) && passed(n)).collect();
+            if dead.is_empty() {
+                continue;
+            }
+            changed = true;
+            let live = |n: &usize| !dead.contains(n);
+            f.blocks[b].params = params.iter().enumerate().filter(|(n, _)| live(n)).map(|(_, &p)| p).collect();
+            for &(t, k) in incoming.get(&b).map_or(&[][..], |v| &v[..]) {
+                let args = std::mem::take(&mut f.insts[t].succs[k].args);
+                f.insts[t].succs[k].args =
+                    args.into_iter().enumerate().filter(|(n, _)| live(n)).map(|(_, a)| a).collect();
+            }
+            for &n in &dead {
+                f.values[params[n]].def = ValueDef::Unused;
+            }
+            for (n, &p) in f.blocks[b].params.clone().iter().enumerate() {
+                f.values[p].def = ValueDef::Param(b, n as u32);
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+}
+
+fn forward_params_only(m: &Module, f: &mut Func) {
     let roots: BTreeSet<Block> = f.roots.iter().map(|r| r.block).collect();
     let mut incoming: BTreeMap<Block, Vec<(Inst, usize)>> = BTreeMap::new();
     for &b in &f.layout {

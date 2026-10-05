@@ -2592,6 +2592,7 @@ mod tests {
         mk(
             &mut sv,
             Constraint::Write {
+                key: None,
                 recv: CKey::Var(VarId::new(0)),
                 name: n,
                 src: CKey::Var(VarId::new(1)),
@@ -2608,6 +2609,7 @@ mod tests {
         mk(
             &mut sv,
             Constraint::Read {
+                key: None,
                 recv: CKey::Var(VarId::new(2)),
                 name: n,
                 dst: CKey::Var(VarId::new(3)),
@@ -2633,6 +2635,7 @@ mod tests {
         mk(
             &mut sv,
             Constraint::Read {
+                key: None,
                 recv: CKey::Var(VarId::new(4)),
                 name: n,
                 dst: CKey::Var(VarId::new(5)),
@@ -2676,6 +2679,7 @@ mod tests {
                 ts: TypeSet::prim(PRIM_DOUBLE),
             },
             Constraint::Write {
+                key: None,
                 recv: CKey::Var(VarId::new(0)),
                 name: n,
                 src: CKey::Var(VarId::new(1)),
@@ -2686,6 +2690,7 @@ mod tests {
                 ts: TypeSet::obj_one(a),
             },
             Constraint::Read {
+                key: None,
                 recv: CKey::Var(VarId::new(2)),
                 name: n,
                 dst: CKey::Var(VarId::new(3)),
@@ -2726,6 +2731,7 @@ mod tests {
             sv.engine.add_con(
                 ScriptId::new(2),
                 Constraint::Read {
+                    key: None,
                     recv: CKey::Var(VarId::new(base)),
                     name: proto_name,
                     dst: CKey::Var(VarId::new(base + 1)),
@@ -2743,6 +2749,7 @@ mod tests {
             sv.engine.add_con(
                 ScriptId::new(2),
                 Constraint::Write {
+                    key: None,
                     recv: CKey::Var(VarId::new(base + 1)),
                     name: m,
                     src: CKey::Var(VarId::new(base + 2)),
@@ -2768,6 +2775,7 @@ mod tests {
         sv.engine.add_con(
             ScriptId::new(1),
             Constraint::Read {
+                key: None,
                 recv: CKey::Var(VarId::new(0)),
                 name: m,
                 dst: CKey::Var(VarId::new(1)),
@@ -2831,6 +2839,7 @@ mod tests {
         sv.engine.add_con(
             ScriptId::new(1),
             Constraint::Read {
+                key: None,
                 recv: CKey::Var(VarId::new(0)),
                 name: m,
                 dst: CKey::Var(VarId::new(1)),
@@ -2867,6 +2876,7 @@ mod tests {
         sv.engine.add_con(
             ScriptId::new(2),
             Constraint::Write {
+                key: None,
                 recv: CKey::Var(VarId::new(1)),
                 name: m,
                 src: CKey::Var(VarId::new(2)),
@@ -2876,6 +2886,7 @@ mod tests {
         sv.engine.add_con(
             ScriptId::new(2),
             Constraint::Write {
+                key: None,
                 recv: CKey::Var(VarId::new(0)),
                 name: proto_name,
                 src: CKey::Var(VarId::new(1)),
@@ -2926,6 +2937,7 @@ mod tests {
                 ts: TypeSet::obj_one(a),
             },
             Constraint::Write {
+                key: None,
                 recv: CKey::Var(VarId::new(2)),
                 name: v1,
                 src: CKey::Var(VarId::new(1)),
@@ -2936,12 +2948,14 @@ mod tests {
                 ts: TypeSet::prim(PRIM_INT32),
             },
             Constraint::Write {
+                key: None,
                 recv: CKey::Var(VarId::new(2)),
                 name: v1,
                 src: CKey::Var(VarId::new(3)),
                 pc: Pc::new(8),
             },
             Constraint::Read {
+                key: None,
                 recv: CKey::Var(VarId::new(2)),
                 name: v1,
                 dst: CKey::Var(VarId::new(4)),
@@ -2991,12 +3005,14 @@ mod tests {
                 pc: Pc::new(0),
             },
             Constraint::Write {
+                key: None,
                 recv: CKey::Var(VarId::new(0)),
                 name: elems,
                 src: CKey::Var(VarId::new(3)),
                 pc: Pc::new(0),
             },
             Constraint::Read {
+                key: None,
                 recv: CKey::Var(VarId::new(0)),
                 name: elems,
                 dst: CKey::Var(VarId::new(4)),
@@ -3016,6 +3032,7 @@ mod tests {
         let c = sv.engine.add_con(
             ScriptId::new(1),
             Constraint::Write {
+                key: None,
                 recv: CKey::Var(VarId::new(0)),
                 name: elems,
                 src: CKey::Var(VarId::new(1)),
