@@ -125,6 +125,7 @@
   NIGHT_RUNTIME_HELPER(night_runtime_iter)                        \
   NIGHT_RUNTIME_HELPER(night_runtime_more_iter)                   \
   NIGHT_RUNTIME_HELPER(night_runtime_end_iter)                    \
+  NIGHT_RUNTIME_HELPER(night_runtime_post_whole_cell)             \
   NIGHT_RUNTIME_HELPER(night_runtime_close_iter_for_exception)    \
   NIGHT_RUNTIME_HELPER(night_runtime_symbol)                      \
   NIGHT_RUNTIME_HELPER(night_runtime_optimize_get_iterator)       \

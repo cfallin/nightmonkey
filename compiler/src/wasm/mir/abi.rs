@@ -190,6 +190,17 @@ pub(crate) const NI_DELETED_BIT: u32 = 1;
 pub(crate) const NI_FLAG_ACTIVE: u32 = 2;
 pub(crate) const NI_FLAG_UNVISITED_DELETION: u32 = 4;
 pub(crate) const NI_FLAG_EMPTY_SINGLETON: u32 = 8;
+pub(crate) const NI_FLAG_INITIALIZED: u32 = 1;
+pub(crate) const NI_FLAG_INDICES_ALLOCATED: u32 = 0x20;
+/// The bytes of one property's index, and of one recorded prototype shape,
+/// after an iterator's properties.
+pub(crate) const NI_INDEX_BYTES: u32 = 4;
+pub(crate) const NI_PROTO_SHAPE_BYTES: u32 = 4;
+/// `Shape::cache_`: a tagged word, an iterator for the shape's objects
+/// where its tag is `SHAPE_CACHE_ITERATOR`.
+pub(crate) const SHAPE_CACHE_OFFSET: u32 = 12;
+pub(crate) const SHAPE_CACHE_TAG_MASK: u32 = 3;
+pub(crate) const SHAPE_CACHE_ITERATOR: u32 = 3;
 
 // --- MapObject and atoms: the inline Map.prototype.get -------------------
 //

@@ -1733,10 +1733,13 @@ bool night_runtime_install_env(JSContext* cx,
                         js::night::Night_strlitStampEpochAddrOff) =
           static_cast<uint32_t>(
               reinterpret_cast<uintptr_t>(&RtState(cx).stampEpoch));
-      // (Night_strlitBindEpochAddrOff is unused: nothing reads a binding
-      // epoch since MIR re-tests a binding's fuse word instead.)
+      // The compartment's active-iterator list, which a for-in started in
+      // compiled code joins (as the JIT's registerIterator, whose IC embeds
+      // the same address).
       *LinMem<uint32_t>(RtState(cx).strLitBase +
-                        js::night::Night_strlitBindEpochAddrOff) = 0;
+                        js::night::Night_strlitEnumeratorsOff) =
+          static_cast<uint32_t>(
+              reinterpret_cast<uintptr_t>(cx->compartment()->enumeratorsAddr()));
       // The plain-object class: MIR's `guard.kind Plain` compares a
       // receiver's clasp against it.
       *LinMem<uint32_t>(RtState(cx).strLitBase +
@@ -5885,6 +5888,12 @@ uint64_t night_runtime_more_iter(JSContext* cx, uint64_t iter) {
 void night_runtime_end_iter(JSContext* cx, uint64_t iter) {
   (void)cx;
   js::CloseIterator(&JS::Value::fromRawBits(iter).toObject());
+}
+
+// A for-in started in compiled code from a shape's cached iterator stored
+// a nursery object in it: the whole-cell post barrier (leaf).
+void night_runtime_post_whole_cell(JSContext* cx, uint32_t cell) {
+  js::night::NightPostWholeCell(cx, cell);
 }
 
 void night_runtime_close_iter_for_exception(JSContext* cx, uint32_t top,

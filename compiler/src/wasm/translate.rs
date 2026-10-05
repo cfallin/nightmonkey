@@ -435,6 +435,10 @@ pub struct Helpers {
     /// `night_runtime_end_iter(cx, iter)`: close the iterator (leaf; also called on
     /// exception unwind through a ForIn try-note range).
     pub end_iter: Func,
+    /// `night_runtime_post_whole_cell(cx, cell i32)`: the whole-cell post
+    /// barrier for a tenured cell a compiled for-in start stored a nursery
+    /// object in (leaf).
+    pub post_whole_cell: Func,
     /// `night_runtime_close_iter_for_exception(cx, top, done i64, iter i64)`: exception
     /// unwind through a `Destructuring` try-note -- close the destructuring
     /// iterator unless `done` is truthy, via IteratorCloseForException (which
@@ -3746,6 +3750,11 @@ mod tests {
             returns: vec![],
         });
         let end_iter = stub(&mut m, ei_sig, false, "night_runtime_end_iter");
+        let pwc_sig = m.signatures.push(SignatureData {
+            params: vec![Type::I32, Type::I32],
+            returns: vec![],
+        });
+        let post_whole_cell = stub(&mut m, pwc_sig, false, "night_runtime_post_whole_cell");
         // close_iter_for_exception: (cx, top, done i64, iter i64) -> ().
         let cife_sig = m.signatures.push(SignatureData {
             params: vec![Type::I32, Type::I32, Type::I64, Type::I64],
@@ -3862,6 +3871,7 @@ mod tests {
                 iter_,
                 more_iter,
                 end_iter,
+                post_whole_cell,
                 close_iter_for_exception,
                 symbol,
                 optimize_get_iterator,

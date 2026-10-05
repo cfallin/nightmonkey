@@ -234,6 +234,10 @@ NIGHT_RUNTIME_EXPORT(night_runtime_more_iter)
 uint64_t night_runtime_more_iter(JSContext* cx, uint64_t iter);
 NIGHT_RUNTIME_EXPORT(night_runtime_end_iter)
 void night_runtime_end_iter(JSContext* cx, uint64_t iter);
+// The whole-cell post barrier for a tenured cell (a cached iterator) a
+// compiled for-in start stored a nursery object in (leaf).
+NIGHT_RUNTIME_EXPORT(night_runtime_post_whole_cell)
+void night_runtime_post_whole_cell(JSContext* cx, uint32_t cell);
 
 // Destructuring try-note unwind: when an exception unwinds through a
 // destructuring pattern, close its iterator unless it is already done.

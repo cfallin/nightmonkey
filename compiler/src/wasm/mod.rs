@@ -827,6 +827,7 @@ pub fn resolve_helpers(
         iter_: resolve(m, "night_runtime_iter")?,
         more_iter: resolve(m, "night_runtime_more_iter")?,
         end_iter: resolve(m, "night_runtime_end_iter")?,
+        post_whole_cell: resolve(m, "night_runtime_post_whole_cell")?,
         close_iter_for_exception: resolve(m, "night_runtime_close_iter_for_exception")?,
         symbol: resolve(m, "night_runtime_symbol")?,
         optimize_get_iterator: resolve(m, "night_runtime_optimize_get_iterator")?,

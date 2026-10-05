@@ -136,7 +136,7 @@ namespace night {
   _(icPrimBooleanShape, 3)                                                     \
   _(icPrimStringShape, 6)                                                      \
   _(strlitStampEpochAddrOff, 28)                                               \
-  _(strlitBindEpochAddrOff, 32)                                                \
+  _(strlitEnumeratorsOff, 32)                                                  \
   _(strlitPlainClassOff, 36)                                                   \
   /* Math native-pointer slots (gEnv.mathNativesPtr), 4 bytes per MN_*.    */  \
   _(mathNativeSlots, 16)                                                       \
@@ -183,8 +183,8 @@ static_assert(Night_argsDynCodeFuseOff + 4 <= Night_argsClassBlockBytes,
               "the dyncode fuse word must fit the args block");
 static_assert(Night_strlitStampEpochAddrOff + 4 <= Night_strlitBlockBytes,
               "the stamp-epoch address must fit the strlit block");
-static_assert(Night_strlitBindEpochAddrOff + 4 <= Night_strlitBlockBytes,
-              "the binding-epoch address must fit the strlit block");
+static_assert(Night_strlitEnumeratorsOff + 4 <= Night_strlitBlockBytes,
+              "the active-iterator list address must fit the strlit block");
 static_assert((Night_bindingFuseArmed & 1) && (Night_bindingFusePredicted & 1) &&
                   !(Night_bindingFuseBlown & 1),
               "a binding fuse is armed exactly when bit 0 is set");

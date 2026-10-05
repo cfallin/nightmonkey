@@ -164,6 +164,10 @@ pub struct Lowered {
 /// A generic call of a native goes straight to it (`native_dispatch`).
 const NATIVE_ROUTE: bool = true;
 
+/// A for-in's start from its object's shape's cached iterator, inline
+/// (`iter_from_shape`).
+const ITER_FROM_SHAPE: bool = true;
+
 /// A generic equality of two strings decides by pointer, length and
 /// atomness before the helper.
 const STRING_EQ_ARM: bool = true;
@@ -4052,7 +4056,12 @@ impl<'a> Lower<'a> {
                         let (at, kv) = (self.atom(name), self.i32c(kind));
                         (h.init_prop_getset, vec![a[0], at, a[1], kv])
                     }
-                    RtOp::Iter => (h.iter_, vec![a[0]]),
+                    RtOp::Iter => {
+                        if ITER_FROM_SHAPE {
+                            self.iter_from_shape(inst, a[0])?;
+                        }
+                        (h.iter_, vec![a[0]])
+                    }
                     RtOp::Check(k) => {
                         let f = match k {
                             mir::ops::CHECK_OBJ_COERCIBLE => h.check_obj_coercible,
@@ -4936,6 +4945,123 @@ impl<'a> Lower<'a> {
         (self.vmap, self.slotted, self.dirty, self.framed, self.cold) = saved;
         self.epoch_same = None;
         self.cur = other;
+        Ok(())
+    }
+
+    /// A for-in's start inline, taking edge 0, as the JIT's
+    /// `ObjectToIterator` (`maybeLoadIteratorFromShape`, `registerIterator`):
+    /// for an object whose shape caches an iterator that no for-in is using,
+    /// with no dense elements on it or its prototypes, and whose prototypes'
+    /// shapes are the ones the iterator recorded, that iterator, holding the
+    /// object, marked active and joined to the compartment's list of active
+    /// ones. The object is stored raw: a nursery one gets the whole-cell
+    /// barrier on the (tenured) iterator object. Anything else falls through
+    /// to the helper, which also fills the shape's cache.
+    fn iter_from_shape(&mut self, inst: mir::Inst, v: Value) -> R<()> {
+        use crate::wasm::mir::abi::{
+            ITER_SLOT_OFFSET, NI_COUNT_OFFSET, NI_FIRST_PROPERTY_OFFSET, NI_FLAGS_OFFSET, NI_FLAG_ACTIVE,
+            NI_FLAG_INDICES_ALLOCATED, NI_FLAG_INITIALIZED, NI_INDEX_BYTES, NI_NEXT_OFFSET, NI_OBJECT_OFFSET,
+            NI_PREV_OFFSET, NI_PROTO_SHAPE_BYTES, SHAPE_CACHE_ITERATOR, SHAPE_CACHE_OFFSET, SHAPE_CACHE_TAG_MASK,
+        };
+        let miss = self.body.add_block();
+        let tag = self.tag_of(v);
+        let is_obj = self.tag_is(tag, TAG_OBJECT as u32);
+        self.check(is_obj, miss);
+        let obj = self.un(Operator::I32WrapI64, v, Type::I32);
+        let shape = self.load_i32(obj, SHAPE_OFFSET);
+        let cache = self.load_i32(shape, SHAPE_CACHE_OFFSET);
+        let mask = self.i32c(SHAPE_CACHE_TAG_MASK);
+        let kind = self.bin(Operator::I32And, cache, mask, Type::I32);
+        let it = self.i32c(SHAPE_CACHE_ITERATOR);
+        let is_iter = self.bin(Operator::I32Eq, kind, it, Type::I32);
+        self.check(is_iter, miss);
+        // No dense elements (the iterator lists only named properties).
+        let no_elems = |l: &mut Self, o: Value| {
+            let elements = l.load_i32(o, OBJ_ELEMENTS_OFFSET);
+            let back = l.i32c(ELEMENTS_INITLEN_BACK);
+            let header = l.bin(Operator::I32Sub, elements, back, Type::I32);
+            let initlen = l.load_i32(header, 0);
+            l.un(Operator::I32Eqz, initlen, Type::I32)
+        };
+        let ok = no_elems(self, obj);
+        self.check(ok, miss);
+        let notag = self.i32c(!SHAPE_CACHE_TAG_MASK);
+        let iter = self.bin(Operator::I32And, cache, notag, Type::I32);
+        let ni = self.load_i32(iter, ITER_SLOT_OFFSET);
+        // Reusable: initialized and not active.
+        let m8 = self.mem(0, NI_FLAGS_OFFSET);
+        let flags = self.un(Operator::I32Load8U { memory: m8 }, ni, Type::I32);
+        let ia = self.i32c(NI_FLAG_INITIALIZED | NI_FLAG_ACTIVE);
+        let state = self.bin(Operator::I32And, flags, ia, Type::I32);
+        let init = self.i32c(NI_FLAG_INITIALIZED);
+        let reusable = self.bin(Operator::I32Eq, state, init, Type::I32);
+        self.check(reusable, miss);
+        // The recorded prototype shapes: after the properties, and their
+        // indices if allocated.
+        let count = self.load_i32(ni, NI_COUNT_OFFSET);
+        let pb = self.i32c(4);
+        let props = self.bin(Operator::I32Mul, count, pb, Type::I32);
+        let ib = self.i32c(NI_INDEX_BYTES);
+        let idx_bytes = self.bin(Operator::I32Mul, count, ib, Type::I32);
+        let ab = self.i32c(NI_FLAG_INDICES_ALLOCATED);
+        let has_idx = self.bin(Operator::I32And, flags, ab, Type::I32);
+        let zero = self.i32c(0);
+        let idx_bytes = self.select(Type::I32, idx_bytes, zero, has_idx);
+        let skip = self.bin(Operator::I32Add, props, idx_bytes, Type::I32);
+        let first = self.i32c(NI_FIRST_PROPERTY_OFFSET);
+        let base = self.bin(Operator::I32Add, ni, first, Type::I32);
+        let shapes = self.bin(Operator::I32Add, base, skip, Type::I32);
+        // Each prototype: no dense elements and the recorded shape; a
+        // matched shape fixes the next prototype, so the walk ends where
+        // the recording does.
+        let (walk, hit) = (self.body.add_block(), self.body.add_block());
+        let cur_shape = self.body.add_blockparam(walk, Type::I32);
+        let cur_rec = self.body.add_blockparam(walk, Type::I32);
+        self.terminate(Terminator::Br { target: BlockTarget { block: walk, args: vec![shape, shapes] } });
+        self.cur = walk;
+        let bs = self.load_i32(cur_shape, SHAPE_BASESHAPE_OFFSET);
+        let proto = self.load_i32(bs, BASESHAPE_PROTO_OFFSET);
+        let more = self.body.add_block();
+        self.cond_br(proto, Self::to(more), Self::to(hit));
+        self.cur = more;
+        let ok = no_elems(self, proto);
+        self.check(ok, miss);
+        let pshape = self.load_i32(proto, SHAPE_OFFSET);
+        let want = self.load_i32(cur_rec, 0);
+        let same = self.bin(Operator::I32Eq, pshape, want, Type::I32);
+        self.check(same, miss);
+        let step = self.i32c(NI_PROTO_SHAPE_BYTES);
+        let next_rec = self.bin(Operator::I32Add, cur_rec, step, Type::I32);
+        self.terminate(Terminator::Br { target: BlockTarget { block: walk, args: vec![pshape, next_rec] } });
+        self.cur = hit;
+        // Start it on this object.
+        self.store_i32(ni, NI_OBJECT_OFFSET, obj);
+        let act = self.i32c(NI_FLAG_ACTIVE);
+        let nf = self.bin(Operator::I32Or, flags, act, Type::I32);
+        let ms = self.mem(0, NI_FLAGS_OFFSET);
+        self.op(Operator::I32Store8 { memory: ms }, &[ni, nf], None);
+        let la = self.i32c(self.h.strlit_slot + crate::region_shape::STRLIT_ENUMERATORS_OFF);
+        let list = self.load_i32(la, 0);
+        self.store_i32(ni, NI_NEXT_OFFSET, list);
+        let last = self.load_i32(list, NI_PREV_OFFSET);
+        self.store_i32(ni, NI_PREV_OFFSET, last);
+        self.store_i32(last, NI_NEXT_OFFSET, ni);
+        self.store_i32(list, NI_PREV_OFFSET, ni);
+        // The object in the nursery: the iterator object's whole-cell
+        // barrier.
+        let cmask = self.i32c(NOT_CHUNK_MASK);
+        let chunk = self.bin(Operator::I32And, obj, cmask, Type::I32);
+        let sb = self.load_i32(chunk, CHUNK_STORE_BUFFER_OFFSET);
+        let (record, done) = (self.body.add_block(), self.body.add_block());
+        self.cond_br(sb, Self::to(record), Self::to(done));
+        self.cur = record;
+        self.call(self.h.post_whole_cell, &[self.cx, iter], &[]);
+        self.terminate(Terminator::Br { target: Self::to(done) });
+        self.cur = done;
+        let r = self.box_tagged(TAG_OBJECT, iter);
+        let t = self.edge(inst, 0, &[r])?;
+        self.terminate(Terminator::Br { target: t });
+        self.cur = miss;
         Ok(())
     }
 

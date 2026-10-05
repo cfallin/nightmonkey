@@ -19,6 +19,7 @@
 
 #include "gc/Nursery.h"
 #include "gc/StoreBuffer.h"  // js::gc::StoreBuffer::putSlot (post-barrier)
+#include "gc/StoreBuffer-inl.h"  // js::gc::StoreBuffer::putWholeCell
 #include "js/Realm.h"        // JS::Realm::offsetOfActiveGlobal
 #include "runtime/NightRegionShape.h"  // Night_allocCellBytes, Night_constructCellBytes
 #include "vm/ArrayObject.h"
@@ -186,8 +187,26 @@ static_assert(NativeIterator::Flags::HasUnvisitedPropertyDeletion == 4,
 static_assert(NativeIterator::Flags::IsEmptyIteratorSingleton == 8,
               "NI_FLAG_EMPTY_SINGLETON");
 
+// The for-in's start runs in compiled code as the JIT's
+// maybeLoadIteratorFromShape and registerIterator do: the iterator the
+// receiver's shape caches, checked against the prototypes' shapes it
+// recorded (after its properties, and their indices if allocated).
+static_assert(NativeIterator::Flags::Initialized == 1, "NI_FLAG_INITIALIZED");
+static_assert(NativeIterator::Flags::IndicesAllocated == 0x20,
+              "NI_FLAG_INDICES_ALLOCATED");
+static_assert(sizeof(PropertyIndex) == 4, "NI_INDEX_BYTES");
+static_assert(sizeof(GCPtr<Shape*>) == 4, "NI_PROTO_SHAPE_BYTES");
+static_assert(Shape::offsetOfCachePtr() == 12, "SHAPE_CACHE_OFFSET");
+static_assert(sizeof(ShapeCachePtr) == sizeof(uintptr_t), "SHAPE_CACHE_OFFSET");
+
 bool NightCheckIteratorLayout() {
-  return PropertyIteratorObject::offsetOfIteratorSlot() == 16;
+  // ShapeCachePtr's tags are private: an iterator's is the low bits of a
+  // word that holds one (SHAPE_CACHE_ITERATOR, under SHAPE_CACHE_TAG_MASK).
+  ShapeCachePtr p;
+  p.setIterator(reinterpret_cast<PropertyIteratorObject*>(uintptr_t(0x1000)));
+  uintptr_t bits;
+  memcpy(&bits, &p, sizeof(bits));
+  return PropertyIteratorObject::offsetOfIteratorSlot() == 16 && bits == 0x1003;
 }
 
 // --- JSString and the inline rope -----------------------------------------
@@ -507,6 +526,16 @@ void NightPostWriteBarrierElem(uint64_t ownerBits, uint32_t index,
       &JS::Value::fromRawBits(ownerBits).toObject().as<NativeObject>();
   cell->storeBuffer()->putSlot(owner, HeapSlot::Element,
                                owner->unshiftedIndex(index), 1);
+}
+
+// The JIT's whole-cell post barrier (jit::PostWriteBarrier): tenured `cell`
+// now holds a nursery pointer outside its slots (an iterator's
+// objectBeingIterated_, stored raw), so the next minor GC traces all of it.
+// One bit per cell until then, where the field's own barrier would add and
+// remove a hashed edge at every for-in's start and close.
+void NightPostWholeCell(JSContext* cx, uint32_t cell) {
+  cx->runtime()->gc.storeBuffer().putWholeCell(
+      reinterpret_cast<gc::Cell*>(uintptr_t(cell)));
 }
 
 // Idempotent (marking an already-black cell is a no-op) and non-moving, so

@@ -659,6 +659,7 @@ mod tests {
         "night_runtime_iter",
         "night_runtime_more_iter",
         "night_runtime_end_iter",
+        "night_runtime_post_whole_cell",
         "night_runtime_close_iter_for_exception",
         "night_runtime_symbol",
         "night_runtime_optimize_get_iterator",

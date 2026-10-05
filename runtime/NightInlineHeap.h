@@ -149,6 +149,7 @@ bool NightFillEnvCell(NightEnvCell* cell, JSObject* callobj);
 // moves nothing and runs no user code, so the caller needs no rooting
 // handshake.
 void NightPostWriteBarrier(uint64_t ownerBits, uint32_t slot, uint64_t valBits);
+void NightPostWholeCell(JSContext* cx, uint32_t cell);
 void NightPostWriteBarrierElem(uint64_t ownerBits, uint32_t index,
                                uint64_t valBits);
 
