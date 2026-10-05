@@ -15,29 +15,38 @@
 
 ROOT=$(git -C "$(dirname "${BASH_SOURCE[0]}")" rev-parse --show-toplevel)
 # Scratch: per-variant binaries, modules, results. Large (a .cwasm is
-# ~100 MB); outside the repo.
-W=${NM_BENCH_DIR:-$HOME/work/nm-bench}
-OCTANE_DIR=${OCTANE_DIR:-$HOME/work/firefox-scratch/octane}
-REACT_JS=${REACT_JS:-$HOME/work/nm-mir-scratch/bench/react.js}
-WASMTIME=${WASMTIME:-$(command -v wasmtime || echo "$HOME/bin/wasmtime")}
+# ~100 MB); outside the repo, and shared by every checkout so that `ab.sh
+# snap` from two worktrees lands in one place.
+W=${NM_BENCH_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/nm-bench}
+# The benchmark sources are vendored in the repo (bench/README.md).
+OCTANE_DIR=${OCTANE_DIR:-$ROOT/bench/octane}
+REACT_JS=${REACT_JS:-$ROOT/bench/react/react.js}
+WASMTIME=${WASMTIME:-$(command -v wasmtime)} \
+  || { echo "nm-bench: no wasmtime on PATH; set WASMTIME" >&2; exit 1; }
 OCTANE="box2d code-load crypto deltablue earley-boyer mandreel navier-stokes pdfjs raytrace regexp richards splay"
 ALL_BENCHES="$OCTANE react"
 
-# prep_src <bench>: write both forms under $W/src (idempotent).
+# prep_src <bench>: write both forms under $W/src. $W is shared by
+# checkouts, so each call rewrites a form whose content differs, by rename
+# (a run elsewhere may be reading the old one).
 prep_src() {
-  local b=$1 src
+  local b=$1 src t f
   mkdir -p "$W/src"
-  [ -f "$W/src/$b.js" ] && [ -f "$W/src/$b.run.js" ] && return 0
   if [ "$b" = react ]; then src=$REACT_JS; else src=$OCTANE_DIR/$b.js; fi
   [ -f "$src" ] || { echo "nm-bench: no source for $b ($src)" >&2; return 1; }
+  t=$(mktemp -d "$W/src/.tmp.XXXXXX")
   # Octane files end with a `main();` line; react's harness defines main()
   # only. Drop a trailing bare call if there is one.
   if [ "$(tail -n 1 "$src" | tr -d '[:space:]')" = "main();" ]; then
-    head -n -1 "$src" > "$W/src/$b.js"
+    head -n -1 "$src" > "$t/$b.js"
   else
-    cp "$src" "$W/src/$b.js"
+    cp "$src" "$t/$b.js"
   fi
-  { cat "$W/src/$b.js"; echo; echo "main();"; } > "$W/src/$b.run.js"
+  { cat "$t/$b.js"; echo; echo "main();"; } > "$t/$b.run.js"
+  for f in "$b.js" "$b.run.js"; do
+    cmp -s "$t/$f" "$W/src/$f" || mv "$t/$f" "$W/src/$f"
+  done
+  rm -rf "$t"
 }
 
 # score_of: the last Octane-style score on stdin.

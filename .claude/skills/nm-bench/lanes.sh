@@ -4,7 +4,8 @@
 #
 #   lanes.sh [N]          (N runs per cell, default 3)
 #
-# Lanes (LANES= picks; default all but aot-base):
+# Lanes (LANES= picks; default all but aot-base, and wasm-interp and weval
+# only when WASM_JS and WEVAL_JS are set):
 #   native-ion       system js, full JIT: the ceiling
 #   native-baseline  system js --no-ion: baseline interpreter + compiler
 #   wasm-interp      SpiderMonkey's C++ interpreter built for wasm32-wasi:
@@ -20,25 +21,48 @@
 # same format), so every ratio column reads "A is Nx faster than B" and
 # the geomean row covers all benches.
 #
-# Env: LANES, BENCHES, CORE (default 10), SYS_JS, WASM_JS, WEVAL_JS, WEVAL,
+# Env: LANES, BENCHES, CORE (default 10),
+#      SYS_JS (default `js` on PATH), WEVAL (default `weval` on PATH),
+#      WASM_JS, WEVAL_JS (no defaults: set them to run those lanes),
 #      NIGHTMONKEY / NIGHT_JS (default this checkout's build/bin),
 #      BASE_NIGHTMONKEY / BASE_JS / BASE_PIPE (the aot-base lane).
 set -uo pipefail
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 N=${1:-3}
-LANES=${LANES:-"native-ion native-baseline wasm-interp weval aot"}
 BENCHES=${BENCHES:-$ALL_BENCHES}
 CORE=${CORE:-10}
-SYS_JS=${SYS_JS:-/home/linuxbrew/.linuxbrew/bin/js}
-WASM_JS=${WASM_JS:-$HOME/work/firefox/obj-wasm/dist/bin/js}
-WEVAL_JS=${WEVAL_JS:-$HOME/work/firefox/obj-weval/dist/bin/js}
-WEVAL=${WEVAL:-$HOME/.cargo/bin/weval}
+SYS_JS=${SYS_JS:-$(command -v js)}
+WASM_JS=${WASM_JS:-}
+WEVAL_JS=${WEVAL_JS:-}
+WEVAL=${WEVAL:-$(command -v weval)}
 NIGHTMONKEY=${NIGHTMONKEY:-$ROOT/build/bin/nightmonkey}
 NIGHT_JS=${NIGHT_JS:-$ROOT/build/bin/js}
 BASE_NIGHTMONKEY=${BASE_NIGHTMONKEY:-}
 BASE_JS=${BASE_JS:-}
 BASE_PIPE=${BASE_PIPE:-}
-RATIO_COLS=${RATIO_COLS:-"aot/wasm-interp aot/weval native-ion/aot native-baseline/aot"}
+# Default lanes: all but aot-base, wasm-interp and weval only when their
+# shells are given. Default ratios: those whose two lanes both run.
+LANES=${LANES:-"native-ion native-baseline ${WASM_JS:+wasm-interp} ${WEVAL_JS:+weval} aot"}
+if [ -z "${RATIO_COLS:-}" ]; then
+  RATIO_COLS=
+  for r in aot/wasm-interp aot/weval native-ion/aot native-baseline/aot; do
+    [[ " $LANES " == *" ${r%%/*} "* && " $LANES " == *" ${r##*/} "* ]] && RATIO_COLS+=" $r"
+  done
+fi
+
+# Each lane's inputs must exist before anything runs.
+need() { [ -n "$2" ] && [ -f "$2" ] || { echo "lanes.sh: lane $1 needs $3 (got '${2}')" >&2; exit 1; }; }
+for l in $LANES; do
+  case $l in
+    native-ion|native-baseline) need "$l" "$SYS_JS" "SYS_JS: a native SpiderMonkey js shell" ;;
+    wasm-interp) need "$l" "$WASM_JS" "WASM_JS: dist/bin/js of a configs/mozconfig-wasm build" ;;
+    weval) need "$l" "$WEVAL_JS" "WEVAL_JS: dist/bin/js of a configs/mozconfig-weval build"
+           need "$l" "$WEVAL" "WEVAL: the weval binary" ;;
+    aot) need "$l" "$NIGHTMONKEY" "NIGHTMONKEY (make -C build)"; need "$l" "$NIGHT_JS" "NIGHT_JS" ;;
+    aot-base) need "$l" "$BASE_NIGHTMONKEY" "BASE_NIGHTMONKEY"; need "$l" "$BASE_JS" "BASE_JS" ;;
+    *) echo "lanes.sh: unknown lane $l" >&2; exit 1 ;;
+  esac
+done
 O=$W/lanes; rm -rf "$O"; mkdir -p "$O"
 pin() { taskset -c "$CORE" "$@"; }
 

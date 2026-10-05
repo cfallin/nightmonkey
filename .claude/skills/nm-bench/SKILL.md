@@ -6,8 +6,10 @@ description: Benchmark NightMonkey on Octane + react. Use to A/B two builds (kee
 # nm-bench
 
 Scripts in this directory. Scratch (variants, modules, results) goes to
-`$NM_BENCH_DIR` (default `~/work/nm-bench`). A `.cwasm` is about 100 MB, so
-keep it out of the repo.
+`$NM_BENCH_DIR` (default `${XDG_CACHE_HOME:-~/.cache}/nm-bench`, shared by
+all checkouts). A `.cwasm` is about 100 MB, so keep it out of the repo.
+The benchmark sources are in the repo under `bench/`. `wasmtime` must be
+on `PATH`, or set `WASMTIME`.
 
 ## Before measuring a build
 
@@ -126,12 +128,15 @@ LANES="native-ion aot aot-base" BASE_NIGHTMONKEY=... BASE_JS=... .claude/skills/
 
 | lane | what | needs |
 |---|---|---|
-| native-ion | system `js`, full JIT: the ceiling | `SYS_JS` (brew spidermonkey) |
+| native-ion | system `js`, full JIT: the ceiling | `SYS_JS` (default `js` on `PATH`) |
 | native-baseline | `js --no-ion` | same |
 | wasm-interp | the C++ interpreter on wasm32-wasi: the floor | `WASM_JS`, built with `configs/mozconfig-wasm`; reads the program on stdin |
-| weval | weval + PBL over the wizer shell: the peer wasm AOT | `WEVAL_JS` (`configs/mozconfig-weval`), `weval`; init function `wizer.initialize` (with a dot) |
+| weval | weval + PBL over the wizer shell: the peer wasm AOT | `WEVAL_JS` (`configs/mozconfig-weval`), `WEVAL` (default `weval` on `PATH`); init function `wizer.initialize` (with a dot) |
 | aot | this checkout (MIR) | `make -C build` |
 | aot-base | another build's `nightmonkey` and `js`, its default pipeline (or `BASE_PIPE`) | `BASE_NIGHTMONKEY`, `BASE_JS` |
+
+wasm-interp and weval run only when `WASM_JS` and `WEVAL_JS` are set.
+`lanes.sh` checks every chosen lane's inputs before it runs anything.
 
 The ratio columns are A/B speedups: aot over wasm-interp and weval, and ion
 and baseline over aot. The geomean row covers every bench, since react
@@ -139,10 +144,12 @@ reports an Octane-style score too.
 
 ## Benchmarks and sources
 
-- **Octane:** `$OCTANE_DIR` (default `~/work/firefox-scratch/octane`), the
-  12 benchmarks.
-- **React:** `$REACT_JS` (default `~/work/nm-mir-scratch/bench/react.js`),
-  a seeded-random harness that prints `Score (version 9)`.
+Vendored in the repo; `bench/README.md` gives their provenance and
+licenses.
+
+- **Octane:** `bench/octane/` (or `$OCTANE_DIR`), the 12 benchmarks.
+- **React:** `bench/react/react.js` (or `$REACT_JS`), a server-render
+  harness with seeded `Math.random` that prints `Score (version 9)`.
 - **Entry point:** each program defines a global `main()`. `lib.sh` writes
   two forms of each:
   - **`<b>.js`** drops Octane's trailing `main();` line. The snapshot flows
