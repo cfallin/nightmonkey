@@ -131,6 +131,13 @@ pub struct Solver<'a> {
     pub args_escaped: rustc_hash::FxHashSet<ScriptId>,
     /// Formals some analyzed call leaves out (`facts::omitted_formals`).
     pub omitted_formals: rustc_hash::FxHashSet<(ScriptId, u32)>,
+    /// The fewest actuals any analyzed call passes each script, per
+    /// context it enters.
+    pub min_actuals: HashMap<(ScriptId, types::CtxId), u32>,
+    /// `T.apply(this, arguments)` edges between contexts, (caller, T): T's
+    /// actuals there are the caller's, so a formal of T past the caller's
+    /// fewest is left out too (`Solver::forwarded_omissions`).
+    pub arg_forwards: rustc_hash::FxHashSet<((ScriptId, types::CtxId), (ScriptId, types::CtxId))>,
     /// Receiver-kind census per property-read site: the least precise
     /// receiver the site was ever evaluated with.
     pub site_recv: HashMap<Site, RecvKind>,
@@ -328,6 +335,8 @@ impl<'a> Solver<'a> {
             escaped: calls::Escaped::default(),
             args_escaped: rustc_hash::FxHashSet::default(),
             omitted_formals: Default::default(),
+            min_actuals: HashMap::default(),
+            arg_forwards: Default::default(),
             site_recv: HashMap::default(),
             site_calls: HashMap::default(),
             site_likely_calls: HashMap::default(),

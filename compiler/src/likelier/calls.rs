@@ -184,12 +184,57 @@ impl Solver<'_> {
         // arithmetic its `== null` tests guard and marks the operands
         // fractional (crypto's multipliers).
         let passed = u32::try_from(args.len().saturating_sub(skip)).unwrap();
-        let nargs = match self.source.objects.get(f.get() as usize) {
+        let m = self.min_actuals.entry((f, cx)).or_insert(passed);
+        *m = (*m).min(passed);
+        for i in passed..self.nargs_of(f) {
+            self.omitted_formals.insert((f, i));
+        }
+    }
+
+    /// Script `f`'s declared formal count.
+    fn nargs_of(&self, f: ScriptId) -> u32 {
+        match self.source.objects.get(f.get() as usize) {
             Some(crate::source::SourceObject::Script(s)) => u32::from(s.nargs),
             _ => 0,
-        };
-        for i in passed..nargs {
-            self.omitted_formals.insert((f, i));
+        }
+    }
+
+    /// The formals left out through `T.apply(this, arguments)`: T gets the
+    /// caller's actuals, so in each context as few as the caller's fewest
+    /// in the context it forwards from, transitively along forwarding
+    /// chains. Per context, so a constructor script many classes share
+    /// (`Class.create`) forwards each `new` site's count to that class's
+    /// initializer, not the fewest of any class. A context no analyzed call
+    /// binds is entered by none, unless its script escaped (then by calls
+    /// with any number: none). After the solve, like the rest of the
+    /// omissions, which nothing in it reads.
+    pub(super) fn forwarded_omissions(&mut self) {
+        let mut edges: Vec<_> = self.arg_forwards.iter().copied().collect();
+        edges.sort_unstable();
+        loop {
+            let mut changed = false;
+            for &(caller, target) in &edges {
+                let m = match self.min_actuals.get(&caller) {
+                    Some(&m) => m,
+                    None if self.escaped.contains(&FnId::script(caller.0))
+                        || self.args_escaped.contains(&caller.0) =>
+                    {
+                        0
+                    }
+                    None => continue,
+                };
+                let t = self.min_actuals.entry(target).or_insert(m);
+                if m < *t {
+                    *t = m;
+                    changed = true;
+                }
+                for i in m..self.nargs_of(target.0) {
+                    changed |= self.omitted_formals.insert((target.0, i));
+                }
+            }
+            if !changed {
+                break;
+            }
         }
     }
 
@@ -684,7 +729,8 @@ impl Solver<'_> {
                         self.bind_args(at, f, cx, &args, 1);
                     } else if arg1_is_arguments {
                         // `T.apply(this, arguments)`: forward the caller's
-                        // own argument rows.
+                        // own argument rows (and its omissions).
+                        self.arg_forwards.insert(((script, ctx), (f, cx)));
                         for i in 0..MAX_TRACKED_FORMALS {
                             let arg = FormalIndex::new(i);
                             let src = self.engine.cell(CellKey::Arg { script, arg, ctx });

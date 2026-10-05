@@ -1844,6 +1844,7 @@ impl Solver<'_> {
         let mut facts = LikelyFacts::default();
         let mut caps = CapDrops::default();
         self.emit_value_claims(&mut facts);
+        self.forwarded_omissions();
         facts.omitted_formals = self.omitted_formals.clone();
         let deleg = self.emit_call_sites(&mut facts, &mut caps);
         self.emit_getter_names(&mut facts);
