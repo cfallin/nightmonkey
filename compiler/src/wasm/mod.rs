@@ -46,6 +46,7 @@ pub use mir::helpers::{
 pub mod inprocess;
 pub mod regex;
 pub mod translate;
+pub mod viz;
 
 pub fn find_export_func(m: &Module, name: &str) -> Result<Func, String> {
     m.exports
@@ -1899,7 +1900,7 @@ pub fn translate_all(
     };
     let mut tier_census = tier::TierCensus::default();
     // `--dump-tiers`: each script's function name, for reading censuses.
-    let fn_names: HashMap<u32, String> = if opts.diagnostics.tiers {
+    let fn_names: HashMap<u32, String> = if opts.diagnostics.tiers || opts.diagnostics.viz.is_some() {
         let mut names: HashMap<u32, String> = source
             .objects
             .iter()
@@ -1942,6 +1943,7 @@ pub fn translate_all(
     // bounds how many built functions are held at once.
     let mir_names = (opts.pipeline == crate::options::Pipeline::Mir).then(|| atoms.names.clone());
     const MIR_CHUNK: usize = 256;
+    let mut viz_records: Vec<String> = vec![];
     for chunk in work.chunks(MIR_CHUNK) {
         let mut prebuilt: Vec<Option<mir::Prebuilt>> = match &mir_names {
             Some(names) => chunk
@@ -1959,7 +1961,20 @@ pub fn translate_all(
             let (outcome, status) =
                 translate_for_pipeline(&tx_ctx, m, &mut atoms, sid, script, id == root_id, pre)?;
             if let Some(n) = fn_names.get(&id.id()) {
-                crate::diag_line!("night: script sid#{sid} {n}");
+                if opts.diagnostics.tiers {
+                    crate::diag_line!("night: script sid#{sid} {n}");
+                }
+            }
+            if opts.diagnostics.viz.is_some() {
+                let texts = mir::VIZ_TEXTS.lock().unwrap().remove(&sid.get());
+                viz_records.push(viz::record(
+                    source,
+                    id.id(),
+                    script,
+                    fn_names.get(&id.id()).map(String::as_str),
+                    &format!("{status}"),
+                    texts.as_ref(),
+                ));
             }
             tier_census.record(sid, status, opts.diagnostics.tiers);
             match outcome {
@@ -2068,6 +2083,11 @@ pub fn translate_all(
                 }
             }
         }
+    }
+    if let Some(path) = &opts.diagnostics.viz {
+        let mut text = viz_records.join("\n");
+        text.push('\n');
+        std::fs::write(path, text).map_err(|e| format!("writing {path}: {e}"))?;
     }
     // The contiguous adapter block (see the loop comment): one
     // `night_abi_sig` adapter per widened-ABI body, in body order, so every

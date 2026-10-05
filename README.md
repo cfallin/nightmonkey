@@ -202,6 +202,17 @@ switches (`--mir-exit-census`, `--block-census`) and the compilation
 options (`--keep-names`, `--pipeline`, `--strict-coverage`).
 Debug sections are stripped by default; `--keep-names` retains them.
 
+To see what a program compiles to, `tools/viz.py` writes one HTML page with,
+per script, its source, its bytecode, its MIR and the lowered waffle IR side
+by side, linked: click a line, op, instruction or value and its counterparts
+in the other columns light up (the URL keeps the selection, so links can be
+shared):
+
+```
+tools/viz.py program.js -o program.html                  # runs nightmonkey --viz
+tools/viz.py react.js -o r.html --only '^pushAttribute$' # a big program: pick scripts
+```
+
 ## Flow 2: in-process (drop-in shell for jit-tests)
 
 Run a program:

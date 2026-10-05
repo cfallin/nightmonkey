@@ -783,6 +783,7 @@ mod tests {
             is_class_ctor: false,
             strict: true,
             has_mapped_args: false,
+            pos: None,
         };
         Source {
             objects: vec![SourceObject::Script(script)],

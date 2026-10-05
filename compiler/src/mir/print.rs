@@ -771,6 +771,12 @@ pub fn print_module(m: &Module) -> String {
 }
 
 pub fn print_func(m: &Module, f: &Func) -> String {
+    print_func_with(m, f, &|_| String::new())
+}
+
+/// `print_func`, with `note(inst)` appended to each instruction's line
+/// (as is: a non-empty note brings its own separator).
+pub fn print_func_with(m: &Module, f: &Func, note: &dyn Fn(crate::mir::entity::Inst) -> String) -> String {
     let ty = |t: &Type| type_str_in(Some(m), t);
     let mut out = String::new();
     let depths: Vec<_> = f
@@ -944,6 +950,7 @@ pub fn print_func(m: &Module, f: &Func) -> String {
             if let Some(w) = f.witness(inst) {
                 write!(out, " !pred{{{}}}", kill_str(&w.may_kill)).unwrap();
             }
+            out.push_str(&note(inst));
             out.push('\n');
         }
     }

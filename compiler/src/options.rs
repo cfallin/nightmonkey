@@ -37,6 +37,10 @@ macro_rules! diag_line {
 pub struct Diagnostics {
     /// Write the analysis fact tables to this path (see `likelier::dump`).
     pub facts: Option<String>,
+    /// Write the visualizer's per-script records (bytecode, MIR, waffle IR
+    /// and their links; `tools/viz.py`) to this path, one JSON object per
+    /// line.
+    pub viz: Option<String>,
     /// Report analysis and translation timings and per-phase counts.
     pub stats: bool,
     /// Emit the per-op emitted-IR census: one record per emitted op
@@ -233,6 +237,7 @@ impl Options {
             "--verify-fixpoint" => d.verify_fixpoint = true,
             "--trace-site" => d.trace_site = Some(arg(flag)?),
             "--dump-facts" => d.facts = Some(arg(flag)?),
+            "--viz" => d.viz = Some(arg(flag)?),
             "--guard-census" => self.instrument.guards = true,
             "--mir-exit-census" => self.instrument.mir_exits = true,
             "--block-census" => self.instrument.blocks = true,

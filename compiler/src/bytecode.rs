@@ -67,6 +67,23 @@ pub struct Script {
     /// formals. The lazy-args machinery builds only the unmapped flavor,
     /// so such scripts stay interpreted (capability gate).
     pub has_mapped_args: bool,
+    /// Where the script's source is, when the snapshot recorded it:
+    /// diagnostics only (the visualizer).
+    pub pos: Option<ScriptPos>,
+}
+
+/// A script's source position (`Script::pos`).
+#[derive(Debug, Clone, Default)]
+pub struct ScriptPos {
+    /// The script's first line, and column (one-origin).
+    pub line: u32,
+    pub column: u32,
+    /// Its span in the source, in the source's code units.
+    pub source_start: u32,
+    pub source_end: u32,
+    /// The position from each pc on, ascending, (pc, line, column): where
+    /// its source notes move it.
+    pub lines: Vec<(Pc, u32, u32)>,
 }
 
 impl Script {

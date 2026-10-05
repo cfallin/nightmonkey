@@ -291,6 +291,9 @@ pub struct DigestBinding {
 pub struct Digest {
     pub script_gcthing_kinds: FxHashMap<u32, Vec<u8>>,
     pub scope_bindings: FxHashMap<u32, Vec<DigestBinding>>,
+    /// Per script, its source position, where the engine recorded one
+    /// (diagnostics only: the visualizer).
+    pub script_pos: FxHashMap<u32, night_compiler::bytecode::ScriptPos>,
 }
 
 impl Digest {
@@ -340,9 +343,40 @@ impl Digest {
             }
             scope_bindings.insert(scope, bindings);
         }
+        // Source positions: an optional trailing section.
+        let mut script_pos = FxHashMap::default();
+        if pos < b.len() {
+            let n = u32_at(&mut pos)?;
+            for _ in 0..n {
+                let script = u32_at(&mut pos)?;
+                let line = u32_at(&mut pos)?;
+                let column = u32_at(&mut pos)?;
+                let source_start = u32_at(&mut pos)?;
+                let source_end = u32_at(&mut pos)?;
+                let k = u32_at(&mut pos)?;
+                let mut lines = Vec::with_capacity(k as usize);
+                for _ in 0..k {
+                    let pc = u32_at(&mut pos)?;
+                    let l = u32_at(&mut pos)?;
+                    let c = u32_at(&mut pos)?;
+                    lines.push((night_compiler::ids::Pc::new(pc), l, c));
+                }
+                script_pos.insert(
+                    script,
+                    night_compiler::bytecode::ScriptPos {
+                        line,
+                        column,
+                        source_start,
+                        source_end,
+                        lines,
+                    },
+                );
+            }
+        }
         Ok(Digest {
             script_gcthing_kinds,
             scope_bindings,
+            script_pos,
         })
     }
 }

@@ -8,6 +8,7 @@
 #include <string.h>
 #include <vector>
 
+#include "frontend/SourceNotes.h"  // SrcNoteIterator
 #include "gc/GC.h"
 #include "js/GCAPI.h"
 #include "js/GCVector.h"
@@ -102,6 +103,11 @@ static bool DelazifyTree(JSContext* cx, JS::Handle<JSScript*> script,
 //   per scope: u32 scopeAddr, u32 numBindings,
 //     per binding: u32 nameAtomAddr (0 for elided), u32 isVar,
 //                  u32 hasEnvSlot, u32 slot
+//   u32 numScripts (source positions, diagnostics only: the visualizer)
+//   per script: u32 scriptAddr, u32 lineno, u32 column (one-origin),
+//     u32 sourceStart, u32 sourceEnd, u32 numEntries,
+//     per entry: u32 pc, u32 line, u32 column -- the position from that pc
+//     on, at each source note that moves it (as PCToLineNumber reads them)
 static void AppendU32(std::vector<uint8_t>& out, uint32_t v) {
   out.push_back(uint8_t(v));
   out.push_back(uint8_t(v >> 8));
@@ -162,6 +168,53 @@ static bool BuildDigest(
       AppendU32(out, bi.kind() == BindingKind::Var ? 1 : 0);
       AppendU32(out, hasEnvSlot ? 1 : 0);
       AppendU32(out, hasEnvSlot ? loc.slot() : 0);
+      n++;
+    }
+    out[countPos] = uint8_t(n);
+    out[countPos + 1] = uint8_t(n >> 8);
+    out[countPos + 2] = uint8_t(n >> 16);
+    out[countPos + 3] = uint8_t(n >> 24);
+  }
+  AppendU32(out, uint32_t(scripts.length()));
+  for (JSScript* script : scripts) {
+    AppendU32(out, uint32_t(reinterpret_cast<uintptr_t>(script)));
+    unsigned startLine = script->lineno();
+    JS::LimitedColumnNumberOneOrigin startCol(script->column());
+    AppendU32(out, startLine);
+    AppendU32(out, startCol.oneOriginValue());
+    AppendU32(out, script->sourceStart());
+    AppendU32(out, script->sourceEnd());
+    size_t countPos = out.size();
+    AppendU32(out, 0);
+    uint32_t n = 0;
+    unsigned lineno = startLine;
+    JS::LimitedColumnNumberOneOrigin column = startCol;
+    ptrdiff_t offset = 0;
+    for (SrcNoteIterator iter(script->notes(), script->notesEnd());
+         !iter.atEnd(); ++iter) {
+      const auto* sn = *iter;
+      offset += sn->delta();
+      SrcNoteType type = sn->type();
+      if (type == SrcNoteType::SetLine) {
+        lineno = SrcNote::SetLine::getLine(sn, startLine);
+        column = JS::LimitedColumnNumberOneOrigin();
+      } else if (type == SrcNoteType::SetLineColumn) {
+        lineno = SrcNote::SetLineColumn::getLine(sn, startLine);
+        column = SrcNote::SetLineColumn::getColumn(sn);
+      } else if (type == SrcNoteType::NewLine) {
+        lineno++;
+        column = JS::LimitedColumnNumberOneOrigin();
+      } else if (type == SrcNoteType::NewLineColumn) {
+        lineno++;
+        column = SrcNote::NewLineColumn::getColumn(sn);
+      } else if (type == SrcNoteType::ColSpan) {
+        column += SrcNote::ColSpan::getSpan(sn);
+      } else {
+        continue;
+      }
+      AppendU32(out, uint32_t(offset));
+      AppendU32(out, lineno);
+      AppendU32(out, column.oneOriginValue());
       n++;
     }
     out[countPos] = uint8_t(n);

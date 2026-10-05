@@ -159,6 +159,25 @@ pub struct Lowered {
     /// Per mnemonic: how many instructions, and the wasm values they
     /// lowered to (`--dump-opsize`).
     pub opsize: BTreeMap<String, (u32, u32)>,
+    /// The body as text, each value marked with the MIR instruction that
+    /// emitted it (`;;@i<n>`, n = the instruction's index): `--viz` only.
+    pub viz_text: Option<String>,
+}
+
+/// `Lowered::viz_text`'s marks: from a value index on, which MIR
+/// instruction (its index + 1; 0 for the entry, edges and hubs) emitted
+/// the values.
+struct VizMarks(Vec<(usize, u32)>);
+
+impl waffle::PrintDecorator for VizMarks {
+    fn after_inst(&self, value: Value, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        let i = value.index();
+        match self.0.partition_point(|&(s, _)| s <= i) {
+            0 => Ok(()),
+            k if self.0[k - 1].1 == 0 => Ok(()),
+            k => write!(f, " ;;@i{}", self.0[k - 1].1 - 1),
+        }
+    }
 }
 
 /// A generic call of a native goes straight to it (`native_dispatch`).
@@ -512,6 +531,8 @@ struct Lower<'a> {
     /// and the emitter of each Wasm value range: (first value, tag).
     value_census: Option<Func>,
     value_tags: Vec<(usize, String)>,
+    /// `--viz`: `VizMarks`, as they are recorded.
+    viz_marks: Option<Vec<(usize, u32)>>,
     /// The instruction being lowered, for the root census's labels.
     cur_inst: Option<mir::Inst>,
     /// Per frame (0 the function's own, then the inline frames): whether
@@ -586,6 +607,9 @@ pub struct LowerOpts {
     /// Count every executed Wasm block, by the MIR ops in it
     /// (`--value-census`).
     pub value_census: bool,
+    /// Keep the body's text, its values marked with their MIR
+    /// instructions (`--viz`).
+    pub viz: bool,
     /// Strict-mode code: a field store's generic fallback throws on failure.
     pub strict: bool,
     /// The activation's environment is its callee's (`baseline::env_is_plain`).
@@ -740,6 +764,7 @@ pub fn lower<'a>(
         root_census: if o.root_census { h.census } else { None },
         value_census: if o.value_census { h.census } else { None },
         value_tags: vec![],
+        viz_marks: o.viz.then(Vec::new),
         cur_inst: None,
         frame_gc: None,
         block_enters: None,
@@ -758,6 +783,10 @@ pub fn lower<'a>(
         add_preds,
     };
     l.run()?;
+    let viz_text = l.viz_marks.take().map(|marks| {
+        let marks = VizMarks(marks);
+        format!("{}", l.body.display_with_decorator("", None, Some(&marks)))
+    });
     crate::wasm::pad_body(&mut l.body, u64::from(l.f.script.get()));
     Ok(Lowered {
         body: l.body,
@@ -771,6 +800,7 @@ pub fn lower<'a>(
         intrinsic_cell_patches: l.intrinsic_cell_patches,
         likely_patches: l.likely_patches,
         opsize: l.opsize,
+        viz_text,
     })
 }
 
@@ -1469,6 +1499,9 @@ impl<'a> Lower<'a> {
                     self.pending_retain.clear();
                 }
                 let before = self.body.values.len();
+                if self.viz_marks.is_some() && self.value_census.is_none() {
+                    self.value_tag("inst");
+                }
                 if self.value_census.is_some() {
                     let mut tag = mir::print::mnemonic(&f.insts[inst].op);
                     if let Some(site) = f.insts[inst].attach.and_then(|a| f.attachments[a].site) {
@@ -1534,6 +1567,15 @@ impl<'a> Lower<'a> {
 
     /// `--value-census`: the Wasm values from here on are `tag`'s.
     fn value_tag(&mut self, tag: &str) {
+        // `--viz`: an instruction's own tag marks it (the loop sets
+        // `cur_inst` first); any other starts unattributed values.
+        if let Some(marks) = self.viz_marks.as_mut() {
+            let i = match (tag.starts_with('('), self.cur_inst) {
+                (false, Some(inst)) => mir::entity::EntityRef::index(inst) as u32 + 1,
+                _ => 0,
+            };
+            marks.push((self.body.values.len(), i));
+        }
         if self.value_census.is_some() {
             self.value_tags.push((self.body.values.len(), tag.to_string()));
         }

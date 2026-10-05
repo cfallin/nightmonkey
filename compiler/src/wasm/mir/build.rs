@@ -5081,6 +5081,7 @@ impl<'s, 'a> Run<'s, 'a> {
                     return Err(format!("BUG: stack depth at {pc} disagrees"));
                 }
                 self.pc = pc;
+                self.f.cur_pc = pc.get() + 1;
                 self.pre = self.st.clone();
                 self.renames.clear();
                 self.exit_blk = None;
@@ -5108,6 +5109,7 @@ impl<'s, 'a> Run<'s, 'a> {
         if self.live {
             self.term(Opcode::Unreachable, vec![], vec![]);
         }
+        self.f.cur_pc = 0;
         let headers: Vec<Pc> = self.preheaders.keys().copied().collect();
         for h in headers {
             if self.wants_onramp(h) {

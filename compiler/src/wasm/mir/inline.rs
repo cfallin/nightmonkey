@@ -384,6 +384,7 @@ pub(crate) fn splice(
                 vmap.insert(r, nr);
             }
             f.inst_frame[ni] = frame(kf.inst_frame[i]);
+            f.inst_pc[ni] = kf.inst_pc[i];
             f.witnesses[ni] = match op {
                 Opcode::Jump if matches!(d.op, Opcode::ExitThrow { .. }) => None,
                 // Finishing the callee may do anything.

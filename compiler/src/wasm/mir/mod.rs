@@ -51,6 +51,13 @@ pub(crate) fn inline_eligible(ctx: &TranslateCtx, script: &Script) -> bool {
         && (!baseline::needs_env(script) || baseline::env_is_plain(ctx.source, script))
 }
 
+/// `--viz`: each MIR-compiled script's MIR text (each instruction marked
+/// `;;@i<index> pc=<pc> s=<script>`) and its lowered body's text (each value
+/// marked `;;@i<index>` with the instruction that emitted it), by script id,
+/// for the translation loop's records.
+pub static VIZ_TEXTS: std::sync::Mutex<std::collections::BTreeMap<u32, (String, String)>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+
 /// A script's MIR, built, optimized and verified: the front half of
 /// [`translate_script`]. `diag` holds the diagnostic lines it produced, for
 /// the serial back half to print in script order.
@@ -165,7 +172,7 @@ pub fn translate_script(
             Some((a, *ctx.fused_gnames.get(&n)?))
         })
         .collect();
-    let lowered = match lower::lower(
+    let mut lowered = match lower::lower(
         m,
         ctx.helpers,
         &mm,
@@ -178,6 +185,7 @@ pub fn translate_script(
             block_census: ctx.opts.instrument.blocks,
             root_census: ctx.opts.instrument.roots,
             value_census: ctx.opts.instrument.values,
+            viz: ctx.opts.diagnostics.viz.is_some(),
             strict: script.strict,
             plain_env: baseline::needs_env(script) && baseline::env_is_plain(ctx.source, script),
             own_env: baseline::needs_env(script) && !baseline::env_is_plain(ctx.source, script),
@@ -232,6 +240,17 @@ pub fn translate_script(
         for (op, (n, vals)) in &lowered.opsize {
             crate::diag_line!("night: mir opsize sid#{sid} {op} n {n} values {vals}");
         }
+    }
+    if let Some(waffle_text) = lowered.viz_text.take() {
+        // Each instruction marked with its index, and the bytecode op it
+        // was built for (pc -1: none) in its frame's script.
+        let mir_text = crate::mir::print::print_func_with(&mm, &f, &|i| {
+            let fr = f.inst_frame[i] as usize;
+            let s = if fr == 0 { f.script } else { f.inline_frames[fr - 1].script };
+            let pc = i64::from(f.inst_pc[i]) - 1;
+            format!(" ;;@i{} pc={pc} s={s}", crate::mir::entity::EntityRef::index(i))
+        });
+        VIZ_TEXTS.lock().unwrap().insert(sid.get(), (mir_text, waffle_text));
     }
     Ok(Ok(Outcome::Compiled {
         sig: ctx.helpers.night_abi_sig2,

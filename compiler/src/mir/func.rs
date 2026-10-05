@@ -229,6 +229,12 @@ pub struct Func {
     pub loops: Vec<LoopDecl>,
     pub attachments: EntityVec<AttachId, Attachment>,
     pub witnesses: EntityMap<Inst, Option<Witness>>,
+    /// The bytecode op each instruction was built for, as its pc + 1 (0 for
+    /// one no op made: a pass's, or parsed text), in its frame's script
+    /// (`inst_frame`): diagnostics only (the visualizer's links).
+    pub inst_pc: EntityMap<Inst, u32>,
+    /// What `add_inst` records in `inst_pc`: the builder sets it per op.
+    pub cur_pc: u32,
 }
 
 impl Func {
@@ -246,6 +252,8 @@ impl Func {
             loops: vec![],
             attachments: EntityVec::new(),
             witnesses: EntityMap::new(),
+            inst_pc: EntityMap::new(),
+            cur_pc: 0,
         }
     }
 
@@ -293,6 +301,9 @@ impl Func {
             .collect();
         self.insts[inst].results = results.clone();
         self.blocks[b].insts.push(inst);
+        if self.cur_pc != 0 {
+            self.inst_pc[inst] = self.cur_pc;
+        }
         (inst, results)
     }
 

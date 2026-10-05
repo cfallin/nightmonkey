@@ -92,6 +92,9 @@ Diagnostics
                            it, or interp, and every decline) and a summary
   --dump-mir               print each MIR body (and an invalid one in full)
   --dump-facts <path>      write the analysis fact tables to <path>
+  --viz <path>             write the visualizer's records (bytecode, MIR,
+                           waffle IR, and their links) to <path>; see
+                           tools/viz.py
   --dump-graph             print the walked script graph and exit
 
 Instrumentation (CHANGES the generated code; never on in production)

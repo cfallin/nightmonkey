@@ -416,6 +416,7 @@ impl<'a, M: MemAccess> Walker<'a, M> {
             is_class_ctor,
             strict,
             has_mapped_args,
+            pos: self.reg.digest.script_pos.get(&addr).cloned(),
         })))
     }
 

@@ -38,11 +38,14 @@ IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
 class Opcode:
-    def __init__(self, name, length, nuses, ndefs):
+    def __init__(self, name, length, nuses, ndefs, format):
         self.name = name
         self.length = length
         self.nuses = nuses
         self.ndefs = ndefs
+        # The operand format: the first `JOF_` type of the entry's format
+        # (the rest are flags), without the prefix.
+        self.format = format
 
 
 def parse_opcodes(text):
@@ -72,7 +75,10 @@ def parse_opcodes(text):
             name = fields[0]
             if not IDENT_RE.match(name):
                 raise SystemExit(f"malformed opcode name: {line.strip()}")
-            ops.append(Opcode(name, int(fields[3]), int(fields[4]), int(fields[5])))
+            fmt = fields[6].split("|")[0].strip()
+            if not fmt.startswith("JOF_"):
+                raise SystemExit(f"malformed opcode format: {line.strip()}")
+            ops.append(Opcode(name, int(fields[3]), int(fields[4]), int(fields[5]), fmt[len("JOF_"):]))
     if not in_table:
         raise SystemExit("no FOR_EACH_OPCODE table found")
     if len(ops) > 256:
@@ -128,6 +134,13 @@ def render(version, text, ops):
     w("        match self {")
     for op in ops:
         w(f"            JSOp::{op.name} => {op.ndefs},")
+    w("        }")
+    w("    }")
+    w("    /// The operand format (Opcodes.h's `JOF_` type, without the prefix).")
+    w("    pub fn format(&self) -> &'static str {")
+    w("        match self {")
+    for op in ops:
+        w(f'            JSOp::{op.name} => "{op.format}",')
     w("        }")
     w("    }")
     w("}")
