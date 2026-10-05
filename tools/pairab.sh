@@ -3,6 +3,9 @@
 #
 #   pairab.sh <binA> <binB>        BENCHES=... N=... SDROOT=...
 #
+# SDROOT (kept) holds per-bench snapshots and modules; by default a fresh
+# directory in /tmp, removed on exit.
+#
 # `quickperf.sh` runs every rep of arm A and then every rep of arm B, which
 # lets any machine drift during the run land entirely on one arm. This
 # alternates the order per rep (A,B then B,A) so drift is shared, and reports
@@ -12,14 +15,13 @@
 # work done in the budget); `Mins/score` is instructions per unit of work and
 # is the comparable one.
 set -uo pipefail
-cd "$(dirname "${BASH_SOURCE[0]}")/../../../.." || exit 1
+ROOT=$(git -C "$(dirname "${BASH_SOURCE[0]}")" rev-parse --show-toplevel) && cd "$ROOT" || exit 1
 A=${1:?usage: pairab.sh <binA> <binB>}
 B=${2:?}
 N=${N:-5}
-WASMTIME=${WASMTIME:-$HOME/bin/wasmtime}
-NIGHT_JS=obj-nightmonkey/dist/bin/js
-MEMCAP=${MEMCAP:-$HOME/bin/memcap}; [ -x "$MEMCAP" ] || MEMCAP=env
-SDROOT=${SDROOT:-${TMPDIR:-/tmp}/night-pairab}
+NIGHT_JS=build/bin/js
+MEMCAP=tools/memcap
+[ -n "${SDROOT:-}" ] || { SDROOT=$(mktemp -d /tmp/night-pairab.XXXXXX); trap 'rm -rf "$SDROOT"' EXIT; }
 mkdir -p "$SDROOT"
 
 med() { sort -n | awk '{a[NR]=$1} END{print (NR%2)?a[(NR+1)/2]:int((a[NR/2]+a[NR/2+1])/2)}'; }
@@ -27,19 +29,19 @@ med() { sort -n | awk '{a[NR]=$1} END{print (NR%2)?a[(NR+1)/2]:int((a[NR/2]+a[NR
 for b in ${BENCHES:?set BENCHES}; do
   SD=$SDROOT/$b; mkdir -p "$SD"
   v=$SD/$b.js
-  [ -f "$v" ] || head -n -1 "octane/$b.js" > "$v"
+  [ -f "$v" ] || head -n -1 "bench/octane/$b.js" > "$v"
   snap=$SD/$b.snap.wasm
   [ -f "$snap" ] || "$MEMCAP" 32G "$A" --shell "$NIGHT_JS" "$v" --keep-snapshot "$snap" -o /dev/null >/dev/null 2>&1
   for arm in a b; do
     bin=$A; [ "$arm" = b ] && bin=$B
     [ -f "$SD/$arm.cwasm" ] && continue
     "$MEMCAP" 32G "$bin" "$snap" -o "$SD/$arm.wasm" >/dev/null 2>&1 || { echo "$b/$arm: compile failed"; continue 2; }
-    "$WASMTIME" compile "$SD/$arm.wasm" -o "$SD/$arm.cwasm" 2>/dev/null
+    wasmtime compile "$SD/$arm.wasm" -o "$SD/$arm.cwasm" 2>/dev/null
   done
   : > "$SD/a.scores"; : > "$SD/b.scores"; : > "$SD/a.ins"; : > "$SD/b.ins"
   one() { # $1 = arm
     taskset -c 1 perf stat -x, -e instructions -o "$SD/s.txt" -- \
-      "$WASMTIME" run --allow-precompiled -W unknown-imports-trap "$SD/$1.cwasm" > "$SD/o.txt" 2>/dev/null
+      wasmtime run --allow-precompiled -W unknown-imports-trap "$SD/$1.cwasm" > "$SD/o.txt" 2>/dev/null
     local s; s=$(grep -oE 'Score.*: [0-9]+' "$SD/o.txt" | grep -oE '[0-9]+$' | tail -1)
     [ -n "$s" ] || return
     echo "$s" >> "$SD/$1.scores"

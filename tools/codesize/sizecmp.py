@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Generated-code size, baseline vs candidate.
 
-  ART=<dir> NEW=<dir> sizecmp.py [bench ...]
+  ART=<dir> NEW=<dir> sizecmp.py [bench ...]     (both required)
 
 ART holds the baseline `<bench>.cwasm` and the `<bench>.snap.wasm` the cutoff
 index is read from; NEW holds `new-<bench>.cwasm`. Only functions at or above
@@ -27,8 +27,8 @@ def cut(w):
     )
 
 
-ART = os.environ.get("ART", "viz-icache/art")
-NEW = os.environ.get("NEW", "/tmp")
+ART = os.environ.get("ART") or sys.exit("sizecmp.py: set ART to the baseline artifact dir")
+NEW = os.environ.get("NEW") or sys.exit("sizecmp.py: set NEW to the candidate artifact dir")
 B = sys.argv[1:] or ["richards", "deltablue", "crypto", "box2d"]
 print(f"{'bench':<14}{'baseline':>12}{'new':>12}{'delta':>11}{'%':>8}")
 to = tn = 0

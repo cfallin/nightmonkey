@@ -2,14 +2,14 @@
 # A/B two sets of cwasm artifacts. Alternates arm order per rep (fixed order
 # gives the first arm ~+0.6% on byte-identical pairs). Best-of-N per arm.
 set -u
-cd "$(git rev-parse --show-toplevel)"
-WT=$HOME/bin/wasmtime
+cd "$(git -C "$(dirname "${BASH_SOURCE[0]}")" rev-parse --show-toplevel)" || exit 1
 N=${N:-3}
 A_DIR=${A_DIR:?set A_DIR to the baseline artifact dir}     # <bench>.cwasm
-B_DIR=${B_DIR:-/tmp}                    # candidate: new-<bench>.cwasm
+B_DIR=${B_DIR:?set B_DIR to the candidate artifact dir}    # new-<bench>.cwasm
 B_PRE=${B_PRE:-new-}
 BENCHES=${BENCHES:-"richards deltablue crypto raytrace earley-boyer navier-stokes splay regexp pdfjs mandreel code-load box2d"}
-run() { cp "$1" /tmp/ab.run.cwasm; taskset -c 1 $WT run --allow-precompiled -W unknown-imports-trap /tmp/ab.run.cwasm 2>/dev/null | grep -oE 'Score.*: [0-9]+' | grep -oE '[0-9]+$' | tail -1; }
+T=$(mktemp -d /tmp/night-ab.XXXXXX); trap 'rm -rf "$T"' EXIT
+run() { cp "$1" "$T/run.cwasm"; taskset -c 1 wasmtime run --allow-precompiled -W unknown-imports-trap "$T/run.cwasm" 2>/dev/null | grep -oE 'Score.*: [0-9]+' | grep -oE '[0-9]+$' | tail -1; }
 printf "%-14s %10s %10s %8s\n" bench A B "B/A"
 tot=0; n=0
 for b in $BENCHES; do

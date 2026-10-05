@@ -33,7 +33,7 @@ import shutil
 import subprocess
 import sys
 
-WASMTIME = os.environ.get("WASMTIME", os.path.expanduser("~/bin/wasmtime"))
+WASMTIME = "wasmtime"
 
 ANN_RE = re.compile(r"\s*([\d.]+)?\s*:\s*([0-9a-f]+):\s+(\S+)(.*)")
 MEM_RE = re.compile(r"\(%r")

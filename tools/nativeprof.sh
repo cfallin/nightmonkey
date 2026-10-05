@@ -14,30 +14,31 @@
 # comparable even though Octane is time-budgeted and the arms complete
 # different iteration counts.
 set -uo pipefail
-cd "$(dirname "${BASH_SOURCE[0]}")/../../../.." || exit 1
+ROOT=$(git -C "$(dirname "${BASH_SOURCE[0]}")" rev-parse --show-toplevel) && cd "$ROOT" || exit 1
 B=${1:?usage: nativeprof.sh <bench> <binA> [binB]}
 A=${2:?}
-C=${3:-js/src/night/nightmonkey/target/release/nightmonkey}
-WASMTIME=${WASMTIME:-$HOME/bin/wasmtime}
-NIGHT_JS=obj-nightmonkey/dist/bin/js
-MEMCAP=${MEMCAP:-$HOME/bin/memcap}; [ -x "$MEMCAP" ] || MEMCAP=env
-SD=${SD:-$(mktemp -d)}; mkdir -p "$SD"
+C=${3:-build/bin/nightmonkey}
+NIGHT_JS=build/bin/js
+MEMCAP=tools/memcap
+# Scratch: $SD if given (kept), else a fresh directory in /tmp (removed).
+[ -n "${SD:-}" ] || { SD=$(mktemp -d /tmp/night-nativeprof.XXXXXX); trap 'rm -rf "$SD"' EXIT; }
+mkdir -p "$SD"
 CPU=${CPU:-1}
 N=${N:-3}
 
 v=$SD/$B.js
-[ -f "$v" ] || head -n -1 "octane/$B.js" > "$v"
+[ -f "$v" ] || head -n -1 "bench/octane/$B.js" > "$v"
 snap=$SD/$B.snap.wasm
 [ -f "$snap" ] || "$MEMCAP" 32G "$A" --shell "$NIGHT_JS" "$v" --keep-snapshot "$snap" -o /dev/null >/dev/null 2>&1
 
 run() { # $1=label $2=binary -> $SD/$1.prof of "share symbol"
   local out=$SD/$1.wasm
   "$MEMCAP" 32G "$2" "$snap" -o "$out" --keep-names >/dev/null 2>&1 || { echo "$1: compile failed" >&2; return 1; }
-  "$WASMTIME" compile "$out" -o "$SD/$1.cwasm" 2>/dev/null
+  wasmtime compile "$out" -o "$SD/$1.cwasm" 2>/dev/null
   local best=0
   for i in $(seq "$N"); do
     taskset -c "$CPU" perf record -q -e instructions:u -c "${PERIOD:-2000000}" -o "$SD/$1.$i.data" -- \
-      "$WASMTIME" run --profile=perfmap --allow-precompiled -W unknown-imports-trap "$SD/$1.cwasm" \
+      wasmtime run --profile=perfmap --allow-precompiled -W unknown-imports-trap "$SD/$1.cwasm" \
       > "$SD/$1.out" 2>/dev/null
     local s; s=$(grep -oE 'Score.*: [0-9]+' "$SD/$1.out" | grep -oE '[0-9]+$' | tail -1)
     [ -n "$s" ] && [ "$s" -gt "$best" ] && { best=$s; cp "$SD/$1.$i.data" "$SD/$1.data"; }

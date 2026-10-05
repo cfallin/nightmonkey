@@ -4,7 +4,7 @@
 #   machperf.sh <bench> <binA> [<binB>]
 #
 # Either arm may be the literal `ion`, which selects the native lane: the
-# system js on the FULL octane file, no wizer and no wasmtime. That is the
+# system `js` (on PATH) on the FULL octane file, no wizer and no wasmtime. That is the
 # ceiling, and it is the only way to read the AOT tier's instruction mix
 # against Ion's. Everything is per score point for the reason below, which is
 # also why a cross-compiler comparison may be read here and nowhere else:
@@ -20,16 +20,16 @@
 # once, and a sixth reads <not counted> silently. Both groups carry
 # instructions and cycles so a mispaired rep is visible rather than averaged in.
 set -uo pipefail
-cd "$(dirname "${BASH_SOURCE[0]}")/../../../.." || exit 1
+ROOT=$(git -C "$(dirname "${BASH_SOURCE[0]}")" rev-parse --show-toplevel) && cd "$ROOT" || exit 1
 B=${1:?usage: machperf.sh <bench> <binA> [binB]}
 A=${2:?}
-C=${3:-js/src/night/nightmonkey/target/release/nightmonkey}
+C=${3:-build/bin/nightmonkey}
 N=${N:-3}
-WASMTIME=${WASMTIME:-$HOME/bin/wasmtime}
-SYS_JS=${SYS_JS:-/home/linuxbrew/.linuxbrew/bin/js}
-NIGHT_JS=obj-nightmonkey/dist/bin/js
-MEMCAP=${MEMCAP:-$HOME/bin/memcap}; [ -x "$MEMCAP" ] || MEMCAP=env
-SD=${SD:-$(mktemp -d)}; mkdir -p "$SD"
+NIGHT_JS=build/bin/js
+MEMCAP=tools/memcap
+# Scratch: $SD if given (kept), else a fresh directory in /tmp (removed).
+[ -n "${SD:-}" ] || { SD=$(mktemp -d /tmp/night-machperf.XXXXXX); trap 'rm -rf "$SD"' EXIT; }
+mkdir -p "$SD"
 CPU=${CPU:-1}
 
 GA=${GA:-instructions,cycles,branches,branch-misses,L1-icache-load-misses}
@@ -40,7 +40,7 @@ GB=${GB:-instructions,cycles,L1-dcache-load-misses,iTLB-load-misses,cache-misses
 v=$SD/$B.js
 snap=$SD/$B.snap.wasm
 if [ "$A" != ion ] || [ "$C" != ion ]; then
-  [ -f "$v" ] || head -n -1 "octane/$B.js" > "$v"
+  [ -f "$v" ] || head -n -1 "bench/octane/$B.js" > "$v"
   aotbin=$A; [ "$aotbin" = ion ] && aotbin=$C
   [ -f "$snap" ] || "$MEMCAP" 32G "$aotbin" --shell "$NIGHT_JS" "$v" --keep-snapshot "$snap" -o /dev/null >/dev/null 2>&1
 fi
@@ -61,13 +61,13 @@ one() { # $1=events $2=statfile $3..=the command -> prints score
 run() { # $1=label $2=binary, or the literal `ion` for the native lane
   local -a cmd
   if [ "$2" = ion ]; then
-    [ -x "$SYS_JS" ] || { echo "$1: no SYS_JS at $SYS_JS"; return; }
-    cmd=("$SYS_JS" "octane/$B.js")
+    command -v js >/dev/null || { echo "$1: no js on PATH"; return; }
+    cmd=(js "bench/octane/$B.js")
   else
     local out=$SD/$1.wasm
     "$MEMCAP" 32G "$2" "$snap" -o "$out" >/dev/null 2>&1 || { echo "$1: compile failed"; return; }
-    "$WASMTIME" compile "$out" -o "$SD/$1.cwasm" 2>/dev/null
-    cmd=("$WASMTIME" run --allow-precompiled -W unknown-imports-trap "$SD/$1.cwasm")
+    wasmtime compile "$out" -o "$SD/$1.cwasm" 2>/dev/null
+    cmd=(wasmtime run --allow-precompiled -W unknown-imports-trap "$SD/$1.cwasm")
   fi
   local best=0 f
   for i in $(seq "$N"); do

@@ -1,0 +1,11 @@
+#!/bin/sh
+# Run a command in a transient cgroup with a hard memory cap, so a runaway
+# process is killed by its own cgroup limit instead of the global OOM killer
+# (which has reaped whole sessions before). Usage: memcap [size] cmd args...
+# Size defaults to 32G. Without systemd-run, runs the command uncapped.
+size=32G
+case "$1" in
+  *[0-9][KMG]) size=$1; shift ;;
+esac
+command -v systemd-run >/dev/null 2>&1 || exec "$@"
+exec systemd-run --user --scope --quiet -p MemoryMax="$size" -p MemorySwapMax=0 "$@"

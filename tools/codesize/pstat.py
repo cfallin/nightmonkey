@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """perf-stat the aot lane (and optionally ion) over event groups; JSON lines out.
-react-bench ion lane needs $PSTAT_TMP/var/react-ion.js (make-harness.py 200 <out>).
+The aot lane runs <artdir>/<bench>.cwasm; the ion lane runs `js` (on PATH)
+on bench/octane/<bench>.js or bench/react/react.js.
 
   pstat.py <artdir> <out.jsonl> [--lanes aot,ion] [--benches a,b] [--groups 1,2,3]
 """
@@ -10,11 +11,9 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 
-FX = os.path.abspath(os.path.join(os.path.dirname(__file__), *[".."] * 5))
-WT = os.path.expanduser("~/bin/wasmtime")
-SYS_JS = "/home/linuxbrew/.linuxbrew/bin/js"
-S = os.environ.get("PSTAT_TMP", "/tmp")
+ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 GROUPS = {
     "1": [
         "cycles",
@@ -60,9 +59,6 @@ def run(cmd, stdin=None):
 
 
 def metric(out, bench):
-    if bench == "react-bench":
-        m = re.findall(r"mean=([0-9.]+)ms", out)
-        return float(m[-1]) if m else None
     m = re.findall(r"Score.*: (\d+)", out)
     return int(m[-1]) if m else None
 
@@ -82,10 +78,12 @@ def parse_stat(err):
 def main():
     art, outp = sys.argv[1], sys.argv[2]
     lanes = arg("--lanes", "aot").split(",")
-    benches = arg("--benches", ",".join(OCT + ["react-bench"])).split(",")
+    benches = arg("--benches", ",".join(OCT + ["react"])).split(",")
     groups = arg("--groups", "1,2,3").split(",")
     core = arg("--core", "1")
-    with open(outp, "a") as f:
+    with tempfile.TemporaryDirectory(prefix="night-pstat.", dir="/tmp") as tmp, open(
+        outp, "a"
+    ) as f:
         for b in benches:
             for lane in lanes:
                 for g in groups:
@@ -95,7 +93,7 @@ def main():
                         if not os.path.exists(src):
                             print(b, lane, "MISSING")
                             continue
-                        cw = f"{S}/pstat.run.cwasm"
+                        cw = f"{tmp}/pstat.run.cwasm"
                         shutil.copy(src, cw)
                         cmd = [
                             "taskset",
@@ -107,7 +105,7 @@ def main():
                             "-e",
                             ev,
                             "--",
-                            WT,
+                            "wasmtime",
                             "run",
                             "--allow-precompiled",
                             "-W",
@@ -116,11 +114,15 @@ def main():
                         ]
                         out, err = run(cmd)
                     else:
-                        js = (
-                            f"{FX}/octane/{b}.js"
-                            if b != "react-bench"
-                            else f"{S}/var/react-ion.js"
-                        )
+                        if b == "react":
+                            # react.js defines main() without calling it.
+                            js = f"{tmp}/react.run.js"
+                            with open(f"{ROOT}/bench/react/react.js") as src, open(
+                                js, "w"
+                            ) as dst:
+                                dst.write(src.read() + "\nmain();\n")
+                        else:
+                            js = f"{ROOT}/bench/octane/{b}.js"
                         cmd = [
                             "taskset",
                             "-c",
@@ -131,7 +133,7 @@ def main():
                             "-e",
                             ev,
                             "--",
-                            SYS_JS,
+                            "js",
                             js,
                         ]
                         out, err = run(cmd)
