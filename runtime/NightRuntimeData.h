@@ -4,9 +4,11 @@
 #ifndef night_runtime_NightRuntimeData_h
 #define night_runtime_NightRuntimeData_h
 
+#include <stddef.h>  // offsetof
 #include <stdint.h>  // uint32_t
 
 #include "js/TypeDecls.h"  // JSContext
+#include "runtime/NightRegionShape.h"  // Night_regexLeaf*
 
 namespace js {
 namespace night {
@@ -34,6 +36,29 @@ struct NightRegexEntry {
 inline constexpr int32_t kRegexMatcherSuccess = 1;
 inline constexpr int32_t kRegexMatcherFailure = 0;
 
+// The regex-leaf block (NightRegionShape.h's regexLeaf*): what MIR's
+// regexp arm reads to run an AOT matcher itself for an exec/test that does
+// not match. A row names the matchers of one RegExpShared, armed by the
+// leaf (night_runtime_regexp_leaf) for a shared it found optimizable,
+// neither global nor sticky; rows are zeroed with the movable caches.
+struct NightRegexLeafRow {
+  uint32_t shared;
+  uint32_t latin1Idx;
+  uint32_t twobyteIdx;
+  uint32_t pad;
+};
+struct NightRegexLeafBlock {
+  int32_t* btStack;
+  uint32_t btElems;
+  int32_t pairs[2 * Night_regexLeafMaxPairs];
+  NightRegexLeafRow rows[Night_regexLeafRows];
+};
+static_assert(offsetof(NightRegexLeafBlock, btStack) == Night_regexLeafBtStackOff);
+static_assert(offsetof(NightRegexLeafBlock, btElems) == Night_regexLeafBtElemsOff);
+static_assert(offsetof(NightRegexLeafBlock, pairs) == Night_regexLeafPairsOff);
+static_assert(offsetof(NightRegexLeafBlock, rows) == Night_regexLeafRowsOff);
+static_assert(sizeof(NightRegexLeafRow) == Night_regexLeafRowBytes);
+
 // Per-runtime AOT state.
 struct NightRuntimeData {
   // AOT-compiled regex matcher table and shared backtrack scratch, published
@@ -49,6 +74,8 @@ struct NightRuntimeData {
   // bytecode interpreter (no matcher, or the matcher returned RETRY).
   uint64_t regexNightMatches = 0;
   uint64_t regexNightFallbacks = 0;
+
+  NightRegexLeafBlock regexLeaf = {};
 };
 
 // The runtime's instance (runtime/NightRuntime.cpp's NightRuntimeState).

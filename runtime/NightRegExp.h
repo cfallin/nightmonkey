@@ -35,6 +35,19 @@ class VectorMatchPairs;
 int NightRegExpLeaf(JSContext* cx, const JS::Value& thisv,
                     const JS::Value& strv, bool forTest, JS::Value* out);
 
+// What MIR's regexp arm needs to decide a non-matching exec/test of `thisv`
+// itself (no GC): where it is an optimizable RegExpObject, neither global
+// nor sticky, whose compiled shared has AOT matchers: its shape, its shared
+// and the matchers' table indices (0 for an encoding without one). False
+// otherwise.
+bool NightRegExpLeafRow(JSContext* cx, const JS::Value& thisv,
+                        uint32_t* shape, uint32_t* shared, uint32_t* latin1Idx,
+                        uint32_t* twobyteIdx);
+
+namespace night {
+struct NightRegexEntry;
+}
+
 namespace irregexp {
 
 // Try the AOT-compiled Wasm matcher for this RegExpShared (single match).
@@ -47,6 +60,10 @@ bool TryNightRegexMatch(JSContext* cx, MutableHandleRegExpShared re,
                         Handle<JSLinearString*> input, size_t startIndex,
                         VectorMatchPairs* matches, bool latin1,
                         RegExpRunStatus* out);
+
+// The AOT matcher entry for `re`, if it has one.
+const js::night::NightRegexEntry* NightRegexEntryFor(JSContext* cx,
+                                                     RegExpShared* re);
 
 }  // namespace irregexp
 }  // namespace js

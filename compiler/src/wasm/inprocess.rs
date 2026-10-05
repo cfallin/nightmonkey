@@ -209,7 +209,7 @@ fn carve_blobs(bytes: &[u8], n_imports: usize) -> Result<Vec<Vec<u8>>, String> {
 /// Defined functions pushed before `translate_all` runs; the funcref table is
 /// pre-padded past them so every table-placed function's index is exactly
 /// `table_base + blob position`.
-const PRE_BODIES: u32 = 10;
+const PRE_BODIES: u32 = 11;
 
 pub fn build_inprocess_batch(
     source: &Source,
@@ -357,7 +357,31 @@ pub fn build_inprocess_batch(
             body,
         ))
     };
-    if direct_call_stub2.index() != n_imports + PRE_BODIES as usize - 1 {
+    // The AOT regex matchers' functype, carried by an inert stub (the
+    // matchers themselves are blobs anywhere): MIR's regexp arm's
+    // `call_indirect` immediate.
+    let regex_matcher_sig = m.signatures.push(SignatureData {
+        params: vec![Type::I32; 6],
+        returns: vec![Type::I32],
+    });
+    let regex_stub = {
+        let mut body = FunctionBody::new(&m, regex_matcher_sig);
+        let entry = body.entry;
+        let i32_ty = body.single_type_list(Type::I32);
+        // Not a status the arm takes as "no match".
+        let retry = body.add_value(ValueDef::Operator(
+            Operator::I32Const { value: 2 },
+            Default::default(),
+            i32_ty,
+        ));
+        body.append_to_block(entry, retry);
+        body.set_terminator(entry, waffle::Terminator::Return { values: vec![retry] });
+        m.funcs.push(FuncDecl::Body(regex_matcher_sig, "night_regex_stub".to_string(), body))
+    };
+    if direct_call_stub2.index() != n_imports + PRE_BODIES as usize - 2
+        || regex_stub.index() != n_imports + PRE_BODIES as usize - 1
+        || regex_matcher_sig.index() != n_imports + PRE_BODIES as usize - 1
+    {
         return Err("pre-body function count misaligned".to_string());
     }
 
@@ -384,6 +408,7 @@ pub fn build_inprocess_batch(
             direct_call_stub,
             night_abi_sig2,
             direct_call_stub2,
+            regex_matcher_sig,
         },
         env.helper_bases(),
     )?;
@@ -921,7 +946,7 @@ mod tests {
         assert_eq!(n_allocs, 2, "allocator called exactly twice");
         assert_eq!(out.extern_table_indices.len(), HELPER_NAMES.len());
         assert_eq!(out.extern_table_indices[0], 100);
-        // stub + 2 TA poly helpers + stub2 precede the compiled script's
+        // stub + 2 TA poly helpers + stub2 + the regex stub precede the compiled script's
         // widened-ABI body (slot PRE_BODIES); the script's dispatched table
         // entry is its night_abi adapter, appended right after the body.
         assert_eq!(out.scripts, vec![(0, PRE_BODIES + 1)]);

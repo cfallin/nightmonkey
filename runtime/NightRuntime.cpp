@@ -1740,6 +1740,23 @@ bool night_runtime_install_env(JSContext* cx,
                         js::night::Night_strlitEnumeratorsOff) =
           static_cast<uint32_t>(
               reinterpret_cast<uintptr_t>(cx->compartment()->enumeratorsAddr()));
+      // MIR's regexp arm: the realm's RegExp.prototype fuse word, the
+      // regex-leaf block (with the matchers' backtrack scratch), and the
+      // optimizable shape, unarmed.
+      {
+        js::night::NightRuntimeData& aot = js::night::NightData(cx);
+        aot.regexLeaf.btStack = aot.regexBtStack;
+        aot.regexLeaf.btElems = aot.regexBtStackElems;
+        *LinMem<uint32_t>(RtState(cx).strLitBase +
+                          js::night::Night_strlitRegExpFuseAddrOff) =
+            static_cast<uint32_t>(reinterpret_cast<uintptr_t>(
+                cx->realm()->realmFuses.optimizeRegExpPrototypeFuse.fuseRef()));
+        *LinMem<uint32_t>(RtState(cx).strLitBase +
+                          js::night::Night_strlitRegexLeafOff) =
+            static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&aot.regexLeaf));
+        *LinMem<uint32_t>(RtState(cx).strLitBase +
+                          js::night::Night_strlitRegExpShapeOff) = 0;
+      }
       // The plain-object class: MIR's `guard.kind Plain` compares a
       // receiver's clasp against it.
       *LinMem<uint32_t>(RtState(cx).strLitBase +
@@ -3673,6 +3690,13 @@ static void NightPurgeMovableCaches() {
     ZeroRegion(RtEnv(cx).intrinsicCellsPtr, RtEnv(cx).intrinsicCellsLen);
   }
   js::night::NightPurgeAddMemo();
+  // MIR's regexp arm caches a shape and RegExpShared pointers.
+  if (RtState(cx).strLitBase) {
+    *LinMem<uint32_t>(RtState(cx).strLitBase +
+                      js::night::Night_strlitRegExpShapeOff) = 0;
+    memset(js::night::NightData(cx).regexLeaf.rows, 0,
+           sizeof(js::night::NightData(cx).regexLeaf.rows));
+  }
   // The string-method and builtin guard cells hold raw function bits;
   // compaction moves functions, so re-write them from the rooted
   // (auto-updated) values.
@@ -6442,12 +6466,32 @@ int32_t night_runtime_typeof_eq(JSContext* cx, uint64_t a, uint32_t operand) {
   return (eq != neq) ? 1 : 0;
 }
 
+// Arm MIR's regexp arm for `re` (see Night_strlitRegExpShapeOff): the
+// optimizable shape and the row of re's shared, so a later exec/test of it
+// that does not match runs its matcher with no call here.
+static void ArmRegExpLeaf(JSContext* cx, uint64_t re) {
+  uint32_t base = RtState(cx).strLitBase;
+  uint32_t shape, shared, l1, tb;
+  if (!base || !js::NightRegExpLeafRow(cx, JS::Value::fromRawBits(re), &shape,
+                                       &shared, &l1, &tb)) {
+    return;
+  }
+  *LinMem<uint32_t>(base + js::night::Night_strlitRegExpShapeOff) = shape;
+  js::night::NightRegexLeafBlock& blk = js::night::NightData(cx).regexLeaf;
+  js::night::NightRegexLeafRow& row =
+      blk.rows[(shared >> 4) & (js::night::Night_regexLeafRows - 1)];
+  row.shared = shared;
+  row.latin1Idx = l1;
+  row.twobyteIdx = tb;
+}
+
 uint64_t night_runtime_regexp_leaf(JSContext* cx, uint64_t re, uint64_t str,
                                    uint32_t forTest) {
   JS::Value out;
-  if (js::NightRegExpLeaf(cx, JS::Value::fromRawBits(re),
-                          JS::Value::fromRawBits(str), forTest != 0,
-                          &out) == 1) {
+  int r = js::NightRegExpLeaf(cx, JS::Value::fromRawBits(re),
+                              JS::Value::fromRawBits(str), forTest != 0, &out);
+  ArmRegExpLeaf(cx, re);
+  if (r == 1) {
     return out.asRawBits();
   }
   return JS::MagicValue(JS_GENERIC_MAGIC).asRawBits();

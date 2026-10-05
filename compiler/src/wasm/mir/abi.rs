@@ -202,6 +202,12 @@ pub(crate) const SHAPE_CACHE_OFFSET: u32 = 12;
 pub(crate) const SHAPE_CACHE_TAG_MASK: u32 = 3;
 pub(crate) const SHAPE_CACHE_ITERATOR: u32 = 3;
 
+// --- RegExpObject: the regexp arm's run of a matcher --------------------
+/// `RegExpObject::offsetOfLastIndex()` and `offsetOfShared()` (fixed slots
+/// 0 and 3; the shared a private GC-thing value, its pointer the low word).
+pub(crate) const REGEXP_LAST_INDEX_OFFSET: u32 = 16;
+pub(crate) const REGEXP_SHARED_OFFSET: u32 = 40;
+
 // --- MapObject and atoms: the inline Map.prototype.get -------------------
 //
 //   MapObject  +16 hash table (bucket pointers)  +48 live count  +56 shift

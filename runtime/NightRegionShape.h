@@ -109,7 +109,7 @@ namespace night {
   /* &PlainObject::class_ @36]. The header word is 0 while the zone does  */  \
   /* not allocate strings in the nursery; the runtime refreshes it after  */  \
   /* every GC, the only place the zone's flag moves.                      */  \
-  _(strlitBlockBytes, 40)                                                      \
+  _(strlitBlockBytes, 56)                                                      \
   _(strlitEmptyStringOff, 0)                                                   \
   _(strlitStrHeaderOff, 4)                                                     \
   _(strlitStrCountAddrOff, 8)                                                  \
@@ -138,6 +138,24 @@ namespace night {
   _(strlitStampEpochAddrOff, 28)                                               \
   _(strlitEnumeratorsOff, 32)                                                  \
   _(strlitPlainClassOff, 36)                                                   \
+  /* A regexp exec/test with no match, decided in compiled code (MIR's     */  \
+  /* regexp arm): the shape of an optimizable RegExpObject (armed by the  */  \
+  /* leaf, zeroed with the movable caches), the address of the realm's     */  \
+  /* optimizeRegExpPrototypeFuse word, and the regex-leaf block's address. */  \
+  _(strlitRegExpShapeOff, 40)                                                  \
+  _(strlitRegExpFuseAddrOff, 44)                                               \
+  _(strlitRegexLeafOff, 48)                                                    \
+  /* The regex-leaf block (NightRuntimeData::regexLeaf): [btStack @0]      */  \
+  /* [btElems @4] [output pairs @8, regexLeafMaxPairs * 8 bytes] [rows]:   */  \
+  /* per RegExpShared (direct-mapped by its address >> 4), [shared @0]     */  \
+  /* [latin1 matcher @4] [two-byte matcher @8] [pad], wasm table indices.  */  \
+  _(regexLeafRows, 64)                                                         \
+  _(regexLeafRowBytes, 16)                                                     \
+  _(regexLeafMaxPairs, 8)                                                      \
+  _(regexLeafBtStackOff, 0)                                                    \
+  _(regexLeafBtElemsOff, 4)                                                    \
+  _(regexLeafPairsOff, 8)                                                      \
+  _(regexLeafRowsOff, 72)                                                      \
   /* Math native-pointer slots (gEnv.mathNativesPtr), 4 bytes per MN_*.    */  \
   _(mathNativeSlots, 16)                                                       \
   /* Inline-alloc and construct cell rows: the compiler sizes the regions  */  \
@@ -188,6 +206,14 @@ static_assert(Night_strlitEnumeratorsOff + 4 <= Night_strlitBlockBytes,
 static_assert((Night_bindingFuseArmed & 1) && (Night_bindingFusePredicted & 1) &&
                   !(Night_bindingFuseBlown & 1),
               "a binding fuse is armed exactly when bit 0 is set");
+static_assert(Night_strlitRegexLeafOff + 4 <= Night_strlitBlockBytes &&
+                  Night_strlitBlockBytes % 8 == 0,
+              "the regexp words must fit the (8-aligned) strlit block");
+static_assert(Night_regexLeafRowsOff ==
+                  Night_regexLeafPairsOff + 8 * Night_regexLeafMaxPairs,
+              "the regex-leaf rows follow the output pairs");
+static_assert((Night_regexLeafRows & (Night_regexLeafRows - 1)) == 0,
+              "the regex-leaf rows are a power of two");
 static_assert(Night_strlitPlainClassOff + 4 <= Night_strlitBlockBytes,
               "the plain-object class must fit the strlit block");
 static_assert(Night_strlitMapClassOff + 4 <= Night_strlitStampEpochAddrOff,

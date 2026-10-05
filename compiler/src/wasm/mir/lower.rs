@@ -168,6 +168,10 @@ const NATIVE_ROUTE: bool = true;
 /// (`iter_from_shape`).
 const ITER_FROM_SHAPE: bool = true;
 
+/// An exec/test that does not match runs its AOT matcher in compiled code
+/// (`regexp_no_match`).
+const REGEXP_NO_MATCH_ARM: bool = true;
+
 /// A generic equality of two strings decides by pointer, length and
 /// atomness before the helper.
 const STRING_EQ_ARM: bool = true;
@@ -8948,11 +8952,120 @@ impl<'a> Lower<'a> {
         let is_test = self.builtin_is(callee, BC_REGEXP_TEST);
         let either = self.bin(Operator::I32Or, is_exec, is_test, Type::I32);
         self.check(either, other);
+        let leaf = self.body.add_block();
+        if REGEXP_NO_MATCH_ARM {
+            self.regexp_no_match(inst, this, s, is_test, leaf)?;
+        } else {
+            self.terminate(Terminator::Br { target: Self::to(leaf) });
+        }
+        self.cur = leaf;
         let r = self.call1(self.h.regexp_leaf, &[self.cx, this, s, is_test], Type::I64);
         let tag = self.tag_of(r);
         let miss = self.tag_is(tag, TAG_MAGIC as u32);
         let t = self.edge(inst, 0, &[r])?;
         self.cond_br(miss, Self::to(other), t);
+        Ok(())
+    }
+
+    /// The no-match half of `re.exec(s)` / `re.test(s)` (the builtins),
+    /// taking edge 0 with `null` / `false`: where `re` has the optimizable
+    /// regexp shape the leaf armed (a plain RegExpObject of this realm's
+    /// prototype, no own properties but `lastIndex`) and the prototype's
+    /// fuse is intact, its `lastIndex` is a number (reading it runs
+    /// nothing), its shared has a row (armed only for one neither global nor
+    /// sticky, with AOT matchers), and `s` is a linear string, the matcher
+    /// runs here, as the JIT's RegExp stubs call theirs. A failed match
+    /// changes nothing (no statics, no `lastIndex`), so that answer is
+    /// final; a match or a retry goes to `leaf`, which runs it again and
+    /// builds what a match needs.
+    fn regexp_no_match(&mut self, inst: mir::Inst, re: Value, s: Value, is_test: Value, leaf: Block) -> R<()> {
+        use crate::region_shape::{
+            REGEX_LEAF_BT_ELEMS_OFF, REGEX_LEAF_BT_STACK_OFF, REGEX_LEAF_PAIRS_OFF, REGEX_LEAF_ROWS,
+            REGEX_LEAF_ROWS_OFF, REGEX_LEAF_ROW_BYTES, STRLIT_REG_EXP_FUSE_ADDR_OFF, STRLIT_REG_EXP_SHAPE_OFF,
+            STRLIT_REGEX_LEAF_OFF,
+        };
+        use crate::wasm::mir::abi::{REGEXP_LAST_INDEX_OFFSET, REGEXP_SHARED_OFFSET};
+        let rt = self.tag_of(re);
+        let st = self.tag_of(s);
+        let ro = self.tag_is(rt, TAG_OBJECT as u32);
+        let ss = self.tag_is(st, TAG_STRING as u32);
+        let both = self.bin(Operator::I32And, ro, ss, Type::I32);
+        self.check(both, leaf);
+        let obj = self.un(Operator::I32WrapI64, re, Type::I32);
+        let shape = self.load_i32(obj, SHAPE_OFFSET);
+        let wsh = self.i32c(self.h.strlit_slot + STRLIT_REG_EXP_SHAPE_OFF);
+        let armed = self.load_i32(wsh, 0);
+        let same = self.bin(Operator::I32Eq, shape, armed, Type::I32);
+        self.check(same, leaf);
+        let wfuse = self.i32c(self.h.strlit_slot + STRLIT_REG_EXP_FUSE_ADDR_OFF);
+        let fuse_at = self.load_i32(wfuse, 0);
+        let fuse = self.load_i32(fuse_at, 0);
+        let intact = self.un(Operator::I32Eqz, fuse, Type::I32);
+        self.check(intact, leaf);
+        let li = self.load_i64(obj, REGEXP_LAST_INDEX_OFFSET);
+        let lt = self.tag_of(li);
+        let k = self.i32c(TAG_INT32 as u32);
+        let num = self.bin(Operator::I32LeU, lt, k, Type::I32);
+        self.check(num, leaf);
+        let shared = self.load_i32(obj, REGEXP_SHARED_OFFSET);
+        let wblk = self.i32c(self.h.strlit_slot + STRLIT_REGEX_LEAF_OFF);
+        let blk = self.load_i32(wblk, 0);
+        let four = self.i32c(4);
+        let h = self.bin(Operator::I32ShrU, shared, four, Type::I32);
+        let mask = self.i32c(REGEX_LEAF_ROWS - 1);
+        let h = self.bin(Operator::I32And, h, mask, Type::I32);
+        let rb = self.i32c(REGEX_LEAF_ROW_BYTES);
+        let off = self.bin(Operator::I32Mul, h, rb, Type::I32);
+        let rows = self.add_off(blk, REGEX_LEAF_ROWS_OFF);
+        let row = self.bin(Operator::I32Add, rows, off, Type::I32);
+        let rshared = self.load_i32(row, 0);
+        let hit = self.bin(Operator::I32Eq, rshared, shared, Type::I32);
+        let z = self.i32c(0);
+        let nz = self.bin(Operator::I32Ne, shared, z, Type::I32);
+        let hit = self.bin(Operator::I32And, hit, nz, Type::I32);
+        self.check(hit, leaf);
+        // The subject: linear; its encoding picks the matcher.
+        let p = self.un(Operator::I32WrapI64, s, Type::I32);
+        let flags = self.load_i32(p, STRING_FLAGS_OFFSET);
+        let lb = self.i32c(STRING_LINEAR_BIT);
+        let lin = self.bin(Operator::I32And, flags, lb, Type::I32);
+        self.check(lin, leaf);
+        let l1b = self.i32c(STRING_LATIN1_CHARS_BIT);
+        let latin1 = self.bin(Operator::I32And, flags, l1b, Type::I32);
+        let l1 = self.load_i32(row, 4);
+        let tb = self.load_i32(row, 8);
+        let fidx = self.select(Type::I32, l1, tb, latin1);
+        self.check(fidx, leaf);
+        let len = self.load_i32(p, STRING_LENGTH_OFFSET);
+        let ib = self.i32c(STRING_INLINE_CHARS_BIT);
+        let inline = self.bin(Operator::I32And, flags, ib, Type::I32);
+        let heap = self.load_i32(p, STRING_CHARS_OFFSET);
+        let here = self.add_off(p, STRING_CHARS_OFFSET);
+        let chars = self.select(Type::I32, here, heap, inline);
+        let start = self.i32c(0);
+        let pairs = self.add_off(blk, REGEX_LEAF_PAIRS_OFF);
+        let bt = self.load_i32(blk, REGEX_LEAF_BT_STACK_OFF);
+        let bte = self.load_i32(blk, REGEX_LEAF_BT_ELEMS_OFF);
+        let args = self.body.arg_pool.from_iter([chars, len, start, pairs, bt, bte, fidx].into_iter());
+        let tys = self.body.type_pool.from_iter([Type::I32].into_iter());
+        let status = self.push_val(ValueDef::Operator(
+            Operator::CallIndirect {
+                sig_index: self.h.regex_matcher_sig,
+                table_index: self.h.indirect_table,
+            },
+            args,
+            tys,
+        ));
+        // kRegexMatcherFailure (0): no match.
+        let none = self.un(Operator::I32Eqz, status, Type::I32);
+        let done = self.body.add_block();
+        self.cond_br(none, Self::to(done), Self::to(leaf));
+        self.cur = done;
+        let f = self.i64c((TAG_BOOLEAN << 32) | 0);
+        let n = self.i64c(TAG_NULL << 32);
+        let r = self.select(Type::I64, f, n, is_test);
+        let t = self.edge(inst, 0, &[r])?;
+        self.terminate(Terminator::Br { target: t });
         Ok(())
     }
 

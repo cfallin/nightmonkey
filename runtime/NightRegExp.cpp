@@ -288,6 +288,33 @@ int js::NightRegExpLeaf(JSContext* cx, const Value& thisv, const Value& strv,
   return 1;
 }
 
+bool js::NightRegExpLeafRow(JSContext* cx, const Value& thisv,
+                            uint32_t* shape, uint32_t* shared,
+                            uint32_t* latin1Idx, uint32_t* twobyteIdx) {
+  JS::AutoCheckCannotGC nogc;
+  if (!thisv.isObject() || !IsOptimizableRegExpObject(&thisv.toObject(), cx)) {
+    return false;
+  }
+  RegExpObject* reobj = &thisv.toObject().as<RegExpObject>();
+  if (reobj->isGlobalOrSticky() || !reobj->hasShared()) {
+    return false;
+  }
+  RegExpShared* re = reobj->getShared();
+  if (re->kind() != RegExpShared::Kind::RegExp) {
+    return false;
+  }
+  const js::night::NightRegexEntry* e = irregexp::NightRegexEntryFor(cx, re);
+  if (!e || e->pairCount > js::night::Night_regexLeafMaxPairs ||
+      (e->latin1Idx == 0 && e->twobyteIdx == 0)) {
+    return false;
+  }
+  *shape = uint32_t(reinterpret_cast<uintptr_t>(reobj->shape()));
+  *shared = uint32_t(reinterpret_cast<uintptr_t>(re));
+  *latin1Idx = e->latin1Idx;
+  *twobyteIdx = e->twobyteIdx;
+  return true;
+}
+
 namespace js {
 namespace irregexp {
 
@@ -302,13 +329,13 @@ namespace irregexp {
 static_assert(js::night::kRegexMatcherSuccess == kExternalMatcherSuccess);
 static_assert(js::night::kRegexMatcherFailure == kExternalMatcherFailure);
 
-bool TryNightRegexMatch(JSContext* cx, MutableHandleRegExpShared re,
-                        Handle<JSLinearString*> input, size_t startIndex,
-                        VectorMatchPairs* matches, bool latin1,
-                        RegExpRunStatus* out) {
+// The AOT matcher entry for `re`, resolving the shared's external word on
+// first use; null where there is none.
+const js::night::NightRegexEntry* NightRegexEntryFor(JSContext* cx,
+                                                     RegExpShared* re) {
   js::night::NightRuntimeData& aot = js::night::NightData(cx);
   if (aot.regexTableCount == 0) {
-    return false;
+    return nullptr;
   }
   // The shared's external word caches the lookup: 0 unresolved, 1 no
   // matcher, else table index + 2.
@@ -346,9 +373,21 @@ bool TryNightRegexMatch(JSContext* cx, MutableHandleRegExpShared re,
     re->setExternalWord(word);
   }
   if (word == 1) {
+    return nullptr;
+  }
+  return &aot.regexTable[word - 2];
+}
+
+bool TryNightRegexMatch(JSContext* cx, MutableHandleRegExpShared re,
+                        Handle<JSLinearString*> input, size_t startIndex,
+                        VectorMatchPairs* matches, bool latin1,
+                        RegExpRunStatus* out) {
+  js::night::NightRuntimeData& aot = js::night::NightData(cx);
+  const js::night::NightRegexEntry* ep = NightRegexEntryFor(cx, re);
+  if (!ep) {
     return false;
   }
-  const js::night::NightRegexEntry& e = aot.regexTable[word - 2];
+  const js::night::NightRegexEntry& e = *ep;
   uint32_t funcIdx = latin1 ? e.latin1Idx : e.twobyteIdx;
   if (funcIdx == 0 || matches->pairCount() != e.pairCount) {
     return false;

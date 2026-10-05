@@ -29,6 +29,7 @@
 #include "vm/JSObject.h"
 #include "vm/JSScript.h"  // BaseScript::offsetOfExternalTierWord
 #include "vm/PlainObject.h"
+#include "vm/RegExpObject.h"
 #include "vm/Shape.h"
 #include "vm/StringType.h"
 
@@ -197,6 +198,8 @@ static_assert(NativeIterator::Flags::IndicesAllocated == 0x20,
 static_assert(sizeof(PropertyIndex) == 4, "NI_INDEX_BYTES");
 static_assert(sizeof(GCPtr<Shape*>) == 4, "NI_PROTO_SHAPE_BYTES");
 static_assert(Shape::offsetOfCachePtr() == 12, "SHAPE_CACHE_OFFSET");
+static_assert(RegExpObject::offsetOfLastIndex() == 16, "REGEXP_LAST_INDEX_OFFSET");
+static_assert(RegExpObject::offsetOfShared() == 40, "REGEXP_SHARED_OFFSET");
 static_assert(sizeof(ShapeCachePtr) == sizeof(uintptr_t), "SHAPE_CACHE_OFFSET");
 
 bool NightCheckIteratorLayout() {

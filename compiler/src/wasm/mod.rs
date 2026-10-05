@@ -666,6 +666,7 @@ pub struct HelperPrebuilt {
     pub direct_call_stub: Func,
     pub night_abi_sig2: waffle::Signature,
     pub direct_call_stub2: Func,
+    pub regex_matcher_sig: waffle::Signature,
 }
 
 /// The baked cell/region base addresses the translator embeds.
@@ -720,6 +721,7 @@ pub fn resolve_helpers(
         indirect_table: pre.indirect_table,
         direct_call_stub: pre.direct_call_stub,
         night_abi_sig2: pre.night_abi_sig2,
+        regex_matcher_sig: pre.regex_matcher_sig,
         direct_call_stub2: pre.direct_call_stub2,
         census: resolve(m, "night_runtime_census").ok(),
         add: resolve(m, "night_runtime_add")?,

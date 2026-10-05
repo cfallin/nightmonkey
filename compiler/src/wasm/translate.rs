@@ -55,6 +55,11 @@ pub struct Helpers {
     /// the body and drop `eff`, so runtime entries and `call_indirect`
     /// never see multivalue.
     pub night_abi_sig2: Signature,
+    /// The AOT regex matchers' all-i32 signature `(input, length, start,
+    /// output regs, backtrack stack, its elems) -> status`, for MIR's
+    /// regexp arm's `call_indirect` (Wasm compares function types
+    /// structurally, so this is the matchers' own type).
+    pub regex_matcher_sig: Signature,
     /// Inert `night_abi_sig2` stub: the initial target of a widened direct
     /// call, rewritten at placement exactly as `direct_call_stub`.
     pub direct_call_stub2: Func,
@@ -2895,6 +2900,10 @@ mod tests {
             ],
             returns: vec![Type::I32, Type::I32],
         });
+        let regex_matcher_sig = m.signatures.push(SignatureData {
+            params: vec![Type::I32; 6],
+            returns: vec![Type::I32],
+        });
         let direct_call_stub2 = {
             let mut body = FunctionBody::new(&m, night_abi_sig2);
             let entry = body.entry;
@@ -3838,6 +3847,7 @@ mod tests {
                 indirect_table,
                 direct_call_stub,
                 night_abi_sig2,
+                regex_matcher_sig,
                 direct_call_stub2,
                 add,
                 concat,

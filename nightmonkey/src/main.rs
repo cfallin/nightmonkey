@@ -357,6 +357,11 @@ fn main() -> Result<()> {
             body,
         ))
     };
+    // A whole module: the regex matchers' own functype, structurally.
+    let regex_matcher_sig = m.signatures.push(waffle::SignatureData {
+        params: vec![waffle::Type::I32; 6],
+        returns: vec![waffle::Type::I32],
+    });
     let helpers = resolve_helpers(
         &mut m,
         &mut |m, name| find_export_func(m, name),
@@ -375,6 +380,7 @@ fn main() -> Result<()> {
             direct_call_stub,
             night_abi_sig2,
             direct_call_stub2,
+            regex_matcher_sig,
         },
         env.helper_bases(),
 
