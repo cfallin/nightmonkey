@@ -59,7 +59,7 @@ use crate::wasm::baseline::layout::{
     ONRAMP_BACKOFF,
 };
 use crate::wasm::mir::abi::{
-    CALLOBJ_CALLEE_OFFSET, CALLOBJ_ENCLOSING_OFFSET, ENV_CELL_ARMED, ENV_CELL_CLASS_WORD, ENV_CELL_GEN,
+    MAX_FIXED_SLOTS, CALLOBJ_CALLEE_OFFSET, CALLOBJ_ENCLOSING_OFFSET, ENV_CELL_ARMED, ENV_CELL_CLASS_WORD, ENV_CELL_GEN,
     LAMBDA_CELL_GEN, LAMBDA_CELL_TEMPLATE,
     BINOP_BITAND, BINOP_BITNOT, BINOP_BITOR, BINOP_BITXOR, BINOP_DEC, BINOP_DIV, BINOP_INC,
     BINOP_LSH, BINOP_MOD, BINOP_MUL, BINOP_RSH, BINOP_SUB, BINOP_URSH, CLASS_WORD_SHALLOW,
@@ -3249,16 +3249,16 @@ impl<'a> Lower<'a> {
                 self.def(inst, p);
             }
             Opcode::EnvLoad(slot) => {
-                let addr = self.slot_addr(a[0], slot.get());
-                let v = self.load_i64(addr, 0);
+                let (addr, off) = self.env_slot(a[0], slot.get());
+                let v = self.load_i64(addr, off);
                 self.def(inst, v);
             }
             Opcode::EnvStore(slot) => {
                 // `setAliasedBinding` zero hops up, inline: the slot store
                 // with its barriers.
-                let addr = self.slot_addr(a[0], slot.get());
-                self.pre_barrier(addr, 0);
-                self.store_i64(addr, 0, a[1]);
+                let (addr, off) = self.env_slot(a[0], slot.get());
+                self.pre_barrier(addr, off);
+                self.store_i64(addr, off, a[1]);
                 let s = self.i32c(slot.get());
                 self.post_barrier(self.h.post_write_barrier, a[0], s, a[1]);
             }
@@ -6603,27 +6603,16 @@ impl<'a> Lower<'a> {
         Ok(())
     }
 
-    /// The address of native object `obj`'s slot `slot`: a fixed slot if
-    /// the shape has that many, else a dynamic one.
-    fn slot_addr(&mut self, obj: Value, slot: u32) -> Value {
-        let shape = self.load_i32(obj, SHAPE_OFFSET);
-        let flags = self.load_i32(shape, SHAPE_IMMUTABLE_FLAGS_OFFSET);
-        let sh = self.i32c(SHAPE_FIXED_SLOTS_SHIFT);
-        let n = self.bin(Operator::I32ShrU, flags, sh, Type::I32);
-        let m = self.i32c(SHAPE_FIXED_SLOTS_MASK_BITS);
-        let nfixed = self.bin(Operator::I32And, n, m, Type::I32);
-        let s = self.i32c(slot);
-        let fixed = self.bin(Operator::I32LtU, s, nfixed, Type::I32);
-        let base = self.i32c(FIXED_SLOTS_BASE);
-        let fixed_base = self.bin(Operator::I32Add, obj, base, Type::I32);
-        let fixed_addr = self.i32c(8 * slot);
-        let fixed_addr = self.bin(Operator::I32Add, fixed_base, fixed_addr, Type::I32);
-        let slots = self.load_i32(obj, NATIVE_SLOTS_OFFSET);
-        let rel = self.bin(Operator::I32Sub, s, nfixed, Type::I32);
-        let eight = self.i32c(8);
-        let off = self.bin(Operator::I32Mul, rel, eight, Type::I32);
-        let dyn_addr = self.bin(Operator::I32Add, slots, off, Type::I32);
-        self.op(Operator::Select, &[fixed_addr, dyn_addr, fixed], Some(Type::I32))
+    /// Where environment object `obj`'s slot `slot` is, as a base and an
+    /// offset: decided statically, as Ion's `GetAliasedVar` is
+    /// (`MAX_FIXED_SLOTS`).
+    fn env_slot(&mut self, obj: Value, slot: u32) -> (Value, u32) {
+        if slot < MAX_FIXED_SLOTS {
+            (obj, FIXED_SLOTS_BASE + 8 * slot)
+        } else {
+            let slots = self.load_i32(obj, NATIVE_SLOTS_OFFSET);
+            (slots, 8 * (slot - MAX_FIXED_SLOTS))
+        }
     }
 
     /// The script's `JSScript*`, re-derived from the callee (a rooted frame

@@ -41,6 +41,12 @@ pub(crate) const FIXED_SLOTS_BASE: u32 = 16;
 /// `slots_` again, reached from a `NativeObject*` in the slot-address
 /// decoder rather than from the object header walk.
 pub(crate) const NATIVE_SLOTS_OFFSET: u32 = 8;
+/// `NativeObject::MAX_FIXED_SLOTS`. An environment object is non-extensible
+/// and made with as many of its slots fixed as an object can hold
+/// (`EmptyEnvironmentShape`), so an aliased binding's slot is fixed below
+/// this and dynamic, at `slot - MAX_FIXED_SLOTS`, at or above it
+/// (`EnvironmentObject::nonExtensibleIsFixedSlot`).
+pub(crate) const MAX_FIXED_SLOTS: u32 = 16;
 
 // --- the likely-class (stamp) word ----------------------------------------
 //
