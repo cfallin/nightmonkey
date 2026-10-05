@@ -922,6 +922,22 @@ static inline void FillTransRow(uint32_t* row, uint32_t oldShape,
   }
   row[0] = oldShape;  // validity marker last
 }
+
+// MIR's element-add arm's row for a SetAddRow (Night_strlitElemAddOff):
+// the transition in a site row's layout, then its key. A transition that
+// skips slots is the C++ replay's alone.
+static void SeedElemAddRow(JSContext* cx, const SetAddRow& t, uint32_t nfixed) {
+  if (t.skip) {
+    return;
+  }
+  uint32_t h = CacheHash(t.oldShape, t.atomId) & (js::night::Night_elemAddRows - 1);
+  uint32_t* row = js::night::NightData(cx).elemAdd +
+                  h * (js::night::Night_elemAddRowBytes / 4);
+  row[0] = 0;
+  row[js::night::Night_elemAddKeyOff / 4] = t.atomId;
+  FillTransRow(row, t.oldShape, t.newShape, t.slot, nfixed, t.protoPtrs,
+               t.protoShapes, t.numProtos);
+}
 static void NightGcSliceCallback(JSContext* cx, JS::GCProgress progress,
                                  const JS::GCDescription& desc);
 
@@ -1756,6 +1772,9 @@ bool night_runtime_install_env(JSContext* cx,
             static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&aot.regexLeaf));
         *LinMem<uint32_t>(RtState(cx).strLitBase +
                           js::night::Night_strlitRegExpShapeOff) = 0;
+        *LinMem<uint32_t>(RtState(cx).strLitBase +
+                          js::night::Night_strlitElemAddOff) =
+            static_cast<uint32_t>(reinterpret_cast<uintptr_t>(aot.elemAdd));
       }
       // The plain-object class: MIR's `guard.kind Plain` compares a
       // receiver's clasp against it.
@@ -3690,6 +3709,9 @@ static void NightPurgeMovableCaches() {
     ZeroRegion(RtEnv(cx).intrinsicCellsPtr, RtEnv(cx).intrinsicCellsLen);
   }
   js::night::NightPurgeAddMemo();
+  // MIR's element-add arm's rows hold shape and prototype pointers.
+  memset(js::night::NightData(cx).elemAdd, 0,
+         sizeof(js::night::NightData(cx).elemAdd));
   // MIR's regexp arm caches a shape and RegExpShared pointers.
   if (RtState(cx).strLitBase) {
     *LinMem<uint32_t>(RtState(cx).strLitBase +
@@ -4265,11 +4287,13 @@ bool night_runtime_set_element(JSContext* cx, uint32_t top, uint64_t recv,
         &JS::Value::fromRawBits(recv).toObject().as<js::NativeObject>();
     uint32_t shapeW = js::night::NightObjectShape(nobj);
     SetAddRow& trow = SetAddAt(cx, shapeW, addKey);
+    uint32_t nfixed = nobj->numFixedSlots();
     if (trow.gen == InlineGen(cx) && trow.oldShape == shapeW &&
         trow.atomId == addKey && !trow.skip &&
         js::night::NightTryAddPropTransition(
             cx, recv, trow.oldShape, trow.newShape, trow.slot, trow.protoPtrs,
             trow.protoShapes, trow.numProtos, val)) {
+      SeedElemAddRow(cx, trow, nfixed);
       return true;
     }
   }
@@ -4315,6 +4339,9 @@ bool night_runtime_set_element(JSContext* cx, uint32_t top, uint64_t recv,
       for (uint32_t i = 0; i < 4; i++) {
         trow.protoPtrs[i] = i < numProtos ? protoPtrs[i] : 0;
         trow.protoShapes[i] = i < numProtos ? protoShapes[i] : 0;
+      }
+      if (obj->is<js::NativeObject>()) {
+        SeedElemAddRow(cx, trow, obj->as<js::NativeObject>().numFixedSlots());
       }
     }
     return true;

@@ -76,6 +76,9 @@ struct NightRuntimeData {
   uint64_t regexNightFallbacks = 0;
 
   NightRegexLeafBlock regexLeaf = {};
+
+  // MIR's element-add arm's table (Night_strlitElemAddOff).
+  alignas(8) uint32_t elemAdd[Night_elemAddRows * Night_elemAddRowBytes / 4] = {};
 };
 
 // The runtime's instance (runtime/NightRuntime.cpp's NightRuntimeState).

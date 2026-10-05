@@ -145,6 +145,15 @@ namespace night {
   _(strlitRegExpShapeOff, 40)                                                  \
   _(strlitRegExpFuseAddrOff, 44)                                               \
   _(strlitRegexLeafOff, 48)                                                    \
+  /* MIR's element-add arm (`props[name] = v` adding `name`): the table's  */  \
+  /* address. Rows are direct-mapped on (old shape, atomPtr | 1) as the     */  \
+  /* global add table, each a site add-transition row (inlineIcTransBytes) */  \
+  /* then the key; filled where night_runtime_set_element learns or replays */  \
+  /* an add, zeroed with the movable caches.                                */  \
+  _(strlitElemAddOff, 52)                                                      \
+  _(elemAddRows, 1024)                                                         \
+  _(elemAddRowBytes, 64)                                                       \
+  _(elemAddKeyOff, 48)                                                         \
   /* The regex-leaf block (NightRuntimeData::regexLeaf): [btStack @0]      */  \
   /* [btElems @4] [output pairs @8, regexLeafMaxPairs * 8 bytes] [rows]:   */  \
   /* per RegExpShared (direct-mapped by its address >> 4), [shared @0]     */  \
@@ -209,6 +218,12 @@ static_assert((Night_bindingFuseArmed & 1) && (Night_bindingFusePredicted & 1) &
 static_assert(Night_strlitRegexLeafOff + 4 <= Night_strlitBlockBytes &&
                   Night_strlitBlockBytes % 8 == 0,
               "the regexp words must fit the (8-aligned) strlit block");
+static_assert(Night_strlitElemAddOff + 4 <= Night_strlitBlockBytes,
+              "the element-add table's address must fit the strlit block");
+static_assert(Night_elemAddKeyOff >= Night_inlineIcTransBytes &&
+                  Night_elemAddKeyOff + 4 <= Night_elemAddRowBytes &&
+                  (Night_elemAddRows & (Night_elemAddRows - 1)) == 0,
+              "an element-add row is a transition row, then its key");
 static_assert(Night_regexLeafRowsOff ==
                   Night_regexLeafPairsOff + 8 * Night_regexLeafMaxPairs,
               "the regex-leaf rows follow the output pairs");

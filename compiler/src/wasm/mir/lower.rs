@@ -172,6 +172,10 @@ const ITER_FROM_SHAPE: bool = true;
 /// (`regexp_no_match`).
 const REGEXP_NO_MATCH_ARM: bool = true;
 
+/// `obj[atom] = v` adding the property replays the element-add table's
+/// transition (`elem_add_arm`).
+const ELEM_ADD_ARM: bool = true;
+
 /// A generic equality of two strings decides by pointer, length and
 /// atomness before the helper.
 const STRING_EQ_ARM: bool = true;
@@ -3533,6 +3537,14 @@ impl<'a> Lower<'a> {
                     self.terminate(Terminator::Br { target: t });
                     self.cur = generic;
                 }
+                // Only where the key may be a string: the arm at every
+                // element store cost mandreel 5.6% of its code (-3.9%).
+                let key_str = !value_tags(&self.ty(d.args[1])).intersect(TagSet::STRING).is_empty();
+                if ELEM_ADD_ARM && key_str {
+                    let generic = self.body.add_block();
+                    self.elem_add_arm(inst, a[0], a[1], a[2], generic)?;
+                    self.cur = generic;
+                }
                 if let Opcode::JsSetElem(strict, _) = d.op {
                     let sv = self.i32c(u32::from(strict));
                     self.js_call(inst, self.h.set_element, &[a[0], a[1], a[2], sv], false)?;
@@ -6406,7 +6418,10 @@ impl<'a> Lower<'a> {
         let (trans, slow) = (self.body.add_block(), self.body.add_block());
         self.set_ic_ways(inst, at, recv, val, way, trans, slow)?;
         self.cur = trans;
-        self.set_ic_trans(inst, name, recv, val, way, slow)?;
+        let row = self.add_off(way, IC_TRANS_ROW_OFF);
+        let preds = self.add_preds.get(&name).cloned().unwrap_or_default();
+        let num = matches!(self.ty(self.f.insts[inst].args[1]), MType::Val(s) if s.tags.subset_of(TagSet::NUMBER));
+        self.set_ic_trans(inst, &preds, recv, val, num, row, slow)?;
         self.cur = slow;
         if let Some(census) = self.exit_census {
             static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -6480,7 +6495,10 @@ impl<'a> Lower<'a> {
         let (trans, slow) = (self.body.add_block(), self.body.add_block());
         self.set_ic_ways(inst, at, recv, val, way, trans, slow)?;
         self.cur = trans;
-        self.set_ic_trans(inst, name, recv, val, way, slow)?;
+        let row = self.add_off(way, IC_TRANS_ROW_OFF);
+        let preds = self.add_preds.get(&name).cloned().unwrap_or_default();
+        let num = matches!(self.ty(self.f.insts[inst].args[1]), MType::Val(s) if s.tags.subset_of(TagSet::NUMBER));
+        self.set_ic_trans(inst, &preds, recv, val, num, row, slow)?;
         self.cur = slow;
         self.slow_census(inst);
         let vouch = self.vouch_types(inst, recv, val);
@@ -6827,16 +6845,15 @@ impl<'a> Lower<'a> {
     fn set_ic_trans(
         &mut self,
         inst: mir::Inst,
-        name: mir::entity::AtomId,
+        preds: &[(u32, u32)],
         recv: Value,
         val: Value,
-        way: Value,
+        num: bool,
+        row: Value,
         slow: Block,
     ) -> R<()> {
-        let num = matches!(self.ty(self.f.insts[inst].args[1]), MType::Val(s) if s.tags.subset_of(TagSet::NUMBER));
         self.check_recv_object(inst, recv, slow);
         let obj = self.un(Operator::I32WrapI64, recv, Type::I32);
-        let row = self.add_off(way, IC_TRANS_ROW_OFF);
         let shape = self.load_i32(obj, SHAPE_OFFSET);
         let old = self.load_i32(row, IC_TRANS_OLDSHAPE);
         let m_old = self.bin(Operator::I32Eq, old, shape, Type::I32);
@@ -6891,9 +6908,8 @@ impl<'a> Lower<'a> {
         let past = self.bin(Operator::I32GeU, slot_off, bound, Type::I32);
         let past = self.bin(Operator::I32And, past, known, Type::I32);
         let past = self.bin(Operator::I32And, past, keyed_k, Type::I32);
-        let preds = self.add_preds.get(&name).cloned().unwrap_or_default();
         let mut hit = past;
-        for (key, off) in preds {
+        for &(key, off) in preds {
             let kv = self.i32c(key);
             let ke = self.bin(Operator::I32Eq, k, kv, Type::I32);
             let ov = self.i32c(off);
@@ -6921,6 +6937,47 @@ impl<'a> Lower<'a> {
         let t = self.edge(inst, 0, &[])?;
         self.terminate(Terminator::Br { target: t });
         Ok(())
+    }
+
+    /// `obj[key] = val` adding `key`, an atom (`props[name] = config[name]`
+    /// over a for-in's keys): the transition the runtime's set learned for
+    /// (the object's shape, the atom), from the element-add table, replayed
+    /// as a named add site replays its own row (`set_ic_trans`, with no
+    /// slot predictions for an unknown name). A key that is no atom, or
+    /// an index, never has a row. Else `other`.
+    fn elem_add_arm(&mut self, inst: mir::Inst, recv: Value, key: Value, val: Value, other: Block) -> R<()> {
+        use crate::region_shape::{ELEM_ADD_KEY_OFF, ELEM_ADD_ROWS, ELEM_ADD_ROW_BYTES, STRLIT_ELEM_ADD_OFF};
+        let kt = self.tag_of(key);
+        let ks = self.tag_is(kt, TAG_STRING as u32);
+        let rt = self.tag_of(recv);
+        let ro = self.tag_is(rt, TAG_OBJECT as u32);
+        let both = self.bin(Operator::I32And, ks, ro, Type::I32);
+        self.check(both, other);
+        let kp = self.un(Operator::I32WrapI64, key, Type::I32);
+        let one = self.i32c(1);
+        let ekey = self.bin(Operator::I32Or, kp, one, Type::I32);
+        let op = self.un(Operator::I32WrapI64, recv, Type::I32);
+        let shape = self.load_i32(op, SHAPE_OFFSET);
+        // NightRuntime.cpp's CacheHash.
+        let three = self.i32c(3);
+        let sh = self.bin(Operator::I32ShrU, shape, three, Type::I32);
+        let k1 = self.i32c(2654435761);
+        let h1 = self.bin(Operator::I32Mul, sh, k1, Type::I32);
+        let k2c = self.i32c(0x9e37_79b9);
+        let k2 = self.bin(Operator::I32Mul, ekey, k2c, Type::I32);
+        let hh = self.bin(Operator::I32Xor, h1, k2, Type::I32);
+        let mask = self.i32c(ELEM_ADD_ROWS - 1);
+        let idx = self.bin(Operator::I32And, hh, mask, Type::I32);
+        let stride = self.i32c(ELEM_ADD_ROW_BYTES);
+        let off = self.bin(Operator::I32Mul, idx, stride, Type::I32);
+        let ta = self.i32c(self.h.strlit_slot + STRLIT_ELEM_ADD_OFF);
+        let tbl = self.load_i32(ta, 0);
+        let row = self.bin(Operator::I32Add, tbl, off, Type::I32);
+        let rkey = self.load_i32(row, ELEM_ADD_KEY_OFF);
+        let same = self.bin(Operator::I32Eq, rkey, ekey, Type::I32);
+        self.check(same, other);
+        let num = matches!(self.ty(self.f.insts[inst].args[2]), MType::Val(s) if s.tags.subset_of(TagSet::NUMBER));
+        self.set_ic_trans(inst, &[], recv, val, num, row, other)
     }
 
     /// The pristine `charCodeAt`/`charAt` on a linear string with an
