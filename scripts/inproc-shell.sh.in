@@ -9,7 +9,9 @@
 #
 # Env: NIGHT_RUNNER, NIGHT_WASM_SHELL, NIGHT_CACHE_DIR override the defaults;
 #      NIGHT_INPROCESS_OFF=1 omits --night-inprocess (the interpreter-only lane);
-#      NIGHT_OPTIONS passes compiler flags to the in-process batch.
+#      NIGHT_OPTIONS passes compiler flags to the in-process batch;
+#      NIGHT_INPROC_STRICT (default 1) makes a batch that fails to compile
+#      abort rather than run the test interpreted.
 set -u
 
 here=$(cd "$(dirname "$0")" && pwd)
@@ -48,6 +50,9 @@ fi
 aot=()
 if [ "${NIGHT_INPROCESS_OFF:-0}" != 1 ]; then
   aot=(--night-inprocess)
+  # A batch that fails to compile would leave every script interpreted and
+  # every test passing: abort instead (NightInproc.cpp's InprocFail).
+  export NIGHT_INPROC_STRICT=${NIGHT_INPROC_STRICT:-1}
   # NIGHT_OPTIONS: compiler flags for the in-process batch, as the
   # nightmonkey CLI takes them (e.g. "--pipeline baseline --dump-tiers").
   if [ -n "${NIGHT_OPTIONS:-}" ]; then

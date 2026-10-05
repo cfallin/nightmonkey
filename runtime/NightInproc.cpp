@@ -43,11 +43,19 @@ night_inproc_alloc(uint32_t size) {
   return static_cast<uint32_t>((addr + 7) & ~uintptr_t(7));
 }
 
+// A failed batch leaves every script interpreted, which every test then
+// passes: under NIGHT_INPROC_STRICT (the test harnesses' shell wrapper sets
+// it) that is fatal, as it always is in a debug build.
 static bool InprocFail(const char* what) {
   fprintf(stderr, "night: inprocess: %s; staying interpreted\n", what);
 #ifdef NIGHTMONKEY_DEBUG
   MOZ_CRASH("in-process AOT compilation failed");
 #endif
+  const char* strict = getenv("NIGHT_INPROC_STRICT");
+  if (strict && strict[0] && strict[0] != '0') {
+    fflush(stderr);
+    abort();
+  }
   return true;
 }
 
