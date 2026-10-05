@@ -2485,6 +2485,164 @@ handler (`ah[action] = [handler, scope]`, dispatched as
   index string built as a name (the engine canonicalizes the key), and a
   strict element store built sloppy (strictness also follows the script).
 
+**M5aa. Why pdfjs's message dispatch is generic (2026-10-04; KICKOFF-11
+item 1, step 0; findings).** The kickoff's premise was that `on`'s and
+`onmessage`'s generic contexts fill when a call degrades. Traced
+(`--trace-cell` now names the context each raise lands in, and reports
+every call into the traced script that degrades, with the reason;
+`--trace-site` lists a script's constraints when no read sits at the
+traced pc; `--stats` counts contexts per script):
+- **Every degraded entry into `on`, `send` and `onmessage` is the
+  context budget.** Four benches spend all 50,000 contexts: crypto,
+  mandreel, pdfjs, react (budget degradations 2k, 122k, 102k, 246k). The
+  constants' note that 1M changes nothing no longer holds: at 1M pdfjs and
+  react still run out, after 56 and 86 s of analysis.
+- **Where it goes.** Call strings multiply along chains: a helper whose
+  caller has `n` contexts and calls it at `k` sites gets `n * k`.
+  mandreel's `emit_32` holds 48,465 of its 50,000; pdfjs's `error` 5.4k,
+  `log` 4.7k, `Cmd_get` 4.6k, `isCmd` 3.1k (17 scripts hold 33k); react's
+  `stringToChunk`, `writeChunk`, `escapeTextForBrowser`,
+  `pushStringAttribute`. Whatever the solver reaches after that binds at
+  its callee's generic context however few contexts the callee has, so
+  which calls keep their precision depends on evaluation order.
+- **The chain breaks before `on`.** In `send`, `this.comObj` is a
+  class-level field of `MessageHandler` joining the fake worker literal
+  with the global object (`new MessageHandler('worker_processor', this)`,
+  the top-level worker branch, dead at run time): `ObjType` has no element
+  for two abstractions of different classes, so it is `AnyObject`, and
+  `this.comObj.postMessage(...)` reaches `postMessage` only through the
+  by-name guess (`bind_by_name`), in one context per site joining every
+  action's message. `comObj.onmessage = function ...` in the constructor
+  writes through a closure slot holding the same pair, so the write is
+  dropped (and `onmessage` escapes): `fakeWorker.onmessage(...)` in
+  `postMessage` resolves its receiver but reads nothing. HEAD's
+  `onmessage` contexts exist only because the write happened to run once
+  while the slot still held the fake worker alone: a write dropped for an
+  `AnyObject` receiver is not monotone (a receiver that grows writes
+  nowhere), so the result depends on evaluation order.
+- **Literal-keyed contexts (step 1) built and measured**
+  (`LITERAL_CTXS`, `Ctxs::push_lit`): a call passing string literals
+  enters its callee in a root keyed by (callee, literals), parented at the
+  generic context, never charged to the budget (pdfjs 270 roots, react
+  314, mandreel 478). `send`'s roots are each action's (data its own
+  literal), `on`'s each registration's; but they cannot carry pdfjs past
+  `send`, for the reasons above, and alone they leave the budget spent.
+- **Per-script bounds** (`CTX_PER_SCRIPT` 128 contexts and
+  `CTX_SCRIPT_WORK` 32,768 instantiated constraints per script): no bench
+  spends the budget; analysis time crypto 9.5 -> 0.6 s, react 3.7 -> 3.5
+  s, pdfjs 2.3 -> 4.3 s, mandreel 2.4 -> 3.8 s. A work budget alone (3M
+  instantiated constraints) and lower depth caps (4..6) were tried first:
+  neither stops the exhaustion (mandreel's and react's helpers explode at
+  depth 1-2), and both cost time.
+- **The bounds triple pdfjs's exits** (58.8k -> 190k a run): with more
+  precise contexts, `applyTextTransforms`'s `ctx.scale(fontSize ...)`
+  and its neighbours bind into `ctxScale`, `ctxTransform` and
+  `ctxTranslate` contexts of their own, so the false int32 belief about
+  `fontSize` (the missing evidence above) reaches those callees' formal
+  claims and matrix stores: six new sites at ~20.5k each (the count of
+  `showText`'s), and 20.5k stamp-epoch bumps at site 7. Precision
+  amplifies an evidence gap; the bounds wait for the gap.
+- What closing pdfjs's chain needs, for the owner: an object element for
+  a few abstractions of different classes (a write to `{global, fake
+  worker}` lands in both; `this.comObj.postMessage` resolves), and guessed
+  dispatch (by-name, region, table) that chains off a precise caller
+  context instead of a CTX0-parented one, so the actions do not join again
+  at `postMessage`.
+
+**M5ab. react: what is left (2026-10-04; KICKOFF-11 item 2).** From the
+profile (`prof.sh react`, 4c0dcb1) and the value census:
+- **Closure variables' slots, statically** (`env_slot`). `env.load` was
+  6.8% of react's executed values at 19.5 values each: its slot address
+  was decoded from the environment's shape (fixed-slot count, then a
+  select between the fixed and the dynamic address). An environment is
+  non-extensible and made with as many fixed slots as an object holds, so
+  as Ion's `GetAliasedVar` (`nonExtensibleIsFixedSlot`) the slot is fixed
+  below `MAX_FIXED_SLOTS` (16) and dynamic at `slot - 16` above: one
+  load, or two. `env.store` likewise. Night test: mir-env-wide.js
+  (closures over 13..40 bindings and a 20-`let` block scope, read and
+  written by MIR and by a direct eval, which goes through the engine's
+  own lookup). It fails against mutants with the boundary at 15 and 17
+  and with the dynamic index off by one (that one only through the eval:
+  MIR's reads and writes agree with each other).
+- **A for-in's start from the shape's cached iterator**
+  (`iter_from_shape`): `night_runtime_iter` was 5.4% of react
+  (createElement's and pushStartGenericElement's for-ins): a third the
+  iterator cache lookup, half the store buffer, where the iterator's
+  `GCPtr` init and its close add and remove a hashed edge each time. As
+  the JIT's `ObjectToIterator`: the iterator the object's shape caches
+  (`Shape::cache_`, tag `ITERATOR`), if initialized and not active, with
+  no dense elements on the object or a prototype and the prototypes'
+  shapes the ones it recorded; the object stored raw, the active bit set,
+  linked into the compartment's list (its address published in the strlit
+  block's word 32, which held the unused binding epoch); a nursery object
+  gets the whole-cell barrier on the (always tenured) iterator object
+  (`night_runtime_post_whole_cell`). The rest takes the helper. Night
+  test: mir-forin-shape-cache.js (reuse, nested for-ins over one object,
+  prototype properties added and deleted, dense elements on the object
+  and on a prototype, deletions mid-iteration before and after a minor
+  GC, many for-ins live at once). It fails against mutants that skip the
+  list link, the barrier, the active test (it hangs), the prototype
+  shapes or the dense-element test.
+- **Omissions through `arguments` forwarding** (box2d's exits).
+  box2d's ~310k exits a run (the census top since before M5w) were one
+  site: `b2Vec2`'s initializer, inlined at its entry, guarding its
+  formals as numbers, called through the generated constructor's
+  `this.b2Vec2.apply(this, arguments)` with no arguments. An analyzed call
+  records the formals it leaves out (`omitted_formals`: no entry claim),
+  but an `arguments` forward copied the caller's argument rows and not its
+  omissions. Now the analysis keeps each script's fewest actuals
+  (`min_actuals`) and the forwarding edges, and after the solve marks a
+  target's formals past its callers' fewest, transitively
+  (`forwarded_omissions`); a caller no analyzed call binds counts as none.
+  Per context: Class.create's constructor is one script for every class,
+  and a per-script count marked every initializer's formals (raytrace
+  -4.2%). box2d's exits: 310k -> ~600; box2d +10.5%. Night test:
+  mir-forward-omitted.js (one and two levels of forwarding, with zero,
+  one and two actuals); an error here is only guarded (an exit storm,
+  results right), so the test checks results and the census checks the
+  exits.
+- **`switch` over string constants** (`switch.str`): the bytecode's
+  chain (`Dup; String; StrictEq; Case` per case) cost ~16 machine
+  instructions a missed case (tag, atom table, flags, every case);
+  pushAttribute's ~90 cases were 13.6% of react. The builder takes three
+  or more at once; the lowering tests the tag and atom flag once and
+  compares pointers per case (a non-atom linear string by length and
+  characters; a rope exits before the chain). react +12.4%. Night test:
+  mir-switch-str.js.
+- **Regexp exec/test with no match, in compiled code**
+  (`regexp_no_match`): escapeTextForBrowser's `/["'&<>]/.exec(text)` was
+  6.4% of react in the leaf, ~1% of it the matcher. As the JIT's RegExp
+  stubs: where the leaf armed the receiver's shape (the optimizable
+  RegExpObject shape) and its shared's row (matchers' table indices, for
+  a shared neither global nor sticky), the fuse is intact and lastIndex
+  a number, the AOT matcher runs from compiled code; a failure is final
+  (it changes nothing), anything else takes the leaf. react +2.4%.
+  Night test: mir-regexp-no-match.js.
+- **`obj[atom] = v` adds** (`elem_add_arm`): createElement's `props[k] =
+  config[k]` reached the runtime's add-table replay through
+  set_element's gates (5.1% of react). The runtime now also writes each
+  add it learns or replays into an element-add table in the site rows'
+  layout, keyed (shape, atom), and the element set replays a hit as a
+  named add site does (`set_ic_trans`, no slot predictions), only where
+  the key may be a string: at every element store the arm cost mandreel
+  5.6% of its code and 3.9%. With the switch's cases loaded where they
+  are compared (`lazy_strs`; their `const.str`s were 4.9% of react's
+  values, all ~90 loaded before the first compare): react +7.5%. Night
+  test: mir-elem-add-arm.js (with the setter, barrier and collision
+  cases each proved by a mutant).
+- **Lanes that cannot pass interpreted**: a failed in-process batch ran
+  every test interpreted, and passed; NIGHT_INPROC_STRICT (set by the
+  harnesses' wrapper) makes it abort. A per-script decline is still only
+  visible to declines.sh: a lazy-operand change that declined both of a
+  test's switches passed the test and its mutants until the dump showed
+  it.
+- Left (react, after these): calls (20.8% of executed values, ~9 per
+  call plus ~21 per entry), the generic property reads (10.8%), string
+  `+` (9.2%); for-in starts that miss the shape cache (a shape whose one
+  cache slot holds an add transition: the engine's global iterator
+  cache, 1.9%); natives through native_dispatch (4.5%, ~30% of it the
+  dispatch itself).
+
 **M6. The rest of §10**: box/unbox cleanup, memory optimizations, and
 numeric optimizations, each with its guard-count and instruction-count
 tests.
