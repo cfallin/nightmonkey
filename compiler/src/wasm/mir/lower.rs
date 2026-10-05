@@ -2989,6 +2989,7 @@ impl<'a> Lower<'a> {
                     default,
                 });
             }
+            Opcode::SwitchStr(n) => self.switch_str(inst, &a, n)?,
             Opcode::StampFresh(w) => {
                 let obj = self.un(Operator::I32WrapI64, a[0], Type::I32);
                 let wv = self.i32c(w);
@@ -6144,6 +6145,63 @@ impl<'a> Lower<'a> {
             self.terminate(Terminator::Br { target: t });
         }
         self.cur = generic;
+        Ok(())
+    }
+
+    /// `switch.str`: `x` against atoms `cases`. A non-string takes the
+    /// default. An atom equals a case exactly when it is that atom, so its
+    /// tag, flags and pointer are tested once and each case is one compare
+    /// of pointers (where a chain of `===`s retests the tag and the flags
+    /// and reloads the atom table at every case). Another linear string
+    /// compares lengths, then characters (a pure leaf); a rope takes
+    /// `fail`.
+    fn switch_str(&mut self, inst: mir::Inst, a: &[Value], n: u32) -> R<()> {
+        use crate::wasm::mir::abi::{STRING_ATOM_BIT, STRING_FLAGS_OFFSET};
+        let x = a[0];
+        let cases = &a[1..];
+        let n = n as usize;
+        let default = self.edge(inst, n, &[])?;
+        let tag = self.tag_of(x);
+        let is_s = self.tag_is(tag, TAG_STRING as u32);
+        let str_b = self.body.add_block();
+        self.cond_br(is_s, Self::to(str_b), default.clone());
+        self.cur = str_b;
+        let p = self.un(Operator::I32WrapI64, x, Type::I32);
+        let flags = self.load_i32(p, STRING_FLAGS_OFFSET);
+        let ab = self.i32c(STRING_ATOM_BIT);
+        let atom = self.bin(Operator::I32And, flags, ab, Type::I32);
+        let (atom_b, other_b) = (self.body.add_block(), self.body.add_block());
+        self.cond_br(atom, Self::to(atom_b), Self::to(other_b));
+        self.cur = atom_b;
+        for (k, &c) in cases.iter().enumerate() {
+            let same = self.bin(Operator::I32Eq, p, c, Type::I32);
+            let next = self.body.add_block();
+            let t = self.edge(inst, k, &[])?;
+            self.cond_br(same, t, Self::to(next));
+            self.cur = next;
+        }
+        self.terminate(Terminator::Br { target: default.clone() });
+        // Not an atom: linear, then by length and characters.
+        self.cur = other_b;
+        let lb = self.i32c(STRING_LINEAR_BIT);
+        let lin = self.bin(Operator::I32And, flags, lb, Type::I32);
+        let lin_b = self.body.add_block();
+        let fail = self.edge(inst, n + 1, &[])?;
+        self.cond_br(lin, Self::to(lin_b), fail);
+        self.cur = lin_b;
+        let len = self.load_i32(p, STRING_LENGTH_OFFSET);
+        for (k, &c) in cases.iter().enumerate() {
+            let cl = self.load_i32(c, STRING_LENGTH_OFFSET);
+            let eq_len = self.bin(Operator::I32Eq, len, cl, Type::I32);
+            let (chars_b, next) = (self.body.add_block(), self.body.add_block());
+            self.cond_br(eq_len, Self::to(chars_b), Self::to(next));
+            self.cur = chars_b;
+            let eq = self.call1(self.h.str_chars_eq, &[p, c], Type::I32);
+            let t = self.edge(inst, k, &[])?;
+            self.cond_br(eq, t, Self::to(next));
+            self.cur = next;
+        }
+        self.terminate(Terminator::Br { target: default });
         Ok(())
     }
 

@@ -331,6 +331,7 @@ pub fn mnemonic(op: &Opcode) -> String {
         Jump => "jump".into(),
         Br => "br".into(),
         Switch(_) => "switch".into(),
+        SwitchStr(_) => "switch.str".into(),
         Return => "return".into(),
         Exit { .. } => "exit".into(),
         ExitThrow { .. } => "exit.throw".into(),

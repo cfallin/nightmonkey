@@ -1145,6 +1145,9 @@ impl Parser {
             if let Opcode::Switch(_) = op {
                 op = Opcode::Switch(ncases);
             }
+            if let Opcode::SwitchStr(_) = op {
+                op = Opcode::SwitchStr(ncases);
+            }
             // Roles are checked here, not by the validator: they are how
             // the text names which edge is which.
             let names: Vec<String> = op.roles().iter().map(|r| r.name()).collect();
@@ -1628,6 +1631,7 @@ fn template(mn: &str) -> Option<Opcode> {
         Jump,
         Br,
         Switch(0),
+        SwitchStr(0),
         Return,
         Exit {
             pc: Pc::new(0),

@@ -213,6 +213,11 @@ const LIT_OPS: bool = true;
 /// are built.
 const RT_OPS: bool = true;
 
+/// A `switch` over string constants (`SWITCH_STR_MIN` cases or more in a
+/// row) as one `switch.str` rather than a chain of `===`s.
+const SWITCH_STR: bool = true;
+const SWITCH_STR_MIN: usize = 3;
+
 /// Whether `T.apply(this, arguments)` forwards the actuals.
 const APPLY_FWD: bool = true;
 /// Whether an arguments object read only for its length and elements is
@@ -5381,6 +5386,73 @@ impl<'s, 'a> Run<'s, 'a> {
         args
     }
 
+    /// `switch (x)` over string constants, as the bytecode spells each case:
+    /// `Dup; String s; StrictEq; Case target` (true pops `x` and jumps,
+    /// false keeps it), the next one after the fallthrough's `JumpTarget`. Where `SWITCH_STR_MIN` or more start at the `Dup` at
+    /// `self.pc`, one `switch.str` decides them all: each case's edge
+    /// without `x`, the default edge to the op after the last `Case` with
+    /// it, and the fail edge an exit here, before the chain. The chain's
+    /// other ops are then reached by no edge, and the walk skips them.
+    /// Returns whether it took the `Dup`.
+    fn string_switch(&mut self) -> R<bool> {
+        let pc = self.pc;
+        let mut cases: Vec<(u32, Pc)> = vec![];
+        // `at`: the op after the last case's `Case` (the default's start);
+        // the next case's `Dup` follows that fallthrough's `JumpTarget`.
+        let mut at = pc;
+        loop {
+            let mut d = at;
+            while !cases.is_empty() && self.s.op_at(d) == Some(JSOp::JumpTarget) {
+                d = d + JSOp::JumpTarget.len();
+            }
+            let s_pc = d + JSOp::Dup.len();
+            let e_pc = s_pc + JSOp::String.len();
+            let c_pc = e_pc + JSOp::StrictEq.len();
+            if self.s.op_at(d) != Some(JSOp::Dup)
+                || self.s.op_at(s_pc) != Some(JSOp::String)
+                || self.s.op_at(e_pc) != Some(JSOp::StrictEq)
+                || self.s.op_at(c_pc) != Some(JSOp::Case)
+            {
+                break;
+            }
+            let idx = self.s.imms(s_pc).next_uint32().unwrap();
+            let off = self.s.imms(c_pc).next_int32().unwrap();
+            cases.push((idx, c_pc.branch(off)));
+            at = c_pc + JSOp::Case.len();
+        }
+        if cases.len() < SWITCH_STR_MIN {
+            return Ok(false);
+        }
+        let fail = self.exit_block(false);
+        let x = self.top();
+        let mut args = vec![self.boxed(x)];
+        for &(idx, _) in &cases {
+            let a = self.atom(idx)?;
+            let s = self.inst(
+                Opcode::ConstStr(a),
+                vec![],
+                Some(MType::Str(mir::types::StrInfo { atom: Some(a) })),
+            );
+            args.push(s);
+        }
+        let lval = self.pop();
+        let mut edges = vec![];
+        for &(_, target) in &cases {
+            edges.push(self.edge_to(target, Some(pc)));
+        }
+        self.st.push(lval);
+        edges.push(self.edge_to(at, Some(pc)));
+        match edges.into_iter().collect::<Option<Vec<Edge>>>() {
+            Some(mut edges) => {
+                edges.push(Self::goto(fail));
+                let n = u32::try_from(cases.len()).unwrap();
+                self.term(Opcode::SwitchStr(n), args, edges);
+            }
+            None => self.term(Opcode::Unreachable, vec![], vec![]),
+        }
+        Ok(true)
+    }
+
     /// Enter leader `pc`: its entry types are the table's (what back edges
     /// brought in earlier runs) joined with every forward edge of this run.
     /// Fills the pending trampolines. `None` if nothing reaches it.
@@ -5790,6 +5862,7 @@ impl<'s, 'a> Run<'s, 'a> {
                     self.pop();
                 }
             }
+            Dup if SWITCH_STR && self.string_switch()? => {}
             Dup => {
                 let x = self.top();
                 self.st.push(x);

@@ -571,6 +571,12 @@ pub enum Opcode {
     Br,
     /// Dense switch over `0..n`, plus a default.
     Switch(u32),
+    /// `switch (x)` over `n` string constants (`x === s_k` for the first
+    /// `k` that holds): operands `x`, then `s_0 .. s_{n-1}` (atoms). Edges:
+    /// one per case, the default (no case holds, `x` not a string
+    /// included), and `fail` for a subject the lowering does not compare
+    /// inline (a rope), before anything happens.
+    SwitchStr(u32),
     Return,
     /// Operands: `this`, `nargs` args, `nlocals` locals, the rval, then
     /// the operand stack (the rest). All `Val(⊤)`.
@@ -932,6 +938,10 @@ impl Opcode {
             Switch(n) => (0..*n)
                 .map(SuccRole::Case)
                 .chain([SuccRole::Default])
+                .collect(),
+            SwitchStr(n) => (0..*n)
+                .map(SuccRole::Case)
+                .chain([SuccRole::Default, SuccRole::Fail])
                 .collect(),
             GuardUnbox(_)
             | GuardTags(_)
@@ -1560,6 +1570,16 @@ pub fn signature(op: &Opcode, args: &[Type], m: &Module) -> SigResult {
         Switch(_) => {
             arity(args, 1)?;
             i32r(&args[0], "switch")?;
+            Sig::none()
+        }
+        SwitchStr(n) => {
+            arity(args, 1 + *n as usize)?;
+            val(&args[0], "switch.str")?;
+            for a in &args[1..] {
+                want(matches!(a, Type::Str(StrInfo { atom: Some(_) })), || {
+                    "switch.str: cases must be atoms".into()
+                })?;
+            }
             Sig::none()
         }
         Return => {
