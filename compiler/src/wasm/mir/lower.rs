@@ -419,6 +419,10 @@ struct Lower<'a> {
     /// The builder's retaining frame stores before the next instruction:
     /// emitted where that instruction can GC (`root`), not before it.
     pending_retain: Vec<((u32, u32), mir::Value)>,
+    /// `const.str`s whose only uses are `switch.str` cases: not emitted
+    /// where they stand; the switch loads each atom where it compares it
+    /// (a switch's cases would otherwise all load before its first).
+    lazy_strs: BTreeMap<mir::Value, mir::entity::AtomId>,
     /// The MIR block being lowered.
     cur_mblock: mir::Block,
     /// Whether the stamp epoch was unchanged across the last `gc_call`.
@@ -605,6 +609,44 @@ pub struct LowerOpts {
 
 /// Lower `f` (a function of `mm`, whose baseline frame is `layout`) into a
 /// new body of `m`.
+/// The `const.str` results used only as `switch.str` cases (`Lower::lazy_strs`).
+fn lazy_switch_strs(f: &mir::Func) -> BTreeMap<mir::Value, mir::entity::AtomId> {
+    let mut strs: BTreeMap<mir::Value, mir::entity::AtomId> = BTreeMap::new();
+    for &b in &f.layout {
+        for &i in &f.blocks[b].insts {
+            if let Opcode::ConstStr(a) = f.insts[i].op {
+                strs.insert(f.insts[i].results[0], a);
+            }
+        }
+    }
+    for &b in &f.layout {
+        for &i in &f.blocks[b].insts {
+            let d = &f.insts[i];
+            let case_uses = if matches!(d.op, Opcode::SwitchStr(_)) { 1 } else { usize::MAX };
+            for (k, v) in d.args.iter().enumerate() {
+                if k < case_uses {
+                    strs.remove(v);
+                }
+            }
+            for e in &d.succs {
+                for a in &e.args {
+                    if let EdgeArg::Value(v) = a {
+                        strs.remove(v);
+                    }
+                }
+            }
+        }
+    }
+    for l in &f.loops {
+        if let Some(e) = &l.entry {
+            for v in &e.state {
+                strs.remove(v);
+            }
+        }
+    }
+    strs
+}
+
 pub fn lower<'a>(
     m: &mut Module,
     h: Helpers,
@@ -654,6 +696,7 @@ pub fn lower<'a>(
         dirty: BTreeSet::new(),
         framed: BTreeMap::new(),
         pending_retain: vec![],
+        lazy_strs: lazy_switch_strs(f),
         cur_mblock: mir::Block::from_u32(0),
         cold: false,
         epoch_same: None,
@@ -1219,9 +1262,10 @@ impl<'a> Lower<'a> {
         let vs = self.f.insts[inst].args.clone();
         let mut out = vec![];
         for v in vs {
-            // A ghost (`Fact`) has no representation: a placeholder no
+            // A ghost (`Fact`) has no representation, and a lazy switch
+            // case is loaded by the switch itself: a placeholder no
             // lowering reads.
-            if machine(&self.ty(v)).is_none() {
+            if machine(&self.ty(v)).is_none() || self.lazy_strs.contains_key(&v) {
                 out.push(self.i32c(0));
                 continue;
             }
@@ -4811,6 +4855,7 @@ impl<'a> Lower<'a> {
                 let sv = self.i32c(u32::from(strict));
                 self.js_call(inst, self.h.set_name, &[a[0], at, a[1], sv], false)?;
             }
+            Opcode::ConstStr(_) if self.lazy_strs.contains_key(&self.f.insts[inst].results[0]) => {}
             Opcode::ConstStr(name) => {
                 // The atom itself, from the startup-filled atom table (a
                 // pinned atom never moves):
@@ -6174,8 +6219,21 @@ impl<'a> Lower<'a> {
     fn switch_str(&mut self, inst: mir::Inst, a: &[Value], n: u32) -> R<()> {
         use crate::wasm::mir::abi::{STRING_ATOM_BIT, STRING_FLAGS_OFFSET};
         let x = a[0];
-        let cases = &a[1..];
         let n = n as usize;
+        // The cases' atoms, each loaded where it is compared (or, for a
+        // case whose atom has other uses, the value already there).
+        let margs = self.f.insts[inst].args.clone();
+        let tslot = self.i32c(self.h.atom_table_slot);
+        let tbl = self.load_i32(tslot, 0);
+        let case = |l: &mut Self, k: usize| -> Value {
+            match l.lazy_strs.get(&margs[1 + k]).copied() {
+                Some(name) => {
+                    let id = l.atoms.intern_chars(l.mm.atoms[name].chars());
+                    l.load_i32(tbl, 4 * id)
+                }
+                None => a[1 + k],
+            }
+        };
         let default = self.edge(inst, n, &[])?;
         let tag = self.tag_of(x);
         let is_s = self.tag_is(tag, TAG_STRING as u32);
@@ -6189,7 +6247,8 @@ impl<'a> Lower<'a> {
         let (atom_b, other_b) = (self.body.add_block(), self.body.add_block());
         self.cond_br(atom, Self::to(atom_b), Self::to(other_b));
         self.cur = atom_b;
-        for (k, &c) in cases.iter().enumerate() {
+        for k in 0..n {
+            let c = case(self, k);
             let same = self.bin(Operator::I32Eq, p, c, Type::I32);
             let next = self.body.add_block();
             let t = self.edge(inst, k, &[])?;
@@ -6206,7 +6265,8 @@ impl<'a> Lower<'a> {
         self.cond_br(lin, Self::to(lin_b), fail);
         self.cur = lin_b;
         let len = self.load_i32(p, STRING_LENGTH_OFFSET);
-        for (k, &c) in cases.iter().enumerate() {
+        for k in 0..n {
+            let c = case(self, k);
             let cl = self.load_i32(c, STRING_LENGTH_OFFSET);
             let eq_len = self.bin(Operator::I32Eq, len, cl, Type::I32);
             let (chars_b, next) = (self.body.add_block(), self.body.add_block());
