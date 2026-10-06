@@ -1,0 +1,41 @@
+config,group,what_is_off,ablation_knobs,validity
+native_ion,engine,"system SpiderMonkey shell (C140), full JIT",js,best of 3
+native_baseline,engine,"system js --no-ion (baseline interp + compiler)",js --no-ion,best of 3
+wasm_interp,engine,"SpiderMonkey C++ interpreter on wasm32-wasi (-O2), wasmtime",~/work/firefox/obj-wasm,best of 3
+weval,engine,"weval + PBL + AOT ICs over the wizer shell (-O3), wasmtime",~/work/firefox/obj-weval,best of 3
+nm_lanes_check,engine,"NightMonkey default, measured in the lanes run (cross-check of nm_default)",,best of 3
+nm_default,nightmonkey,"nothing (full MIR tier + analysis)",,median of 4 pad seeds x 6 batches
+nm_baseline,tier,"MIR tier (baseline tier only)",--pipeline baseline,clean
+nm_facts_all,analysis,"every analysis fact (empty prediction)",facts_all,clean except box2d (275K exits)
+nm_facts_slots,analysis,"slot prediction: prop_sites + this/arg/field class hints (all ICs)",facts_slots,clean
+nm_facts_heap,analysis,"value types of heap loads: fields elems env slots globals",facts_heap,clean
+nm_facts_args,analysis,"interprocedural arg/return types",facts_args,clean
+nm_facts_calls,analysis,"call-target facts only",facts_calls,STORM: inconsistent facts (this-layout entry guards fail every call); do not quote as value of call targets
+nm_calls_cg,calls,"codegen use of call targets: inlining direct calls inline new call fwd predicted methods/global fns",inlining+direct_calls+inline_construct+call_fwd+method_loads+predicted_gnames,clean; FAIL earley/mandreel/pdfjs (reducifier blowup)
+nm_inlining,calls,"inlining",inlining,clean; FAIL earley/mandreel/pdfjs (reducifier blowup)
+nm_direct_calls,calls,"guarded direct call arm for non-inlined known callees",direct_calls,clean
+nm_inline_construct,calls,"inlining of new F()",inline_construct,clean
+nm_mir_opt,optimizer,"every pass in mir::opt::optimize (incl. PEA SROA GVN LICM guard hoisting ...)",group mir_opt,clean
+nm_nothing,optimizer,"all facts + all optimizer passes",facts_all+mir_opt,FAIL mandreel (wasm function-size limit)
+nm_pea,optimizer,partial escape analysis,pea,clean
+nm_sroa,optimizer,scalar replacement,sroa,clean
+nm_licm,optimizer,loop-invariant code motion,licm,clean
+nm_gvn,optimizer,global value numbering,gvn,clean
+nm_hoist_guards,optimizer,guard hoisting to preheaders,hoist_guards,clean
+nm_hoist_reads,optimizer,loop read hoisting,hoist_reads,clean
+nm_mem_vn,optimizer,memory value numbering / forwarding,mem_vn,clean
+nm_promote,optimizer,loop-carried caching of closure vars,promote,clean
+nm_int_ranges,optimizer,int range analysis (overflow-check removal),int_ranges,clean
+nm_trunc_demand,optimizer,truncation demand (uncheck int32 ops whose results are truncated),trunc_demand,clean
+nm_thread_jumps,optimizer,jump threading,thread_jumps,clean
+nm_sink_to_exits,optimizer,sinking dead-on-fast-path ops into exits,sink_to_exits,clean
+nm_recover_at_exits,optimizer,recompute wrapped arithmetic at exits,recover_at_exits,clean
+nm_field_masks,speculation,"type-preserving field stores (TYPES maintenance) -- reads still trust TYPES",field_masks,STORM: inconsistent; use nm_facts_heap for the value of field types
+nm_speculate_int_first,speculation,int32-first speculation of numeric ops,speculate_int_first,clean
+nm_noexitops,speculation,"exit-on-rare-path generic ops (prim.* getprop.data getelem.data elem exits) -> rejoining generic ops",prim_ops+data_gets+elem_data+elem_load_exits+elem_store_exits,clean; 2 scripts declined to baseline
+nm_narrow_tests,speculation,type narrowing on branches,narrow_tests,clean
+nm_cls_hints,speculation,advisory class hints -> typed sites,cls_hints,clean
+nm_typed_gnames,speculation,typed global reads/writes behind binding checks,typed_gnames,clean
+nm_hoist_native,speculation,hoist array receiver guard to loop entry,hoist_native,clean
+nm_inner_onramps,onramps,"inner-loop onramps (outermost loops only)",inner_onramps,clean
+nm_onramps_all,onramps,"the 400-byte inner-onramp cap (uncapped)",NIGHT_INNER_ONRAMP_BYTES=1000000,clean

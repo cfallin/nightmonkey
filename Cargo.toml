@@ -21,4 +21,4 @@ debug = false
 # waffle 0.3.3 pre-release (O(1) dominance queries: `validate` was quadratic
 # in large bodies). Drop once 0.3.3 is on crates.io.
 [patch.crates-io]
-waffle = { git = "https://github.com/bytecodealliance/waffle", branch = "cfallin/release-0.3.3" }
+waffle = { path = "/home/cfallin/.cache/nm-bench/waffle-exp" }

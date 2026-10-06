@@ -678,6 +678,7 @@ pub fn analyze(
     // The census runs last so it can report what the emission phase
     // refused at its caps, not just what the fixpoint did.
     let mut facts = sv.emit();
+    crate::ablate::facts(&mut facts);
     if opts.diagnostics.viz.is_some() {
         viz::collect(&sv, &facts);
     }

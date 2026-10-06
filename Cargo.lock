@@ -2154,7 +2154,6 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 [[package]]
 name = "waffle"
 version = "0.3.3"
-source = "git+https://github.com/bytecodealliance/waffle?branch=cfallin/release-0.3.3#c27296ed24546de56d1135bbde6bb7b15c212c2e"
 dependencies = [
  "anyhow",
  "fxhash",

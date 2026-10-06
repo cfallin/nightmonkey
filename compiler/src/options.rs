@@ -197,6 +197,12 @@ pub struct Options {
 impl Options {
     /// The inner-loop onramp budget in effect (`mir_inner_onramp_bytes`).
     pub fn inner_onramp_bytes(&self) -> u32 {
+        if crate::ablate::off("inner_onramps") {
+            return 0;
+        }
+        if let Some(n) = std::env::var("NIGHT_INNER_ONRAMP_BYTES").ok().and_then(|s| s.parse().ok()) {
+            return n;
+        }
         self.mir_inner_onramp_bytes.unwrap_or(400)
     }
 }

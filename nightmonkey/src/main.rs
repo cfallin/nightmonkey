@@ -751,6 +751,21 @@ fn main() -> Result<()> {
     img.write_u32(reg_addr + OFF_TOOL_VERSION, TOOL_VERSION)?;
 
     image::update(&mut m, &img);
+    // EXPERIMENT: compile each body through waffle's backend alone,
+    // naming it first, to find a body the backend blows up on.
+    if std::env::var_os("NIGHT_BACKEND_TRACE").is_some() {
+        for (f, d) in m.funcs.entries() {
+            if let Some(b) = d.body() {
+                eprintln!("backend {} {} blocks {} values {}", waffle::entity::EntityRef::index(f), d.name(), b.blocks.len(), b.values.len());
+                let t = std::time::Instant::now();
+                let red = waffle::backend::reducify::Reducifier::new(b).run();
+                eprintln!("backend reduced {} blocks {} values {} {}ms", waffle::entity::EntityRef::index(f), red.blocks.len(), red.values.len(), t.elapsed().as_millis());
+                drop(red);
+                let r = waffle::backend::WasmFuncBackend::compile(b);
+                eprintln!("backend done {} {}ms ok={}", waffle::entity::EntityRef::index(f), t.elapsed().as_millis(), r.is_ok());
+            }
+        }
+    }
     let t = std::time::Instant::now();
     let mut out_bytes = m
         .to_wasm_bytes()

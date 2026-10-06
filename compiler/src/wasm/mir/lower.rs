@@ -95,15 +95,15 @@ use crate::wasm::translate::{
 
 type R<T> = Result<T, String>;
 
-/// Whether `new` of a compiled constructor calls it directly.
-const DIRECT_CONSTRUCT: bool = true;
+// Whether `new` of a compiled constructor calls it directly.
+crate::knob!( DIRECT_CONSTRUCT, "direct_construct", "lower");
 
-/// Whether global binding writes get their inline arm.
-const INLINE_GNAME_SETS: bool = true;
+// Whether global binding writes get their inline arm.
+crate::knob!( INLINE_GNAME_SETS, "inline_gname_sets", "lower");
 
-/// A call whose callee's type proves its script calls that script's body
-/// with no native arms and no classify (`js_call_proven`).
-const PROVEN_CALLS: bool = true;
+// A call whose callee's type proves its script calls that script's body
+// with no native arms and no classify (`js_call_proven`).
+crate::knob!( PROVEN_CALLS, "proven_calls", "lower");
 /// The most arguments past the first an inline `push` stores (each costs a
 /// store and a post-barrier test).
 const PUSH_ARM_MAX_EXTRA: usize = 7;
@@ -180,27 +180,27 @@ impl waffle::PrintDecorator for VizMarks {
     }
 }
 
-/// A generic call of a native goes straight to it (`native_dispatch`).
-const NATIVE_ROUTE: bool = true;
+// A generic call of a native goes straight to it (`native_dispatch`).
+crate::knob!( NATIVE_ROUTE, "native_route", "lower");
 
-/// A for-in's start from its object's shape's cached iterator, inline
-/// (`iter_from_shape`).
-const ITER_FROM_SHAPE: bool = true;
+// A for-in's start from its object's shape's cached iterator, inline
+// (`iter_from_shape`).
+crate::knob!( ITER_FROM_SHAPE, "iter_from_shape", "lower");
 
-/// An exec/test that does not match runs its AOT matcher in compiled code
-/// (`regexp_no_match`).
-const REGEXP_NO_MATCH_ARM: bool = true;
+// An exec/test that does not match runs its AOT matcher in compiled code
+// (`regexp_no_match`).
+crate::knob!( REGEXP_NO_MATCH_ARM, "regexp_no_match_arm", "lower");
 
-/// `obj[atom] = v` adding the property replays the element-add table's
-/// transition (`elem_add_arm`).
-const ELEM_ADD_ARM: bool = true;
+// `obj[atom] = v` adding the property replays the element-add table's
+// transition (`elem_add_arm`).
+crate::knob!( ELEM_ADD_ARM, "elem_add_arm", "lower");
 
-/// A generic equality of two strings decides by pointer, length and
-/// atomness before the helper.
-const STRING_EQ_ARM: bool = true;
+// A generic equality of two strings decides by pointer, length and
+// atomness before the helper.
+crate::knob!( STRING_EQ_ARM, "string_eq_arm", "lower");
 
-/// A generic element store tries the call-free append/hole arm first.
-const APPEND_ARM: bool = true;
+// A generic element store tries the call-free append/hole arm first.
+crate::knob!( APPEND_ARM, "append_arm", "lower");
 
 /// The `math_natives_base` slot of a Math native the builder names
 /// (`Math.<fn>`).
@@ -232,21 +232,21 @@ pub(crate) fn native_math_index(name: &str) -> Option<u32> {
 /// earley-boyer 3.1%, raytrace 2.2% (2026-10-04), so the owner decides.
 const IC_BASE_FROM_CX: bool = false;
 
-/// `guard.unbox.f64num` branches on the tag, the double first, rather
-/// than converting both ways and selecting (`unbox_num_edges`).
-const NUM_UNBOX_BRANCHY: bool = true;
+// `guard.unbox.f64num` branches on the tag, the double first, rather
+// than converting both ways and selecting (`unbox_num_edges`).
+crate::knob!( NUM_UNBOX_BRANCHY, "num_unbox_branchy", "lower");
 
-/// An int32 add or sub of a constant checks overflow with one compare of
-/// the other operand against a bound.
-const CONST_OVF_COMPARE: bool = true;
+// An int32 add or sub of a constant checks overflow with one compare of
+// the other operand against a bound.
+crate::knob!( CONST_OVF_COMPARE, "const_ovf_compare", "lower");
 
-/// `load_elem` tests the tag its `ok` block's unbox guard wants first
-/// (`load_elem_unboxed`).
-const FUSED_ELEM_UNBOX: bool = true;
+// `load_elem` tests the tag its `ok` block's unbox guard wants first
+// (`load_elem_unboxed`).
+crate::knob!( FUSED_ELEM_UNBOX, "fused_elem_unbox", "lower");
 
-/// A loop's managed values enter its header in registers unless one may
-/// cross a GC on the loop's expected path (`gc_only_off_path`).
-const HOT_CROSSINGS_ONLY: bool = true;
+// A loop's managed values enter its header in registers unless one may
+// cross a GC on the loop's expected path (`gc_only_off_path`).
+crate::knob!( HOT_CROSSINGS_ONLY, "hot_crossings_only", "lower");
 
 /// Whether `op`'s lowering reaches a may-GC call only off its expected
 /// path: an inline arm handles the common case, and the helper behind it
@@ -1752,11 +1752,11 @@ impl<'a> Lower<'a> {
                     live.remove(&r);
                 }
                 if self.may_gc(i) {
-                    let hot = HOT_CROSSINGS_ONLY && !gc_only_off_path(&d.op);
+                    let hot = HOT_CROSSINGS_ONLY() && !gc_only_off_path(&d.op);
                     let g = crossed_gen.entry(b).or_default();
                     for &v in live.iter().filter(|&&v| managed(v)) {
                         cand.insert(v);
-                        if hot || !HOT_CROSSINGS_ONLY {
+                        if hot || !HOT_CROSSINGS_ONLY() {
                             g.insert(v);
                         }
                     }
@@ -3124,7 +3124,7 @@ impl<'a> Lower<'a> {
                 let tys: Vec<MType> = d.args.iter().map(|&v| self.ty(v)).collect();
                 self.exit(ResumeWord { pc, mode }, &a, &tys, &dead, nargs, nlocals)?;
             }
-            Opcode::GuardUnbox(UnboxKind::F64Num) if NUM_UNBOX_BRANCHY && self.plain_guard(inst) => {
+            Opcode::GuardUnbox(UnboxKind::F64Num) if NUM_UNBOX_BRANCHY() && self.plain_guard(inst) => {
                 let tag = self.tag_of(a[0]);
                 let have = value_tags(&self.ty(d.args[0]));
                 self.unbox_num_edges(inst, a[0], tag, have)?;
@@ -3185,7 +3185,7 @@ impl<'a> Lower<'a> {
                 self.guard(inst, ok, &[i])?;
             }
             Opcode::I32Ovf(op @ (ArithOp::Add | ArithOp::Sub))
-                if CONST_OVF_COMPARE && self.const_i32(d.args[1]).or(if op == ArithOp::Add { self.const_i32(d.args[0]) } else { None }).is_some() =>
+                if CONST_OVF_COMPARE() && self.const_i32(d.args[1]).or(if op == ArithOp::Add { self.const_i32(d.args[0]) } else { None }).is_some() =>
             {
                 // `x + c` (either side) or `x - c`: overflow is `x` past
                 // one bound, one compare rather than a widened sum.
@@ -3606,7 +3606,7 @@ impl<'a> Lower<'a> {
                 let t = self.edge(inst, 0, &[])?;
                 self.terminate(Terminator::Br { target: t });
                 self.cur = slow;
-                if APPEND_ARM {
+                if APPEND_ARM() {
                     let generic = self.body.add_block();
                     self.elem_append_arm(inst, a[0], a[1], a[2], duty, num, generic)?;
                     self.cur = generic;
@@ -3626,7 +3626,7 @@ impl<'a> Lower<'a> {
                 // Only where the key may be a string: the arm at every
                 // element store cost mandreel 5.6% of its code (-3.9%).
                 let key_str = !value_tags(&self.ty(d.args[1])).intersect(TagSet::STRING).is_empty();
-                if ELEM_ADD_ARM && key_str {
+                if ELEM_ADD_ARM() && key_str {
                     let generic = self.body.add_block();
                     self.elem_add_arm(inst, a[0], a[1], a[2], generic)?;
                     self.cur = generic;
@@ -3802,7 +3802,7 @@ impl<'a> Lower<'a> {
                 let f = self.edge(inst, 1, &[])?;
                 self.terminate(Terminator::Br { target: f });
             }
-            Opcode::LoadElem if FUSED_ELEM_UNBOX && self.fusable_unbox(inst).is_some() => {
+            Opcode::LoadElem if FUSED_ELEM_UNBOX() && self.fusable_unbox(inst).is_some() => {
                 let (g, k, p) = self.fusable_unbox(inst).unwrap();
                 self.load_elem_unboxed(inst, g, k, p, a[0], a[1])?;
             }
@@ -3848,7 +3848,7 @@ impl<'a> Lower<'a> {
                 // Past the initialized length or into a hole: the append
                 // arm, where the prototypes' proof allows (it writes the
                 // lengths, and runs no JS); else `fail`.
-                if APPEND_ARM && append {
+                if APPEND_ARM() && append {
                     let miss = self.body.add_block();
                     let recv = self.box_tagged(TAG_OBJECT, a[0]);
                     let key = self.box_tagged(TAG_INT32, a[1]);
@@ -4160,7 +4160,7 @@ impl<'a> Lower<'a> {
                         (h.init_prop_getset, vec![a[0], at, a[1], kv])
                     }
                     RtOp::Iter => {
-                        if ITER_FROM_SHAPE {
+                        if ITER_FROM_SHAPE() {
                             self.iter_from_shape(inst, a[0])?;
                         }
                         (h.iter_, vec![a[0]])
@@ -4496,7 +4496,7 @@ impl<'a> Lower<'a> {
                 let compiled = self.bin(Operator::I32Ne, funcidx, z, Type::I32);
                 let fits = self.stack_fits(top, HEADROOM);
                 let maybe = self.bin(Operator::I32And, compiled, fits, Type::I32);
-                let enabled = self.i32c(u32::from(DIRECT_CONSTRUCT));
+                let enabled = self.i32c(u32::from(DIRECT_CONSTRUCT()));
                 let maybe = self.bin(Operator::I32And, maybe, enabled, Type::I32);
                 let (chk, generic) = (self.body.add_block(), self.body.add_block());
                 self.cond_br(maybe, Self::to(chk), Self::to(generic));
@@ -4889,7 +4889,7 @@ impl<'a> Lower<'a> {
                 self.js_call(inst, self.h.bind_unqualified_gname, &[at], false)?;
             }
             Opcode::JsSetName(name, strict) => {
-                if let Some(&bid) = self.gname_bids.get(&name).filter(|_| INLINE_GNAME_SETS) {
+                if let Some(&bid) = self.gname_bids.get(&name).filter(|_| INLINE_GNAME_SETS()) {
                     let fused = self.gname_fused.get(&name).copied();
                     self.gname_set_arms(inst, bid, a[1], fused)?;
                 }
@@ -6395,7 +6395,7 @@ impl<'a> Lower<'a> {
         let t = self.edge(inst, 0, &[r])?;
         self.terminate(Terminator::Br { target: t });
         self.cur = slow;
-        if STRING_EQ_ARM {
+        if STRING_EQ_ARM() {
             // Two strings: one pointer is
             // equal; different lengths (a rope carries its length, so no
             // flatten) or two atoms (deduplicated) are unequal. Else the
@@ -8490,7 +8490,7 @@ impl<'a> Lower<'a> {
             },
             _ => None,
         };
-        if let Some(addr) = proven.filter(|_| PROVEN_CALLS) {
+        if let Some(addr) = proven.filter(|_| PROVEN_CALLS()) {
             return self.js_call_proven(inst, ops, iter, addr, HEADROOM);
         }
         if ops.len() == 3 && !iter {
@@ -8620,7 +8620,7 @@ impl<'a> Lower<'a> {
 
         self.cur = generic_b;
         let argc_v = self.i32c(argc);
-        if NATIVE_ROUTE {
+        if NATIVE_ROUTE() {
             // A native callee (the classify proved a function with no
             // script) goes straight to its JSNative;
             // `native_dispatch` punts the natives that need the generic
@@ -9112,7 +9112,7 @@ impl<'a> Lower<'a> {
         let either = self.bin(Operator::I32Or, is_exec, is_test, Type::I32);
         self.check(either, other);
         let leaf = self.body.add_block();
-        if REGEXP_NO_MATCH_ARM {
+        if REGEXP_NO_MATCH_ARM() {
             self.regexp_no_match(inst, this, s, is_test, leaf)?;
         } else {
             self.terminate(Terminator::Br { target: Self::to(leaf) });

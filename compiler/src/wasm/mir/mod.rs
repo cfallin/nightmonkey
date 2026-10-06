@@ -17,8 +17,8 @@ use crate::wasm::baseline::layout;
 use crate::wasm::translate::{AtomTable, ExtraBody, Outcome, TranslateCtx};
 use waffle::Module;
 
-/// Whether MIR inlines calls (§5.5; in progress).
-const INLINING: bool = true;
+// Whether MIR inlines calls (§5.5; in progress).
+crate::knob!( INLINING, "inlining", "inl");
 
 /// The most bytecode a script may have to be inlined (§5.5).
 pub(crate) const INLINE_MAX_BYTECODE: usize = 500;
@@ -33,7 +33,7 @@ const MAX_MIR_INSTS: usize = 60_000;
 /// callers, that its baseline body must resume at any op.
 pub(crate) fn inline_eligible(ctx: &TranslateCtx, script: &Script) -> bool {
     use crate::bytecode::TryNoteKind;
-    INLINING
+    INLINING()
         && ctx.opts.pipeline == crate::options::Pipeline::Mir
         && script.addr != 0
         && script.bytecode.len() <= INLINE_MAX_BYTECODE
@@ -234,6 +234,23 @@ pub fn translate_script(
             script.bytecode.len(),
             f.roots.len(),
             f.inline_frames.len()
+        );
+    }
+    if ctx.opts.diagnostics.stats {
+        // EXPERIMENT: what waffle's reducifier duplicates in this body
+        // (reachable blocks and instructions before and after).
+        let count = |b: &waffle::FunctionBody| {
+            let cfg = waffle::cfg::CFGInfo::new(b);
+            let insts: usize = cfg.rpo.values().map(|&bl| b.blocks[bl].insts.len()).sum();
+            (cfg.rpo.len(), insts)
+        };
+        let (b0, i0) = count(&lowered.body);
+        let red = waffle::backend::reducify::Reducifier::new(&lowered.body).run();
+        let (b1, i1) = count(&red);
+        let onramps = f.roots.iter().filter(|r| matches!(r.kind, crate::mir::func::RootKind::Onramp(_))).count();
+        crate::diag_line!(
+            "night: reduce sid#{sid} blocks {b0} {b1} insts {i0} {i1} onramps {onramps} loops {}",
+            f.loops.len()
         );
     }
     if ctx.opts.diagnostics.opsize {

@@ -1,0 +1,6 @@
+b1-analysis: base baseline facts_all facts_slots facts_heap facts_calls facts_args
+b2-passes: base calls_cg pea sroa licm inlining hoist_guards gvn
+b3-passes2: base hoist_reads mem_vn promote int_ranges mir_opt nothing
+b4-mech: base inner_onramps onramps_all noexitops cls_hints field_masks direct_calls
+b5-mech2: base speculate_int_first narrow_tests typed_gnames hoist_native trunc_demand inline_construct
+b6-misc: base thread_jumps sink_to_exits recover_at_exits

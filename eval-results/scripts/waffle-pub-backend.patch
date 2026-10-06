@@ -1,0 +1,12 @@
+diff -ru '--exclude=target' c27296e/src/lib.rs /home/cfallin/.cache/nm-bench/waffle-exp/src/lib.rs
+--- c27296e/src/lib.rs	2026-10-01 18:42:23.049372708 -0700
++++ /home/cfallin/.cache/nm-bench/waffle-exp/src/lib.rs	2026-10-05 23:23:50.498466348 -0700
+@@ -19,7 +19,7 @@
+ // Likewise for wasm-encoder.
+ pub use wasm_encoder;
+ 
+-mod backend;
++pub mod backend;
+ pub mod cfg;
+ pub mod entity;
+ mod errors;

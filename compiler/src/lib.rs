@@ -57,6 +57,7 @@
 //! `night_compile` hostcall) or a standalone module produced by the
 //! snapshot compiler, `nightmonkey`.
 
+pub mod ablate;
 pub mod bytecode;
 pub mod constants;
 pub mod env_regions;

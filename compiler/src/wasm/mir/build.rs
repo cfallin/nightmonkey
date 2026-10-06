@@ -174,72 +174,72 @@ impl Ty {
     }
 }
 
-/// The representation a numeric claim is speculated in (§8's
-/// guard-at-defs): int32 for an int32-only claim; with `int_first`, also
-/// for a number claim with int32 in it that is not flagged double-first,
-/// exiting on a double; f64
-/// for other number claims. `None` for anything else. Int-first suits
-/// formals, element and name reads (indices, digits, counters: crypto's
-/// am3 gains 17%); property reads and call results often hold doubles
-/// the claim does not flag (raytrace's vectors), and an exit per double
-/// costs far more than the ToInt32s int-first saves.
-/// An element access whose key MIR knows is a non-index string constant is
-/// built as the property access of that name.
-const CONST_KEY_PROPS: bool = true;
+// The representation a numeric claim is speculated in (§8's
+// guard-at-defs): int32 for an int32-only claim; with `int_first`, also
+// for a number claim with int32 in it that is not flagged double-first,
+// exiting on a double; f64
+// for other number claims. `None` for anything else. Int-first suits
+// formals, element and name reads (indices, digits, counters: crypto's
+// am3 gains 17%); property reads and call results often hold doubles
+// the claim does not flag (raytrace's vectors), and an exit per double
+// costs far more than the ToInt32s int-first saves.
+// An element access whose key MIR knows is a non-index string constant is
+// built as the property access of that name.
+crate::knob!( CONST_KEY_PROPS, "const_key_props", "build");
 
-const SPECULATE_INT_FIRST: bool = true;
+crate::knob!( SPECULATE_INT_FIRST, "speculate_int_first", "build");
 
-/// Whether a dense element load's miss (a hole, out of bounds) exits
-/// rather than running the generic read and rejoining, where no typed
-/// array can reach the site (`elem_poly_sites`: the bundle references no
-/// typed-array constructor), so a native receiver is one with dense
-/// elements and a miss is rare. Where one can, the generic read stays: a
-/// typed array the analysis took for an array misses every time, and an
-/// exit per execution costs far more than the facts the rejoin kills
-/// (pdfjs's FlateStream_getCode: 1.5M exits).
-const ELEM_LOAD_EXITS: bool = true;
+// Whether a dense element load's miss (a hole, out of bounds) exits
+// rather than running the generic read and rejoining, where no typed
+// array can reach the site (`elem_poly_sites`: the bundle references no
+// typed-array constructor), so a native receiver is one with dense
+// elements and a miss is rare. Where one can, the generic read stays: a
+// typed array the analysis took for an array misses every time, and an
+// exit per execution costs far more than the facts the rejoin kills
+// (pdfjs's FlateStream_getCode: 1.5M exits).
+crate::knob!( ELEM_LOAD_EXITS, "elem_load_exits", "build");
 
-/// Whether a dense element store neither the inline arms nor the
-/// runtime's append can do (a hole under indexed prototypes, frozen
-/// elements) exits rather than running the generic store and rejoining,
-/// at a site as `ELEM_LOAD_EXITS` has them.
-const ELEM_STORE_EXITS: bool = true;
+// Whether a dense element store neither the inline arms nor the
+// runtime's append can do (a hole under indexed prototypes, frozen
+// elements) exits rather than running the generic store and rejoining,
+// at a site as `ELEM_LOAD_EXITS()` has them.
+crate::knob!( ELEM_STORE_EXITS, "elem_store_exits", "build");
 
-/// Whether stamped literal sites build `lit.new` and `lit.init`
-/// (MIR-MEMORY.md §4) rather than `js.rt.newobject` and `js.rt.initprop`.
-const LIT_OPS: bool = true;
+// Whether stamped literal sites build `lit.new` and `lit.init`
+// (MIR-MEMORY.md §4) rather than `js.rt.newobject` and `js.rt.initprop`.
+crate::knob!( LIT_OPS, "lit_ops", "build");
 
-/// Whether the generic runtime ops (`js.rt`, `js.throw`, `js.typeof`)
-/// are built.
-const RT_OPS: bool = true;
+// Whether the generic runtime ops (`js.rt`, `js.throw`, `js.typeof`)
+// are built.
+crate::knob!( RT_OPS, "rt_ops", "build");
 
-/// A `switch` over string constants (`SWITCH_STR_MIN` cases or more in a
-/// row) as one `switch.str` rather than a chain of `===`s.
-const SWITCH_STR: bool = true;
+// A `switch` over string constants (`SWITCH_STR_MIN` cases or more in a
+// row) as one `switch.str` rather than a chain of `===`s.
+crate::knob!( SWITCH_STR, "switch_str", "build");
 const SWITCH_STR_MIN: usize = 3;
 
-/// Whether `T.apply(this, arguments)` forwards the actuals.
-const APPLY_FWD: bool = true;
-/// Whether an arguments object read only for its length and elements is
-/// elided (`compute_args_reads`).
-const ARGS_READS: bool = true;
+// Whether `T.apply(this, arguments)` forwards the actuals.
+crate::knob!( APPLY_FWD, "apply_fwd", "build");
+// Whether an arguments object read only for its length and elements is
+// elided (`compute_args_reads`).
+crate::knob!( ARGS_READS, "args_reads", "build");
 
-/// Whether `T.call(thisArg, args…)` inlines its resolved targets.
-const CALL_FWD: bool = true;
+// Whether `T.call(thisArg, args…)` inlines its resolved targets.
+crate::knob!( CALL_FWD, "call_fwd", "build");
 
-/// Whether an inlined `new` builds its constructor for a `this` of the
-/// constructing type (MIR.md §2.3, `Ty::Ctor`).
-const CTOR_TYPES: bool = true;
+// Whether an inlined `new` builds its constructor for a `this` of the
+// constructing type (MIR.md §2.3, `Ty::Ctor`).
+crate::knob!( CTOR_TYPES, "ctor_types", "build");
 
-/// Whether scripts that read their actuals are built.
-const ACTUALS: bool = true;
+// Whether scripts that read their actuals are built.
+crate::knob!( ACTUALS, "actuals", "build");
 
 fn num_claim_ty(claim: crate::facts::Claim, int_first: bool) -> Option<Ty> {
     let prims = claim.prims();
     if claim.is_none() || claim.is_object() || prims.is_empty() {
         None
     } else if prims.subset_of(PRIM_INT32)
-        || (SPECULATE_INT_FIRST
+        || (SPECULATE_INT_FIRST()
             && int_first
             && prims.subset_of(crate::opsem::NUM)
             && prims.intersects(PRIM_INT32)
@@ -505,100 +505,100 @@ pub fn build<'a>(
     build_at(ctx, names, sid, script, is_global, InlineCtx::ROOT, &[], None, None).map(|(m, f, _, _)| (m, f))
 }
 
-/// Element accesses the analysis predicts on arrays, with int32 keys, are
-/// `load_elem`/`store_elem` on a native receiver.
-const NATIVE_ELEMS: bool = true;
+// Element accesses the analysis predicts on arrays, with int32 keys, are
+// `load_elem`/`store_elem` on a native receiver.
+crate::knob!( NATIVE_ELEMS, "native_elems", "build");
 
-/// Element accesses the analysis predicts on typed arrays are
-/// `load_ta`/`store_ta`.
-const TA_ELEMS: bool = true;
+// Element accesses the analysis predicts on typed arrays are
+// `load_ta`/`store_ta`.
+crate::knob!( TA_ELEMS, "ta_elems", "build");
 
-/// A loop-invariant array's receiver guard is hoisted to the loop's entry.
-const HOIST_NATIVE: bool = true;
+// A loop-invariant array's receiver guard is hoisted to the loop's entry.
+crate::knob!( HOIST_NATIVE, "hoist_native", "build");
 
-/// Scripts whose mapped `arguments` alias formals are built: the formals
-/// are read and written through the object.
-const MAPPED_ARGS: bool = true;
+// Scripts whose mapped `arguments` alias formals are built: the formals
+// are read and written through the object.
+crate::knob!( MAPPED_ARGS, "mapped_args", "build");
 
-/// `new` of a site's one constructor is inlined.
-const INLINE_CONSTRUCT: bool = true;
+// `new` of a site's one constructor is inlined.
+crate::knob!( INLINE_CONSTRUCT, "inline_construct", "build");
 
-/// Typed field accesses exit on a dirty IC arm rather than rejoin.
-const DIRTY_EXITS: bool = true;
+// Typed field accesses exit on a dirty IC arm rather than rejoin.
+crate::knob!( DIRTY_EXITS, "dirty_exits", "build");
 
-/// A generic numeric op or compare whose operands are not predicted
-/// objects is `prim.*`, exiting where an operand would call user code.
-const PRIM_OPS: bool = true;
+// A generic numeric op or compare whose operands are not predicted
+// objects is `prim.*`, exiting where an operand would call user code.
+crate::knob!( PRIM_OPS, "prim_ops", "build");
 
-/// A wrapper constructor's forward of its `this` under construction exits
-/// where the target is not the one resolved for the copy, or the `.apply`
-/// is not the builtin (no generic op sees the object).
-const CTOR_FWD_EXITS: bool = true;
+// A wrapper constructor's forward of its `this` under construction exits
+// where the target is not the one resolved for the copy, or the `.apply`
+// is not the builtin (no generic op sees the object).
+crate::knob!( CTOR_FWD_EXITS, "ctor_fwd_exits", "build");
 
-/// An inlined `new F()` of a layout constructor allocates `this` from
-/// `F.prototype` (`new_this`), which runs no code, instead of the generic
-/// `create_this`.
-const NEW_THIS: bool = true;
+// An inlined `new F()` of a layout constructor allocates `this` from
+// `F.prototype` (`new_this`), which runs no code, instead of the generic
+// `create_this`.
+crate::knob!( NEW_THIS, "new_this", "build");
 
-/// A generic element read is a data read (`getelem.data`), exiting where
-/// the read would run code.
-const ELEM_DATA: bool = true;
+// A generic element read is a data read (`getelem.data`), exiting where
+// the read would run code.
+crate::knob!( ELEM_DATA, "elem_data", "build");
 
-/// A by-name property read whose name no known getter has is a data read
-/// (`getprop.data`), exiting where the lookup would run code.
-const DATA_GETS: bool = true;
+// A by-name property read whose name no known getter has is a data read
+// (`getprop.data`), exiting where the lookup would run code.
+crate::knob!( DATA_GETS, "data_gets", "build");
 
-/// A type test a branch consumes narrows the tested value on the branch
-/// it proves (`fuse_test`).
-const NARROW_TESTS: bool = true;
+// A type test a branch consumes narrows the tested value on the branch
+// it proves (`fuse_test`).
+crate::knob!( NARROW_TESTS, "narrow_tests", "build");
 
-/// A global the analysis predicts holds one function (`gname_fns`) is
-/// read as that function behind its value fuse's predicted state
-/// (`check.binding.fn`).
-const PREDICTED_GNAMES: bool = true;
-/// Reads of predicted methods through their cells (`method.load`).
-const METHOD_LOADS: bool = true;
-/// Callees inlined at a receiver of a proven type are built for it.
-const TYPED_THIS: bool = true;
+// A global the analysis predicts holds one function (`gname_fns`) is
+// read as that function behind its value fuse's predicted state
+// (`check.binding.fn`).
+crate::knob!( PREDICTED_GNAMES, "predicted_gnames", "build");
+// Reads of predicted methods through their cells (`method.load`).
+crate::knob!( METHOD_LOADS, "method_loads", "build");
+// Callees inlined at a receiver of a proven type are built for it.
+crate::knob!( TYPED_THIS, "typed_this", "build");
 
-/// An inlined `new` of a constructor whose body starts by storing its
-/// formals into its first fields makes the object with them
-/// (`new_this.init`), the body built to skip those stores.
-const PREFILL_INITS: bool = true;
+// An inlined `new` of a constructor whose body starts by storing its
+// formals into its first fields makes the object with them
+// (`new_this.init`), the body built to skip those stores.
+crate::knob!( PREFILL_INITS, "prefill_inits", "build");
 
-/// A call of a known single callee not inlined gets a direct arm
-/// (`attach_targets`).
-const DIRECT_CALLS: bool = true;
+// A call of a known single callee not inlined gets a direct arm
+// (`attach_targets`).
+crate::knob!( DIRECT_CALLS, "direct_calls", "build");
 
-/// A call of a closure the frame knows (`Ty::Fn`) has exactly its script
-/// as callee, and a callee built for inlining knows its formals' closures.
-const CALL_KNOWN_FNS: bool = true;
+// A call of a closure the frame knows (`Ty::Fn`) has exactly its script
+// as callee, and a callee built for inlining knows its formals' closures.
+crate::knob!( CALL_KNOWN_FNS, "call_known_fns", "build");
 
 /// How many likely callees a call not inlined gets direct arms for.
 const MAX_DIRECT_TARGETS: usize = 4;
 
 
-/// A generic element op at a polymorphic typed-array site probes the
-/// typed-array kinds (`ta_poly`).
-const TA_POLY: bool = true;
+// A generic element op at a polymorphic typed-array site probes the
+// typed-array kinds (`ta_poly`).
+crate::knob!( TA_POLY, "ta_poly", "build");
 
-/// A typed array's `.length` is its length slot (`length.ta`).
-const LENGTH_TA: bool = true;
+// A typed array's `.length` is its length slot (`length.ta`).
+crate::knob!( LENGTH_TA, "length_ta", "build");
 
-/// Property stores keep TYPES for a value of the field's predicted type
-/// (`field_claim`), and reads under TYPES are of that type.
-const FIELD_MASKS: bool = true;
+// Property stores keep TYPES for a value of the field's predicted type
+// (`field_claim`), and reads under TYPES are of that type.
+crate::knob!( FIELD_MASKS, "field_masks", "build");
 
 /// How many classes a store lists (`field_claim`) before it names only
 /// the receiver's predicted ones.
 const MAX_STORE_CLASSES: usize = crate::wasm::mir::stamp::MAX_STORE_CLASSES;
 
-/// Receivers the analysis hints one class for get typed sites
-/// (`hinted_site`).
-const CLS_HINTS: bool = true;
+// Receivers the analysis hints one class for get typed sites
+// (`hinted_site`).
+crate::knob!( CLS_HINTS, "cls_hints", "build");
 
-/// `Math.<fn>(...)` calls are typed ops behind a native check (`math_call`).
-const MATH_CALLS: bool = true;
+// `Math.<fn>(...)` calls are typed ops behind a native check (`math_call`).
+crate::knob!( MATH_CALLS, "math_calls", "build");
 
 /// The Math functions `math_call` types, by property name.
 fn math_fn_named(s: &str) -> Option<MathFn> {
@@ -635,19 +635,19 @@ fn math_fn_name(m: MathFn) -> &'static str {
     }
 }
 
-/// Generic ops keep proven layouts on their clean edge (`js_keep`).
-const KEEP_ON_CLEAN: bool = true;
+// Generic ops keep proven layouts on their clean edge (`js_keep`).
+crate::knob!( KEEP_ON_CLEAN, "keep_on_clean", "build");
 
-/// Syntactic globals read and written as `load_gname`/`store_gname`
-/// behind `check.binding` (§3).
-const TYPED_GNAMES: bool = true;
+// Syntactic globals read and written as `load_gname`/`store_gname`
+// behind `check.binding` (§3).
+crate::knob!( TYPED_GNAMES, "typed_gnames", "build");
 
-/// `a.length` of a receiver the builder has array evidence for is
-/// `length.array` behind `guard.kind Array` (§7).
-const LENGTH_ARRAY: bool = true;
+// `a.length` of a receiver the builder has array evidence for is
+// `length.array` behind `guard.kind Array` (§7).
+crate::knob!( LENGTH_ARRAY, "length_array", "build");
 
-/// Guard a method's `this` to its predicted layouts at `FunctionThis`.
-const THIS_ENTRY_GUARD: bool = true;
+// Guard a method's `this` to its predicted layouts at `FunctionThis`.
+crate::knob!( THIS_ENTRY_GUARD, "this_entry_guard", "build");
 
 /// How deep inlining nests below a call site in a loop, and below one not
 /// in a loop (the root site's).
@@ -701,10 +701,10 @@ fn build_at<'a>(
     // is nothing to alias, and the object (made by the runtime, which maps
     // by the callee) is an unmapped one plus `callee`: scheme runtimes'
     // variadic `sc_list`, prototype.js's `Class.create` wrapper.
-    if script.has_mapped_args && script.nargs > 0 && !MAPPED_ARGS {
+    if script.has_mapped_args && script.nargs > 0 && !MAPPED_ARGS() {
         return Err("mapped arguments".into());
     }
-    if !ACTUALS && fl.rebase_vp {
+    if !ACTUALS() && fl.rebase_vp {
         return Err("reads actuals".into());
     }
     // The env chain is fixed for the whole activation (§5.1): the callee's
@@ -714,8 +714,8 @@ fn build_at<'a>(
     let mut shape = Shape::of(ctx, sid, script, fl, depths)?;
     shape.names = Some(names);
     shape.apply_fwd = crate::wasm::translate::compute_apply_fwd_pcs(script, &ctx.facts.apply_sites, sid.get())
-        .filter(|s| APPLY_FWD && !s.is_empty());
-    if shape.apply_fwd.is_none() && ARGS_READS {
+        .filter(|s| APPLY_FWD() && !s.is_empty());
+    if shape.apply_fwd.is_none() && ARGS_READS() {
         let length: Vec<u16> = "length".encode_utf16().collect();
         let is_length = |n: u32| {
             script.gcthings.get(n as usize).is_some_and(|&gc| {
@@ -1407,7 +1407,7 @@ impl<'s, 'a> Run<'s, 'a> {
         }
         let array_cls = |k: u32| self.mm.array_key_min.is_some_and(|min| k + 1 >= min);
         let evidence = recv.ty == Ty::Native || self.val_cls.get(&recv.v).is_some_and(|&k| array_cls(k));
-        if !LENGTH_ARRAY || !evidence || !TagSet::OBJECT.subset_of(recv.ty.tags()) {
+        if !LENGTH_ARRAY() || !evidence || !TagSet::OBJECT.subset_of(recv.ty.tags()) {
             return false;
         }
         let o = match recv.ty {
@@ -1431,7 +1431,7 @@ impl<'s, 'a> Run<'s, 'a> {
         }
         // A predicted function (`gname_fns`): its script's address is what
         // the runtime's arm compares, and what a guard on it would.
-        let pred = self.s.ctx.binding_preds.get(&slot).filter(|_| PREDICTED_GNAMES).map(|&(k, addr)| {
+        let pred = self.s.ctx.binding_preds.get(&slot).filter(|_| PREDICTED_GNAMES()).map(|&(k, addr)| {
             self.mm.script_addrs.insert(k, addr);
             k
         });
@@ -1745,7 +1745,7 @@ impl<'s, 'a> Run<'s, 'a> {
         let Some(&m) = self.math_fns.get(&self.st[n - argc - 2].v) else {
             return false;
         };
-        if !MATH_CALLS || argc != m.arity() {
+        if !MATH_CALLS() || argc != m.arity() {
             return false;
         }
         let operands: Vec<Slot> = self.st.drain(n - argc - 2..).collect();
@@ -2267,9 +2267,9 @@ impl<'s, 'a> Run<'s, 'a> {
 
     /// The layout a constructor `k`'s `this` is under construction for,
     /// and its TYPES, when a construct allocates it with `word`: the
-    /// sentinel with `k`'s own early key (`CTOR_TYPES`).
+    /// sentinel with `k`'s own early key (`CTOR_TYPES()`).
     fn ctor_of_word(&mut self, k: ScriptId, word: u32) -> Option<(u32, bool)> {
-        if !CTOR_TYPES || word & crate::wasm::mir::abi::CLASS_WORD_SENTINEL == 0 {
+        if !CTOR_TYPES() || word & crate::wasm::mir::abi::CLASS_WORD_SENTINEL == 0 {
             return None;
         }
         let early = (word >> crate::wasm::mir::abi::EARLY_KEY_SHIFT) & 0xFFF;
@@ -2559,7 +2559,7 @@ impl<'s, 'a> Run<'s, 'a> {
     /// guards into this one while no fence intervenes (§10.1), and their
     /// IC fallbacks go with them.
     fn guard_this_layout(&mut self) {
-        if !THIS_ENTRY_GUARD {
+        if !THIS_ENTRY_GUARD() {
             return;
         }
         let ctx = self.s.ctx;
@@ -2570,7 +2570,7 @@ impl<'s, 'a> Run<'s, 'a> {
         // so its first add guards that state (`guard.ctor K, 0`, exiting on
         // a miss: a call without `new`, an object made elsewhere) and its
         // adds are `init_field`s, as in an inlined construct.
-        if CTOR_TYPES && matches!(self.top().ty, Ty::Val(_)) {
+        if CTOR_TYPES() && matches!(self.top().ty, Ty::Val(_)) {
             if let Some(si) = ctx.stamp_ctors_in.get(&sid) {
                 let key = si.layout_id;
                 if self.ctor_layout(key).is_some() {
@@ -2666,7 +2666,7 @@ impl<'s, 'a> Run<'s, 'a> {
             Ty::Ta(k) => k,
             _ => *self.s.ctx.facts.ta_elem_sites.get(&self.site(pc))?,
         };
-        if !TA_ELEMS || k == crate::opsem::TaKind::Uint32 || key.ty.num() != Some(Num::I32) {
+        if !TA_ELEMS() || k == crate::opsem::TaKind::Uint32 || key.ty.num() != Some(Num::I32) {
             return None;
         }
         let o = match recv.ty {
@@ -2704,7 +2704,7 @@ impl<'s, 'a> Run<'s, 'a> {
             || facts.elem_sites.get(&site).is_some_and(|c| {
                 c.is_object() || (!c.prims().is_empty() && c.prims().subset_of(crate::opsem::NUM))
             });
-        if !NATIVE_ELEMS
+        if !NATIVE_ELEMS()
             || (recv.ty != Ty::Native && !predicted)
             || key.ty.num() != Some(Num::I32)
             || !TagSet::OBJECT.subset_of(recv.ty.tags())
@@ -2854,14 +2854,14 @@ impl<'s, 'a> Run<'s, 'a> {
     }
 
     /// The classes a store of field `name` at `pc` through `recv` checks
-    /// its value against (`FIELD_MASKS`), each with its own predicted type
+    /// its value against (`FIELD_MASKS()`), each with its own predicted type
     /// for the field, as an IC validating the object's class before it
     /// stores: every class typing the field (complete) where they are few,
     /// else those the receiver is predicted of (the site row's, the hinted
     /// class, or, through `this`, the script's own row or the layout its
     /// constructor builds).
     fn field_claim(&mut self, pc: Pc, name: mir::entity::AtomId, recv: Slot) -> Option<(Vec<(u32, TagSet)>, bool)> {
-        if !FIELD_MASKS {
+        if !FIELD_MASKS() {
             return None;
         }
         // A name the analysis never interned is a field no class types.
@@ -2912,7 +2912,7 @@ impl<'s, 'a> Run<'s, 'a> {
     /// layout row (`this_layouts_in`). The hint is unchecked; the typed
     /// access guards it, reading through the IC on a miss.
     fn hinted_site(&mut self, recv: mir::Value, name: mir::entity::AtomId) -> Option<TypedSite> {
-        if !CLS_HINTS {
+        if !CLS_HINTS() {
             return None;
         }
         let cls = *self.val_cls.get(&recv)?;
@@ -2975,7 +2975,7 @@ impl<'s, 'a> Run<'s, 'a> {
             return Ok(());
         }
         // A typed array's length: its length slot.
-        if let (Ty::Ta(_), true) = (recv.ty, LENGTH_TA) {
+        if let (Ty::Ta(_), true) = (recv.ty, LENGTH_TA()) {
             if self.mm.atoms[a].chars() == "length".encode_utf16().collect::<Vec<u16>>().as_slice() {
                 let n = self.inst(Opcode::LengthTa, vec![recv.v], Some(MType::i32_range(0, i64::from(i32::MAX))));
                 self.push(n, Ty::I32);
@@ -3191,7 +3191,7 @@ impl<'s, 'a> Run<'s, 'a> {
     /// op, for baseline to do it; the op's own TypeError or RangeError
     /// takes the throw exit.
     fn prim_or_js(&mut self, op: Opcode, args: Vec<mir::Value>, out: MType) -> mir::Value {
-        let Some(p) = mir::ops::PrimOp::of(&op).filter(|_| PRIM_OPS) else {
+        let Some(p) = mir::ops::PrimOp::of(&op).filter(|_| PRIM_OPS()) else {
             return self.js(op, args, out);
         };
         let ok = self.new_block();
@@ -3220,7 +3220,7 @@ impl<'s, 'a> Run<'s, 'a> {
     /// else the generic set.
     fn set_elem(&mut self, strict: bool, duty: bool, x: mir::Value, k: mir::Value, y: mir::Value, post: Slot) {
         let int_key = matches!(self.f.ty(k), MType::Val(v) if v.tags.is_nonempty_subset_of(TagSet::INT32));
-        if ELEM_DATA && int_key {
+        if ELEM_DATA() && int_key {
             if let Some(dirty) = self.dirty_exit(None, Some(post)) {
                 let ok = self.new_block();
                 let fail = self.exit_block(false);
@@ -3247,7 +3247,7 @@ impl<'s, 'a> Run<'s, 'a> {
     /// or throw exits here, before the op, for baseline to do it; an
     /// engine error takes the throw exit.
     fn get_elem(&mut self, x: mir::Value, k: mir::Value) -> mir::Value {
-        if !ELEM_DATA {
+        if !ELEM_DATA() {
             return self.js(Opcode::JsGetElem, vec![x, k], MType::VAL_TOP);
         }
         let ok = self.new_block();
@@ -3274,7 +3274,7 @@ impl<'s, 'a> Run<'s, 'a> {
     /// analysis knows of has its name (`getter_names`), so a lookup that
     /// would run code is rare, and exits.
     fn data_get_ok(&self, a: mir::entity::AtomId) -> bool {
-        DATA_GETS
+        DATA_GETS()
             && self.s.names.is_some_and(|ns| {
                 ns.lookup(self.mm.atoms[a].chars())
                     .is_none_or(|n| !self.s.ctx.facts.getter_names.contains(&n))
@@ -3364,7 +3364,7 @@ impl<'s, 'a> Run<'s, 'a> {
         let mut call = vec![callee];
         call.extend(&vals);
         self.likely_targets = match target {
-            Some(k) if DIRECT_CALLS && self.s.direct_ok(k) => vec![k],
+            Some(k) if DIRECT_CALLS() && self.s.direct_ok(k) => vec![k],
             _ => vec![],
         };
         let r = if set {
@@ -3514,7 +3514,7 @@ impl<'s, 'a> Run<'s, 'a> {
     /// would refuse): its copies (the call's `this`) are then of that type,
     /// and the method, inlined, is built for it, with no guard of its own.
     fn method_get(&mut self, next: Pc, a: mir::entity::AtomId, recv: Slot) -> bool {
-        let Some(&ms) = self.s.ctx.method_sites_in.get(&self.site(self.pc)).filter(|_| METHOD_LOADS) else {
+        let Some(&ms) = self.s.ctx.method_sites_in.get(&self.site(self.pc)).filter(|_| METHOD_LOADS()) else {
             return false;
         };
         // The IC arm exits after the read, with its value pushed.
@@ -3531,7 +3531,7 @@ impl<'s, 'a> Run<'s, 'a> {
             hi: crate::ids::LayoutKey::new(ms.hi_layout_id),
         };
         let types = (ms.layout_id..=ms.hi_layout_id).all(|kk| self.s.types_bit(kk) != 0);
-        let typed_recv = TYPED_THIS
+        let typed_recv = TYPED_THIS()
             && self
                 .s
                 .ctx
@@ -3785,7 +3785,7 @@ impl<'s, 'a> Run<'s, 'a> {
         post: Option<Slot>,
     ) -> Option<mir::Value> {
         debug_assert_eq!(self.next_pc, Some(next));
-        let dirty = if DIRTY_EXITS { self.dirty_exit(out, post) } else { None };
+        let dirty = if DIRTY_EXITS() { self.dirty_exit(out, post) } else { None };
         let Some(dirty) = dirty else {
             // Nowhere to exit to: a fence.
             return match out {
@@ -3864,7 +3864,7 @@ impl<'s, 'a> Run<'s, 'a> {
     /// Whether a kill here can exit at the next pc (`dirty_exit`), with
     /// `results` values there on top of the frame as it is now.
     fn keepable(&self, results: usize) -> bool {
-        KEEP_ON_CLEAN
+        KEEP_ON_CLEAN()
             && self
                 .next_pc
                 .and_then(|next| self.s.depths.at(next))
@@ -4061,7 +4061,7 @@ impl<'s, 'a> Run<'s, 'a> {
         // to the target the analysis resolved for this copy: another target
         // (`initialize` replaced) is baseline's to call, which keeps the
         // object from every generic op (MIR-MEMORY.md §6).
-        if this_ctor && CTOR_FWD_EXITS {
+        if this_ctor && CTOR_FWD_EXITS() {
             let ex = self.exit_block(false);
             self.term(Opcode::Jump, vec![], vec![Self::goto(ex)]);
             self.at(join);
@@ -4142,12 +4142,12 @@ impl<'s, 'a> Run<'s, 'a> {
         // next pc's value is the construct's, not `this`, so a kill here
         // has nowhere to exit to.
         let proto_atom = self.mm.intern_atom(&"prototype".encode_utf16().collect::<Vec<u16>>());
-        let new_this = NEW_THIS && nt == vals[0] && self.ctor_of_word(k, word).is_some() && self.data_get_ok(proto_atom);
+        let new_this = NEW_THIS() && nt == vals[0] && self.ctor_of_word(k, word).is_some() && self.data_get_ok(proto_atom);
         let mut callee = callee.clone();
         // The constructor's leading stores of its formals, made with the
         // allocation (`new_this.init`): the body is built for the object
         // with those fields, and skips them.
-        let prefilled = if new_this && PREFILL_INITS {
+        let prefilled = if new_this && PREFILL_INITS() {
             self.ctor_prefill(k, word, &vals[2..vals.len() - 1])
         } else {
             None
@@ -4415,7 +4415,7 @@ impl<'s, 'a> Run<'s, 'a> {
             }],
         );
         self.at(slow);
-        if raw.is_some() && CTOR_FWD_EXITS {
+        if raw.is_some() && CTOR_FWD_EXITS() {
             // Another `.apply` for a `this` under construction: baseline's
             // (`inline_call_this`'s rule).
             let ex = self.exit_block(false);
@@ -4491,7 +4491,7 @@ impl<'s, 'a> Run<'s, 'a> {
         fns: &[Option<ScriptId>],
         this_ctor: Option<((u32, FieldSet, bool), Slot, mir::Value)>,
     ) -> Option<mir::Value> {
-        if !CALL_FWD {
+        if !CALL_FWD() {
             return None;
         }
         let site = self.site(self.pc);
@@ -4681,7 +4681,7 @@ impl<'s, 'a> Run<'s, 'a> {
             self.widen = true;
             return None;
         }
-        if HOIST_NATIVE && self.s.loops.contains_key(&to) {
+        if HOIST_NATIVE() && self.s.loops.contains_key(&to) {
             for (i, (&a, &b)) in tys.iter().zip(&want).enumerate() {
                 if matches!(a, Ty::Native | Ty::Ta(_)) && matches!(b, Ty::Val(t) if TagSet::OBJECT.subset_of(t)) {
                     self.hoist_req.insert((to, i), a);
@@ -4718,7 +4718,7 @@ impl<'s, 'a> Run<'s, 'a> {
     fn fuse_test(&mut self, x: Slot, tags: TagSet, negate: bool) -> bool {
         let Ty::Val(have) = x.ty else { return false };
         let narrowed = have.intersect(tags);
-        if !NARROW_TESTS || narrowed.is_empty() || narrowed == have {
+        if !NARROW_TESTS() || narrowed.is_empty() || narrowed == have {
             return false;
         }
         let Some(bpc) = self.next_pc else { return false };
@@ -4786,7 +4786,7 @@ impl<'s, 'a> Run<'s, 'a> {
     fn narrow_instanceof(&mut self, x: Slot) {
         let Ty::Val(have) = x.ty else { return };
         let obj = TagSet::OBJECT;
-        if !NARROW_TESTS || have.intersect(obj).is_empty() || have.subset_of(obj) {
+        if !NARROW_TESTS() || have.intersect(obj).is_empty() || have.subset_of(obj) {
             return;
         }
         let Some(bpc) = self.next_pc else { return };
@@ -5732,7 +5732,7 @@ impl<'s, 'a> Run<'s, 'a> {
                 }
                 self.st.push(x);
             }
-            ToString if RT_OPS => {
+            ToString if RT_OPS() => {
                 // A string is its own ToString.
                 let v = self.top();
                 if !v.ty.tags().is_nonempty_subset_of(TagSet::STRING) {
@@ -5742,29 +5742,29 @@ impl<'s, 'a> Run<'s, 'a> {
                     self.push(r, Ty::Val(TagSet::STRING));
                 }
             }
-            BuiltinObject if RT_OPS => {
+            BuiltinObject if RT_OPS() => {
                 let kind = u32::from(p.next_uint8().unwrap());
                 let r = self.js(Opcode::JsRt(RtOp::BuiltinObject(kind)), vec![], MType::val(TagSet::OBJECT));
                 self.push(r, Ty::Val(TagSet::OBJECT));
             }
-            Symbol if RT_OPS => {
+            Symbol if RT_OPS() => {
                 let code = u32::from(p.next_uint8().unwrap());
                 let sym = TagSet::prims(crate::opsem::PRIM_SYMBOL);
                 let r = self.js(Opcode::JsRt(RtOp::Symbol(code)), vec![], MType::val(sym));
                 self.push(r, Ty::Val(sym));
             }
-            GetIntrinsic if RT_OPS => {
+            GetIntrinsic if RT_OPS() => {
                 // A realm constant, from its cell once armed.
                 let a = self.atom(p.next_uint32().unwrap())?;
                 let r = self.js(Opcode::JsRt(RtOp::Intrinsic(a)), vec![], MType::VAL_TOP);
                 self.push(r, Ty::Val(TagSet::ALL));
             }
-            RegExp if RT_OPS => {
+            RegExp if RT_OPS() => {
                 let idx = p.next_uint32().unwrap();
                 let r = self.js(Opcode::JsRt(RtOp::RegExp(idx)), vec![], MType::val(TagSet::OBJECT));
                 self.push(r, Ty::Val(TagSet::OBJECT));
             }
-            InitPropGetter | InitHiddenPropGetter | InitPropSetter | InitHiddenPropSetter if RT_OPS => {
+            InitPropGetter | InitHiddenPropGetter | InitPropSetter | InitHiddenPropSetter if RT_OPS() => {
                 let a = self.atom(p.next_uint32().unwrap())?;
                 let kind = u32::from(matches!(op, InitPropSetter | InitHiddenPropSetter))
                     | (u32::from(matches!(op, InitHiddenPropGetter | InitHiddenPropSetter)) << 1);
@@ -5820,7 +5820,7 @@ impl<'s, 'a> Run<'s, 'a> {
                 let e = self.env_at(0);
                 let r = self.js_static(Opcode::JsLambda(index), vec![e], MType::val(TagSet::OBJECT));
                 let ty = match self.s.script.gcthings.get(index as usize) {
-                    Some(&gc) if !gc.is_other() && CALL_KNOWN_FNS => match self.s.ctx.source.object(gc) {
+                    Some(&gc) if !gc.is_other() && CALL_KNOWN_FNS() => match self.s.ctx.source.object(gc) {
                         // The function gcthing names its script.
                         crate::source::SourceObject::Object(o) => match o.script {
                             Some(k) => Ty::Fn(ScriptId::new(k.id())),
@@ -5864,7 +5864,7 @@ impl<'s, 'a> Run<'s, 'a> {
                     self.pop();
                 }
             }
-            Dup if SWITCH_STR && self.string_switch()? => {}
+            Dup if SWITCH_STR() && self.string_switch()? => {}
             Dup => {
                 let x = self.top();
                 self.st.push(x);
@@ -6290,7 +6290,7 @@ impl<'s, 'a> Run<'s, 'a> {
             BindUnqualifiedGName => {
                 let index = p.next_uint32().unwrap();
                 let a = self.atom(index)?;
-                if let Some(&slot) = self.s.syn_bids.get(&index).filter(|_| TYPED_GNAMES) {
+                if let Some(&slot) = self.s.syn_bids.get(&index).filter(|_| TYPED_GNAMES()) {
                     // The target of an assignment to a syntactic global:
                     // while the binding is the global's writable data
                     // property (the check the store makes, which then
@@ -6316,7 +6316,7 @@ impl<'s, 'a> Run<'s, 'a> {
                 let env = self.pop();
                 let (e, y) = (self.boxed(env), self.boxed(v));
                 match self.s.syn_bids.get(&index) {
-                    Some(&slot) if TYPED_GNAMES => {
+                    Some(&slot) if TYPED_GNAMES() => {
                         // §3: `check.binding.write`, then a leaf store of
                         // the slot; a miss exits here.
                         let b = self.binding(a, slot);
@@ -6533,7 +6533,7 @@ impl<'s, 'a> Run<'s, 'a> {
                     }
                 }
                 let r = match self.s.syn_bids.get(&index) {
-                    Some(&slot) if TYPED_GNAMES => {
+                    Some(&slot) if TYPED_GNAMES() => {
                         let b = self.binding(a, slot);
                         if let Some(k) = self.mm.bindings[b].pred {
                             // A predicted function: while the binding's
@@ -6614,7 +6614,7 @@ impl<'s, 'a> Run<'s, 'a> {
                 let v = self.inst(Opcode::ActualArg, vec![ki], Some(MType::VAL_TOP));
                 self.push(v, Ty::Val(TagSet::ALL));
             }
-            GetElem if CONST_KEY_PROPS && self.st.last().and_then(|k| self.const_key_atom(*k)).is_some() => {
+            GetElem if CONST_KEY_PROPS() && self.st.last().and_then(|k| self.const_key_atom(*k)).is_some() => {
                 // `o["name"]` (a key MIR knows is that string): `o.name`.
                 let key = self.pop();
                 let a = self.const_key_atom(key).unwrap();
@@ -6622,7 +6622,7 @@ impl<'s, 'a> Run<'s, 'a> {
                 self.get_prop_op(pc, pc + op.len(), a, recv)?;
             }
             GetElem => {
-                self.ta_poly_site = TA_POLY && self.s.ctx.facts.elem_poly_sites.contains(&self.site(pc));
+                self.ta_poly_site = TA_POLY() && self.s.ctx.facts.elem_poly_sites.contains(&self.site(pc));
                 let key = self.pop();
                 let recv = self.pop();
                 let ta = self.ta_elem(pc, recv, key);
@@ -6630,7 +6630,7 @@ impl<'s, 'a> Run<'s, 'a> {
                     // The element inline, as a boxed number; out of
                     // bounds, the generic op (a fence unless it keeps, or
                     // a data read).
-                    if !ELEM_DATA {
+                    if !ELEM_DATA() {
                         self.demote_for_generic_arm(1);
                     }
                     let (ok, generic, join) = (self.new_block(), self.new_block(), self.new_block());
@@ -6680,7 +6680,7 @@ impl<'s, 'a> Run<'s, 'a> {
                     r
                 } else {
                 match self.native_elem(pc, recv, key) {
-                    Some((o, i)) if ELEM_LOAD_EXITS && !self.ta_poly_site => {
+                    Some((o, i)) if ELEM_LOAD_EXITS() && !self.ta_poly_site => {
                         // A dense element inline; out of bounds or a
                         // hole, an exit (nothing has happened yet): no
                         // generic op rejoins, so what the code after it
@@ -6691,7 +6691,7 @@ impl<'s, 'a> Run<'s, 'a> {
                         // A dense element inline; out of bounds or a
                         // hole, the generic op (a fence unless it keeps,
                         // or a data read).
-                        if !ELEM_DATA {
+                        if !ELEM_DATA() {
                             self.demote_for_generic_arm(1);
                         }
                         let (ok, generic, join) = (self.new_block(), self.new_block(), self.new_block());
@@ -6743,7 +6743,7 @@ impl<'s, 'a> Run<'s, 'a> {
                 self.guard_result(claim.unwrap_or_default(), pc + op.len(), true);
             }
             SetElem | StrictSetElem
-                if CONST_KEY_PROPS
+                if CONST_KEY_PROPS()
                     && self.st.len() >= 2
                     && self.const_key_atom(self.st[self.st.len() - 2]).is_some() =>
             {
@@ -6755,7 +6755,7 @@ impl<'s, 'a> Run<'s, 'a> {
                 self.set_prop_op(pc, pc + op.len(), a, recv, v, op == StrictSetElem);
             }
             SetElem | StrictSetElem => {
-                self.ta_poly_site = TA_POLY && self.s.ctx.facts.elem_poly_sites.contains(&self.site(pc));
+                self.ta_poly_site = TA_POLY() && self.s.ctx.facts.elem_poly_sites.contains(&self.site(pc));
                 let v = self.pop();
                 let key = self.pop();
                 let recv = self.pop();
@@ -6815,7 +6815,7 @@ impl<'s, 'a> Run<'s, 'a> {
                     self.st.push(v);
                 } else {
                 match self.native_elem(pc, recv, key) {
-                    Some((o, i)) if ELEM_STORE_EXITS && !self.ta_poly_site => {
+                    Some((o, i)) if ELEM_STORE_EXITS() && !self.ta_poly_site => {
                         // A dense overwrite or append inline (the lowering's
                         // append arm); a store it cannot do (growth, a hole
                         // past the prototypes' proof) exits before it.
@@ -6883,7 +6883,7 @@ impl<'s, 'a> Run<'s, 'a> {
                 }
             }
             // Generic operations through their runtime helpers.
-            Instanceof | In | HasOwn if RT_OPS => {
+            Instanceof | In | HasOwn if RT_OPS() => {
                 let b = self.pop();
                 let a = self.pop();
                 let (x, y) = (self.boxed(a), self.boxed(b));
@@ -6898,7 +6898,7 @@ impl<'s, 'a> Run<'s, 'a> {
                     self.narrow_instanceof(a);
                 }
             }
-            DelProp | StrictDelProp if RT_OPS => {
+            DelProp | StrictDelProp if RT_OPS() => {
                 let a = self.atom(p.next_uint32().unwrap())?;
                 let o = self.pop();
                 let x = self.boxed(o);
@@ -6906,7 +6906,7 @@ impl<'s, 'a> Run<'s, 'a> {
                 let v = self.js(Opcode::JsRt(r), vec![x], MType::val(TagSet::BOOLEAN));
                 self.push(v, Ty::Val(TagSet::BOOLEAN));
             }
-            DelElem | StrictDelElem if RT_OPS => {
+            DelElem | StrictDelElem if RT_OPS() => {
                 let k = self.pop();
                 let o = self.pop();
                 let (x, y) = (self.boxed(o), self.boxed(k));
@@ -6914,13 +6914,13 @@ impl<'s, 'a> Run<'s, 'a> {
                 let v = self.js(Opcode::JsRt(r), vec![x, y], MType::val(TagSet::BOOLEAN));
                 self.push(v, Ty::Val(TagSet::BOOLEAN));
             }
-            NewInit | NewObject if RT_OPS => {
+            NewInit | NewObject if RT_OPS() => {
                 let n = self.s.ctx.lit_nslots_in.get(&self.site(self.pc)).copied().unwrap_or(0);
                 let lid = self.s.ctx.lit_stamps_in.get(&self.site(self.pc)).copied();
                 // A stamped site's allocation is typed (`lit.new`, no
                 // fence: MIR-MEMORY.md §4); another's, the generic op.
                 let v = match lid {
-                    Some(_) if LIT_OPS => self.js_static(Opcode::LitNew(n), vec![], MType::val(TagSet::OBJECT)),
+                    Some(_) if LIT_OPS() => self.js_static(Opcode::LitNew(n), vec![], MType::val(TagSet::OBJECT)),
                     _ => self.js(Opcode::JsRt(RtOp::NewObject(n)), vec![], MType::val(TagSet::OBJECT)),
                 };
                 // An object-literal stamp site: the layout idx with SLOTS
@@ -6929,13 +6929,13 @@ impl<'s, 'a> Run<'s, 'a> {
                     let w = (lid + 1) | crate::wasm::mir::abi::CLASS_WORD_SLOTS;
                     self.inst(Opcode::StampFresh(w), vec![v], None);
                     self.val_cls.insert(v, lid);
-                    if LIT_OPS {
+                    if LIT_OPS() {
                         self.lit_rows.insert(v, lid);
                     }
                 }
                 self.push(v, Ty::Val(TagSet::OBJECT));
             }
-            NewArray if RT_OPS => {
+            NewArray if RT_OPS() => {
                 let len = p.next_uint32().unwrap();
                 let v = self.js(Opcode::JsRt(RtOp::NewArray(len)), vec![], MType::val(TagSet::OBJECT));
                 // An array stamp site: the key with TYPES and RANGES, which
@@ -6946,7 +6946,7 @@ impl<'s, 'a> Run<'s, 'a> {
                 }
                 self.push(v, Ty::Val(TagSet::OBJECT));
             }
-            InitProp | InitHiddenProp | InitLockedProp if RT_OPS => {
+            InitProp | InitHiddenProp | InitLockedProp if RT_OPS() => {
                 // [obj, v] -> [obj]
                 use crate::wasm::mir::abi::{INIT_ATTR_ENUMERATE, INIT_ATTR_HIDDEN, INIT_ATTR_LOCKED};
                 let a = self.atom(p.next_uint32().unwrap())?;
@@ -6969,7 +6969,7 @@ impl<'s, 'a> Run<'s, 'a> {
                     _ => self.js_void(Opcode::JsRt(RtOp::InitProp(a, attrs)), vec![x, y]),
                 }
             }
-            InitElem | InitHiddenElem | InitLockedElem if RT_OPS => {
+            InitElem | InitHiddenElem | InitLockedElem if RT_OPS() => {
                 // [obj, key, v] -> [obj]
                 use crate::wasm::mir::abi::{INIT_ATTR_ENUMERATE, INIT_ATTR_HIDDEN, INIT_ATTR_LOCKED};
                 let attrs = match op {
@@ -6984,7 +6984,7 @@ impl<'s, 'a> Run<'s, 'a> {
                 let (x, y, z) = (self.boxed(o), self.boxed(k), self.boxed(v));
                 self.js_void(Opcode::JsRt(RtOp::InitElem(attrs, r)), vec![x, y, z]);
             }
-            InitElemArray if RT_OPS => {
+            InitElemArray if RT_OPS() => {
                 // [obj, v] -> [obj]
                 let index = p.next_uint32().unwrap();
                 let v = self.pop();
@@ -6995,7 +6995,7 @@ impl<'s, 'a> Run<'s, 'a> {
                 let e = crate::wasm::mir::abi::INIT_ATTR_ENUMERATE;
                 self.js_void(Opcode::JsRt(RtOp::InitElem(e, r)), vec![x, k, z]);
             }
-            InitElemInc if RT_OPS => {
+            InitElemInc if RT_OPS() => {
                 // [obj, idx, v] -> [obj, idx + 1]: an array literal's
                 // spread, its index an int32 (the literal's positions).
                 let v = self.pop();
@@ -7013,7 +7013,7 @@ impl<'s, 'a> Run<'s, 'a> {
                 let n = self.inst(Opcode::I32Wrap(ArithOp::Add), vec![iv, one], Some(MType::I32_TOP));
                 self.push(n, Ty::I32);
             }
-            ToPropertyKey if RT_OPS => {
+            ToPropertyKey if RT_OPS() => {
                 // An int32, a string or a symbol is its own key.
                 let x = self.top();
                 let keyish = TagSet::INT32.union(TagSet::STRING).union(TagSet::prims(crate::opsem::PRIM_SYMBOL));
@@ -7024,13 +7024,13 @@ impl<'s, 'a> Run<'s, 'a> {
                     self.push(r, Ty::Val(TagSet::ALL));
                 }
             }
-            Typeof | TypeofExpr if RT_OPS => {
+            Typeof | TypeofExpr if RT_OPS() => {
                 let a = self.pop();
                 let x = self.boxed(a);
                 let v = self.inst(Opcode::JsTypeof, vec![x], Some(MType::val(TagSet::STRING)));
                 self.push(v, Ty::Val(TagSet::STRING));
             }
-            Throw if RT_OPS => {
+            Throw if RT_OPS() => {
                 let a = self.pop();
                 let x = self.boxed(a);
                 let err = self.exit_block(true);
@@ -7183,7 +7183,7 @@ impl<'s, 'a> Run<'s, 'a> {
                 let nslots = crate::wasm::mir::stamp::construct_nslots(self.s.ctx, mono, site);
                 let word = self.s.alloc_word(mono, site);
                 let callee = match mono {
-                    Some(k) if INLINE_CONSTRUCT => {
+                    Some(k) if INLINE_CONSTRUCT() => {
                         self.admit(&[k], true, &|s, k, ictx| s.callee(k, ictx)).map(|mut t| t.remove(0))
                     }
                     _ => None,
@@ -7676,7 +7676,7 @@ impl<'s, 'a> Run<'s, 'a> {
                 // A published receiver of a proven type: callees built for
                 // it, its own guard subsumed.
                 let recv_obj = match operands.get(1).map(|x| x.ty) {
-                    Some(Ty::Obj(keys, t, sl)) if TYPED_THIS && recv_ctor.is_none() => {
+                    Some(Ty::Obj(keys, t, sl)) if TYPED_THIS() && recv_ctor.is_none() => {
                         Some(((keys.lo.get(), keys.hi.get(), t, sl), operands[1].v))
                     }
                     _ => None,
@@ -7716,7 +7716,7 @@ impl<'s, 'a> Run<'s, 'a> {
                 } else {
                     // Not inlined: a known single callee is called
                     // directly while it is the callee.
-                    self.likely_targets = if DIRECT_CALLS
+                    self.likely_targets = if DIRECT_CALLS()
                         && sids.len() <= MAX_DIRECT_TARGETS
                         && sids.iter().all(|&k| self.s.direct_ok(k))
                     {
