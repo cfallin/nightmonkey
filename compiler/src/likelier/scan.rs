@@ -132,6 +132,21 @@ pub struct ScanTables {
     pub call_str_arg1: HashMap<Site, NameId>,
     /// Names a literal or class accessor (`get x()`, `set x(v)`) defines.
     pub accessor_defs: rustc_hash::FxHashSet<NameId>,
+    /// `--viz` only: record `pushed`.
+    pub viz: bool,
+    /// `--viz`: per op, the values it pushed, as the scan left them (a
+    /// cell, or an unmaterialized constant). Diagnostics only.
+    pub pushed: HashMap<Site, Vec<Pushed>>,
+}
+
+/// One value an op pushed, for `--viz`: its cell, or a constant the scan
+/// never materialized.
+#[derive(Clone, Debug)]
+pub struct Pushed {
+    pub key: Option<CKey>,
+    pub prims: Prims,
+    pub num: Option<ValueRange>,
+    pub str_const: Option<NameId>,
 }
 
 #[derive(Clone, PartialEq)]
@@ -243,6 +258,9 @@ pub struct Scan<'a, 'b> {
     live: std::collections::BTreeMap<Pc, Vec<bool>>,
     /// The script makes an `arguments` object, which may alias its formals.
     uses_arguments: bool,
+    /// `--viz`: the last op's pc and how many values it pushed, recorded
+    /// at the next op (when they are on the stack).
+    viz_pending: Option<(Pc, usize)>,
 }
 
 /// Formals live in the flow-sensitive slot map above every real local slot.
@@ -337,7 +355,24 @@ impl<'a, 'b> Scan<'a, 'b> {
                 crate::wasm::baseline::layout::local_count(script),
             ),
             uses_arguments: crate::wasm::translate::uses_arguments(script),
+            viz_pending: None,
         }
+    }
+
+    /// `--viz`: record what the last op pushed (the top of the stack now).
+    fn viz_record(&mut self) {
+        let Some((pc, n)) = self.viz_pending.take() else { return };
+        if n == 0 || self.ft_dead || self.stack.len() < n {
+            return;
+        }
+        let vals = self.stack[self.stack.len() - n..]
+            .iter()
+            .map(|e| match e.val {
+                Val::Key(k) => Pushed { key: Some(k), prims: Prims::EMPTY, num: e.num, str_const: e.str_const },
+                Val::Imm(p) => Pushed { key: None, prims: p, num: e.num, str_const: e.str_const },
+            })
+            .collect();
+        self.tables.pushed.insert(Site::new(self.script_id, pc), vals);
     }
 
     /// Whether slot-map key `slot` (a local, or a formal's `arg_slot`) is
@@ -1199,6 +1234,10 @@ impl<'a, 'b> Scan<'a, 'b> {
 impl OpcodeVisitor for Scan<'_, '_> {
     fn before_op(&mut self, pc: Pc, op: JSOp, nuses: usize, ndefs: usize) {
         use JSOp::*;
+        if self.tables.viz {
+            self.viz_record();
+            self.viz_pending = Some((pc, ndefs));
+        }
         self.cur_pc = pc;
         if matches!(
             op,

@@ -115,6 +115,31 @@ pub fn record(
     if let Some((mir, waffle)) = texts {
         write!(out, ",\"mir\":{},\"waffle\":{}", json_str(mir), json_str(waffle)).unwrap();
     }
+    // What the analysis knows: script-wide lines, and per pc the pushed
+    // values' types and the site's rows.
+    let view = crate::likelier::viz::VIEW
+        .lock()
+        .unwrap()
+        .as_mut()
+        .and_then(|v| v.scripts.remove(&sid));
+    if let Some(v) = view {
+        let list = |l: &[String]| l.iter().map(|t| json_str(t)).collect::<Vec<_>>().join(",");
+        let sites: Vec<String> = v
+            .sites
+            .iter()
+            .map(|(pc, (pushed, rows))| format!("\"{pc}\":[[{}],[{}]]", list(pushed), list(rows)))
+            .collect();
+        write!(out, ",\"facts\":{{\"script\":[{}],\"sites\":{{{}}}}}", list(&v.script), sites.join(",")).unwrap();
+    }
     out.push('}');
     out
+}
+
+/// The record of the predicted layouts the facts name (`L<key>`): one
+/// line, `{"layouts":{"<key>":"<fields>",...}}`.
+pub fn layouts_record() -> Option<String> {
+    let guard = crate::likelier::viz::VIEW.lock().unwrap();
+    let v = guard.as_ref()?;
+    let l: Vec<String> = v.layouts.iter().map(|(k, t)| format!("\"{k}\":{}", json_str(t))).collect();
+    Some(format!("{{\"layouts\":{{{}}}}}", l.join(",")))
 }

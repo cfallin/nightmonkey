@@ -20,6 +20,7 @@ pub mod heap;
 pub mod scan;
 pub mod stats;
 pub mod types;
+pub mod viz;
 
 use crate::facts::LikelyFacts;
 use crate::options::Options;
@@ -328,7 +329,10 @@ impl<'a> Solver<'a> {
             opts,
             engine,
             names,
-            tables: scan::ScanTables::default(),
+            tables: scan::ScanTables {
+                viz: opts.diagnostics.viz.is_some(),
+                ..Default::default()
+            },
             heap: heap::Heap::default(),
             ctxs: calls::Ctxs::new(),
             stats: stats::Stats::default(),
@@ -674,6 +678,9 @@ pub fn analyze(
     // The census runs last so it can report what the emission phase
     // refused at its caps, not just what the fixpoint did.
     let mut facts = sv.emit();
+    if opts.diagnostics.viz.is_some() {
+        viz::collect(&sv, &facts);
+    }
     if opts.diagnostics.stats {
         sv.census(t0);
     }

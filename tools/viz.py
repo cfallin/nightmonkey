@@ -9,6 +9,15 @@ click a source line, a bytecode op, a MIR instruction or a waffle value, and
 what corresponds to it in the other columns lights up and scrolls into
 view. A MIR instruction inlined from another script names its origin.
 
+The bytecode column also carries what the analysis knows: each op notes
+the type of the value it pushed (its cell, joined over the script's
+analyzed contexts) or its call's targets, and the Analysis column shows
+the script's formals, receiver and return and, for the selected op, every
+pushed value's type and every fact the analysis emitted at its site
+(property slots and claims, call targets, method and element facts).
+`sN` names script N (click to go to it); `L<k>` a predicted layout (hover
+or see the list below it for its fields).
+
 The links come from the compiler: the snapshot's per-script source
 position and pc -> line table (the engine's source notes), each MIR
 instruction's bytecode pc (recorded by the builder; instructions an
@@ -65,6 +74,17 @@ def line_of_offset(starts, off):
     return lo + 1
 
 
+def guess_name(rec, src_lines):
+    """The script's name, or for an anonymous function what its first line
+    assigns it to (`X.prototype.m = function`, `m: function`), marked `~`."""
+    name = rec.get("name") or ""
+    pos = rec.get("pos")
+    if not name and pos and pos["line"] <= len(src_lines):
+        m = RE_GUESS.search(src_lines[pos["line"] - 1])
+        name = "~" + m.group(1) if m else ""
+    return name or f"<anonymous #{rec['sid']}>"
+
+
 def prepare(rec, starts, src_lines):
     """A record's columns, linked, in the page's compact form."""
     sid = rec["sid"]
@@ -104,15 +124,10 @@ def prepare(rec, starts, src_lines):
             wf.append([text[: m.start()].rstrip(), int(m.group(1))])
         else:
             wf.append([text, -1])
-    name = rec["name"]
-    if not name and line0 is not None:
-        # An anonymous function: named by what its first line assigns it
-        # to (`X.prototype.m = function`, `m: function`), marked `~`.
-        m = RE_GUESS.search(src_lines[line0 - 1])
-        name = "~" + m.group(1) if m else ""
+    facts = rec.get("facts", {})
     return {
         "sid": sid,
-        "name": name or f"<anonymous #{sid}>",
+        "name": guess_name(rec, src_lines),
         "tier": rec["tier"],
         "nargs": rec["nargs"],
         "line0": line0,
@@ -120,6 +135,9 @@ def prepare(rec, starts, src_lines):
         "ops": ops,
         "mir": mir,
         "wf": wf,
+        # The analysis: script-wide lines, and per pc [pushed, rows].
+        "fs": facts.get("script", []),
+        "fp": facts.get("sites", {}),
     }
 
 
@@ -127,10 +145,12 @@ PAGE = r"""<!doctype html>
 <html><head><meta charset="utf-8"><title>__TITLE__</title>
 <style>
 :root { --bg:#fbfbf8; --fg:#1d1d1b; --muted:#8a8a82; --line:#e3e2dc; --hi:#ffe9a8; --hi2:#fff5d6;
-        --side:#f3f2ec; --sel:#d9e8ff; --code:#24292f; --pc:#7a6a2f; --inl:#8350a0; }
+        --side:#f3f2ec; --sel:#d9e8ff; --code:#24292f; --pc:#7a6a2f; --inl:#8350a0;
+        --ty:#2f6f5e; --link:#1f5fbf; }
 @media (prefers-color-scheme: dark) {
   :root { --bg:#17181a; --fg:#e4e3dd; --muted:#8b8b85; --line:#2c2d30; --hi:#5b4a14; --hi2:#3a3220;
-          --side:#1f2023; --sel:#24364f; --code:#e4e3dd; --pc:#d0b866; --inl:#c79ae0; }
+          --side:#1f2023; --sel:#24364f; --code:#e4e3dd; --pc:#d0b866; --inl:#c79ae0;
+          --ty:#7cc7b0; --link:#7fb0ff; }
 }
 * { box-sizing: border-box; }
 body { margin:0; background:var(--bg); color:var(--fg); font:13px/1.45 system-ui, sans-serif;
@@ -163,7 +183,18 @@ body { margin:0; background:var(--bg); color:var(--fg); font:13px/1.45 system-ui
 .pc { color:var(--pc); }
 .inl { color:var(--inl); }
 .dim { color:var(--muted); }
-#c-src { width:72ch; } #c-ops { width:52ch; } #c-mir { width:110ch; } #c-wf { width:110ch; }
+#c-src { width:72ch; } #c-ops { width:84ch; } #c-an { width:64ch; } #c-mir { width:110ch; } #c-wf { width:110ch; }
+.ty { color:var(--ty); }
+#b-an { white-space:normal; padding:6px 10px 40vh; cursor:default; }
+#b-an div { padding:0; cursor:default; min-height:0; }
+#b-an div:hover { background:none; }
+#b-an h3 { font:600 11px system-ui, sans-serif; text-transform:uppercase; letter-spacing:.05em;
+           color:var(--muted); margin:10px 0 4px; }
+#b-an h3:first-child { margin-top:2px; }
+#b-an ul { margin:0; padding-left:1.2em; }
+#b-an li { margin:1px 0; overflow-wrap:anywhere; }
+a.s { color:var(--link); cursor:pointer; text-decoration:underline dotted; }
+span.L { color:var(--inl); text-decoration:underline dotted; cursor:help; }
 .empty { padding:10px; color:var(--muted); font-family:system-ui, sans-serif; white-space:normal; }
 </style></head>
 <body>
@@ -173,6 +204,7 @@ body { margin:0; background:var(--bg); color:var(--fg); font:13px/1.45 system-ui
 <div id="cols">
 <div class="col" id="c-src"><h2>Source</h2><div class="body" id="b-src"></div></div>
 <div class="col" id="c-ops"><h2>Bytecode</h2><div class="body" id="b-ops"></div></div>
+<div class="col" id="c-an"><h2>Analysis</h2><div class="body" id="b-an"></div></div>
 <div class="col" id="c-mir"><h2>MIR</h2><div class="body" id="b-mir"></div></div>
 <div class="col" id="c-wf"><h2>Waffle IR</h2><div class="body" id="b-wf"></div></div>
 </div></div>
@@ -215,8 +247,9 @@ function show(k) {
   h = '';
   for (const [pc, name, args, line] of s.ops)
     h += '<div data-pc="' + pc + '"><span class="n">' + pc + '</span>' + esc(name) +
-         (args ? ' <span class="dim">' + esc(args) + '</span>' : '') + '</div>';
+         (args ? ' <span class="dim">' + esc(args) + '</span>' : '') + note(s, pc) + '</div>';
   $('b-ops').innerHTML = h;
+  analysis(null);
   // MIR.
   h = '';
   if (!s.mir.length) h = '<div class="empty">Not compiled by MIR (' + esc(s.tier) + ').</div>';
@@ -235,6 +268,58 @@ function show(k) {
   $('b-wf').innerHTML = h;
   for (const id of ['b-src', 'b-ops', 'b-mir', 'b-wf']) $(id).scrollTop = 0;
 }
+
+// What the analysis knows, in the bytecode column (a short note per op)
+// and the Analysis column (everything, for the script and the selected op).
+const L = D.layouts || {}, NAMES = D.names || {};
+function sname(sid) { return NAMES[sid] || ('#' + sid); }
+function short(t) {
+  return t.replace(/  \[\d+ ctxs\]/, '').replace(/  \((this|constant|formal \d+|global [^)]*|closure slot \d+)\)$/, '');
+}
+function note(s, pc) {
+  const f = s.fp[pc];
+  if (!f) return '';
+  const [pushed, rows] = f;
+  let t = '';
+  const call = rows.find(r => r.startsWith('call targets: '));
+  if (call) t = '\u21d2 ' + call.slice(14).split(', ').map(x => sname(+x.slice(1))).join(', ');
+  else if (pushed.length) t = '\u2192 ' + pushed.map(short).join(' , ').replace(/\bs(\d+)\b/g, (m, n) => sname(+n));
+  if (!t) return '';
+  if (t.length > 60) t = t.slice(0, 59) + '\u2026';
+  return '  <span class="ty">' + esc(t) + '</span>';
+}
+// A fact line with its script names linked and its layouts explained.
+function fact(t, seen) {
+  return esc(t).replace(/\bs(\d+)\b|\bL(\d+)\b/g, (m, sid, k) => {
+    if (sid !== undefined) return '<a class="s" data-sid="' + sid + '">' + esc(sname(+sid)) + ' (s' + sid + ')</a>';
+    seen.add(k);
+    return '<span class="L" title="' + esc(L[k] || '?').replace(/"/g, '&quot;') + '">L' + k + '</span>';
+  });
+}
+function analysis(pc) {
+  const s = S[cur], seen = new Set();
+  const ul = a => '<ul>' + a.map(t => '<li>' + fact(t, seen) + '</li>').join('') + '</ul>';
+  let h = '';
+  if (pc !== null) {
+    const op = s.ops.find(o => o[0] === pc);
+    h += '<h3>pc ' + pc + (op ? ' ' + esc(op[1]) + (op[2] ? ' ' + esc(op[2]) : '') : '') + '</h3>';
+    const f = s.fp[pc];
+    if (!f) h += '<div class="dim">Nothing recorded at this op.</div>';
+    else {
+      if (f[0].length) h += '<h3>Pushes</h3>' + ul(f[0].map((t, k) => (f[0].length > 1 ? '#' + k + ' ' : '') + t));
+      if (f[1].length) h += '<h3>Facts at this site</h3>' + ul(f[1]);
+    }
+  } else h += '<div class="dim">Click an op for what the analysis knows at it.</div>';
+  if (s.fs.length) h += '<h3>Script</h3>' + ul(s.fs);
+  if (seen.size) h += '<h3>Layouts</h3>' + ul([...seen].sort((a, b) => a - b).map(k => 'L' + k + ' = ' + (L[k] || '?')));
+  $('b-an').innerHTML = h;
+}
+$('b-an').onclick = ev => {
+  const a = ev.target.closest('a.s');
+  if (!a) return;
+  const k = S.findIndex(x => String(x.sid) === a.dataset.sid);
+  if (k >= 0) show(k);
+};
 
 // The page's state in the URL (`#s=<sid>&line=<l>`, `&pc=`, `&i=`): a
 // link to a script and a selection in it.
@@ -262,6 +347,8 @@ function select(lines, pcs, insts) {
     pcs.add(pc); const l = opLine.get(pc); if (l) lines.add(l);
   }
   for (const pc of pcs) { const l = opLine.get(pc); if (l) lines.add(l); }
+  const first = [...pcs].sort((a, b) => a - b)[0];
+  analysis(first === undefined ? null : first);
   mark('b-src', e => lines.has(+e.dataset.l));
   mark('b-ops', e => pcs.has(+e.dataset.pc));
   mark('b-mir', e => insts.has(+e.dataset.i));
@@ -317,11 +404,17 @@ def main():
     path = args.viz or run_compiler(args, args.source)
     only = re.compile(args.only) if args.only else None
     scripts = []
+    layouts = {}
+    names = {}
     with open(path, encoding="utf-8") as f:
         for raw in f:
             if not raw.strip():
                 continue
             rec = json.loads(raw)
+            if "layouts" in rec:
+                layouts = rec["layouts"]
+                continue
+            names[rec["sid"]] = guess_name(rec, lines)
             name = rec.get("name") or ""
             if name.startswith("[self-hosted]") and not args.self_hosted:
                 continue
@@ -337,7 +430,8 @@ def main():
     scripts.sort(key=lambda s: (s["line0"] is None, s["line0"] or 0, s["sid"]))
 
     title = args.title or os.path.basename(args.source)
-    data = json.dumps({"source": lines, "scripts": scripts}, separators=(",", ":"))
+    data = json.dumps({"source": lines, "scripts": scripts, "layouts": layouts, "names": names},
+                      separators=(",", ":"))
     page = (PAGE.replace("__TITLE__", html.escape(title))
                 .replace("__DATA__", data.replace("</", "<\\/")))
     with open(args.output, "w", encoding="utf-8") as f:

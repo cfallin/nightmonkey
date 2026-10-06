@@ -2085,6 +2085,7 @@ pub fn translate_all(
         }
     }
     if let Some(path) = &opts.diagnostics.viz {
+        viz_records.extend(viz::layouts_record());
         let mut text = viz_records.join("\n");
         text.push('\n');
         std::fs::write(path, text).map_err(|e| format!("writing {path}: {e}"))?;
