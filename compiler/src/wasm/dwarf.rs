@@ -561,16 +561,32 @@ impl Cx<'_, '_> {
         let _ = script;
         let lp = &mut self.dwarf.unit.line_program;
         lp.begin_sequence(Some(Address::Constant(u64::from(fl.start))));
-        let mut last: Option<(u32, u32)> = None;
-        let mut last_line = None;
-        let mut seen_body = false;
+        // Cover the function from its entry: code before the first
+        // tagged instruction is frame setup.
+        let (line, col) = position(PROLOGUE_LOC);
+        let row = lp.row();
+        row.address_offset = 0;
+        row.file = self.file_id;
+        row.line = u64::from(line);
+        row.column = u64::from(col);
+        row.is_statement = true;
+        lp.generate_row();
+        let mut last: Option<(u32, u32)> = Some((line, col));
+        let mut last_line = Some(line);
+        // A debugger stops after the prologue: at the first statement
+        // (the first code on a line other than the function's own, if
+        // any; else its first op).
+        let first_stmt = rows
+            .iter()
+            .find(|&&(_, pc)| pc != PROLOGUE_LOC && position(pc).0 != pos.line)
+            .or_else(|| rows.iter().find(|&&(_, pc)| pc != PROLOGUE_LOC))
+            .map(|&(off, _)| off);
         for &(off, pc) in rows {
             let (line, col) = position(pc);
-            let prologue_end = pc != PROLOGUE_LOC && !seen_body;
+            let prologue_end = Some(off) == first_stmt;
             if last == Some((line, col)) && !prologue_end {
                 continue;
             }
-            seen_body |= pc != PROLOGUE_LOC;
             let row = lp.row();
             row.address_offset = u64::from(off - fl.start);
             row.file = self.file_id;
