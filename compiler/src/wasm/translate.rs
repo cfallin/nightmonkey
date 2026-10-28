@@ -4807,6 +4807,7 @@ mod tests {
             is_named_lambda: false,
             env_nfixed: None,
             env_slot_values: vec![],
+            all_bindings: vec![],
         }));
         let mut s = script(code, 1);
         s.body_scope = Some(scope_id);

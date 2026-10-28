@@ -580,6 +580,7 @@ impl<'a, M: MemAccess> Walker<'a, M> {
             env_slot_values: vec![],
             is_named_lambda: false,
             env_nfixed,
+            all_bindings: vec![],
         })))
     }
 
@@ -605,15 +606,20 @@ impl<'a, M: MemAccess> Walker<'a, M> {
             .collect::<Vec<_>>();
         for (name_atom, is_var, env_slot) in bindings {
             if name_atom == 0 {
+                self.source
+                    .object_mut(SourceObjectId::new(id))
+                    .as_scope_mut()
+                    .all_bindings
+                    .push((None, is_var, env_slot));
                 continue;
             }
             let kind_string = lay.get(Field::traceKindString) as u8;
             let nid = self.add(name_atom, kind_string)?;
-            self.source
-                .object_mut(SourceObjectId::new(id))
-                .as_scope_mut()
-                .bindings
-                .push((SourceObjectId::new(nid), is_var, env_slot));
+            let scope = self.source.object_mut(SourceObjectId::new(id)).as_scope_mut();
+            scope.bindings.push((SourceObjectId::new(nid), is_var, env_slot));
+            scope
+                .all_bindings
+                .push((Some(SourceObjectId::new(nid)), is_var, env_slot));
         }
         // Live environment slot values (the closure-captured module handles),
         // when the snapshot caught an activation of this scope.

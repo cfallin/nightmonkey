@@ -11,6 +11,38 @@ fn dropped(name: &str) -> bool {
 
 /// Drop the name and DWARF custom sections from a serialized module.
 pub fn strip(wasm: &[u8]) -> Result<Vec<u8>> {
+    strip_where(wasm, dropped)
+}
+
+/// Drop only the DWARF custom sections.
+pub fn strip_dwarf(wasm: &[u8]) -> Result<Vec<u8>> {
+    strip_where(wasm, |name| name.starts_with(".debug"))
+}
+
+/// Append a custom section.
+pub fn append_custom(wasm: &mut Vec<u8>, name: &str, data: &[u8]) {
+    let mut payload = vec![];
+    put_uleb(&mut payload, name.len());
+    payload.extend_from_slice(name.as_bytes());
+    payload.extend_from_slice(data);
+    wasm.push(0);
+    put_uleb(wasm, payload.len());
+    wasm.extend_from_slice(&payload);
+}
+
+fn put_uleb(out: &mut Vec<u8>, mut v: usize) {
+    loop {
+        let byte = (v & 0x7f) as u8;
+        v >>= 7;
+        if v == 0 {
+            out.push(byte);
+            return;
+        }
+        out.push(byte | 0x80);
+    }
+}
+
+fn strip_where(wasm: &[u8], dropped: impl Fn(&str) -> bool) -> Result<Vec<u8>> {
     if !wasm.starts_with(b"\0asm") || wasm.len() < 8 {
         bail!("not a wasm module");
     }

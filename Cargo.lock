@@ -1332,6 +1332,7 @@ checksum = "743fb55ba31b18fb1ecef6bdc9aa2743314978ac084044301a7eee33fb99a20d"
 name = "night-compiler"
 version = "0.1.0"
 dependencies = [
+ "gimli 0.33.0",
  "log",
  "rayon",
  "rustc-hash",
@@ -2154,8 +2155,6 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 [[package]]
 name = "waffle"
 version = "0.3.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1b083d7d2b68bd1da2ac0491d68e56096ccc3c8bac7bc998fe015744825c54f3"
 dependencies = [
  "anyhow",
  "fxhash",

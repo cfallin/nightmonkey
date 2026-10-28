@@ -140,6 +140,7 @@ pub fn dump(source: &Source, root: SourceObjectId) -> String {
                 env_slot_values,
                 is_named_lambda,
                 env_nfixed: _,
+                all_bindings: _,
             }) => {
                 let binds: Vec<String> = bindings
                     .iter()

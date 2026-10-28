@@ -43,6 +43,9 @@ struct Args {
     keep_snapshot: Option<PathBuf>,
     keep_names: bool,
     dump_graph: bool,
+    /// `--debug-source`: the program source a `--debug-info` build's DWARF
+    /// names (by default the input, when it is a `.js` program).
+    debug_source: Option<PathBuf>,
     opts: Options,
 }
 
@@ -68,6 +71,13 @@ usage: nightmonkey [options] <input> -o <output>
 Output
   -o <path>                the compiled module
   --keep-names             keep the name and DWARF sections (stripped by default)
+  --debug-info             compile for source-level debugging: baseline
+                           bodies only, with DWARF (lines, functions,
+                           arguments, locals, globals, and the engine's heap
+                           layout for pretty-printing JS values); implies
+                           --keep-names
+  --debug-source <path>    the program source the DWARF names (default: the
+                           input, when it is a .js program)
 
 Compilation
   --pipeline <p>           which tiers compile scripts: mir (default; MIR
@@ -121,6 +131,7 @@ fn parse_args() -> Result<Args> {
     let mut keep_snapshot = None;
     let mut keep_names = false;
     let mut dump_graph = false;
+    let mut debug_source = None;
     let mut opts = Options::default();
     let mut it = std::env::args().skip(1);
     fn val(it: &mut impl Iterator<Item = String>, flag: &str) -> Result<String> {
@@ -142,6 +153,9 @@ fn parse_args() -> Result<Args> {
             }
             "--keep-names" => keep_names = true,
             "--dump-graph" => dump_graph = true,
+            "--debug-source" => {
+                debug_source = Some(PathBuf::from(val(&mut it, "--debug-source")?))
+            }
             _ if opts
                 .apply_flag(&a, &mut || it.next())
                 .map_err(anyhow::Error::msg)? => {}
@@ -164,6 +178,7 @@ fn parse_args() -> Result<Args> {
         keep_snapshot,
         keep_names,
         dump_graph,
+        debug_source,
         opts,
     })
 }
@@ -585,6 +600,7 @@ fn main() -> Result<()> {
     let TranslateOut {
         mut atoms,
         sid_to_index,
+        source_id_to_func,
         strlit_patches,
         regex_entries,
         prop_ic_base,
@@ -752,11 +768,38 @@ fn main() -> Result<()> {
 
     image::update(&mut m, &img);
     let t = std::time::Instant::now();
-    let mut out_bytes = m
-        .to_wasm_bytes()
+    let (mut out_bytes, code_layout) = m
+        .to_wasm_bytes_with_layout()
         .map_err(|e| anyhow!("serialize transformed module: {e}"))?;
     let unstripped = out_bytes.len();
-    if !args.keep_names {
+    if opts.debug_info {
+        // The snapshot's own DWARF (the runtime's) describes code offsets
+        // the transform moved: replace it with the program's.
+        out_bytes = strip::strip_dwarf(&out_bytes)?;
+        let path = match &args.debug_source {
+            Some(p) => p.clone(),
+            None if args.input.extension().is_some_and(|e| e == "js") => args.input.clone(),
+            None => bail!("--debug-info with a snapshot input needs --debug-source <program.js>"),
+        };
+        let path = std::fs::canonicalize(&path).unwrap_or(path);
+        let global_object = source
+            .global_object
+            .and_then(|g| walk_out.object_addr.get(&g.id()).copied());
+        let sections = night_compiler::wasm::dwarf::build(&night_compiler::wasm::dwarf::DebugInput {
+            source: &source,
+            root: root_id,
+            path: &path.display().to_string(),
+            bodies: &|sid| source_id_to_func.get(&sid).copied(),
+            layout: &code_layout,
+            image: &img,
+            object_addr: &|id| walk_out.object_addr.get(&id).copied(),
+            global_object,
+        })
+        .map_err(|e| anyhow!("debug info: {e}"))?;
+        for (name, data) in sections {
+            strip::append_custom(&mut out_bytes, &name, &data);
+        }
+    } else if !args.keep_names {
         out_bytes = strip::strip(&out_bytes)?;
     }
     if stats {
@@ -779,6 +822,12 @@ fn main() -> Result<()> {
         );
     }
     Ok(())
+}
+
+impl night_compiler::wasm::dwarf::heap::Image for image::Image {
+    fn read_u32(&self, addr: u32) -> Option<u32> {
+        image::Image::read_u32(self, addr).ok()
+    }
 }
 
 /// Whether snapshot value `vid` is of claimed type `c` (its tag; an

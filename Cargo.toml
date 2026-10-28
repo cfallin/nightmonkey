@@ -18,3 +18,7 @@ license = "Apache-2.0 WITH LLVM-exception"
 [profile.release]
 debug = false
 
+
+# Debug-info work: use the sibling waffle checkout.
+[patch.crates-io]
+waffle = { path = "../waffle" }

@@ -19,6 +19,7 @@ use rayon::prelude::*;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 pub mod baseline;
+pub mod dwarf;
 pub mod mir;
 pub mod tier;
 pub use mir::abi::EARLY_KEY_MAX;

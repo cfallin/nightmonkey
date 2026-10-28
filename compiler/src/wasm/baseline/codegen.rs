@@ -144,6 +144,9 @@ pub(super) struct Gen<'a> {
     /// The op being lowered and its entry depth.
     pc: Pc,
     d: u32,
+    /// Emitting the frame setup ahead of the first op: such code is
+    /// tagged `dwarf::PROLOGUE_LOC`, so a debugger stops after it.
+    debug_prologue: bool,
 }
 
 type R<T> = Result<T, String>;
@@ -258,6 +261,7 @@ impl<'a> Gen<'a> {
             prop_ic_patches: vec![],
             pc: Pc::new(0),
             d: 0,
+            debug_prologue: false,
         })
     }
 
@@ -266,6 +270,16 @@ impl<'a> Gen<'a> {
     fn push_val(&mut self, def: ValueDef) -> Value {
         let v = self.body.add_value(def);
         self.body.append_to_block(self.cur, v);
+        if self.ctx.opts.debug_info {
+            // The location space is the script's bytecode pcs: the DWARF
+            // emitter (`wasm::dwarf`) maps each to its source position.
+            let loc = if self.debug_prologue {
+                crate::wasm::dwarf::PROLOGUE_LOC
+            } else {
+                self.pc.get()
+            };
+            self.body.source_locs[v] = waffle::SourceLoc::from(loc);
+        }
         v
     }
 
@@ -1007,6 +1021,7 @@ impl<'a> Gen<'a> {
             .map(|(h, e)| (Pc::new(h), Pc::new(e)))
             .collect();
         self.loops.sort();
+        self.debug_prologue = true;
         self.frame_regs();
         for w in self.ext_resumes.clone() {
             if self.depths.at(w.pc).is_none() {
@@ -1055,6 +1070,7 @@ impl<'a> Gen<'a> {
             return Err("BUG: onramps without resume words".into());
         }
         self.prologue();
+        self.debug_prologue = false;
         let mut leaders = layout::leaders(self.script);
         // A suspend returns, so the code after it is entered only by a
         // resume: each landing starts a block.
@@ -1356,6 +1372,7 @@ impl<'a> Gen<'a> {
             .collect();
         let targets: Vec<ResumeWord> = self.resume_words.iter().copied().collect();
         for (h, disp, code) in headers {
+            self.pc = h;
             let mut hops = vec![];
             for &t in &targets {
                 let chain = self.dispatch_chain(t.pc);

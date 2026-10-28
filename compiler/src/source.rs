@@ -184,6 +184,13 @@ pub struct ScopeData {
     /// carried one. Lets an aliased-var access address its slot statically
     /// instead of decoding the fixed/dynamic split from the live shape.
     pub env_nfixed: Option<u32>,
+    /// Every binding the scope declares, in `BindingIter` order, including
+    /// elided ones (a destructuring formal's slot has no name): (name,
+    /// is_var, environment slot if closed over). `bindings` drops the
+    /// elided entries, which shifts positions; source-level debug info
+    /// (`wasm::dwarf`) needs the positions to recover frame and argument
+    /// slots.
+    pub all_bindings: Vec<(Option<SourceObjectId>, bool, Option<u32>)>,
 }
 
 /// The static scope an aliased-var access at `pc` in `script` names:

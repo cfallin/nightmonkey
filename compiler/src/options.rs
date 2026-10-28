@@ -190,6 +190,12 @@ pub struct Options {
     /// reducifier duplicates code for that. 0 = outermost loops only.
     /// `None` = the default, [`Options::inner_onramp_bytes`].
     pub mir_inner_onramp_bytes: Option<u32>,
+    /// Compile for source-level debugging (`--debug-info`): baseline bodies
+    /// only (every JS value in its frame slot, at a layout that is a
+    /// function of the script), each instruction tagged with its bytecode
+    /// pc, so the caller can emit DWARF for the output module
+    /// (`wasm::dwarf`).
+    pub debug_info: bool,
     pub diagnostics: Diagnostics,
     pub instrument: Instrumentation,
 }
@@ -215,6 +221,10 @@ impl Options {
         match flag {
             "--pipeline" => self.pipeline = arg(flag)?.parse()?,
             "--strict-coverage" => self.strict_coverage = true,
+            "--debug-info" => {
+                self.debug_info = true;
+                self.pipeline = Pipeline::Baseline;
+            }
             "--mir-inner-onramp-bytes" => {
                 self.mir_inner_onramp_bytes = Some(
                     arg(flag)?
