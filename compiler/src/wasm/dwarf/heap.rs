@@ -255,6 +255,9 @@ const ENUMS: &[(&str, &[(&str, i64)])] = &[
             ("KIND_SHIFT", 4),
             ("KIND_MASK", 3),
             ("KIND_DICTIONARY", 3),
+            // Shared and dictionary shapes (native objects) have it;
+            // proxy and Wasm GC shapes do not.
+            ("IS_NATIVE_BIT", 1 << 4),
             ("FIXED_SLOTS_SHIFT", SHAPE_FIXED_SLOTS_SHIFT as i64),
             ("FIXED_SLOTS_MASK", SHAPE_FIXED_SLOTS_MASK_BITS as i64),
         ],

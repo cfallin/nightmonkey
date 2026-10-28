@@ -225,6 +225,8 @@ const SK_CATCH: u8 = 4;
 const SK_FUNCTION_LEXICAL: u8 = 7;
 const SK_CLASS_BODY: u8 = 8;
 const SK_WITH: u8 = 9;
+const SK_GLOBAL: u8 = 12;
+const SK_NON_SYNTACTIC: u8 = 13;
 const SK_MODULE: u8 = 14;
 
 /// Where `BindingIter` puts a binding (`BindingLocation`).
@@ -469,7 +471,35 @@ impl Cx<'_, '_> {
 
         // The body scope's bindings, at function level.
         if let Some(body) = script.body_scope {
-            self.scope_vars(script, &frame_layout, sub, body, &ranges)?;
+            self.scope_vars(script, &frame_layout, sub, body, &ranges, &BTreeSet::new())?;
+            // Then the bindings this function closes over: those of the
+            // enclosing functions' environments, up to the global scope,
+            // except where a nearer binding shadows them.
+            let mut shadowed: BTreeSet<String> = BTreeSet::new();
+            let mut own = vec![body];
+            own.extend(script.scope_notes.iter().filter_map(|n| {
+                script.gcthings.get(n.gcthing_index as usize).copied()
+            }));
+            for s in own {
+                for (name, _, _) in self.bindings(s) {
+                    shadowed.extend(name.and_then(|n| self.string(n)));
+                }
+            }
+            let mut cur = self.scope(body).and_then(|s| s.enclosing);
+            while let Some(scope) = cur {
+                let Some(data) = self.scope(scope) else { break };
+                if matches!(data.kind, SK_GLOBAL | SK_NON_SYNTACTIC) {
+                    break;
+                }
+                let (has_environment, enclosing) = (data.has_environment, data.enclosing);
+                if has_environment {
+                    self.scope_vars(script, &frame_layout, sub, scope, &ranges, &shadowed)?;
+                }
+                for (name, _, _) in self.bindings(scope) {
+                    shadowed.extend(name.and_then(|n| self.string(n)));
+                }
+                cur = enclosing;
+            }
         }
         // Block scopes, as lexical blocks over the code of their notes.
         let mut blocks: BTreeMap<u32, Vec<(Pc, u32)>> = BTreeMap::new();
@@ -503,7 +533,14 @@ impl Cx<'_, '_> {
                 .unit
                 .get_mut(block)
                 .set(gimli::DW_AT_ranges, AttributeValue::RangeListRef(list));
-            self.scope_vars(script, &frame_layout, block, SourceObjectId::new(scope), &ranges)?;
+            self.scope_vars(
+                script,
+                &frame_layout,
+                block,
+                SourceObjectId::new(scope),
+                &ranges,
+                &BTreeSet::new(),
+            )?;
         }
         Ok(())
     }
@@ -595,17 +632,27 @@ impl Cx<'_, '_> {
         parent: UnitEntryId,
         scope: SourceObjectId,
         ranges: &dyn Fn(&dyn Fn(Pc) -> bool) -> Vec<(u32, u32)>,
+        shadowed: &BTreeSet<String>,
     ) -> Result<(), String> {
+        // A scope of an enclosing function: only its environment's
+        // bindings are reachable from here.
+        let own = script.body_scope == Some(scope)
+            || script.scope_notes.iter().any(|n| {
+                script.gcthings.get(n.gcthing_index as usize) == Some(&scope)
+            });
         let env_nfixed = self.scope(scope).and_then(|s| s.env_nfixed);
         let is_function = self.scope(scope).map(|s| s.kind) == Some(SK_FUNCTION);
         let nargs = self.function_nargs(scope);
         for (i, (name, _is_var, loc)) in self.bindings(scope).into_iter().enumerate() {
-            let formal = is_function && (i as u32) < nargs;
+            let formal = own && is_function && (i as u32) < nargs;
             let Some(name) = name.and_then(|n| self.string(n)) else {
                 continue;
             };
             // Synthetic bindings (`.this`, `.generator`, `*namespace*`...).
-            if name.starts_with('.') || name.starts_with('*') {
+            if name.starts_with('.') || name.starts_with('*') || shadowed.contains(&name) {
+                continue;
+            }
+            if !own && !matches!(loc, BindingLoc::Environment(_)) {
                 continue;
             }
             match loc {
