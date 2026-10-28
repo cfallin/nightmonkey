@@ -494,6 +494,20 @@ pub fn own_property_slot(image: &dyn Image, obj: u32, name: &str) -> Option<Slot
     None
 }
 
+/// The name in a function object's atom slot: its explicit name, or the
+/// name the frontend guessed for an anonymous function from where it is
+/// assigned (`Scheduler.prototype.schedule`).
+pub fn function_atom(image: &dyn Image, fun: u32) -> Option<String> {
+    // JSFunction::AtomSlot (fixed slot 3).
+    let slot = FIXED_SLOTS_BASE + 8 * 3;
+    let (payload, tag) = (image.read_u32(fun + slot)?, image.read_u32(fun + slot + 4)?);
+    // JSVAL_TAG_STRING.
+    if tag != 0xFFFF_FF86 || payload == 0 {
+        return None;
+    }
+    read_atom(image, payload).map(|c| String::from_utf16_lossy(&c))
+}
+
 /// The characters of the flat string (an atom) at `s`.
 fn read_atom(image: &dyn Image, s: u32) -> Option<Vec<u16>> {
     let flags = image.read_u32(s)?;

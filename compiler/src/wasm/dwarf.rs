@@ -160,7 +160,20 @@ pub fn build(input: &DebugInput) -> Result<Vec<(String, Vec<u8>)>, String> {
         }
     }
 
-    let names = function_names(input.source);
+    let mut names = function_names(input.source);
+    // Anonymous functions: the name the frontend guessed, from the image.
+    for (i, o) in input.source.objects.iter().enumerate() {
+        let SourceObject::Object(od) = o else { continue };
+        let Some(s) = od.script else { continue };
+        if names.contains_key(&s.id()) {
+            continue;
+        }
+        if let Some(name) = (input.object_addr)(u32::try_from(i).unwrap())
+            .and_then(|addr| heap::function_atom(input.image, addr))
+        {
+            names.insert(s.id(), name);
+        }
+    }
     let funcs: HashMap<Func, usize> = input
         .layout
         .funcs
